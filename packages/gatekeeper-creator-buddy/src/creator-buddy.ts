@@ -4,11 +4,11 @@
 //  - a small read-only session capability backed by the Guaikei content-search API and headless
 //    browser rendering.
 //
-// PHASE 1 (this file, as first submitted): the slash-command/catalog plumbing is real and the
-// vendored skills are wired end to end. The Guaikei- and rendering-backed session methods below are
-// signature-complete but throw -- see the TODO(PR2)/TODO(PR3) comments. The vendored skill text
-// itself still contains its original shell-out instructions (python3/bash/ffmpeg), which do not
-// work in this runtime; rewriting that text to call the session methods below is also TODO(PR3).
+// Status: the slash-command/catalog plumbing and the Guaikei-backed search/detail/profile methods
+// are real. `renderImage` (BROWSER-backed) is still signature-complete but throws -- see the
+// TODO(PR3) comment on it. The vendored skill text itself still contains its original shell-out
+// instructions (python3/bash/ffmpeg), which do not work in this runtime; rewriting that text to
+// call the session methods below is also TODO(PR3).
 // See vendor/VENDORED_FROM.md and docs/adr/0001-creator-buddy-gatekeeper.md.
 
 import {
@@ -26,6 +26,10 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { parseSkillManifest, buildAgentSkillMessage } from "@gadgets/workshop-shared/agent-skill";
 import { CREATOR_BUDDY_SKILLS } from "./generated/skills.js";
+import {
+  searchXiaohongshuNotes, getXiaohongshuNoteDetail, getXiaohongshuCreatorProfile,
+  type XiaohongshuSearchOptions,
+} from "./guaikei-api.js";
 
 // The Creator Buddy icon: the Phosphor "Sparkle" glyph as a self-contained SVG data URI (no
 // external/branded asset), matching AvatarImage's { url } shape.
@@ -40,11 +44,6 @@ const CREATOR_BUDDY_ICON = {
 };
 
 // Agent-facing API returned by describeBinding(). Keep in sync with the return types below.
-//
-// TODO(PR2): searchXiaohongshuNotes/getXiaohongshuNoteDetail/getXiaohongshuCreatorProfile return
-// `{ raw: unknown }` because Guaikei's actual response fields have not been mapped yet -- see
-// guaikei.js in the vendored source, which itself only forwards `JSON.stringify(data)`. Replace
-// `raw: unknown` with real fields once PR2 maps them; do not guess at field names here.
 const CREATOR_BUDDY_TYPES = `
 /**
  * Content-creation Agent Skills, plus a small Xiaohongshu (小红书) content-search and image
@@ -54,12 +53,14 @@ const CREATOR_BUDDY_TYPES = `
 interface CreatorBuddy {
   /** Search recent Xiaohongshu notes by keyword. Backed by the Guaikei API. */
   searchXiaohongshuNotes(
-    keyword: string, opts?: XiaohongshuSearchOptions): Promise<XiaohongshuSearchResult>;
+    keyword: string, opts?: XiaohongshuSearchOptions): Promise<XiaohongshuNoteSummary[]>;
   /** Fetch full detail for a single Xiaohongshu note by its URL. */
-  getXiaohongshuNoteDetail(url: string, opts?: { limit?: number }): Promise<XiaohongshuNoteDetail>;
-  /** Fetch a Xiaohongshu creator's profile and recent notes by their homepage URL. */
-  getXiaohongshuCreatorProfile(
-    url: string, opts?: { limit?: number }): Promise<XiaohongshuCreatorProfile>;
+  getXiaohongshuNoteDetail(url: string, opts?: { limit?: number }): Promise<XiaohongshuNoteSummary>;
+  /**
+   * Fetch a Xiaohongshu creator's profile and recent notes by their homepage URL. Guaikei's
+   * response fields for this endpoint are undocumented, so the result is passed through unmapped.
+   */
+  getXiaohongshuCreatorProfile(url: string, opts?: { limit?: number }): Promise<unknown>;
   /**
    * Render self-contained HTML (e.g. a cover or diagram template) to a PNG image via headless
    * browser rendering. Used in place of the vendored skills' local ffmpeg/image-gen scripts, which
@@ -79,10 +80,15 @@ interface XiaohongshuSearchOptions {
   limit?: number;
 }
 
-// Shape TBD -- see the TODO(PR2) comment above this block.
-interface XiaohongshuSearchResult { raw: unknown }
-interface XiaohongshuNoteDetail { raw: unknown }
-interface XiaohongshuCreatorProfile { raw: unknown }
+/** A Xiaohongshu note. \`extra\` carries every Guaikei-returned field not listed here, unmapped. */
+interface XiaohongshuNoteSummary {
+  id?: string;
+  xsecToken?: string;
+  /** The note's canonical URL, derived from id + xsecToken. */
+  url?: string;
+  user?: { userId?: string; xsecToken?: string; url?: string };
+  extra: Record<string, unknown>;
+}
 `;
 
 // ---------------------------------------------------------------------------
@@ -209,7 +215,7 @@ export class CreatorBuddyGatekeeper
   }
 
   async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<CreatorBuddySession> {
-    return new CreatorBuddySession(approvalQueue.dup());
+    return new CreatorBuddySession(approvalQueue.dup(), this.env.GUAIKEI_API_TOKEN);
   }
 
   async getSlashCommandProvider(): Promise<CreatorBuddySlashCommandProvider> {
@@ -301,33 +307,43 @@ class CreatorBuddySlashCommandProvider extends NativeRpcTarget implements SlashC
 @validateRpc()
 export class CreatorBuddySession extends RpcTarget {
   #approvalQueue: NativeRpcStub<ApprovalQueue>;
+  #guaikeiToken: string;
 
-  constructor(approvalQueue: NativeRpcStub<ApprovalQueue>) {
+  constructor(approvalQueue: NativeRpcStub<ApprovalQueue>, guaikeiToken: string) {
     super();
     this.#approvalQueue = approvalQueue;
+    this.#guaikeiToken = guaikeiToken;
   }
 
   [Symbol.dispose]() {
     this.#approvalQueue[Symbol.dispose]();
   }
 
-  // TODO(PR2): call the Guaikei API (env.GUAIKEI_API_TOKEN) and authorize the read as an
-  // observation before returning data, mirroring gzh-Skills/global-content-search/src/platforms/
-  // guaikei.js's search()/detail()/user() in vendor/global-content-search/SKILL.md.
-  async searchXiaohongshuNotes(
-      _keyword: string,
-      _opts?: { type?: number; sort?: number; time?: number; limit?: number },
-      ): Promise<{ raw: unknown }> {
-    throw new Error("Not yet implemented -- see PR2 (Guaikei search capability).");
+  async searchXiaohongshuNotes(keyword: string, opts?: XiaohongshuSearchOptions) {
+    let notes = await searchXiaohongshuNotes(this.#guaikeiToken, keyword, opts);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Xiaohongshu search",
+      description: `Searched Xiaohongshu for "${keyword}"; found ${notes.length} note(s).`,
+    });
+    return notes;
   }
 
-  async getXiaohongshuNoteDetail(_url: string, _opts?: { limit?: number }): Promise<{ raw: unknown }> {
-    throw new Error("Not yet implemented -- see PR2 (Guaikei search capability).");
+  async getXiaohongshuNoteDetail(url: string, opts?: { limit?: number }) {
+    let note = await getXiaohongshuNoteDetail(this.#guaikeiToken, url, opts);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Xiaohongshu note detail",
+      description: `Fetched detail for Xiaohongshu note: ${url}`,
+    });
+    return note;
   }
 
-  async getXiaohongshuCreatorProfile(
-      _url: string, _opts?: { limit?: number }): Promise<{ raw: unknown }> {
-    throw new Error("Not yet implemented -- see PR2 (Guaikei search capability).");
+  async getXiaohongshuCreatorProfile(url: string, opts?: { limit?: number }) {
+    let profile = await getXiaohongshuCreatorProfile(this.#guaikeiToken, url, opts);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Xiaohongshu creator profile",
+      description: `Fetched creator profile and recent notes: ${url}`,
+    });
+    return profile;
   }
 
   // TODO(PR3): render via the BROWSER binding (see packages/workshop-backend's Puppeteer-based
