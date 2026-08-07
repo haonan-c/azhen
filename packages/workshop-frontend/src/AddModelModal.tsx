@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, DIRECT_ONLY_AI_PROVIDERS, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 
@@ -21,6 +21,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   openai: 'OpenAI',
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
+  deepseek: 'DeepSeek',
   ollama: 'Ollama',
 }
 
@@ -30,6 +31,7 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   openai: 'sk-...',
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
+  deepseek: 'sk-...',
   ollama: '(optional)',
 }
 
@@ -66,10 +68,12 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
   const providerOrder = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
   for (const provider of providerOrder) {
-    if (enabledProviders && !enabledProviders.has(provider)) continue
+    const directOnly = DIRECT_ONLY_AI_PROVIDERS.has(provider)
+    if (enabledProviders && !enabledProviders.has(provider) && !directOnly) continue
 
-    // In gateway mode, suggested models are already built-in, so don't list them.
-    if (!gatewayMode) {
+    // Gateway-backed suggested models are already built in. Direct-only suggested models still
+    // need to be offered because they use the user's own credentials.
+    if (!gatewayMode || directOnly) {
       for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
         options.push({
           value: encodeSelection(provider, modelId),
@@ -113,6 +117,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const enabledProviders: Set<string> | null = gatewayMode
     ? new Set(aiConfig.enabledProviders)
     : null
+  const usesDirectCredentials = !gatewayMode ||
+    (selection !== null && DIRECT_ONLY_AI_PROVIDERS.has(selection.provider))
 
   // Reset all state when dialog closes
   useEffect(() => {
@@ -161,17 +167,15 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     const isOllama = selection?.provider === 'ollama'
     const isCloudflare = selection?.provider === 'cloudflare'
-    const showCredentials = !gatewayMode
-
-    if (showCredentials && selection && !isOllama && !apiToken.trim()) {
+    if (usesDirectCredentials && selection && !isOllama && !apiToken.trim()) {
       newErrors.apiToken = 'Please enter your API token'
     }
 
-    if (showCredentials && isCloudflare && !accountId.trim()) {
+    if (usesDirectCredentials && isCloudflare && !accountId.trim()) {
       newErrors.accountId = 'Please enter your Cloudflare account ID'
     }
 
-    if (showCredentials && isOllama && !apiUrl.trim()) {
+    if (usesDirectCredentials && isOllama && !apiUrl.trim()) {
       newErrors.apiUrl = 'Please enter the Ollama API URL'
     }
 
@@ -197,9 +201,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       const config: AiModelConfig = {
         provider: selection!.provider,
         model: finalModelId,
-        apiToken: gatewayMode ? '' : apiToken.trim(),
-        ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
-        ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
+        apiToken: usesDirectCredentials ? apiToken.trim() : '',
+        ...(usesDirectCredentials && accountId.trim() && { accountId: accountId.trim() }),
+        ...(usesDirectCredentials && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
       }
 
       await authenticatedApi.addModel(profile, config)
@@ -218,7 +222,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
   const isCloudflare = selection?.provider === 'cloudflare'
-  const showCredentials = !gatewayMode
+  const showCredentials = usesDirectCredentials
 
   // Group options by provider for rendering with visual separators.
   const groupedOptions: { provider: string; items: typeof options }[] = []
