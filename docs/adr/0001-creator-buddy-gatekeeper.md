@@ -14,7 +14,7 @@ implementation (see `.agents/skills/write-gatekeeper/SKILL.md` for what that tri
 
 **Why**: the Context Library can only distribute *documents*. Most of Creator Buddy's Skills are
 not self-contained prose — their instructions shell out to scripts that call a third-party content
-API (Guaikei, for Xiaohongshu search) or render HTML templates to images. Those are capabilities,
+API (TikHub, for Xiaohongshu search) or render HTML templates to images. Those are capabilities,
 not content, and Context Library gatekeepers have no mechanism to expose a capability alongside a
 document. Splitting "the Skill text" (Context Library) from "the API/rendering capability it
 depends on" (a new gatekeeper) would have put two coupled things in two separately-deployed,

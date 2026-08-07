@@ -1,6 +1,6 @@
 ---
 name: global-content-search
-description: 全域内容搜索（本部署仅小红书）｜当提到小红书关键词搜索、笔记详情、博主作品监控时使用。经本部署的 CreatorBuddy 会话（Guaikei）调用；B站、抖音在本部署不可用。
+description: 全域内容搜索（本部署仅小红书）｜当提到小红书关键词搜索、笔记详情、博主作品监控时使用。经本部署的 CreatorBuddy 会话（TikHub）调用；B站、抖音在本部署不可用。
 license: MIT
 metadata:
   type: command
@@ -21,13 +21,13 @@ metadata:
 
 # 全域内容搜索
 
-> **本部署说明**：原版按 Agent Reach（OpenCLI/xiaohongshu-mcp/xhs-cli/bili-cli 等本地 CLI）优先、Guaikei API 兜底的顺序访问小红书和 B站，抖音走可选的 `DOUYIN_COMMAND`。这些 CLI 都依赖本地进程，本部署运行在 Workers 沙箱里没有对应能力；**本部署只保留小红书一条路径，且只有 Guaikei 这一个后端**，B站、抖音均不可用。以下命令示例（`node src/xiaohongshu/*-cli.js`）均为原版参考，本部署改用下方"快速使用"里的会话方法调用。
+> **本部署说明**：原版按 Agent Reach（OpenCLI/xiaohongshu-mcp/xhs-cli/bili-cli 等本地 CLI）优先、第三方 API 兜底的顺序访问小红书和 B站，抖音走可选的 `DOUYIN_COMMAND`。这些 CLI 都依赖本地进程，本部署运行在 Workers 沙箱里没有对应能力；**本部署只保留小红书一条路径，且只有 TikHub 这一个后端**，B站、抖音均不可用。以下命令示例（`node src/xiaohongshu/*-cli.js`）均为原版参考，本部署改用下方"快速使用"里的会话方法调用。
 
 ## 1. 技能概述
 
 本部署的访问路径：
 
-- 小红书关键词搜索、笔记详情/评论、博主作品：统一经 `env[N]` 上的 CreatorBuddy 会话（`env[N]` 指本次对话里的 Creator Buddy 绑定），无需配置 Key（部署管理员已配置好 Guaikei token）。
+- 小红书关键词搜索、笔记详情/评论、博主作品：统一经 `env[N]` 上的 CreatorBuddy 会话（`env[N]` 指本次对话里的 Creator Buddy 绑定），无需配置 Key（部署管理员已配置好 TikHub API key）。
 - B站、抖音：本部署未接入，直接告知用户不支持，不要尝试调用 CLI。
 
 ## 2. 核心能力

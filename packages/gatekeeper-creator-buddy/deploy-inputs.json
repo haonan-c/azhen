@@ -1,12 +1,12 @@
 [
   {
-    "name": "GUAIKEI_API_TOKEN",
+    "name": "TIKHUB_API_KEY",
     "kind": "secret",
-    "label": "Guaikei API token",
-    "consoleUrl": "https://www.guaikei.com",
+    "label": "TikHub API key",
+    "consoleUrl": "https://user.tikhub.io/dashboard/overview",
     "setupSteps": [
-      "Sign up for a Guaikei account and subscribe to the content-search API.",
-      "Copy your API token from the Guaikei dashboard here."
+      "Sign up for a TikHub account and enable the Xiaohongshu API.",
+      "Copy your API key from the TikHub dashboard here."
     ]
   }
 ]

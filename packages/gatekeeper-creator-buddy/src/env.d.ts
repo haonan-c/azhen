@@ -2,6 +2,6 @@
 
 declare namespace Cloudflare {
   interface Env {
-    GUAIKEI_API_TOKEN: string;
+    TIKHUB_API_KEY: string;
   }
 }

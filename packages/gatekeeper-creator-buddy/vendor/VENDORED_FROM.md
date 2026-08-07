@@ -26,15 +26,15 @@ all; this repository does not push changes back upstream.
 
 These were investigated in more depth than the initial exclusion pass, which only looked for
 `ffmpeg`/`npx` in the skill text. Digging into the actual scripts each one shells out to turned up
-data sources beyond Guaikei that this deployment does not integrate. Rather than silently mapping
-them to Guaikei (which would produce data the skill author never intended, or none), each file's
+data sources beyond the Xiaohongshu API that this deployment does not integrate. Rather than silently mapping
+them to TikHub (which would produce data the skill author never intended, or none), each file's
 `SKILL.md` carries a prominent note explaining why it's inert here, and the original text is
 otherwise left untouched as reference:
 
 - `baokuan-article-analysis`, `gzh-explosive-content-detector` — both call the same undocumented
   third-party endpoint (`onetotenvip.com/skill/cozeSkill/getWxCozeSkillData`), reached in
   `baokuan-article-analysis`'s case over a raw TLS socket with certificate verification disabled.
-  Neither is Guaikei-backed (both are 公众号/WeChat, and Guaikei only covers 小红书/Xiaohongshu).
+  Neither is Xiaohongshu-backed (both are 公众号/WeChat, while this deployment only covers 小红书/Xiaohongshu).
 - `space-chart-image` — primary path is a runtime-native image-generation model (Codex
   `image_gen`/`image2`); its scripted fallback needs a separate `LABNANA_API_KEY`
   (`api.labnana.com`), not integrated.
@@ -45,7 +45,7 @@ otherwise left untouched as reference:
 
 Shell-out instructions (`python3`/`bash`/`node ... -cli.js`) were replaced with calls against the
 `CreatorBuddy` session capability (`env[N].searchXiaohongshuNotes()` /
-`getXiaohongshuNoteDetail()` / `getXiaohongshuCreatorProfile()`, all Guaikei-backed and
+`getXiaohongshuNoteDetail()` / `getXiaohongshuCreatorProfile()`, all TikHub-backed and
 Xiaohongshu-only — B站/抖音/公众号 routes in the original multi-platform skills are explicitly
 marked unavailable rather than silently dropped) or `env[N].renderImage()` (HTML → PNG via
 Browser Rendering, replacing local ffmpeg/image-gen script references). Two skills

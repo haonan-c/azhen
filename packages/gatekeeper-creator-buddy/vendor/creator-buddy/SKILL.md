@@ -50,7 +50,7 @@ metadata:
 
 如果用户没有指定平台，但给了链接，按链接域名判断平台。
 
-> **本部署说明**：本部署只接入了**小红书**一个数据源（Guaikei，经 `env[N]` 上的 CreatorBuddy 绑定调用，`env[N]` 指本次对话里的 Creator Buddy 会话）。B站、抖音、公众号在原版里依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐 / onetotenvip 等后端本部署均未接入。遇到这些平台的请求，直接告诉用户"本部署当前只支持小红书数据查询"，不要尝试调用下面已删除的脚本/CLI，也不要编造数据。
+> **本部署说明**：本部署只接入了**小红书**一个数据源（TikHub，经 `env[N]` 上的 CreatorBuddy 绑定调用，`env[N]` 指本次对话里的 Creator Buddy 会话）。B站、抖音、公众号在原版里依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐 / onetotenvip 等后端本部署均未接入。遇到这些平台的请求，直接告诉用户"本部署当前只支持小红书数据查询"，不要尝试调用下面已删除的脚本/CLI，也不要编造数据。
 
 ## 路由规则
 
@@ -127,5 +127,5 @@ metadata:
 - 不绕过验证码、登录、风控或平台限制。
 - 小红书详情常需要搜索结果里的完整 `xsec_token` URL。
 - B站、抖音、公众号在本部署没有接入的数据源，遇到直接说明，不要编造。
-- 小红书数据由本部署的 CreatorBuddy 会话（Guaikei）提供，是唯一路径，不是兜底。
+- 小红书数据由本部署的 CreatorBuddy 会话（TikHub）提供，是唯一路径，不是兜底。
 - 热度是传播信号，不等于内容质量，也不等于适合用户账号定位。

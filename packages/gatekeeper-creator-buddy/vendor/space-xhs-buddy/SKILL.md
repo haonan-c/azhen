@@ -90,7 +90,7 @@ note-analytics ──┤
 
 ## 第 3 步：开工前先说明数据依赖
 
-`hotspot` 依赖本部署的 Guaikei 数据源，由部署管理员配置好，无需用户自己配置 Key；`xhs-html` 需要 PNG 时经本部署的渲染能力（`env[N].renderImage`）导出，同样无需额外配置。`note-analytics` 不连网，直接分析用户贴的数据。
+`hotspot` 依赖本部署的 TikHub 数据源，由部署管理员配置好，无需用户自己配置 Key；`xhs-html` 需要 PNG 时经本部署的渲染能力（`env[N].renderImage`）导出，同样无需额外配置。`note-analytics` 不连网，直接分析用户贴的数据。
 
 若 `hotspot` 调用失败（如上游服务不可用），如实告知用户"本次小红书数据源不可用"，不要编造互动数字，也不要引导用户配置环境变量——本部署的数据源不是用户自己配的。
 

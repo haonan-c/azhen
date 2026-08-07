@@ -1,10 +1,10 @@
 // Creator Buddy gatekeeper. Auto-provisions one account per user; the account provides an unnamed
 // agent capsule (CreatorBuddyGatekeeper) exposing:
 //  - 20 vendored Agent Skills (see vendor/) as slash commands and Agent Catalog entries, and
-//  - a small read-only session capability backed by the Guaikei content-search API and headless
+//  - a small read-only session capability backed by the TikHub content-search API and headless
 //    browser rendering.
 //
-// The slash-command/catalog plumbing, Guaikei-backed methods, and BROWSER-backed rendering are
+// The slash-command/catalog plumbing, TikHub-backed methods, and BROWSER-backed rendering are
 // implemented. Runtime-specific instructions use these capabilities instead of local dependencies.
 // See vendor/VENDORED_FROM.md and docs/adr/0001-creator-buddy-gatekeeper.md.
 
@@ -26,7 +26,7 @@ import { CREATOR_BUDDY_SKILLS, CREATOR_BUDDY_DOCS } from "./generated/skills.js"
 import {
   searchXiaohongshuNotes, getXiaohongshuNoteDetail, getXiaohongshuCreatorProfile,
   type XiaohongshuSearchOptions,
-} from "./guaikei-api.js";
+} from "./tikhub-api.js";
 import { renderImage } from "./render.js";
 
 // The Creator Buddy icon: the Phosphor "Sparkle" glyph as a self-contained SVG data URI (no
@@ -54,14 +54,13 @@ interface CreatorBuddy {
    * "xhs-html/references/style-registry.md"). Returns null if the id is unknown.
    */
   read(docId: string): Promise<{ id: string; content: string } | null>;
-  /** Search recent Xiaohongshu notes by keyword. Backed by the Guaikei API. */
+  /** Search recent Xiaohongshu notes by keyword. Backed by the TikHub API. */
   searchXiaohongshuNotes(
     keyword: string, opts?: XiaohongshuSearchOptions): Promise<XiaohongshuNoteSummary[]>;
   /** Fetch full detail for a single Xiaohongshu note by its URL. */
   getXiaohongshuNoteDetail(url: string, opts?: { limit?: number }): Promise<XiaohongshuNoteSummary>;
   /**
-   * Fetch a Xiaohongshu creator's profile and recent notes by their homepage URL. Guaikei's
-   * response fields for this endpoint are undocumented, so the result is passed through unmapped.
+   * Fetch a Xiaohongshu creator's profile and recent notes by their homepage URL.
    */
   getXiaohongshuCreatorProfile(url: string, opts?: { limit?: number }): Promise<unknown>;
   /**
@@ -73,17 +72,21 @@ interface CreatorBuddy {
 }
 
 interface XiaohongshuSearchOptions {
-  /** Guaikei's numeric content-type filter. 0 = all. */
+  /** Numeric content-type filter. 0 = all, 1 = video, 2 = image. */
   type?: number;
-  /** Guaikei's numeric sort order. 0 = default (relevance). */
+  /** Numeric sort order. 0 = relevance, 1 = latest, 2 = likes, 3 = comments, 4 = collects. */
   sort?: number;
-  /** Guaikei's numeric recency filter. 0 = any time. */
+  /** Numeric recency filter. 0 = any time, 1 = day, 2 = week, 3 = half-year. */
   time?: number;
   /** Maximum results. Defaults to 20. */
   limit?: number;
 }
 
-/** A Xiaohongshu note. \`extra\` carries every Guaikei-returned field not listed here, unmapped. */
+/**
+ * A Xiaohongshu note. \`extra\` contains a bounded set of content and engagement fields returned
+ * by TikHub, such as title, desc, type, interaction counts, timestamp, published_at, and
+ * cover_image_url.
+ */
 interface XiaohongshuNoteSummary {
   id?: string;
   xsecToken?: string;
@@ -122,7 +125,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   }
 
   // Mint a fresh account capability with no user identity and no per-account state: every account
-  // sees the same vendored skills and the same deployment-wide Guaikei token, so there is nothing
+  // sees the same vendored skills and the same deployment-wide TikHub key, so there is nothing
   // to key by account.
   @skipRpcValidation()
   async createAccount(): Promise<Fetcher<GatekeeperUser>> {
@@ -192,7 +195,7 @@ export class CreatorBuddyAccount
   }
 }
 
-// Every account sees identical data (vendored skills + a deployment-wide Guaikei token), so there
+// Every account sees identical data (vendored skills + a deployment-wide TikHub key), so there
 // is nothing for a verifier to check. See CreatorBuddyGatekeeper.addObserver below.
 @validateRpc()
 export class CreatorBuddyVerifier
@@ -226,7 +229,7 @@ export class CreatorBuddyGatekeeper
   }
 
   async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<CreatorBuddySession> {
-    return new CreatorBuddySession(approvalQueue.dup(), this.env.GUAIKEI_API_TOKEN, this.env.BROWSER);
+    return new CreatorBuddySession(approvalQueue.dup(), this.env.TIKHUB_API_KEY, this.env.BROWSER);
   }
 
   async getSlashCommandProvider(): Promise<CreatorBuddySlashCommandProvider> {
@@ -258,7 +261,7 @@ export class CreatorBuddyGatekeeper
 
   // Strategy D (low-stakes, see .agents/skills/write-gatekeeper/SKELETON.md): every user with
   // access to their own Creator Buddy singleton sees identical vendored skills and the same
-  // deployment-wide Guaikei token, so there is nothing observer-specific to verify.
+  // deployment-wide TikHub key, so there is nothing observer-specific to verify.
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
   async removeObserver(_id: string): Promise<void> {}
 
@@ -316,13 +319,13 @@ class CreatorBuddySlashCommandProvider extends NativeRpcTarget implements SlashC
 @validateRpc()
 export class CreatorBuddySession extends RpcTarget {
   #approvalQueue: NativeRpcStub<ApprovalQueue>;
-  #guaikeiToken: string;
+  #tikhubApiKey: string;
   #browser: BrowserRun;
 
-  constructor(approvalQueue: NativeRpcStub<ApprovalQueue>, guaikeiToken: string, browser: BrowserRun) {
+  constructor(approvalQueue: NativeRpcStub<ApprovalQueue>, tikhubApiKey: string, browser: BrowserRun) {
     super();
     this.#approvalQueue = approvalQueue;
-    this.#guaikeiToken = guaikeiToken;
+    this.#tikhubApiKey = tikhubApiKey;
     this.#browser = browser;
   }
 
@@ -341,7 +344,7 @@ export class CreatorBuddySession extends RpcTarget {
   }
 
   async searchXiaohongshuNotes(keyword: string, opts?: XiaohongshuSearchOptions) {
-    let notes = await searchXiaohongshuNotes(this.#guaikeiToken, keyword, opts);
+    let notes = await searchXiaohongshuNotes(this.#tikhubApiKey, keyword, opts);
     await this.#approvalQueue.authorizeObservation({
       title: "Xiaohongshu search",
       description: `Searched Xiaohongshu for "${keyword}"; found ${notes.length} note(s).`,
@@ -350,7 +353,7 @@ export class CreatorBuddySession extends RpcTarget {
   }
 
   async getXiaohongshuNoteDetail(url: string, opts?: { limit?: number }) {
-    let note = await getXiaohongshuNoteDetail(this.#guaikeiToken, url, opts);
+    let note = await getXiaohongshuNoteDetail(this.#tikhubApiKey, url, opts);
     await this.#approvalQueue.authorizeObservation({
       title: "Xiaohongshu note detail",
       description: `Fetched detail for Xiaohongshu note: ${url}`,
@@ -359,7 +362,7 @@ export class CreatorBuddySession extends RpcTarget {
   }
 
   async getXiaohongshuCreatorProfile(url: string, opts?: { limit?: number }) {
-    let profile = await getXiaohongshuCreatorProfile(this.#guaikeiToken, url, opts);
+    let profile = await getXiaohongshuCreatorProfile(this.#tikhubApiKey, url, opts);
     await this.#approvalQueue.authorizeObservation({
       title: "Xiaohongshu creator profile",
       description: `Fetched creator profile and recent notes: ${url}`,

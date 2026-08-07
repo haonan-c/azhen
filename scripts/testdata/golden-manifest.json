@@ -200,8 +200,8 @@
           "type": "browser"
         },
         {
-          "name": "GUAIKEI_API_TOKEN",
-          "text": "$SECRET(GUAIKEI_API_TOKEN)",
+          "name": "TIKHUB_API_KEY",
+          "text": "$SECRET(TIKHUB_API_KEY)",
           "type": "secret_text"
         }
       ],
@@ -212,13 +212,13 @@
       ],
       "inputs": [
         {
-          "consoleUrl": "https://www.guaikei.com",
+          "consoleUrl": "https://user.tikhub.io/dashboard/overview",
           "kind": "secret",
-          "label": "Guaikei API token",
-          "name": "GUAIKEI_API_TOKEN",
+          "label": "TikHub API key",
+          "name": "TIKHUB_API_KEY",
           "setupSteps": [
-            "Sign up for a Guaikei account and subscribe to the content-search API.",
-            "Copy your API token from the Guaikei dashboard here."
+            "Sign up for a TikHub account and enable the Xiaohongshu API.",
+            "Copy your API key from the TikHub dashboard here."
           ]
         }
       ],
