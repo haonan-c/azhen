@@ -91,6 +91,12 @@ export const CREATOR_BUDDY_DOCS: BundledDoc[] = ${JSON.stringify(docs, null, 2)}
 `;
 
 await mkdir(dirname(outFile), { recursive: true });
-await writeFile(outFile, generated);
+let existing = await readFile(outFile, "utf8").catch(error => {
+  if (error?.code === "ENOENT") return null;
+  throw error;
+});
+if (existing !== generated) await writeFile(outFile, generated);
 
-console.log(`Bundled ${skills.length} skill(s) and ${docs.length} doc(s) from ${vendorDir} -> ${outFile}`);
+let status = existing === generated ? "up to date" : "wrote";
+console.log(
+    `Bundled ${skills.length} skill(s) and ${docs.length} doc(s) from ${vendorDir}; ${status}: ${outFile}`);
