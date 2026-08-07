@@ -55,10 +55,14 @@ const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit) => {
 }) as typeof fetch;
 
 // Runs one request through the handle with the fetch stub and returns what was sent.
-async function captureRequest(handle: ModelHandle): Promise<CapturedRequest> {
+async function captureRequest(handle: ModelHandle, maxTokens?: number): Promise<CapturedRequest> {
   const stream = await handle.stream(handle.model, {
     messages: [{ role: "user", content: "hello", timestamp: 0 }],
-  }, { fetch: fetchStub, maxRetries: 0 });
+  }, {
+    fetch: fetchStub,
+    maxRetries: 0,
+    ...(maxTokens === undefined ? {} : { maxTokens }),
+  });
   const message = await stream.result();
   expect(message.stopReason).toBe("error");
   expect(capturedRequests.length).toBeGreaterThan(0);
@@ -261,7 +265,7 @@ describe("getModel AI Gateway routing", () => {
   });
 });
 
-describe("getModel direct routing (no gateway)", () => {
+describe("getModel direct routing", () => {
   beforeEach(() => {
     capturedRequests.length = 0;
   });
@@ -363,6 +367,65 @@ describe("getModel direct routing (no gateway)", () => {
       }, INITIATOR);
       expect(handle.model.baseUrl).toBe("http://my-ollama:11434/v1");
     }
+  });
+
+  it("routes DeepSeek to its official API with the config's own bearer token", async () => {
+    const handle = getModel(env({
+      CF_AI_GATEWAY_PROVIDERS: "anthropic,deepseek",
+    }), {
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+      apiToken: "deepseek-token",
+    }, INITIATOR, {
+      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
+    });
+
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.baseUrl).toBe("https://api.deepseek.com");
+    expect(handle.model.maxTokens).toBe(64_000);
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+
+    const request = await captureRequest(handle, handle.model.maxTokens);
+    expect(request.url).toBe("https://api.deepseek.com/chat/completions");
+    expect(request.headers.get("authorization")).toBe("Bearer deepseek-token");
+    expect(request.headers.get("cf-aig-authorization")).toBeNull();
+    const body = JSON.parse(request.body);
+    expect(body.max_tokens).toBe(64_000);
+    expect(body).not.toHaveProperty("max_completion_tokens");
+    // Reasoning is off by default: pi's deepseek thinking-format emits an explicit disable.
+    expect(body.thinking).toEqual({ type: "disabled" });
+  }, 15000);
+
+  it("keeps Ollama direct when platform and user gateways are configured", async () => {
+    const handle = getModel(env({
+      CF_AI_GATEWAY_PROVIDERS: "anthropic,ollama",
+    }), {
+      provider: "ollama",
+      model: "qwen3:8b",
+      apiToken: "ollama-token",
+      apiUrl: "http://my-ollama:11434",
+    }, INITIATOR, {
+      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
+    });
+
+    expect(handle.model.baseUrl).toBe("http://my-ollama:11434/v1");
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("http://my-ollama:11434/v1/chat/completions");
+    expect(request.headers.get("authorization")).toBe("Bearer ollama-token");
+    expect(request.headers.get("cf-aig-authorization")).toBeNull();
+  }, 15000);
+
+  it("lets a DeepSeek config override the base URL (proxy)", () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+      apiToken: "deepseek-token",
+      apiUrl: "https://deepseek-proxy.example.com/v1",
+    }, INITIATOR);
+
+    expect(handle.model.baseUrl).toBe("https://deepseek-proxy.example.com/v1");
   });
 });
 

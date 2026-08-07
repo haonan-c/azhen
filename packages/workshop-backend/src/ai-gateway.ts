@@ -1,4 +1,10 @@
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS } from "@gadgets/workshop-shared/api";
+import {
+  AiChatAuthorInfo,
+  AiModelConfig,
+  AiModelProvider,
+  DIRECT_ONLY_AI_PROVIDERS,
+  SUGGESTED_MODELS,
+} from "@gadgets/workshop-shared/api";
 import { UserAiModelRecord } from "./user.js";
 
 // The model used for quick tasks like title generation when AI Gateway mode is active.
@@ -12,7 +18,7 @@ export class AiGatewayConfig {
   readonly workersAiGateway?: string;
   readonly accountId: string;
   readonly apiToken: string;
-  readonly providers: Set<string>;
+  readonly providers: ReadonlySet<AiModelProvider>;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -33,9 +39,18 @@ export class AiGatewayConfig {
     this.workersAiGateway = env.CF_AI_GATEWAY_WAI_DIRECT === "true"
       ? undefined
       : env.CF_AI_GATEWAY_WAI || this.gateway;
-    this.providers = new Set(
+    const configuredProviders = new Set(
       (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map(s => s.trim()).filter(s => s !== "")
     );
+    this.providers = new Set(
+      (Object.keys(SUGGESTED_MODELS) as AiModelProvider[]).filter(provider =>
+        configuredProviders.has(provider) && !DIRECT_ONLY_AI_PROVIDERS.has(provider))
+    );
+  }
+
+  /** Whether a provider can be added while AI Gateway mode is active. */
+  canConfigureProvider(provider: AiModelProvider): boolean {
+    return DIRECT_ONLY_AI_PROVIDERS.has(provider) || this.providers.has(provider);
   }
 
   /**
@@ -43,8 +58,9 @@ export class AiGatewayConfig {
    */
   getModelList(): AiChatAuthorInfo[] {
     let result: AiChatAuthorInfo[] = [];
-    for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
+    for (let provider of Object.keys(SUGGESTED_MODELS) as AiModelProvider[]) {
       if (this.providers.has(provider)) {
+        let models = SUGGESTED_MODELS[provider];
         for (let [id, model] of Object.entries(models)) {
           result.push({ type: "agent", id, name: model.name });
         }
@@ -58,7 +74,8 @@ export class AiGatewayConfig {
    * SUGGESTED_MODEL for an enabled gateway provider, or undefined otherwise.
    */
   resolveModel(modelId: string): UserAiModelRecord | undefined {
-    for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
+    for (let provider of Object.keys(SUGGESTED_MODELS) as AiModelProvider[]) {
+      let models = SUGGESTED_MODELS[provider];
       if (this.providers.has(provider) && modelId in models) {
         return {
           profile: { type: "agent", id: modelId, name: models[modelId].name },

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AiGatewayConfig,
   AiGatewayLogRetryableError,
   getAiGatewayLogCost,
 } from "../src/ai-gateway.js";
@@ -12,6 +13,39 @@ function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
     ...overrides,
   } as Cloudflare.Env;
 }
+
+describe("AiGatewayConfig model discovery", () => {
+  // DeepSeek is BYOK-direct-only (no gatewayNativeModel branch); it must stay out of gateway
+  // discovery even when mistakenly listed in CF_AI_GATEWAY_PROVIDERS, or the UI would surface a
+  // model that fails at request time.
+  const config = () => new AiGatewayConfig(env({
+    CF_AI_GATEWAY_ACCOUNT_ID: "acct",
+    CF_AI_GATEWAY_API_TOKEN: "token",
+    CF_AI_GATEWAY_PROVIDERS: "anthropic,deepseek,ollama,unknown-provider",
+  }));
+
+  it("keeps only known Gateway-capable providers in the effective set", () => {
+    expect(config().providers).toEqual(new Set(["anthropic"]));
+  });
+
+  it("allows direct-only providers to be configured as BYOK models", () => {
+    expect(config().canConfigureProvider("anthropic")).toBe(true);
+    expect(config().canConfigureProvider("deepseek")).toBe(true);
+    expect(config().canConfigureProvider("ollama")).toBe(true);
+    expect(config().canConfigureProvider("openai")).toBe(false);
+  });
+
+  it("excludes DeepSeek from the gateway model list", () => {
+    const ids = config().getModelList().map(m => m.id);
+    expect(ids.some(id => id.startsWith("deepseek"))).toBe(false);
+    expect(ids).toContain("claude-opus-5");
+  });
+
+  it("does not resolve a DeepSeek model through the gateway", () => {
+    expect(config().resolveModel("deepseek-v4-flash")).toBeUndefined();
+    expect(config().resolveModel("claude-opus-5")).toBeDefined();
+  });
+});
 
 describe("getAiGatewayLogCost", () => {
   afterEach(() => vi.unstubAllGlobals());

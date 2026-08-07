@@ -10,12 +10,19 @@ import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/ope
 import { stream as openaiResponsesStream } from "@earendil-works/pi-ai/api/openai-responses";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
+import {
+  AiChatAuthorInfo,
+  AiModelConfig,
+  DIRECT_ONLY_AI_PROVIDERS,
+  SUGGESTED_MODELS,
+  WORKERS_AI_OUTPUT_LIMIT,
+}
   from "@gadgets/workshop-shared/api";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
@@ -123,6 +130,7 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
+    case "deepseek": return (DEEPSEEK_MODELS as Record<string, Model<Api>>)[modelId];
     case "ollama": return undefined;
     default: return undefined;
   }
@@ -342,9 +350,15 @@ function makeHandle(args: HandleArgs): ModelHandle {
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
-  // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
-  // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
-  // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
+  // These providers have no AI Gateway route. Existing BYOK models remain usable when either a
+  // platform or user Gateway is active, and always retain their own credentials.
+  if (DIRECT_ONLY_AI_PROVIDERS.has(config.provider)) {
+    return getModelDirect(config, options.sessionAffinity);
+  }
+
+  // BYOK: a connected user's own Cloudflare account pays for every Gateway-capable provider,
+  // including Workers AI, through unified billing. Honored regardless of whether a platform AI
+  // Gateway is configured, so connected users are always billed correctly for those providers.
   if (options.userGateway) {
     return getModelViaUserGateway(
         config, buildMetadata(initiator, options.metadata), options.userGateway,
@@ -567,6 +581,40 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         ...(config.apiToken === ""
             ? { apiKey: "unused", headers: { Authorization: null } }
             : { apiKey: config.apiToken }),
+        sessionAffinity,
+      });
+    case "deepseek":
+      // DeepSeek's official API is OpenAI Chat-Completions compatible; pi's catalog carries the
+      // model metadata (1M window, cost, thinking format). BYOK: the user's DeepSeek key -- and
+      // optionally a proxy URL -- come from the model config.
+      //
+      // Reasoning is intentionally left OFF by default: it keeps requests cheaper and faster and
+      // stops reasoning_content from ballooning the context (which would trigger compaction far
+      // sooner). We still pass `reasoning: true` on purpose -- it is what makes pi's deepseek
+      // thinking-format emit an explicit `thinking: {type: "disabled"}` when no reasoning effort is
+      // set (see openai-completions.ts). Were it false, pi would send no thinking field and
+      // DeepSeek's own API default (thinking ON) would apply. To opt reasoning back in, give this
+      // provider a default reasoning effort in makeHandle's `apiExtras`.
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: catalog?.name ?? config.model,
+          api: "openai-completions",
+          provider: "deepseek",
+          baseUrl: config.apiUrl ?? catalog?.baseUrl ?? "https://api.deepseek.com",
+          reasoning: catalog?.reasoning ?? true,
+          input: catalog?.input ?? ["text"],
+          cost: catalog?.cost ?? ZERO_COST,
+          ...window,
+          thinkingLevelMap: catalog?.thinkingLevelMap,
+          compat: {
+            ...catalog?.compat,
+            // pi 0.83 defaults OpenAI-compatible providers to `max_completion_tokens`, but the
+            // DeepSeek Chat Completions API accepts `max_tokens`.
+            maxTokensField: "max_tokens",
+          },
+        },
+        apiKey: config.apiToken,
         sessionAffinity,
       });
     case "openai":

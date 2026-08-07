@@ -33,6 +33,12 @@ describe("assertChatAttachmentSupportedByProvider", () => {
       .toThrow("Unsupported file type");
     expect(() => assertChatAttachmentSupportedByProvider("ollama", "application/zip", 1))
       .toThrow("Unsupported file type");
+    // DeepSeek's chat models are text-only: text is accepted, images and PDFs are not.
+    expect(() => assertChatAttachmentSupportedByProvider("deepseek", "text/plain", 1)).not.toThrow();
+    expect(() => assertChatAttachmentSupportedByProvider("deepseek", "image/png", 1))
+      .toThrow("Unsupported file type");
+    expect(() => assertChatAttachmentSupportedByProvider("deepseek", "application/pdf", 1))
+      .toThrow("Unsupported file type");
   });
 
   it("enforces the per-file byte limit", () => {
