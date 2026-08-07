@@ -917,7 +917,12 @@ export type CloudflareAccountOption = {
 };
 
 // Supported AI providers.
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider =
+    "openai" | "anthropic" | "google" | "cloudflare" | "deepseek" | "ollama";
+
+/** Providers that always use their model config's BYOK credentials instead of AI Gateway. */
+export const DIRECT_ONLY_AI_PROVIDERS: ReadonlySet<AiModelProvider> =
+    new Set<AiModelProvider>(["deepseek", "ollama"]);
 
 // Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`.
 export type AiGatewayInfo = {
@@ -982,6 +987,20 @@ export const SUGGESTED_MODELS: Record<
   },
   "google": {
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
+  },
+  "deepseek": {
+    // DeepSeek's official API (OpenAI Chat-Completions compatible). Both models carry a 1M-token
+    // window. `outputLimit` is a deliberate cap below pi's catalog max (384k): it is both the
+    // response cap and the slice reserved from the prompt budget, so 64k caps responses at a
+    // practical size while leaving ~936k as prompt budget -- long chats rarely compact. Raise it
+    // for bigger single responses (at the cost of a smaller prompt budget), or lower it to compact
+    // even later.
+    "deepseek-v4-flash": {
+      name: "DeepSeek V4 Flash", contextWindow: 1_000_000, outputLimit: 64_000,
+    },
+    "deepseek-v4-pro": {
+      name: "DeepSeek V4 Pro", contextWindow: 1_000_000, outputLimit: 64_000,
+    },
   },
   "ollama": {
   },
