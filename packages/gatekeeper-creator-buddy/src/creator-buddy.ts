@@ -25,11 +25,12 @@ import type {
   SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult, ResourceConfiguratorFrame,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { parseSkillManifest, buildAgentSkillMessage } from "@gadgets/workshop-shared/agent-skill";
-import { CREATOR_BUDDY_SKILLS } from "./generated/skills.js";
+import { CREATOR_BUDDY_SKILLS, CREATOR_BUDDY_DOCS } from "./generated/skills.js";
 import {
   searchXiaohongshuNotes, getXiaohongshuNoteDetail, getXiaohongshuCreatorProfile,
   type XiaohongshuSearchOptions,
 } from "./guaikei-api.js";
+import { renderImage } from "./render.js";
 
 // The Creator Buddy icon: the Phosphor "Sparkle" glyph as a self-contained SVG data URI (no
 // external/branded asset), matching AvatarImage's { url } shape.
@@ -51,6 +52,11 @@ const CREATOR_BUDDY_TYPES = `
  * methods a skill's own instructions may call directly.
  */
 interface CreatorBuddy {
+  /**
+   * Read a skill's reference/asset document by id (a skill's own instructions supply the id, e.g.
+   * "xhs-html/references/style-registry.md"). Returns null if the id is unknown.
+   */
+  read(docId: string): Promise<{ id: string; content: string } | null>;
   /** Search recent Xiaohongshu notes by keyword. Backed by the Guaikei API. */
   searchXiaohongshuNotes(
     keyword: string, opts?: XiaohongshuSearchOptions): Promise<XiaohongshuNoteSummary[]>;
@@ -215,7 +221,7 @@ export class CreatorBuddyGatekeeper
   }
 
   async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<CreatorBuddySession> {
-    return new CreatorBuddySession(approvalQueue.dup(), this.env.GUAIKEI_API_TOKEN);
+    return new CreatorBuddySession(approvalQueue.dup(), this.env.GUAIKEI_API_TOKEN, this.env.BROWSER);
   }
 
   async getSlashCommandProvider(): Promise<CreatorBuddySlashCommandProvider> {
@@ -308,15 +314,27 @@ class CreatorBuddySlashCommandProvider extends NativeRpcTarget implements SlashC
 export class CreatorBuddySession extends RpcTarget {
   #approvalQueue: NativeRpcStub<ApprovalQueue>;
   #guaikeiToken: string;
+  #browser: BrowserRun;
 
-  constructor(approvalQueue: NativeRpcStub<ApprovalQueue>, guaikeiToken: string) {
+  constructor(approvalQueue: NativeRpcStub<ApprovalQueue>, guaikeiToken: string, browser: BrowserRun) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#guaikeiToken = guaikeiToken;
+    this.#browser = browser;
   }
 
   [Symbol.dispose]() {
     this.#approvalQueue[Symbol.dispose]();
+  }
+
+  async read(docId: string) {
+    let doc = CREATOR_BUDDY_DOCS.find(entry => entry.id === docId);
+    if (!doc) return null;
+    await this.#approvalQueue.authorizeObservation({
+      title: "Creator Buddy reference document",
+      description: `Read reference document: ${docId}`,
+    });
+    return doc;
   }
 
   async searchXiaohongshuNotes(keyword: string, opts?: XiaohongshuSearchOptions) {
@@ -346,10 +364,12 @@ export class CreatorBuddySession extends RpcTarget {
     return profile;
   }
 
-  // TODO(PR3): render via the BROWSER binding (see packages/workshop-backend's Puppeteer-based
-  // Gadget PDF export for the existing pattern) and authorize the read as an observation.
-  async renderImage(
-      _html: string, _opts?: { width?: number; height?: number }): Promise<{ dataUri: string }> {
-    throw new Error("Not yet implemented -- see PR3 (BROWSER-backed rendering capability).");
+  async renderImage(html: string, opts?: { width?: number; height?: number }) {
+    let result = await renderImage(this.#browser, html, opts);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Rendered image",
+      description: `Rendered a ${(opts?.width ?? 1080)}x${(opts?.height ?? 1440)} image from HTML.`,
+    });
+    return result;
   }
 }

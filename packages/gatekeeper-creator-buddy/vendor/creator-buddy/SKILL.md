@@ -1,6 +1,6 @@
 ---
 name: creator-buddy
-description: 创作者全域内容搜索总控 Skill。用户发送平台名+关键词、平台链接，或要求分析博主、文章风格、热度、点赞、收藏、评论、爆款原因、选题方向时触发；根据平台和任务自动路由到小红书热门笔记、全域内容搜索、公众号爆款搜索、公众号赛道分析等分支 Skill。
+description: 创作者内容搜索总控 Skill（本部署仅支持小红书）。用户发送平台名+关键词、平台链接，或要求分析博主、文章风格、热度、点赞、收藏、评论、爆款原因、选题方向时触发；小红书请求路由到热点搜集/选题分支 Skill，其余平台明确告知本部署未接入。
 license: MIT
 metadata:
   type: orchestrator
@@ -8,16 +8,11 @@ metadata:
   version: "1.0.0"
   routes:
     - gzh-Skills/xhs-hotnotes
-    - gzh-Skills/global-content-search
-    - gzh-Skills/gzh-explosive-content-detector
-    - gzh-Skills/baokuan-article-analysis
+    - xhs-Skills/space-xhs-hotspot
   tags:
     - creator
     - content-search
     - xiaohongshu
-    - bilibili
-    - douyin
-    - wechat
     - viral-content
     - creator-analytics
 ---
@@ -53,131 +48,32 @@ metadata:
 - 抖音：`抖音`、`douyin`
 - 公众号：`公众号`、`微信`、`gzh`、`wechat`
 
-如果用户没有指定平台，但给了链接，按链接域名判断平台。  
-如果用户没有指定平台，也没有链接，默认走全域思路：小红书 + 公众号 + B站，抖音仅在有可用 `DOUYIN_COMMAND` 时执行。
+如果用户没有指定平台，但给了链接，按链接域名判断平台。
+
+> **本部署说明**：本部署只接入了**小红书**一个数据源（Guaikei，经 `env[N]` 上的 CreatorBuddy 绑定调用，`env[N]` 指本次对话里的 Creator Buddy 会话）。B站、抖音、公众号在原版里依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐 / onetotenvip 等后端本部署均未接入。遇到这些平台的请求，直接告诉用户"本部署当前只支持小红书数据查询"，不要尝试调用下面已删除的脚本/CLI，也不要编造数据。
 
 ## 路由规则
 
-### 1. 小红书关键词热度
+### 1. 小红书关键词热度、链接、博主、评论
 
-优先使用 `gzh-Skills/xhs-hotnotes` 查询热门笔记，因为它有相关性、热度、时效评分和 HTML 报告。
+统一通过 `env[N]` 上的 CreatorBuddy 会话调用：
 
-```bash
-python3 gzh-Skills/xhs-hotnotes/scripts/fetch_xhs_hot_articles.py \
-  --keyword "<关键词>" \
-  --start-date "<YYYY-MM-DD>"
-```
+- 关键词热度：`env[N].searchXiaohongshuNotes(keyword, opts)`（`opts` 可选 `type`/`sort`/`time`/`limit`）
+- 笔记详情：`env[N].getXiaohongshuNoteDetail(url, opts)`
+- 博主作品：`env[N].getXiaohongshuCreatorProfile(url, opts)`
 
 适用：
 
 - `小红书 Codex`
 - `小红书最近什么爆`
 - `找小红书 AI编程 热门笔记`
-- 需要互动数、点赞、收藏、评论、分享、评分
+- 需要互动数、点赞、收藏、评论、分享
 
-### 2. 小红书链接、博主、评论分析
+深入的搜索策略、时间窗、泛化词处理见 `gzh-Skills/xhs-hotnotes`；跨笔记趋势判断、选题建议见 `xhs-Skills/space-xhs-hotspot`。
 
-使用 `gzh-Skills/global-content-search`。它的顺序是：
+### 2. B站、抖音、公众号
 
-1. 先走 Agent Reach 后端：OpenCLI / xiaohongshu-mcp / xhs-cli
-2. Agent Reach 搜不了时，提示或使用 `GUAIKEI_API_TOKEN` 兜底
-
-关键词：
-
-```bash
-node gzh-Skills/global-content-search/src/xiaohongshu/search-cli.js \
-  --platform xiaohongshu \
-  --keyword "<关键词>" \
-  --limit 20
-```
-
-笔记详情/评论：
-
-```bash
-node gzh-Skills/global-content-search/src/xiaohongshu/detail-cli.js \
-  --platform xiaohongshu \
-  --url "<小红书笔记URL>" \
-  --limit 100
-```
-
-博主作品：
-
-```bash
-node gzh-Skills/global-content-search/src/xiaohongshu/post-cli.js \
-  --platform xiaohongshu \
-  --url "<小红书主页URL>" \
-  --limit 20
-```
-
-### 3. B站关键词、视频、UP主
-
-使用 `gzh-Skills/global-content-search`。优先 `bili-cli` / `opencli bilibili`，否则走 B站公开 API。
-
-```bash
-node gzh-Skills/global-content-search/src/xiaohongshu/search-cli.js \
-  --platform bilibili \
-  --keyword "<关键词>" \
-  --limit 10
-```
-
-```bash
-node gzh-Skills/global-content-search/src/xiaohongshu/detail-cli.js \
-  --platform bilibili \
-  --url "<BV号或视频链接>"
-```
-
-适用：
-
-- `B站 Codex`
-- `分析这个 B站视频`
-- `查这个 UP 主最近发了什么`
-- 需要播放、收藏、点赞、评论、标题风格
-
-### 4. 抖音
-
-抖音当前作为扩展入口。若环境中有 `DOUYIN_COMMAND`，则走自定义只读 CLI；否则明确告诉用户当前未配置抖音后端。
-
-```bash
-node gzh-Skills/global-content-search/src/xiaohongshu/search-cli.js \
-  --platform douyin \
-  --keyword "<关键词>" \
-  --limit 10
-```
-
-不要假装已经查到抖音数据。
-
-### 5. 公众号关键词爆款
-
-使用 `gzh-Skills/gzh-explosive-content-detector`。
-
-```bash
-python3 gzh-Skills/gzh-explosive-content-detector/scripts/fetch_gzh_trends.py \
-  --keyword "<关键词>" \
-  --start-date "<YYYY-MM-DD>"
-```
-
-适用：
-
-- `公众号 Codex`
-- `查一下公众号 Agent 爆款`
-- `最近微信文章有什么热的`
-
-### 6. 公众号赛道聚合分析
-
-使用 `gzh-Skills/baokuan-article-analysis`。适合多关键词、赛道级报告。
-
-```bash
-python3 gzh-Skills/baokuan-article-analysis/scripts/daily_sector_trends.py \
-  --sector "<赛道名>=关键词1,关键词2,关键词3" \
-  --days 7 \
-  --output-dir ./reports
-```
-
-适用：
-
-- `帮我看 AI Agent 赛道公众号爆款`
-- `对比 Codex / Claude Code / AI编程`
-- 需要 HTML 报告、数据去重、标题模式和写作参考
+本部署未接入对应数据源（见上方"本部署说明"）。直接告知用户当前不支持，不要调用任何脚本。
 
 ## 输出格式
 
@@ -230,6 +126,6 @@ python3 gzh-Skills/baokuan-article-analysis/scripts/daily_sector_trends.py \
 - 只读公开数据，不做发帖、评论、点赞等写操作。
 - 不绕过验证码、登录、风控或平台限制。
 - 小红书详情常需要搜索结果里的完整 `xsec_token` URL。
-- 抖音不是内置后端，必须依赖 `DOUYIN_COMMAND` 或未来 Agent Reach 支持。
-- Guaikei API 只作为小红书兜底，不替代 Agent Reach 的优先级。
+- B站、抖音、公众号在本部署没有接入的数据源，遇到直接说明，不要编造。
+- 小红书数据由本部署的 CreatorBuddy 会话（Guaikei）提供，是唯一路径，不是兜底。
 - 热度是传播信号，不等于内容质量，也不等于适合用户账号定位。

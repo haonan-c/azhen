@@ -7,6 +7,12 @@
     "watch_dir": "src",
   },
   "compatibility_date": "2026-02-02",
+  // Renders vendored HTML templates (covers, diagrams) to images for skills that would otherwise
+  // shell out to ffmpeg/local image-gen, which don't exist in this runtime. Optional: renderImage()
+  // throws a clear error when unbound rather than failing the whole gatekeeper.
+  "browser": {
+    "binding": "BROWSER",
+  },
   // DO classes are reached via ctx.exports; no durable_objects binding needed.
   "migrations": [
     {

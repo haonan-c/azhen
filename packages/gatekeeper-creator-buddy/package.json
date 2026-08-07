@@ -12,6 +12,7 @@
     "clean": "rm -rf dist src/generated"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "^1.2.0",
     "@gadgets/workshop-shared": "workspace:*",
     "capnweb": "^0.8.0",
     "capnweb-validate": "0.2.1"

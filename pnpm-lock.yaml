@@ -243,6 +243,9 @@ importers:
 
   packages/gatekeeper-creator-buddy:
     dependencies:
+      '@cloudflare/puppeteer':
+        specifier: ^1.2.0
+        version: 1.2.0(supports-color@10.2.2)
       '@gadgets/workshop-shared':
         specifier: workspace:*
         version: link:../workshop-shared

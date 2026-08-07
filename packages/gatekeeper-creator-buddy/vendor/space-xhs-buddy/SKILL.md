@@ -9,9 +9,11 @@ description: 小红书创作总控台。判断用户当前卡在哪一环，路�
 
 **最重要的一条**：用户说的需求，往往不是他真正的问题。说"帮我起个标题"的人，可能真正的问题是账号没定位；说"帮我写篇笔记"的人，可能真正的问题是上一篇为什么没流量他还没搞清。**先花一轮问清处境，再动手。**
 
+> **本部署说明**：原版有八个专项技能，本部署少两个能力：①`space-xhs-account-audit`（账号体检）本次未纳入vendor，遇到"账号体检/竞品对标"需求，直接用 `note-analytics` 的方法论对用户手头的多篇数据做横向分析代替，并告知用户本部署暂不支持整体账号打分。②`space-xhs-image`（生图型封面）依赖 Codex 内置生图模型，本部署没有生成式图像模型，此路径不可用——图文类需求一律走 `xhs-html`（HTML 排版 + `renderImage` 渲染 PNG），不要路由到 `space-xhs-image`。
+
 ---
 
-## 八个专项技能与各自的边界
+## 六个专项技能与各自的边界
 
 | 技能 | 干什么 | 不干什么 |
 |---|---|---|
@@ -19,15 +21,8 @@ description: 小红书创作总控台。判断用户当前卡在哪一环，路�
 | `space-xhs-hotspot` | 热点选题：拉近期高互动笔记、判趋势、爆款共性提取、跨赛道对比、出选题卡 | 不写正文、不起标题 |
 | `space-xhs-title` | 标题：15 种小红书方法批量出候选、评分、合规校验、A/B 建议 | 不写正文 |
 | `space-xhs-writer` | 正文：7 种笔记类型、开头 3 行、标签策略、合规改写、发布前 14 项体检 | 不做标题矩阵、不出图 |
-| `xhs-html` | 小红书多页图文（**排版型**）：把内容拆成 6 张以上 3:4 HTML 卡片，支持 62 种风格，中文精确可编辑 | 不生成位图插画 |
-| `space-xhs-image` | 封面与内页（**生图型**）：调用 Codex 内置生图模型，制作白底紫绿科技感 3:4 信息图 | 不提供可编辑 HTML |
-| `space-xhs-account-audit` | 账号体检：八维打分、竞品对标、卡点定位 | 不做单篇数据复盘 |
+| `xhs-html` | 小红书多页图文：把内容拆成 6 张以上 3:4 HTML 卡片，支持 62 种风格，中文精确可编辑；需要 PNG 时经渲染能力导出 | 不生成位图插画 |
 | `space-xhs-note-analytics` | 笔记复盘：六层漏斗归因、多篇横向找规律 | 不做账号整体诊断 |
-
-**两组最容易串台的**：
-
-1. **账号级 vs 笔记级**：问"我的号为什么不涨粉"→ `account-audit`；问"这条为什么没流量"→ `note-analytics`。
-2. **两个图文技能**：需要可编辑、文字确定的完整图文，走 `xhs-html`；需要模型直接生成科技感位图，走 `space-xhs-image`。用户提供参考图并说“做类似这种图片”时，优先走 `space-xhs-image`。
 
 ---
 
@@ -39,13 +34,11 @@ description: 小红书创作总控台。判断用户当前卡在哪一环，路�
 |---|---|---|
 | "想做小红书但不知道做什么" / 只丢来一段自我介绍 | 还没定位 | `positioning` |
 | "定位有了，不知道写什么" | 缺选题 | `hotspot` |
-| "有素材/有想法，要变成笔记" | 生产 | `writer` → `title` → `xhs-html` 或 `space-xhs-image` |
+| "有素材/有想法，要变成笔记" | 生产 | `writer` → `title` → `xhs-html` |
 | "标题不行 / 没人点" | 单点优化 | `title`（先确认是 CTR 低还是曝光就低） |
 | "封面不好看 / 想统一风格" | 单点优化 | `xhs-html` |
-| "想要科技感生图/参考图做类似风格" / "用 Codex 生图" | 视觉生产 | `space-xhs-image` |
 | "发了没数据 / 这条为什么不行" | 单篇复盘 | `note-analytics` |
-| "号做了一阵没起色 / 帮我看看主页" | 账号体检 | `account-audit` |
-| "想拆解某个博主 / 竞品" | 对标 | `account-audit` |
+| "号做了一阵没起色 / 帮我看看主页" / "想拆解某个博主 / 竞品" | 账号体检（本部署不支持整体打分） | `note-analytics`（对多篇数据做横向分析代替，并说明局限） |
 
 **分流前必问的一个问题**：如果用户还没发过任何笔记，却来问标题或封面 —— 先拉回 `positioning`。没有定位的标题优化是无效功。
 
@@ -58,24 +51,24 @@ description: 小红书创作总控台。判断用户当前卡在哪一环，路�
 ### 链 A：从零起号（用户没做过小红书）
 
 ```
-positioning ──► hotspot ──► writer ──► title ──► xhs-html / space-xhs-image ──► 发布
-     │                                                        │
-     └──────────── 累计 20-30 篇后 ────► account-audit ◄───────┘
+positioning ──► hotspot ──► writer ──► title ──► xhs-html ──► 发布
+     │                                                    │
+     └──────────── 累计 20-30 篇后 ──────► note-analytics（横向找规律）◄───────┘
 ```
 
 1. `positioning` 走完 7 步，产出定位句 + 内容支柱 + 前 20 篇选题
 2. 从前 20 篇里挑第 1 篇，用 `hotspot` 验证这个方向近期有没有流量、找对标笔记
 3. `writer` 写正文（此时定位和对标都已在手，正文质量最高）
 4. `title` 基于正文出标题矩阵
-5. 根据交付格式选择 `xhs-html` 或 `space-xhs-image`
-6. 发布后攒够数据 → `note-analytics` 单篇复盘；攒够 20-30 篇 → `account-audit` 复诊
+5. `xhs-html` 出图文
+6. 发布后攒够数据 → `note-analytics` 单篇复盘；攒够 20-30 篇 → `note-analytics` 多篇横向找规律（本部署没有整体账号打分，用多篇横向分析代替）
 
 **停顿点**：第 1 步结束必须让用户确认定位；第 3 步结束必须让用户补真实细节（`writer` 会标 `[此处需你补真实细节]`，不要替他编）。
 
 ### 链 B：日常产出（定位已定，出一篇笔记）
 
 ```
-hotspot ──► writer ──► title ──► xhs-html / space-xhs-image
+hotspot ──► writer ──► title ──► xhs-html
 ```
 
 最常用的一条。`hotspot` 的选题卡可以整条粘给 `writer`。
@@ -85,9 +78,9 @@ hotspot ──► writer ──► title ──► xhs-html / space-xhs-image
 ### 链 C：诊断改进（已有账号，数据不好）
 
 ```
-                 ┌─ 曝光就低 ──────────► account-audit（标签/定位/权重问题）
+                 ┌─ 曝光就低 ──────────► note-analytics（标签/定位/权重问题，横向找规律）
 note-analytics ──┤
-                 ├─ 曝光够但 CTR 低 ───► title + xhs-html / space-xhs-image
+                 ├─ 曝光够但 CTR 低 ───► title + xhs-html
                  └─ 点击够但互动低 ───► writer（开头留人/价值兑现）
 ```
 
@@ -95,20 +88,11 @@ note-analytics ──┤
 
 ---
 
-## 第 3 步：开工前先探数据源
+## 第 3 步：开工前先说明数据依赖
 
-`hotspot` 和 `account-audit` 的量化能力依赖 API Key。第一次为某个用户服务时先探一次，避免走到一半才发现拿不到数据：
+`hotspot` 依赖本部署的 Guaikei 数据源，由部署管理员配置好，无需用户自己配置 Key；`xhs-html` 需要 PNG 时经本部署的渲染能力（`env[N].renderImage`）导出，同样无需额外配置。`note-analytics` 不连网，直接分析用户贴的数据。
 
-```bash
-env | grep -E '^(REDFOX_API_KEY|SOCIALDATAX_API_KEY|GUAIKEI_API_TOKEN)=' | sed 's/=.*/=<set>/'
-```
-
-| 状态 | 影响 |
-|---|---|
-| 有任一 Key | `hotspot` 能拉真实互动数据，`account-audit` 能量化分析 |
-| 都没有 | 两者降级为 WebSearch / 截图定性路径，**仍可用**，但拿不到互动数。此时禁止编造互动量级，结论要标注"未经数据验证" |
-
-其余技能可直接使用。`xhs-html` 的 HTML 渲染链路依赖 playwright + 本机 Chrome，`note-analytics` 的表格处理依赖 pandas；`space-xhs-image` 直接调用 Codex 内置 `image_gen`，不需要 API Key 或外部生图后端。
+若 `hotspot` 调用失败（如上游服务不可用），如实告知用户"本次小红书数据源不可用"，不要编造互动数字，也不要引导用户配置环境变量——本部署的数据源不是用户自己配的。
 
 ---
 

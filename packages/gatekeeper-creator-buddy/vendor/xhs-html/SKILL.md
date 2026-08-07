@@ -24,7 +24,7 @@ description: 将用户提供的文章、笔记、教程、SOP、清单、网页�
 
 ### 1. 风格
 
-根据内容赛道，从 `references/style-registry.md` 的 62 种风格中推荐 5 种，再加 1 个“智能匹配”：
+根据内容赛道，从 `env[N].read("xhs-html/references/style-registry.md")`（`env[N]` 指本次对话里的 Creator Buddy 绑定）的 62 种风格中推荐 5 种，再加 1 个“智能匹配”：
 
 ```text
 推荐风格
@@ -77,7 +77,7 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 
 ## 页序
 
-按内容选择结构，不机械套模板。详细模式见 `references/page-patterns.md`。
+按内容选择结构，不机械套模板。详细模式见 `env[N].read("xhs-html/references/page-patterns.md")`。
 
 ### 默认 8 张实操结构
 
@@ -100,12 +100,12 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 
 ## 设计系统
 
-制作前读取：
+制作前用 `env[N].read(docId)` 读取（`env[N]` 指本次对话里的 Creator Buddy 绑定）：
 
-1. `references/xhs-html-guide.md`：单 HTML 多页结构、字号、安全区和校验规则。
-2. `references/page-patterns.md`：教程、清单、方法论、故事的页序与页面组件。
-3. `references/style-registry.md`：62 种风格和赛道匹配。
-4. 用户选中离线预设时读取 `references/style-presets.md`；其他风格按 registry 拉取规范。
+1. `xhs-html/references/xhs-html-guide.md`：单 HTML 多页结构、字号、安全区和校验规则。
+2. `xhs-html/references/page-patterns.md`：教程、清单、方法论、故事的页序与页面组件。
+3. `xhs-html/references/style-registry.md`：62 种风格和赛道匹配。
+4. 用户选中离线预设时读取 `xhs-html/references/style-presets.md`；其他风格按 registry 拉取规范。
 
 风格只决定颜色、字体气质、圆角、线条和装饰母题，不改变内容逻辑。不得为了“像某品牌”牺牲中文可读性。
 
@@ -122,7 +122,7 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 
 ## HTML 工程约束
 
-以 `assets/xhs-template.html` 为骨架：
+以 `env[N].read("xhs-html/assets/xhs-template.html")` 读到的内容为骨架：
 
 - `body` 只负责把所有页面纵向排列并留出预览间距。
 - 每页使用 `<section class="sheet">`，固定 `width:1080px;height:1440px;overflow:hidden`。
@@ -139,15 +139,9 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 3. 若风格或页数未明确，提供“5+1 风格”和“6/7/8/9 张”选择并等待确认。
 4. 先写页级大纲：每页标题、唯一任务、关键材料；检查是否循序渐进。
 5. 使用同一 HTML 生成全部 `.sheet`。
-6. 运行：
-
-```bash
-python3 scripts/check_contrast.py --tokens path/to/index.html
-node scripts/render_xhs.mjs --html path/to/index.html --out-dir /tmp/xhs-check --strict
-```
-
-7. 检查每页尺寸、溢出、安全区、可读性、重复元素和整组节奏；发现问题后修改 HTML 再检查。
-8. 交付 HTML 的绝对路径链接，并说明页数、风格和内容结构。用户只要 HTML 时不要附加 PNG。
+6. 质量检查（本部署说明：原版这一步跑本地脚本 `scripts/check_contrast.py`/`scripts/render_xhs.mjs`，本部署改为：对每个 `.sheet` 调用一次 `env[N].renderImage(sheetHtml, { width: 1080, height: 1440 })`——把该 `.sheet` 单独包一层 `<html><body>` 后传入——用返回的图逐页目视检查尺寸、溢出、对比度、安全区、重复元素和整组节奏；`env[N]` 指本次对话里的 Creator Buddy 绑定）。
+7. 发现问题后修改 HTML 再检查一遍。
+8. 默认交付完整 HTML 文本，并说明页数、风格和内容结构。用户明确要 PNG 时，才对每页调用 `renderImage` 并逐张交付。
 
 ## 质量闸门
 

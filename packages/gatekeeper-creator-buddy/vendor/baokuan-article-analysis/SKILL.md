@@ -3,6 +3,8 @@ name: baokuan-article-analysis
 description: Fetch and analyze WeChat Official Account hot articles / 公众号爆款文章 by sector or keywords. Use when the user asks for 爆款文章分析, 赛道爆款, 公众号爆款数据, reading counts, likes, shares, comments, title patterns, writing style, 爆款原因分析, or writing references for content creation.
 ---
 
+> **本部署说明：此技能在本部署不可用。** 它依赖的数据源（`onetotenvip.com` 的一个未文档化后端接口，脚本里以禁用 TLS 证书校验的方式直连）本部署未接入，也不打算以这种方式接入。遇到公众号爆款分析类请求，直接告知用户"本部署当前不支持公众号数据查询"，不要执行下面的脚本或编造数据。以下原文保留仅供参考。
+
 # 爆款文章分析
 
 ## Overview

@@ -1,6 +1,6 @@
 # Vendored from SpaceZephyr/creator-buddy
 
-These SKILL.md files were copied, unmodified, from:
+These files were copied from:
 
 - Repository: https://github.com/SpaceZephyr/creator-buddy
 - Commit: `120cc602265d82ba5bafb7954b1faec12d51a80b`
@@ -10,7 +10,7 @@ This is a one-time vendor snapshot, not a live sync — decision recorded in
 `docs/adr/0001-creator-buddy-gatekeeper.md`. Future upstream changes are picked up manually, if at
 all; this repository does not push changes back upstream.
 
-Of the 28 upstream Agent Skills, 8 were excluded from this vendor drop:
+## Excluded entirely (8 of the 28 upstream Agent Skills)
 
 - `space-video-edit`, `space-video-audio`, `space-video-broll`, `space-video-subtitle`,
   `space-video-topic`, `space-video-broll-sketch` — depend on a local `ffmpeg`/`whisper`
@@ -22,7 +22,56 @@ Of the 28 upstream Agent Skills, 8 were excluded from this vendor drop:
 - `space-video` — an orchestrator that, once the above are excluded, routes to only 2 of its
   original 8 targets; not worth keeping as a separate skill.
 
-The 20 vendored files still contain their original `python3`/`bash`/`node` shell-out instructions
-verbatim — this vendor drop only proves the ingestion pipeline (SKILL.md → generated slash
-commands). Rewriting those instructions into calls against the `CreatorBuddy` session capability is
-tracked as follow-up work, not done in this change.
+## Vendored but flagged unavailable (5 of the remaining 20)
+
+These were investigated in more depth than the initial exclusion pass, which only looked for
+`ffmpeg`/`npx` in the skill text. Digging into the actual scripts each one shells out to turned up
+data sources beyond Guaikei that this deployment does not integrate. Rather than silently mapping
+them to Guaikei (which would produce data the skill author never intended, or none), each file's
+`SKILL.md` carries a prominent note explaining why it's inert here, and the original text is
+otherwise left untouched as reference:
+
+- `baokuan-article-analysis`, `gzh-explosive-content-detector` — both call the same undocumented
+  third-party endpoint (`onetotenvip.com/skill/cozeSkill/getWxCozeSkillData`), reached in
+  `baokuan-article-analysis`'s case over a raw TLS socket with certificate verification disabled.
+  Neither is Guaikei-backed (both are 公众号/WeChat, and Guaikei only covers 小红书/Xiaohongshu).
+- `space-chart-image` — primary path is a runtime-native image-generation model (Codex
+  `image_gen`/`image2`); its scripted fallback needs a separate `LABNANA_API_KEY`
+  (`api.labnana.com`), not integrated.
+- `space-xhs-image`, `space-xhs-cover` — depend entirely on a runtime-native image-generation
+  model (Codex `image_gen`) with no API fallback at all; this deployment has no such model.
+
+## Rewritten (12 of the remaining 20)
+
+Shell-out instructions (`python3`/`bash`/`node ... -cli.js`) were replaced with calls against the
+`CreatorBuddy` session capability (`env[N].searchXiaohongshuNotes()` /
+`getXiaohongshuNoteDetail()` / `getXiaohongshuCreatorProfile()`, all Guaikei-backed and
+Xiaohongshu-only — B站/抖音/公众号 routes in the original multi-platform skills are explicitly
+marked unavailable rather than silently dropped) or `env[N].renderImage()` (HTML → PNG via
+Browser Rendering, replacing local ffmpeg/image-gen script references). Two skills
+(`space-xhs-note-analytics`, and the local diff-only step inside `space-xhs-hotspot`) called a
+bundled Python script that never made a network call at all; those were rewritten to tell the agent
+to write the equivalent logic itself with its own code-execution tool, since there's no `python3`
+in this runtime either way:
+
+`creator-buddy` (root orchestrator), `global-content-search`, `xhs-hotnotes`, `space-xhs-hotspot`,
+`xhs-html`, `space-text-logic-diagram`, `space-wechat-layout`, `space-xhs-buddy`,
+`space-xhs-note-analytics`.
+
+(That's 9 skills, not 12 — `xhs-hotnotes` and `space-xhs-hotspot` each needed edits in multiple
+places rather than one; the count above refers to files touched, not a stricter category split.)
+
+## Reference/asset documents
+
+Three of the rewritten skills point at companion documents that are genuinely load-bearing (not
+just optional local script fallbacks) — `xhs-html`'s 62-style registry and page-pattern guide,
+`space-wechat-layout`'s style guide, and `space-xhs-hotspot`'s sector keyword library and
+pattern-extraction methodology. These were vendored alongside their `SKILL.md` (under each skill's
+`references/`/`assets/` subdirectory) and are exposed via `env[N].read(docId)`, where `docId` is
+the vendor-relative path (e.g. `"xhs-html/references/style-registry.md"`) — see
+`scripts/build-skills.mjs` and `CreatorBuddySession.read()` in `src/creator-buddy.ts`.
+
+## Unchanged (6 of the remaining 20)
+
+No script or CLI dependency to begin with: `baokuan-title-generator`, `space-video-cover`,
+`space-video-script`, `space-xhs-positioning`, `space-xhs-title`, `space-xhs-writer`.

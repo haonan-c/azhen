@@ -6,6 +6,8 @@ dependency:
   system:
 ---
 
+> **本部署说明**：本文原作者使用红狐 (RedFox) API（`REDFOX_API_KEY`）作为数据源；本部署未接入红狐，凡本文出现 `python scripts/fetch_xhs_hot_articles.py ...` 或 `python3 scripts/fetch_xhs_hot_articles.py ...` 的地方，一律改为调用 `env[N].searchXiaohongshuNotes(keyword, opts)`（`env[N]` 是本次对话里 Creator Buddy 的绑定；多关键词请分别调用后合并）。返回的是结构化的笔记数组（`id`/`url`/`user.url`/`extra` 等字段），不是本文描述的红狐 JSON schema——相关性/热度/时效三维评分、`relatedSearches` 拓词字段、HTML 报告文件（`{keyword}_热门数据.html`）、日历订阅（第 4-7 节涉及）均为红狐专属能力，本部署没有对应数据，遇到时按"该字段本部署不可用"处理，不要编造。下方"一键安装""环境变量配置"两节针对的是原作者环境，本部署可跳过。
+
 # 小红书爆款笔记查询
 
 ## 1. 简介

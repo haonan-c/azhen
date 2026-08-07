@@ -196,6 +196,10 @@
     "gatekeeper-creator-buddy": {
       "bindings": [
         {
+          "name": "BROWSER",
+          "type": "browser"
+        },
+        {
           "name": "GUAIKEI_API_TOKEN",
           "text": "$SECRET(GUAIKEI_API_TOKEN)",
           "type": "secret_text"

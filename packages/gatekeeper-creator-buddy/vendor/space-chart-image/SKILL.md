@@ -6,6 +6,8 @@ description: |
   【公众号配图版】用户给内容 → 产出公众号配图。优先用当前环境内置出图模型（Codex 内置 image_gen/image2、workbuddy 出图模型）直接生成 PNG；无内置模型时回退 scripts/ 下的 API 脚本。
 ---
 
+> **本部署说明：此技能在本部署不可用。** 它的主路径依赖运行时内置的生成式图像模型（Codex `image_gen`/`image2` 等），本部署没有这类模型；它的脚本兜底路径依赖 `LABNANA_API_KEY`（api.labnana.com），本部署也未接入。遇到图表可视化类请求，直接告知用户"本部署当前不支持 AI 生成图表"；如果只是要一张结构清晰的图（不要求"设计感"），可以改用 `space-text-logic-diagram` 生成 HTML/SVG 再经 `env[N].renderImage()` 导出。以下原文保留仅供参考。
+
 # Chart Image：AI 图表绘制器
 
 ## 你的角色

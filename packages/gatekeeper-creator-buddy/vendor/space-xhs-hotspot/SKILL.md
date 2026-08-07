@@ -21,36 +21,15 @@ description: 小红书热点搜集与选题判断。按关键词/赛道拉取近
 
 ---
 
-## 第 0 步：数据源探测与降级（每次执行前先做，不要假设 Key 存在）
+## 第 0 步：数据源（本部署说明）
 
-```bash
-env | grep -E '^(REDFOX_API_KEY|SOCIALDATAX_API_KEY|GUAIKEI_API_TOKEN)=' | sed 's/=.*/=<set>/'
-```
+> 原作者版本在红狐 API / socialdatax CLI / 怪壳 CLI 三条路线间自动降级，均未配置时才走 WebSearch 兜底。**本部署只接入了其中的 Guaikei（怪壳）路线**，通过 `env[N].searchXiaohongshuNotes(keyword, opts)` / `getXiaohongshuNoteDetail(url, opts)` / `getXiaohongshuCreatorProfile(url, opts)` 调用（`env[N]` 是本次对话里 Creator Buddy 的绑定）；红狐、socialdatax 路线在本部署不存在，不要尝试探测对应环境变量或调用它们的脚本/CLI。
 
-按下表**从上往下**取第一条可用路线；某条路线报错（401/余额不足/网络失败）时继续往下降级，并在输出里注明"本次数据来自 X 路线"。
+- 结果没有红狐特有的**热度/相关性/时效三维评分**和 `relatedSearches` 拓词字段——`searchXiaohongshuNotes` 返回的是笔记数组（`id`/`url`/`user.url`/`extra`），评分相关的输出格式（见"输出格式"一节的评分列）不适用，去掉评分列即可，其余照常。
+- `getXiaohongshuCreatorProfile` 能拿到博主信息，但和下方"账号量级"一节提到的 `authorFans` 字段是否存在取决于 Guaikei 实际返回内容（未验证过，遇到没有就如实说"粉丝字段缺失"，不要估算，这条原文里对怪壳路线本来就有同样的提醒）。
+- 若调用失败（超时、鉴权错误等），按原文"兜底"模板的精神如实告知用户"本次小红书数据源不可用"，不要静默失败，也不要引导用户配置本部署没有的红狐/socialdatax 环境变量。
 
-| 优先级 | 环境变量 | 路线 | 强项 | 短板 |
-|---|---|---|---|---|
-| 1 | `REDFOX_API_KEY` | 红狐 API（本 skill 自带脚本） | 唯一有**热度/相关性/时效三维评分**和 `relatedSearches` 拓词；天然只含 1000+ 爆款，信噪比最高 | 只有近 30 天；T+1 更新；无评论 |
-| 2 | `SOCIALDATAX_API_KEY` | socialdatax CLI（npx，见 `xhs-content-research`） | 近实时；有 `--since-days`、多种排序、图文/视频筛选 | 无评分，需自己按互动排序；按量计费 |
-| 3 | `GUAIKEI_API_TOKEN` | 怪壳 Node CLI（见 `xiaohongshu-content-tools`） | 能拿**笔记详情 + 评论区 + 博主全部作品**，做深挖唯一选择 | 需 node，脚本在另一 skill 目录下 |
-| 兜底 | 无 | WebSearch 手动 | 零配置 | 无互动数，只能看到标题和大致方向 |
-
-具体命令、参数、报错处理见 `references/data_sources.md`（执行前读它）。
-
-**三个 Key 都没有时**，不要静默失败，按此模板回复：
-
-```
-未检测到小红书数据源，本次用公开搜索兜底（拿不到互动数，只能看内容方向）。
-
-想要带互动数据的完整热点分析，配置任一即可（推荐第 1 个）：
-  export REDFOX_API_KEY=...        # https://redfox.hk/settings/api-keys  近30天爆款库，带热度评分
-  export SOCIALDATAX_API_KEY=...   # https://socialdatax.com/ai          近实时搜索
-  export GUAIKEI_API_TOKEN=...     # https://www.guaikei.com             详情+评论深挖
-写进 ~/.zshrc 后重开终端即可。
-```
-
-然后**继续用 WebSearch 兜底跑完流程**（`site:xiaohongshu.com <关键词>` + 小红书热点类聚合站），只是把"互动数"列换成"来源"列，并在结论里标注"未经互动数据验证"。不要因为没 Key 就停在提示上。
+具体路线对比见 `env[N].read("space-xhs-hotspot/references/data_sources.md")`（`env[N]` 指本次对话里的 Creator Buddy 绑定；历史参考，只有"怪壳"一行仍适用于本部署）。
 
 ---
 
@@ -71,9 +50,9 @@ env | grep -E '^(REDFOX_API_KEY|SOCIALDATAX_API_KEY|GUAIKEI_API_TOKEN)=' | sed '
 - 覆盖四个维度，各 2~3 个：**趋势词**（老钱风、多巴胺、松弛感）、**人群词**（学生党、小个子、宝妈、打工人）、**场景词**（通勤、约会、露营、租房）、**意图词**（平替、避雷、测评、清单）。
 - 优先用用户自述里出现过的词。用户说"我平时写小众电影、书评、港台文化"，就该查「小众电影/港台电影/书单推荐」，而不是查「电影」。
 
-### 赛道词库：`references/xhs_sectors.json`
+### 赛道词库：`env[N].read("space-xhs-hotspot/references/xhs_sectors.json")`
 
-不要凭空想拓展词——先查词库。它按小红书官方 24 个一级赛道组织，每个赛道给 `trend` / `audience` / `scene` / `intent` 四个维度的可查询细分词，正好对应上面四个维度。
+不要凭空想拓展词——先查词库（`env[N]` 指本次对话里的 Creator Buddy 绑定）。它按小红书官方 24 个一级赛道组织，每个赛道给 `trend` / `audience` / `scene` / `intent` 四个维度的可查询细分词，正好对应上面四个维度。
 
 **什么时候读它**（三种场景，其余场景别浪费上下文）：
 
@@ -131,7 +110,7 @@ env | grep -E '^(REDFOX_API_KEY|SOCIALDATAX_API_KEY|GUAIKEI_API_TOKEN)=' | sed '
 
 上面五个切口回答"这个赛道现在是什么样"，共性提取回答**"这批爆款为什么爆，哪些我能抄，哪些抄不了"**——后者才是用户真正要的东西。
 
-执行前读 `references/pattern_extraction.md`，按它做三件事：
+执行前读 `env[N].read("space-xhs-hotspot/references/pattern_extraction.md")`，按它做三件事：
 
 1. **逐条打两个标签**：形态标签（清单/教程/测评/经历/避雷/数据/资源/身份背书）+ 爆款机制标签（新鲜感/结果感/场景感/身份感/情绪感/反差感/收藏动机/争议感），一条笔记取最强的 1~2 个机制。
 2. **数成分布**：形态 X/20、机制 X/20、标题高频词 top 10~14。**≥40% 才叫共性，20%~40% 叫次主流，<20% 且只有 1~2 条支撑的只能叫个例**，不许包装成趋势。
@@ -147,22 +126,9 @@ env | grep -E '^(REDFOX_API_KEY|SOCIALDATAX_API_KEY|GUAIKEI_API_TOKEN)=' | sed '
 
 **触发条件**：用户问"最近还火吗""比上个月怎么样""哪个赛道更值得写""我该选 A 还是 B"，或第 1 步做了赛道下切拿到多组数据。
 
-**做法**：把每次查询的结果 JSON 各自落盘，再用 `scripts/compare_sets.py` 归一对齐（离线脚本，不联网、不需要 Key）。
+**做法**：`scripts/compare_sets.py` 是纯离线脚本（不联网、不需要 Key），本部署没有 python3 可执行环境，改为**用你自己的代码执行能力**对多组 `searchXiaohongshuNotes` 的返回结果做等价计算：按互动数中位数/最高值、藏赞比、评赞比、小号（<1万粉）占比、主形态、主钩子分组统计，再取标题高频词、词层交集与独有词——逻辑同下方"怎么读对比结果"表格，只是不再依赖落盘 JSON 和该脚本。
 
-```bash
-S=~/.claude/skills/space-xhs-hotspot/scripts
-
-# 多赛道横向：同一时间窗，谁的量级更高、形态和钩子有什么差别
-python3 $S/compare_sets.py 通勤穿搭=a.json 老钱风=b.json 学生党穿搭=c.json --top 20
-
-# 单赛道纵向：同一个词，本周 vs 上月
-python3 $S/compare_sets.py 本周=this.json 上月=last.json --label-kind time
-
-# 要结构化数据自己再加工时
-python3 $S/compare_sets.py a.json b.json --json
-```
-
-- 输入是**已落盘的 JSON**，两种格式自动识别：红狐脚本输出（`items[]`）、怪壳 `search-cli.js` 的结果文件（`results[]`）。怪壳 **stdout 混着日志行不能直接解析**，用它自动落盘的 `xiaohongshu-content-tools/logs/*_search.json`。
+- 输入直接是 `searchXiaohongshuNotes` 各次调用的返回数组，不需要落盘再解析。
 - 标签就是查询词，脚本会用它剔除高频词里的查询词本身（不然 top 词永远是查询词自己）。
 - 输出：对比总表（样本/互动中位数/互动最高/藏赞比/评赞比/小号占比/主形态/主钩子）+ 每组的形态、钩子、标题高频词、最高互动笔记 + 词层交集与独有词。
 - 样本 < 8 条的组，脚本会自己打 ⚠️，转述时要带上这句警告。
@@ -216,7 +182,7 @@ python3 $S/compare_sets.py a.json b.json --json
 
 每条后面跟一句话解读，不要只丢数字。
 
-### ④ 爆款共性（样本 ≥ 8 条时必给，格式见 `references/pattern_extraction.md`）
+### ④ 爆款共性（样本 ≥ 8 条时必给，格式见 `space-xhs-hotspot/references/pattern_extraction.md`）
 
 ```
 共性：收藏动机 12/20（60%，主流）｜身份感 9/20（45%，主流）｜反差感 3/20（个例）
