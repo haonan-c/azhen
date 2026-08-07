@@ -206,7 +206,9 @@
         }
       ],
       "compatibilityDate": "2026-02-02",
-      "compatibilityFlags": [],
+      "compatibilityFlags": [
+        "nodejs_compat"
+      ],
       "inputs": [
         {
           "consoleUrl": "https://www.guaikei.com",

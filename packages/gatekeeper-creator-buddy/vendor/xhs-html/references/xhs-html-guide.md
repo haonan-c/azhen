@@ -138,10 +138,8 @@ body{
 
 生成后运行：
 
-```bash
-python3 scripts/check_contrast.py --tokens index.html
-node scripts/render_xhs.mjs --html index.html --out-dir /tmp/xhs-check --strict
-```
+把每个自包含页面传给
+`env[N].renderImage(html, { width: 1080, height: 1440 })`，再目视检查对比度、溢出和安全区。
 
 逐页检查：
 

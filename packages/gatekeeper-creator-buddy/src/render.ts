@@ -48,6 +48,9 @@ export async function renderImage(
     return await withDeadline((async () => {
       let page = await browser.newPage();
       await page.setViewport({ width, height });
+      // The input is static markup. Disabling JavaScript closes active network channels such as
+      // WebSocket that Puppeteer's HTTP request interception does not observe.
+      await page.setJavaScriptEnabled(false);
       await page.setRequestInterception(true);
       page.on("request", request => {
         let url = request.url();
@@ -57,7 +60,9 @@ export async function renderImage(
           void request.abort();
         }
       });
-      await page.setContent(html, { waitUntil: "networkidle0" });
+      // With JavaScript disabled and all external requests blocked, the load event is the complete
+      // lifecycle signal. Waiting for network-idle can hang under request interception.
+      await page.setContent(html, { waitUntil: "load" });
       let base64 = await page.screenshot({
         type: "png", encoding: "base64", clip: { x: 0, y: 0, width, height },
       });

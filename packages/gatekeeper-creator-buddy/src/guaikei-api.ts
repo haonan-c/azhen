@@ -72,7 +72,7 @@ function deriveUserUrl(userId?: string, xsecToken?: string): string | undefined 
 type RawGuaikeiNote = {
   id?: string;
   xsec_token?: string;
-  user?: { user_id?: string; xsec_token?: string; [key: string]: unknown };
+  user?: { user_id?: string; nickname?: string; xsec_token?: string; [key: string]: unknown };
   [key: string]: unknown;
 };
 
@@ -82,21 +82,34 @@ export type XiaohongshuNoteSummary = {
   id?: string;
   xsecToken?: string;
   url?: string;
-  user?: { userId?: string; xsecToken?: string; url?: string };
+  user?: {
+    userId?: string;
+    nickname?: string;
+    xsecToken?: string;
+    url?: string;
+    extra: Record<string, unknown>;
+  };
   extra: Record<string, unknown>;
 };
 
 function toNoteSummary(raw: RawGuaikeiNote): XiaohongshuNoteSummary {
   let { id, xsec_token: xsecToken, user, ...extra } = raw;
+  let normalizedUser;
+  if (user) {
+    let { user_id: userId, nickname, xsec_token: userXsecToken, ...userExtra } = user;
+    normalizedUser = {
+      userId,
+      nickname,
+      xsecToken: userXsecToken,
+      url: deriveUserUrl(userId, userXsecToken),
+      extra: userExtra,
+    };
+  }
   return {
     id,
     xsecToken,
     url: deriveNoteUrl(id, xsecToken),
-    user: user ? {
-      userId: user.user_id,
-      xsecToken: user.xsec_token,
-      url: deriveUserUrl(user.user_id, user.xsec_token),
-    } : undefined,
+    user: normalizedUser,
     extra,
   };
 }

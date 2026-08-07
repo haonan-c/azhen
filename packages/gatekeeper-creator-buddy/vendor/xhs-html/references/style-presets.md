@@ -1,9 +1,9 @@
 # 12 套现成图文风格 TOKEN（离线可用，已过对比度验证）
 
-`npx getdesign` 拉不到时（无网络 / 无 Node）用这里的块**兜底**；能联网时优先拉真规范，这里的值是近似还原。
+本部署始终使用这里的离线 token，不运行外部命令，也不联网拉取风格规范。
 
 用法：整块替换 `assets/xhs-template.html` 的 `:root{...}` 颜色与排版段，其余不动。
-每套下方标注了实测对比度（用 `scripts/check_contrast.py` 算的，主标题 ≥7:1、accent ≥4.5:1 全部达标）。
+每套下方标注了离线验证的对比度；主标题 ≥7:1、accent ≥4.5:1 全部达标。
 
 **深色套装记得同时设 `<body data-mood="dark">`。**
 
@@ -109,14 +109,10 @@ ink 13.5:1 · accent 7.5:1 ｜ **大面积高饱和底色在双列信息流里�
 
 ## 快速套用
 
-```bash
-# 1) 复制模板
-cp assets/xhs-template.html work/index.html
-# 2) 把上面某一块贴进 :root（颜色 + 排版段）
-# 3) 深色套装额外改 <body data-mood="dark">
-# 4) 验证 + 出图
-python3 scripts/check_contrast.py --tokens work/index.html
-node scripts/render_xhs.mjs --html work/index.html --out-dir /tmp/xhs-check --strict
-```
+1. 用 `env[N].read("xhs-html/assets/xhs-template.html")` 读取模板。
+2. 把上面某一块贴进 `:root` 的颜色和排版段。
+3. 深色套装额外设置 `<body data-mood="dark">`。
+4. 把自包含 HTML 传给 `env[N].renderImage(html, { width: 1080, height: 1440 })`，目视检查对比度和排版。
 
-**这 12 套之外的品牌**（共 62 个）见 `references/style-registry.md`，联网时用 getdesign 拉真规范。
+**这 12 套之外的品牌**（共 62 个）见 `references/style-registry.md`；按其中的视觉描述生成
+自包含 CSS，不访问网络。

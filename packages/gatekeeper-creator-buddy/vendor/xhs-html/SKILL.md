@@ -105,7 +105,8 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 1. `xhs-html/references/xhs-html-guide.md`：单 HTML 多页结构、字号、安全区和校验规则。
 2. `xhs-html/references/page-patterns.md`：教程、清单、方法论、故事的页序与页面组件。
 3. `xhs-html/references/style-registry.md`：62 种风格和赛道匹配。
-4. 用户选中离线预设时读取 `xhs-html/references/style-presets.md`；其他风格按 registry 拉取规范。
+4. 需要精确 token 时读取 `xhs-html/references/style-presets.md`；其他风格只按 registry 的
+   视觉描述生成自包含 CSS，不运行外部命令或访问网络。
 
 风格只决定颜色、字体气质、圆角、线条和装饰母题，不改变内容逻辑。不得为了“像某品牌”牺牲中文可读性。
 
@@ -139,7 +140,10 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 3. 若风格或页数未明确，提供“5+1 风格”和“6/7/8/9 张”选择并等待确认。
 4. 先写页级大纲：每页标题、唯一任务、关键材料；检查是否循序渐进。
 5. 使用同一 HTML 生成全部 `.sheet`。
-6. 质量检查（本部署说明：原版这一步跑本地脚本 `scripts/check_contrast.py`/`scripts/render_xhs.mjs`，本部署改为：对每个 `.sheet` 调用一次 `env[N].renderImage(sheetHtml, { width: 1080, height: 1440 })`——把该 `.sheet` 单独包一层 `<html><body>` 后传入——用返回的图逐页目视检查尺寸、溢出、对比度、安全区、重复元素和整组节奏；`env[N]` 指本次对话里的 Creator Buddy 绑定）。
+6. 质量检查：把每个 `.sheet` 单独包在自包含的 `<html><body>` 中，再调用
+   `env[N].renderImage(sheetHtml, { width: 1080, height: 1440 })`。用返回的图逐页目视检查
+   尺寸、溢出、对比度、安全区、重复元素和整组节奏。`env[N]` 是本次对话中的
+   Creator Buddy 绑定。
 7. 发现问题后修改 HTML 再检查一遍。
 8. 默认交付完整 HTML 文本，并说明页数、风格和内容结构。用户明确要 PNG 时，才对每页调用 `renderImage` 并逐张交付。
 

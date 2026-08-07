@@ -3,13 +3,12 @@
   "name": "gatekeeper-creator-buddy",
   "main": ".wrangler/validate/src/index.ts",
   "build": {
-    "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
+    "command": "pnpm run build:skills && pnpm exec capnweb-validate build --out .wrangler/validate",
     "watch_dir": "src",
   },
   "compatibility_date": "2026-02-02",
-  // Renders vendored HTML templates (covers, diagrams) to images for skills that would otherwise
-  // shell out to ffmpeg/local image-gen, which don't exist in this runtime. Optional: renderImage()
-  // throws a clear error when unbound rather than failing the whole gatekeeper.
+  "compatibility_flags": ["nodejs_compat"],
+  // Renders self-contained vendored HTML templates (covers and diagrams) to images.
   "browser": {
     "binding": "BROWSER",
   },

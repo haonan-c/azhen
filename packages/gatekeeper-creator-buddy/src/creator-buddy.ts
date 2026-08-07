@@ -4,11 +4,8 @@
 //  - a small read-only session capability backed by the Guaikei content-search API and headless
 //    browser rendering.
 //
-// Status: the slash-command/catalog plumbing and the Guaikei-backed search/detail/profile methods
-// are real. `renderImage` (BROWSER-backed) is still signature-complete but throws -- see the
-// TODO(PR3) comment on it. The vendored skill text itself still contains its original shell-out
-// instructions (python3/bash/ffmpeg), which do not work in this runtime; rewriting that text to
-// call the session methods below is also TODO(PR3).
+// The slash-command/catalog plumbing, Guaikei-backed methods, and BROWSER-backed rendering are
+// implemented. Runtime-specific instructions use these capabilities instead of local dependencies.
 // See vendor/VENDORED_FROM.md and docs/adr/0001-creator-buddy-gatekeeper.md.
 
 import {
@@ -92,7 +89,13 @@ interface XiaohongshuNoteSummary {
   xsecToken?: string;
   /** The note's canonical URL, derived from id + xsecToken. */
   url?: string;
-  user?: { userId?: string; xsecToken?: string; url?: string };
+  user?: {
+    userId?: string;
+    nickname?: string;
+    xsecToken?: string;
+    url?: string;
+    extra: Record<string, unknown>;
+  };
   extra: Record<string, unknown>;
 }
 `;
@@ -194,7 +197,9 @@ export class CreatorBuddyAccount
 @validateRpc()
 export class CreatorBuddyVerifier
     extends WorkerEntrypoint<Cloudflare.Env>
-    implements GatekeeperUserVerifier {}
+    implements GatekeeperUserVerifier {
+  verify(): void {}
+}
 
 // ---------------------------------------------------------------------------
 // Gadget-side read path. Read-only: no actions are ever submitted.
@@ -239,12 +244,10 @@ export class CreatorBuddyGatekeeper
         }))
         .toSorted((left, right) => left.title.localeCompare(right.title));
     let catalog = boundAgentCatalog(entries, request);
-    if (catalog.entries.length > 0) {
-      await authorizer.authorizeObservation({
-        title: "Creator Buddy catalog",
-        description: `Listed ${catalog.entries.length} available Creator Buddy skill(s).`,
-      });
-    }
+    await authorizer.authorizeObservation({
+      title: "Creator Buddy catalog",
+      description: `Listed ${catalog.entries.length} available Creator Buddy skill(s).`,
+    });
     return catalog;
   }
 

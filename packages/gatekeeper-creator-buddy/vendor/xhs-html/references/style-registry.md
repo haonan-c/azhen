@@ -1,8 +1,8 @@
 # 风格注册表（小红书多页图文适配版）
 
-风格规范来自 `getdesign`：`npx -y getdesign@latest add <slug>` 会在当前目录生成 `DESIGN.md`（含精确 colors / typography / radius / shadow）。**本机实测可用**（无需 API Key，需联网 + Node）。
-
-拉不到时用 `references/style-presets.md` 的 12 套离线 token 兜底。
+本部署不运行 `getdesign` 或其他本地命令。12 套常用风格的精确 token 在
+`xhs-html/references/style-presets.md`；其余风格只使用本文件的视觉描述生成自包含 CSS，
+不得访问网络补充规范。
 
 ---
 
