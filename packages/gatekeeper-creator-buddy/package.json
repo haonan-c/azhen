@@ -1,0 +1,24 @@
+{
+  "name": "@gadgets/gatekeeper-creator-buddy",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "echo \"run 'pnpm dev-server' in the root directory instead\" >&2 && exit 1",
+    "deploy": "pnpm run build:skills && wrangler deploy",
+    "build:skills": "node scripts/build-skills.mjs",
+    "build": "pnpm run build:skills && tsc",
+    "types:check": "pnpm run build:skills && tsc --noEmit",
+    "clean": "rm -rf dist src/generated"
+  },
+  "dependencies": {
+    "@gadgets/workshop-shared": "workspace:*",
+    "capnweb": "^0.8.0",
+    "capnweb-validate": "0.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.115.0"
+  }
+}

@@ -192,6 +192,7 @@ const PASSTHROUGH_GATEKEEPER_VARS = {
     "MCP_PORTAL_TRUST_ANNOTATIONS", "MCP_ALLOW_INSECURE",
   ],
   "gatekeeper-mcp": ["MCP_ALLOW_INSECURE"],
+  "gatekeeper-creator-buddy": ["GUAIKEI_API_TOKEN"],
 };
 
 for (const gk of gatekeepers) {

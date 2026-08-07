@@ -193,6 +193,60 @@
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/context"
       }
     },
+    "gatekeeper-creator-buddy": {
+      "bindings": [
+        {
+          "name": "GUAIKEI_API_TOKEN",
+          "text": "$SECRET(GUAIKEI_API_TOKEN)",
+          "type": "secret_text"
+        }
+      ],
+      "compatibilityDate": "2026-02-02",
+      "compatibilityFlags": [],
+      "inputs": [
+        {
+          "consoleUrl": "https://www.guaikei.com",
+          "kind": "secret",
+          "label": "Guaikei API token",
+          "name": "GUAIKEI_API_TOKEN",
+          "setupSteps": [
+            "Sign up for a Guaikei account and subscribe to the content-search API.",
+            "Copy your API token from the Guaikei dashboard here."
+          ]
+        }
+      ],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "index.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "CreatorBuddyGatekeeper"
+          ],
+          "tag": "v0"
+        }
+      ],
+      "modules": [
+        {
+          "name": "index.js",
+          "r2Key": "blobs/modules/045d58b4c86a74fc0afb34acccd340619917439ff279f46f87a605586f177c89",
+          "sha256": "045d58b4c86a74fc0afb34acccd340619917439ff279f46f87a605586f177c89",
+          "size": 66,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "creator-buddy",
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/creator-buddy"
+      }
+    },
     "gatekeeper-email": {
       "bindings": [],
       "compatibilityDate": "2026-02-02",
