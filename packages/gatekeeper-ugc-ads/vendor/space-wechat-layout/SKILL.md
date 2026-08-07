@@ -11,7 +11,7 @@ Create a local HTML preview page that renders a provided article as WeChat-compa
 
 **定位**：这是公众号「整篇视觉/排版」这一路——用户给文章内容，你输出可直接贴进公众号编辑器的 **HTML 排版**（`复制 HTML` 一键搬运）。是本集合里配图 Skill 的搭档：`space-chart-image` / `space-text-logic-diagram` 出**单张配图**，本 Skill 出**整篇排版**。
 
-**输出**：默认 HTML（本 Skill 主路径）。需要把某个区块（如头图/金句卡）导出成图片时，把该区块单独包一层 `<html><body>` 后传给 `env[N].renderImage(html, opts)`（`env[N]` 指本次对话里的 Creator Buddy 绑定）；本部署没有生成式图像模型，不能"重绘"，只能渲染你写出的 HTML。
+**输出**：默认 HTML（本 Skill 主路径）。需要把某个区块（如头图/金句卡）导出成图片时，把该区块单独包一层 `<html><body>` 后传给 `env[N].renderImage(html, opts)`（`env[N]` 指本次对话里的 UGC Ads 绑定）；本部署没有生成式图像模型，不能"重绘"，只能渲染你写出的 HTML。
 
 **内容不改写**：只做排版层面的轻调整，保留全部事实、顺序、引用、结论。
 
@@ -30,7 +30,7 @@ Create a local HTML preview page that renders a provided article as WeChat-compa
      - reflective/narrative/opinion → Claude
      - technical/tutorial/product notes → OpenAI
      - data/list/comparison/education → Google
-   - Read via `env[N].read("space-wechat-layout/references/style-guide.md")` (`env[N]` is this conversation's Creator Buddy binding) only when implementing the chosen style or when comparing styles.
+   - Read via `env[N].read("space-wechat-layout/references/style-guide.md")` (`env[N]` is this conversation's UGC Ads binding) only when implementing the chosen style or when comparing styles.
 
 3. **Prepare the content**
    - Do not rewrite the article substantially.

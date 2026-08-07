@@ -1,4 +1,4 @@
-# Vendor Creator Buddy as its own gatekeeper, not a Context Library collection
+# Vendor UGC Ads as its own gatekeeper, not a Context Library collection
 
 Status: accepted
 
@@ -9,10 +9,10 @@ platform already has a mechanism built for exactly this shape of thing:
 that become slash commands for every user, with no per-deployment code changes.
 
 We decided **not** to use that path, and instead vendored the Skill text into a new package,
-`packages/gatekeeper-creator-buddy`, with its own `GatekeeperVendor`/`GatekeeperUser`/`Gatekeeper`
+`packages/gatekeeper-ugc-ads`, with its own `GatekeeperVendor`/`GatekeeperUser`/`Gatekeeper`
 implementation (see `.agents/skills/write-gatekeeper/SKILL.md` for what that triad means).
 
-**Why**: the Context Library can only distribute *documents*. Most of Creator Buddy's Skills are
+**Why**: the Context Library can only distribute *documents*. Most of the vendored Skills are
 not self-contained prose — their instructions shell out to scripts that call a third-party content
 API (TikHub, for Xiaohongshu search) or render HTML templates to images. Those are capabilities,
 not content, and Context Library gatekeepers have no mechanism to expose a capability alongside a
@@ -30,10 +30,10 @@ wasn't inventing a new mechanism, just reusing an existing one from a different 
 The one thing this decision does *not* buy: a gatekeeper is a Cloudflare Worker, with no shell, no
 Python, no `ffmpeg`, no filesystem. "Capability" here means a typed RPC method backed by a real
 `fetch()` call or Cloudflare's Browser Rendering — not literal execution of the vendored scripts.
-Every one of Creator Buddy's `python3`/`bash`/`node ...-cli.js` invocations had to be individually
+Every upstream `python3`/`bash`/`node ...-cli.js` invocation had to be individually
 rewritten into a session method call (or, for the handful of Skills whose upstream data source
 turned out to have no equivalent in this deployment — see
-`packages/gatekeeper-creator-buddy/vendor/VENDORED_FROM.md` — flagged as unavailable rather than
+`packages/gatekeeper-ugc-ads/vendor/VENDORED_FROM.md` — flagged as unavailable rather than
 silently faked). "Gatekeeper" does not mean "sandbox that can run arbitrary code"; see the [Skill]
 and [Gatekeeper] entries in `CONTEXT.md`.
 

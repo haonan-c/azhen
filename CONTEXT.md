@@ -41,9 +41,9 @@ This is distinct from a similarly-named but different thing:
 The `SlashCommandProvider` + `getAgentCatalog` + session-method surface a gatekeeper exposes so
 that vendored Skill text has something real to call. First established by
 `packages/gatekeeper-context` (Skills backed by user-authored Context Library collections) and
-`packages/gatekeeper-creator-buddy` (Skills backed by a vendored, one-time snapshot of a
+`packages/gatekeeper-ugc-ads` (Skills backed by a vendored, one-time snapshot of a
 third-party Skill collection plus a small data/rendering capability). See
-`docs/adr/0001-creator-buddy-gatekeeper.md` for why a Skill collection sometimes gets its own
+`docs/adr/0001-ugc-ads-gatekeeper.md` for why a Skill collection sometimes gets its own
 gatekeeper instead of living in the Context Library.
 
 ## Session
@@ -57,6 +57,6 @@ silent side effect.
 ## Vendored (Skill collection)
 
 Copied once from an upstream repository at a specific commit, then maintained independently — not
-a live sync, not a git submodule. See `packages/gatekeeper-creator-buddy/vendor/VENDORED_FROM.md`
+a live sync, not a git submodule. See `packages/gatekeeper-ugc-ads/vendor/VENDORED_FROM.md`
 for the pattern: record the source commit, list what was excluded and why, and don't push changes
 back upstream.

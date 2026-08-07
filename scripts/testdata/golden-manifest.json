@@ -193,67 +193,6 @@
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/context"
       }
     },
-    "gatekeeper-creator-buddy": {
-      "bindings": [
-        {
-          "name": "BROWSER",
-          "type": "browser"
-        },
-        {
-          "name": "TIKHUB_API_KEY",
-          "text": "$SECRET(TIKHUB_API_KEY)",
-          "type": "secret_text"
-        }
-      ],
-      "compatibilityDate": "2026-02-02",
-      "compatibilityFlags": [
-        "nodejs_compat",
-        "allow_irrevocable_stub_storage"
-      ],
-      "inputs": [
-        {
-          "consoleUrl": "https://user.tikhub.io/dashboard/overview",
-          "kind": "secret",
-          "label": "TikHub API key",
-          "name": "TIKHUB_API_KEY",
-          "setupSteps": [
-            "Sign up for a TikHub account and enable the Xiaohongshu API.",
-            "Copy your API key from the TikHub dashboard here."
-          ]
-        }
-      ],
-      "installable": true,
-      "kind": "gatekeeper",
-      "mainModule": "index.js",
-      "migrations": [
-        {
-          "new_sqlite_classes": [
-            "CreatorBuddyGatekeeper"
-          ],
-          "tag": "v0"
-        }
-      ],
-      "modules": [
-        {
-          "name": "index.js",
-          "r2Key": "blobs/modules/045d58b4c86a74fc0afb34acccd340619917439ff279f46f87a605586f177c89",
-          "sha256": "045d58b4c86a74fc0afb34acccd340619917439ff279f46f87a605586f177c89",
-          "size": 66,
-          "type": "esm"
-        }
-      ],
-      "observability": {
-        "enabled": true,
-        "head_sampling_rate": 1,
-        "logs": {
-          "invocation_logs": false
-        }
-      },
-      "shortName": "creator-buddy",
-      "vars": {
-        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/creator-buddy"
-      }
-    },
     "gatekeeper-email": {
       "bindings": [],
       "compatibilityDate": "2026-02-02",
@@ -954,6 +893,67 @@
       "shortName": "supabase",
       "vars": {
         "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/supabase"
+      }
+    },
+    "gatekeeper-ugc-ads": {
+      "bindings": [
+        {
+          "name": "BROWSER",
+          "type": "browser"
+        },
+        {
+          "name": "TIKHUB_API_KEY",
+          "text": "$SECRET(TIKHUB_API_KEY)",
+          "type": "secret_text"
+        }
+      ],
+      "compatibilityDate": "2026-02-02",
+      "compatibilityFlags": [
+        "nodejs_compat",
+        "allow_irrevocable_stub_storage"
+      ],
+      "inputs": [
+        {
+          "consoleUrl": "https://user.tikhub.io/dashboard/overview",
+          "kind": "secret",
+          "label": "TikHub API key",
+          "name": "TIKHUB_API_KEY",
+          "setupSteps": [
+            "Sign up for a TikHub account and enable the Xiaohongshu API.",
+            "Copy your API key from the TikHub dashboard here."
+          ]
+        }
+      ],
+      "installable": true,
+      "kind": "gatekeeper",
+      "mainModule": "index.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "UgcAdsGatekeeper"
+          ],
+          "tag": "v0"
+        }
+      ],
+      "modules": [
+        {
+          "name": "index.js",
+          "r2Key": "blobs/modules/d8911cb775d10e275d12ca1a65002a2f75635a7a4ae8fd0eab912dbfab719116",
+          "sha256": "d8911cb775d10e275d12ca1a65002a2f75635a7a4ae8fd0eab912dbfab719116",
+          "size": 60,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "shortName": "ugc-ads",
+      "vars": {
+        "BASE_URL": "$PUBLIC_BASE_URL/gatekeeper/ugc-ads"
       }
     },
     "gatekeeper-zoominfo": {

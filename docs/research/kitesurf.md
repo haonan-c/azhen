@@ -17,9 +17,9 @@ Kitesurf 适合做本项目的轻量浏览器执行层。它最适合公开网�
 
 ## 对本项目的优先用途
 
-### P0：完成 Creator Buddy 的 HTML 图片渲染
+### P0：完成 UGC Ads 的 HTML 图片渲染
 
-`packages/gatekeeper-creator-buddy/src/creator-buddy.ts` 中的 `renderImage()` 仍是 TODO。它接收自包含 HTML，并返回 PNG data URI。小红书卡片、封面和逻辑图通常是无登录、短生命周期、固定画布的 HTML。这与 Kitesurf 的一次性截图任务高度匹配。
+`packages/gatekeeper-ugc-ads/src/ugc-ads.ts` 中的 `renderImage()` 仍是 TODO。它接收自包含 HTML，并返回 PNG data URI。小红书卡片、封面和逻辑图通常是无登录、短生命周期、固定画布的 HTML。这与 Kitesurf 的一次性截图任务高度匹配。
 
 建议先用代表性的中文模板做兼容性试验。验收项应包括字体、Grid/Flex、SVG、渐变、阴影、分页、1080×1440 尺寸和多页截图。失败时回退到 Chromium。
 
@@ -48,11 +48,11 @@ Kitesurf 的低 CPU、低内存和短生命周期模型适合突发任务，例�
 - Browser Run 的 Workers `quickAction()` 需要 compatibility date `2026-03-24` 或更晚；本仓库相关 Worker 当前是 `2026-02-02`。升级日期后必须运行类型检查和相关回归测试。[Quick Actions 文档](https://developers.cloudflare.com/browser-run/quick-actions/)
 - 仓库当前使用的 `@cloudflare/puppeteer@1.2.0` 的 `launch()` 选项没有 Kitesurf 引擎字段。因此，现有 `launch(env.BROWSER)` 不是一个已验证的直接切换点。官方当前说明的选择方式是对 CDP 或 Quick Action 端点添加 `browser=kitesurf`。
 - 建议采用任务路由：公开、无登录、短任务先用 Kitesurf；兼容失败或任务需要登录状态、WebGL、视频、反机器人握手、长期会话、像素精度时使用 Chromium。
-- 首个试点应放在 Creator Buddy gatekeeper，而不是 Workshop kernel。这样改动范围小，也符合本项目通过 Gatekeeper 提供外部能力的边界。
+- 首个试点应放在 UGC Ads gatekeeper，而不是 Workshop kernel。这样改动范围小，也符合本项目通过 Gatekeeper 提供外部能力的边界。
 
 ## 建议的试点成功标准
 
-1. 选取 20 个真实 Creator Buddy HTML 样本。
+1. 选取 20 个真实 UGC Ads HTML 样本。
 2. Kitesurf 成功生成全部预期尺寸的 PNG，且无溢出、缺字或关键布局错误。
 3. 记录 Kitesurf 与 Chromium 的成功率、墙钟时间、Browser Run 用量和输出差异。
 4. Kitesurf 失败时可自动、可观测地回退到 Chromium。

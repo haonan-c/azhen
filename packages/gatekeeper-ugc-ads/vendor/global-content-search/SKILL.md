@@ -1,6 +1,6 @@
 ---
 name: global-content-search
-description: 全域内容搜索（本部署仅小红书）｜当提到小红书关键词搜索、笔记详情、博主作品监控时使用。经本部署的 CreatorBuddy 会话（TikHub）调用；B站、抖音在本部署不可用。
+description: 全域内容搜索（本部署仅小红书）｜当提到小红书关键词搜索、笔记详情、博主作品监控时使用。经本部署的 UgcAds 会话（TikHub）调用；B站、抖音在本部署不可用。
 license: MIT
 metadata:
   type: command
@@ -27,7 +27,7 @@ metadata:
 
 本部署的访问路径：
 
-- 小红书关键词搜索、笔记详情/评论、博主作品：统一经 `env[N]` 上的 CreatorBuddy 会话（`env[N]` 指本次对话里的 Creator Buddy 绑定），无需配置 Key（部署管理员已配置好 TikHub API key）。
+- 小红书关键词搜索、笔记详情/评论、博主作品：统一经 `env[N]` 上的 UgcAds 会话（`env[N]` 指本次对话里的 UGC Ads 绑定），无需配置 Key（部署管理员已配置好 TikHub API key）。
 - B站、抖音：本部署未接入，直接告知用户不支持，不要尝试调用 CLI。
 
 ## 2. 核心能力

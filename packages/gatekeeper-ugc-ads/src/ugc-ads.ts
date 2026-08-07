@@ -1,12 +1,12 @@
-// Creator Buddy gatekeeper. Auto-provisions one account per user; the account provides an unnamed
-// agent capsule (CreatorBuddyGatekeeper) exposing:
+// UGC Ads gatekeeper. Auto-provisions one account per user; the account provides an unnamed
+// agent capsule (UgcAdsGatekeeper) exposing:
 //  - 20 vendored Agent Skills (see vendor/) as slash commands and Agent Catalog entries, and
 //  - a small read-only session capability backed by the TikHub content-search API and headless
 //    browser rendering.
 //
 // The slash-command/catalog plumbing, TikHub-backed methods, and BROWSER-backed rendering are
 // implemented. Runtime-specific instructions use these capabilities instead of local dependencies.
-// See vendor/VENDORED_FROM.md and docs/adr/0001-creator-buddy-gatekeeper.md.
+// See vendor/VENDORED_FROM.md and docs/adr/0001-ugc-ads-gatekeeper.md.
 
 import {
   WorkerEntrypoint, DurableObject, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget,
@@ -22,16 +22,16 @@ import type {
   SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult, ResourceConfiguratorFrame,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { parseSkillManifest, buildAgentSkillMessage } from "@gadgets/workshop-shared/agent-skill";
-import { CREATOR_BUDDY_SKILLS, CREATOR_BUDDY_DOCS } from "./generated/skills.js";
+import { UGC_ADS_SKILLS, UGC_ADS_DOCS } from "./generated/skills.js";
 import {
   searchXiaohongshuNotes, getXiaohongshuNoteDetail, getXiaohongshuCreatorProfile,
   type XiaohongshuSearchOptions,
 } from "./tikhub-api.js";
 import { renderImage } from "./render.js";
 
-// The Creator Buddy icon: the Phosphor "Sparkle" glyph as a self-contained SVG data URI (no
+// The UGC Ads icon: the Phosphor "Sparkle" glyph as a self-contained SVG data URI (no
 // external/branded asset), matching AvatarImage's { url } shape.
-const CREATOR_BUDDY_ICON = {
+const UGC_ADS_ICON = {
   url: "data:image/svg+xml," + encodeURIComponent(
     "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256' fill='currentColor'>" +
     "<path d='M208,144a15.78,15.78,0,0,1-10.42,14.94l-51.65,19-19,51.61a15.92,15.92,0,0,1-29.88,0" +
@@ -42,13 +42,13 @@ const CREATOR_BUDDY_ICON = {
 };
 
 // Agent-facing API returned by describeBinding(). Keep in sync with the return types below.
-const CREATOR_BUDDY_TYPES = `
+const UGC_ADS_TYPES = `
 /**
  * Content-creation Agent Skills, plus a small Xiaohongshu (小红书) content-search and image
  * rendering capability. Skills are invoked as slash commands; this interface is for the session
  * methods a skill's own instructions may call directly.
  */
-interface CreatorBuddy {
+interface UgcAds {
   /**
    * Read a skill's reference/asset document by id (a skill's own instructions supply the id, e.g.
    * "xhs-html/references/style-registry.md"). Returns null if the id is unknown.
@@ -104,18 +104,18 @@ interface XiaohongshuNoteSummary {
 `;
 
 // ---------------------------------------------------------------------------
-// Vendor — top-level entrypoint the Workshop binds as GATEKEEPER_CREATOR_BUDDY.
+// Vendor — top-level entrypoint the Workshop binds as GATEKEEPER_UGC_ADS.
 
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   async describe(): Promise<VendorDescription> {
     return {
-      displayName: "Creator Buddy",
-      url: "https://github.com/SpaceZephyr/creator-buddy",
-      logo: CREATOR_BUDDY_ICON,
+      displayName: "UGC Ads",
+      url: "https://github.com/haonan-c/azhen",
+      logo: UGC_ADS_ICON,
       tagline: "Content-creation skills for 公众号, 小红书, and video",
       description:
-        "Creator Buddy bundles a suite of content-creation Agent Skills -- positioning, " +
+        "UGC Ads bundles a suite of content-creation Agent Skills -- positioning, " +
         "titles, copywriting, and cover/diagram rendering -- for WeChat Official Account, " +
         "Xiaohongshu, and video creators, plus a small Xiaohongshu content-search capability. " +
         "Always available -- no connection needed.",
@@ -129,42 +129,42 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   // to key by account.
   @skipRpcValidation()
   async createAccount(): Promise<Fetcher<GatekeeperUser>> {
-    return this.ctx.exports.CreatorBuddyAccount({ props: {} }) as unknown as Fetcher<GatekeeperUser>;
+    return this.ctx.exports.UgcAdsAccount({ props: {} }) as unknown as Fetcher<GatekeeperUser>;
   }
 
   // --- Resource-connection GatekeeperVendor surface (not applicable to this vendor) ---
 
   connectAccount(_callback: Fetcher<GatekeeperConnectCallback>,
                  _options?: GatekeeperConnectOptions): Promise<{ url: string }> {
-    throw new Error("Creator Buddy is auto-provisioned; it has no connect flow.");
+    throw new Error("UGC Ads is auto-provisioned; it has no connect flow.");
   }
   async getSupportedResources(_options?: { userId?: string }): Promise<SupportedResource[]> {
     return [];
   }
   async getTypeScriptTypes(): Promise<string> {
-    return CREATOR_BUDDY_TYPES;
+    return UGC_ADS_TYPES;
   }
 }
 
 // ---------------------------------------------------------------------------
 // Account — per-user capability; declares the singleton read/search/render path.
 
-type CreatorBuddyAccountProps = {};
+type UgcAdsAccountProps = {};
 
 @validateRpc()
-export class CreatorBuddyAccount
-    extends WorkerEntrypoint<Cloudflare.Env, CreatorBuddyAccountProps>
+export class UgcAdsAccount
+    extends WorkerEntrypoint<Cloudflare.Env, UgcAdsAccountProps>
     implements GatekeeperUser {
   async describe(): Promise<AccountDescription> {
     return {
-      displayName: "Creator Buddy",
-      avatar: CREATOR_BUDDY_ICON,
-      singleton: { tsType: "CreatorBuddy" },
+      displayName: "UGC Ads",
+      avatar: UGC_ADS_ICON,
+      singleton: { tsType: "UgcAds" },
     };
   }
 
   async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<any>>> {
-    return this.ctx.exports.CreatorBuddyGatekeeper({ props: {} });
+    return this.ctx.exports.UgcAdsGatekeeper({ props: {} });
   }
 
   // --- GatekeeperUser resource surface (no URL-addressed resources) ---
@@ -172,10 +172,10 @@ export class CreatorBuddyAccount
     return [];
   }
   getGatekeeperClassFor(_url: string): never {
-    throw new Error("Creator Buddy has no URL-addressed resources.");
+    throw new Error("UGC Ads has no URL-addressed resources.");
   }
   startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
-    throw new Error("Creator Buddy has no URL-addressed resources.");
+    throw new Error("UGC Ads has no URL-addressed resources.");
   }
   async ensureResources(_resourceUrlPatterns: string[]): Promise<{ url?: string }> {
     return {};
@@ -183,7 +183,7 @@ export class CreatorBuddyAccount
   // No per-account state to delete.
   async revoke(): Promise<void> {}
   reconnect(): never {
-    throw new Error("Creator Buddy is a singleton gatekeeper; it has no connect flow.");
+    throw new Error("UGC Ads is a singleton gatekeeper; it has no connect flow.");
   }
   async getAuthenticatedEmail(): Promise<string | null> {
     return null;
@@ -191,14 +191,14 @@ export class CreatorBuddyAccount
 
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.CreatorBuddyVerifier({ props: {} });
+    return this.ctx.exports.UgcAdsVerifier({ props: {} });
   }
 }
 
 // Every account sees identical data (vendored skills + a deployment-wide TikHub key), so there
-// is nothing for a verifier to check. See CreatorBuddyGatekeeper.addObserver below.
+// is nothing for a verifier to check. See UgcAdsGatekeeper.addObserver below.
 @validateRpc()
-export class CreatorBuddyVerifier
+export class UgcAdsVerifier
     extends WorkerEntrypoint<Cloudflare.Env>
     implements GatekeeperUserVerifier {
   verify(): void {}
@@ -207,39 +207,39 @@ export class CreatorBuddyVerifier
 // ---------------------------------------------------------------------------
 // Gadget-side read path. Read-only: no actions are ever submitted.
 
-type CreatorBuddyGatekeeperProps = {};
+type UgcAdsGatekeeperProps = {};
 
 @validateRpc()
-export class CreatorBuddyGatekeeper
-    extends DurableObject<Cloudflare.Env, CreatorBuddyGatekeeperProps>
-    implements Gatekeeper<CreatorBuddySession> {
+export class UgcAdsGatekeeper
+    extends DurableObject<Cloudflare.Env, UgcAdsGatekeeperProps>
+    implements Gatekeeper<UgcAdsSession> {
   async describe(): Promise<ResourceDescription> {
     return {
-      url: "creator-buddy://buddy",
-      title: "Creator Buddy",
+      url: "ugc-ads://ads",
+      title: "UGC Ads",
       snippet: "Content-creation skills and Xiaohongshu search for 公众号, 小红书, and video.",
-      suggestedBindingName: "CREATOR_BUDDY",
-      tsType: "CreatorBuddy",
+      suggestedBindingName: "UGC_ADS",
+      tsType: "UgcAds",
       hasSlashCommands: true,
     };
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return CREATOR_BUDDY_TYPES;
+    return UGC_ADS_TYPES;
   }
 
-  async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<CreatorBuddySession> {
-    return new CreatorBuddySession(approvalQueue.dup(), this.env.TIKHUB_API_KEY, this.env.BROWSER);
+  async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<UgcAdsSession> {
+    return new UgcAdsSession(approvalQueue.dup(), this.env.TIKHUB_API_KEY, this.env.BROWSER);
   }
 
-  async getSlashCommandProvider(): Promise<CreatorBuddySlashCommandProvider> {
-    return new CreatorBuddySlashCommandProvider();
+  async getSlashCommandProvider(): Promise<UgcAdsSlashCommandProvider> {
+    return new UgcAdsSlashCommandProvider();
   }
 
   async getAgentCatalog(
       request: AgentCatalogRequest,
       authorizer: NativeRpcStub<ObservationAuthorizer>): Promise<AgentCatalog> {
-    let entries = CREATOR_BUDDY_SKILLS
+    let entries = UGC_ADS_SKILLS
         .map(skill => ({
           id: skill.name,
           title: skill.name,
@@ -248,8 +248,8 @@ export class CreatorBuddyGatekeeper
         .toSorted((left, right) => left.title.localeCompare(right.title));
     let catalog = boundAgentCatalog(entries, request);
     await authorizer.authorizeObservation({
-      title: "Creator Buddy catalog",
-      description: `Listed ${catalog.entries.length} available Creator Buddy skill(s).`,
+      title: "UGC Ads catalog",
+      description: `Listed ${catalog.entries.length} available UGC Ads skill(s).`,
     });
     return catalog;
   }
@@ -260,21 +260,21 @@ export class CreatorBuddyGatekeeper
   }
 
   // Strategy D (low-stakes, see .agents/skills/write-gatekeeper/SKELETON.md): every user with
-  // access to their own Creator Buddy singleton sees identical vendored skills and the same
+  // access to their own UGC Ads singleton sees identical vendored skills and the same
   // deployment-wide TikHub key, so there is nothing observer-specific to verify.
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
   async removeObserver(_id: string): Promise<void> {}
 
   // Read-only gatekeeper: no actions are submitted, so these callbacks should never run.
   applyAction(_action: number): Promise<void> {
-    throw new Error("Creator Buddy is read-only and implements no actions.");
+    throw new Error("UGC Ads is read-only and implements no actions.");
   }
   rejectAction(_action: number): Promise<void | { restart?: boolean }> {
-    throw new Error("Creator Buddy is read-only and implements no actions.");
+    throw new Error("UGC Ads is read-only and implements no actions.");
   }
   revertAction(_action: number):
       Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
-    throw new Error("Creator Buddy is read-only and implements no actions.");
+    throw new Error("UGC Ads is read-only and implements no actions.");
   }
 }
 
@@ -283,9 +283,9 @@ export class CreatorBuddyGatekeeper
 // vendor source). `id` is the skill's validated frontmatter name, already checked unique by
 // scripts/build-skills.mjs.
 
-class CreatorBuddySlashCommandProvider extends NativeRpcTarget implements SlashCommandProvider {
+class UgcAdsSlashCommandProvider extends NativeRpcTarget implements SlashCommandProvider {
   async list(): Promise<SlashCommandDescriptor[]> {
-    return CREATOR_BUDDY_SKILLS.map(skill => ({
+    return UGC_ADS_SKILLS.map(skill => ({
       id: skill.name,
       name: skill.name,
       description: skill.description,
@@ -296,11 +296,11 @@ class CreatorBuddySlashCommandProvider extends NativeRpcTarget implements SlashC
       id: string,
       args: string,
       authorizer: NativeRpcStub<ObservationAuthorizer>): Promise<SlashCommandResult> {
-    let skill = CREATOR_BUDDY_SKILLS.find(entry => entry.name === id);
-    if (!skill) throw new Error("The selected Creator Buddy skill is no longer available.");
+    let skill = UGC_ADS_SKILLS.find(entry => entry.name === id);
+    if (!skill) throw new Error("The selected UGC Ads skill is no longer available.");
     let manifest = parseSkillManifest("SKILL.md", skill.content);
     await authorizer.authorizeObservation({
-      title: "Creator Buddy skill",
+      title: "UGC Ads skill",
       description: `Invoked the "${manifest.name}" skill.`,
     });
     return {
@@ -313,11 +313,11 @@ class CreatorBuddySlashCommandProvider extends NativeRpcTarget implements SlashC
 }
 
 // ---------------------------------------------------------------------------
-// Session — the RPC object exposed to the Gadget as `CreatorBuddy` (see CREATOR_BUDDY_TYPES above
+// Session — the RPC object exposed to the Gadget as `UgcAds` (see UGC_ADS_TYPES above
 // for its agent-facing type). Read-only: every method authorizes an observation before returning.
 
 @validateRpc()
-export class CreatorBuddySession extends RpcTarget {
+export class UgcAdsSession extends RpcTarget {
   #approvalQueue: NativeRpcStub<ApprovalQueue>;
   #tikhubApiKey: string;
   #browser: BrowserRun;
@@ -334,10 +334,10 @@ export class CreatorBuddySession extends RpcTarget {
   }
 
   async read(docId: string) {
-    let doc = CREATOR_BUDDY_DOCS.find(entry => entry.id === docId);
+    let doc = UGC_ADS_DOCS.find(entry => entry.id === docId);
     if (!doc) return null;
     await this.#approvalQueue.authorizeObservation({
-      title: "Creator Buddy reference document",
+      title: "UGC Ads reference document",
       description: `Read reference document: ${docId}`,
     });
     return doc;

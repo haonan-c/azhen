@@ -1,5 +1,5 @@
 {
-  "name": "@gadgets/gatekeeper-creator-buddy",
+  "name": "@gadgets/gatekeeper-ugc-ads",
   "version": "1.0.0",
   "type": "module",
   "main": "./src/index.ts",

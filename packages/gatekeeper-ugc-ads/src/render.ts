@@ -1,5 +1,5 @@
 // Renders a self-contained HTML string to a PNG image via Cloudflare Browser Rendering. Used by
-// CreatorBuddySession.renderImage() in place of the vendored skills' local ffmpeg/image-gen
+// UgcAdsSession.renderImage() in place of the vendored skills' local ffmpeg/image-gen
 // scripts, which don't exist in this runtime -- see e.g. vendor/space-video-cover/SKILL.md and
 // vendor/space-text-logic-diagram/SKILL.md. Much simpler than workshop-backend's Gadget PDF export
 // (packages/workshop-backend/src/browser-export.ts): there is no live RPC bridge to a running

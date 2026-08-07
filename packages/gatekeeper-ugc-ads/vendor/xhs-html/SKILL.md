@@ -24,7 +24,7 @@ description: 将用户提供的文章、笔记、教程、SOP、清单、网页�
 
 ### 1. 风格
 
-根据内容赛道，从 `env[N].read("xhs-html/references/style-registry.md")`（`env[N]` 指本次对话里的 Creator Buddy 绑定）的 62 种风格中推荐 5 种，再加 1 个“智能匹配”：
+根据内容赛道，从 `env[N].read("xhs-html/references/style-registry.md")`（`env[N]` 指本次对话里的 UGC Ads 绑定）的 62 种风格中推荐 5 种，再加 1 个“智能匹配”：
 
 ```text
 推荐风格
@@ -100,7 +100,7 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 
 ## 设计系统
 
-制作前用 `env[N].read(docId)` 读取（`env[N]` 指本次对话里的 Creator Buddy 绑定）：
+制作前用 `env[N].read(docId)` 读取（`env[N]` 指本次对话里的 UGC Ads 绑定）：
 
 1. `xhs-html/references/xhs-html-guide.md`：单 HTML 多页结构、字号、安全区和校验规则。
 2. `xhs-html/references/page-patterns.md`：教程、清单、方法论、故事的页序与页面组件。
@@ -143,7 +143,7 @@ D. 9 张 — 深入版：适合完整 SOP 或多步骤教程
 6. 质量检查：把每个 `.sheet` 单独包在自包含的 `<html><body>` 中，再调用
    `env[N].renderImage(sheetHtml, { width: 1080, height: 1440 })`。用返回的图逐页目视检查
    尺寸、溢出、对比度、安全区、重复元素和整组节奏。`env[N]` 是本次对话中的
-   Creator Buddy 绑定。
+   UGC Ads 绑定。
 7. 发现问题后修改 HTML 再检查一遍。
 8. 默认交付完整 HTML 文本，并说明页数、风格和内容结构。用户明确要 PNG 时，才对每页调用 `renderImage` 并逐张交付。
 

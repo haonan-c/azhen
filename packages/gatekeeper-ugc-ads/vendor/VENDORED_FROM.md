@@ -7,7 +7,7 @@ These files were copied from:
 - Commit date: 2026-08-04
 
 This is a one-time vendor snapshot, not a live sync — decision recorded in
-`docs/adr/0001-creator-buddy-gatekeeper.md`. Future upstream changes are picked up manually, if at
+`docs/adr/0001-ugc-ads-gatekeeper.md`. Future upstream changes are picked up manually, if at
 all; this repository does not push changes back upstream.
 
 ## Excluded entirely (8 of the 28 upstream Agent Skills)
@@ -44,7 +44,7 @@ otherwise left untouched as reference:
 ## Rewritten (12 of the remaining 20)
 
 Shell-out instructions (`python3`/`bash`/`node ... -cli.js`) were replaced with calls against the
-`CreatorBuddy` session capability (`env[N].searchXiaohongshuNotes()` /
+`UgcAds` session capability (`env[N].searchXiaohongshuNotes()` /
 `getXiaohongshuNoteDetail()` / `getXiaohongshuCreatorProfile()`, all TikHub-backed and
 Xiaohongshu-only — B站/抖音/公众号 routes in the original multi-platform skills are explicitly
 marked unavailable rather than silently dropped) or `env[N].renderImage()` (HTML → PNG via
@@ -54,12 +54,15 @@ bundled Python script that never made a network call at all; those were rewritte
 to write the equivalent logic itself with its own code-execution tool, since there's no `python3`
 in this runtime either way:
 
-`creator-buddy` (root orchestrator), `global-content-search`, `xhs-hotnotes`, `space-xhs-hotspot`,
+`ugc-ads` (root orchestrator), `global-content-search`, `xhs-hotnotes`, `space-xhs-hotspot`,
 `xhs-html`, `space-text-logic-diagram`, `space-wechat-layout`, `space-xhs-buddy`,
 `space-xhs-note-analytics`.
 
 (That's 9 skills, not 12 — `xhs-hotnotes` and `space-xhs-hotspot` each needed edits in multiple
 places rather than one; the count above refers to files touched, not a stricter category split.)
+
+The upstream `creator-buddy` root orchestrator is exposed locally as `ugc-ads`. The
+`ask-ugc-ads` router is a local addition and is not part of the upstream snapshot.
 
 ## Reference/asset documents
 
@@ -69,7 +72,7 @@ just optional local script fallbacks) — `xhs-html`'s 62-style registry and pag
 pattern-extraction methodology. These were vendored alongside their `SKILL.md` (under each skill's
 `references/`/`assets/` subdirectory) and are exposed via `env[N].read(docId)`, where `docId` is
 the vendor-relative path (e.g. `"xhs-html/references/style-registry.md"`) — see
-`scripts/build-skills.mjs` and `CreatorBuddySession.read()` in `src/creator-buddy.ts`.
+`scripts/build-skills.mjs` and `UgcAdsSession.read()` in `src/ugc-ads.ts`.
 
 ## Unchanged (6 of the remaining 20)
 

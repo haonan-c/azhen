@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "gatekeeper-creator-buddy",
+  "name": "gatekeeper-ugc-ads",
   "main": ".wrangler/validate/src/index.ts",
   "build": {
     "command": "pnpm run build:skills && pnpm exec capnweb-validate build --out .wrangler/validate",
@@ -16,7 +16,7 @@
   "migrations": [
     {
       "tag": "v0",
-      "new_sqlite_classes": ["CreatorBuddyGatekeeper"],
+      "new_sqlite_classes": ["UgcAdsGatekeeper"],
     },
   ],
   "observability": {

@@ -3,7 +3,7 @@ import type { EnabledCollectionInfo } from "./context-types.js";
 import { encodeDocId } from "./context-types.js";
 
 // Generic SKILL.md frontmatter parsing/expansion is shared with other gatekeepers that surface
-// Agent Skills (see packages/gatekeeper-creator-buddy); only the collection-scoped catalog/picker
+// Agent Skills (see packages/gatekeeper-ugc-ads); only the collection-scoped catalog/picker
 // builders below are specific to the Context Library.
 export {
   isSkillManifestPath, parseSkillManifest, buildAgentSkillMessage,

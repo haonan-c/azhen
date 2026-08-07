@@ -1,5 +1,5 @@
 // Thin client for TikHub's read-only Xiaohongshu APIs. The Session surface stays provider-neutral;
-// this module maps TikHub's App V2/Web V3 response shapes into the stable Creator Buddy summary.
+// this module maps TikHub's App V2/Web V3 response shapes into the stable UGC Ads summary.
 
 const TIKHUB_BASE_URL = "https://api.tikhub.io";
 const MAX_SEARCH_RESULTS = 100;

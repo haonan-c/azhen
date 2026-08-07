@@ -22,7 +22,7 @@ description: 小红书热点搜集与选题判断。通过本部署的 TikHub �
 
 ## 第 0 步：数据源（本部署说明）
 
-> 原作者版本有多条本地 CLI 路线。**本部署只接入 TikHub**，通过 `env[N].searchXiaohongshuNotes(keyword, opts)` / `getXiaohongshuNoteDetail(url, opts)` / `getXiaohongshuCreatorProfile(url, opts)` 调用（`env[N]` 是本次对话里 Creator Buddy 的绑定）；不要探测环境变量，也不要调用原版脚本或 CLI。
+> 原作者版本有多条本地 CLI 路线。**本部署只接入 TikHub**，通过 `env[N].searchXiaohongshuNotes(keyword, opts)` / `getXiaohongshuNoteDetail(url, opts)` / `getXiaohongshuCreatorProfile(url, opts)` 调用（`env[N]` 是本次对话里 UGC Ads 的绑定）；不要探测环境变量，也不要调用原版脚本或 CLI。
 
 - 结果没有红狐特有的**热度/相关性/时效三维评分**和 `relatedSearches` 拓词字段——`searchXiaohongshuNotes` 返回的是笔记数组（`id`/`url`/`user.url`/`extra`），评分相关的输出格式（见"输出格式"一节的评分列）不适用，去掉评分列即可，其余照常。
 - `getXiaohongshuCreatorProfile` 返回 TikHub 实际提供的公开资料和近期作品；粉丝字段缺失时如实说明，不要估算。
@@ -51,7 +51,7 @@ description: 小红书热点搜集与选题判断。通过本部署的 TikHub �
 
 ### 赛道词库：`env[N].read("space-xhs-hotspot/references/xhs_sectors.json")`
 
-不要凭空想拓展词——先查词库（`env[N]` 指本次对话里的 Creator Buddy 绑定）。它按小红书官方 24 个一级赛道组织，每个赛道给 `trend` / `audience` / `scene` / `intent` 四个维度的可查询细分词，正好对应上面四个维度。
+不要凭空想拓展词——先查词库（`env[N]` 指本次对话里的 UGC Ads 绑定）。它按小红书官方 24 个一级赛道组织，每个赛道给 `trend` / `audience` / `scene` / `intent` 四个维度的可查询细分词，正好对应上面四个维度。
 
 **什么时候读它**（三种场景，其余场景别浪费上下文）：
 
@@ -216,7 +216,7 @@ TikHub 当前 Session 不返回 `relatedSearches`。从本轮标题和正文的�
 - **不只给能抄的**。共性提取必须同时给「不可复用」清单，指明是身份壁垒、资源壁垒还是账号壁垒。
 - **不同参数不混比**。关键词、排序或时间档位不同的结果不能当成同一口径直接比较。
 - **超窗口不糊弄**。用户要精确的 30 天或 60 天时，说明当前只支持一天/一周/半年档位；未经用户同意不得替换时间范围。
-- **不越权深挖**。要评论区或博主作品时，调用 Creator Buddy 的详情/博主方法；不要要求用户提供部署密钥，也不要用搜索结果脑补评论区。
+- **不越权深挖**。要评论区或博主作品时，调用 UGC Ads 的详情/博主方法；不要要求用户提供部署密钥，也不要用搜索结果脑补评论区。
 
 ---
 

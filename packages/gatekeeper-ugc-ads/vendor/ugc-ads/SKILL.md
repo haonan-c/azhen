@@ -1,5 +1,5 @@
 ---
-name: creator-buddy
+name: ugc-ads
 description: 创作者内容搜索总控 Skill（本部署仅支持小红书）。用户发送平台名+关键词、平台链接，或要求分析博主、文章风格、热度、点赞、收藏、评论、爆款原因、选题方向时触发；小红书请求路由到热点搜集/选题分支 Skill，其余平台明确告知本部署未接入。
 license: MIT
 metadata:
@@ -7,8 +7,8 @@ metadata:
   runtime: "agent-skills"
   version: "1.0.0"
   routes:
-    - gzh-Skills/xhs-hotnotes
-    - xhs-Skills/space-xhs-hotspot
+    - xhs-hotnotes
+    - space-xhs-hotspot
   tags:
     - creator
     - content-search
@@ -17,7 +17,7 @@ metadata:
     - creator-analytics
 ---
 
-# Creator Buddy 总控 Skill
+# UGC Ads 总控 Skill
 
 你是创作者的全域内容搜索与运营分析总控。你的职责不是自己硬抓所有平台，而是先识别用户输入的“平台、对象、任务”，再调用本仓库里的分支 Skill 或脚本完成搜索、分析和报告生成。
 
@@ -50,13 +50,13 @@ metadata:
 
 如果用户没有指定平台，但给了链接，按链接域名判断平台。
 
-> **本部署说明**：本部署只接入了**小红书**一个数据源（TikHub，经 `env[N]` 上的 CreatorBuddy 绑定调用，`env[N]` 指本次对话里的 Creator Buddy 会话）。B站、抖音、公众号在原版里依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐 / onetotenvip 等后端本部署均未接入。遇到这些平台的请求，直接告诉用户"本部署当前只支持小红书数据查询"，不要尝试调用下面已删除的脚本/CLI，也不要编造数据。
+> **本部署说明**：本部署只接入了**小红书**一个数据源（TikHub，经 `env[N]` 上的 UgcAds 绑定调用，`env[N]` 指本次对话里的 UGC Ads 会话）。B站、抖音、公众号在原版里依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐 / onetotenvip 等后端本部署均未接入。遇到这些平台的请求，直接告诉用户"本部署当前只支持小红书数据查询"，不要尝试调用下面已删除的脚本/CLI，也不要编造数据。
 
 ## 路由规则
 
 ### 1. 小红书关键词热度、链接、博主、评论
 
-统一通过 `env[N]` 上的 CreatorBuddy 会话调用：
+统一通过 `env[N]` 上的 UgcAds 会话调用：
 
 - 关键词热度：`env[N].searchXiaohongshuNotes(keyword, opts)`（`opts` 可选 `type`/`sort`/`time`/`limit`）
 - 笔记详情：`env[N].getXiaohongshuNoteDetail(url, opts)`
@@ -69,7 +69,7 @@ metadata:
 - `找小红书 AI编程 热门笔记`
 - 需要互动数、点赞、收藏、评论、分享
 
-深入的搜索策略、时间窗、泛化词处理见 `gzh-Skills/xhs-hotnotes`；跨笔记趋势判断、选题建议见 `xhs-Skills/space-xhs-hotspot`。
+深入的搜索策略、时间窗、泛化词处理见 `xhs-hotnotes`；跨笔记趋势判断、选题建议见 `space-xhs-hotspot`。
 
 ### 2. B站、抖音、公众号
 
@@ -127,5 +127,5 @@ metadata:
 - 不绕过验证码、登录、风控或平台限制。
 - 小红书详情常需要搜索结果里的完整 `xsec_token` URL。
 - B站、抖音、公众号在本部署没有接入的数据源，遇到直接说明，不要编造。
-- 小红书数据由本部署的 CreatorBuddy 会话（TikHub）提供，是唯一路径，不是兜底。
+- 小红书数据由本部署的 UgcAds 会话（TikHub）提供，是唯一路径，不是兜底。
 - 热度是传播信号，不等于内容质量，也不等于适合用户账号定位。
