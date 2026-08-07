@@ -40,7 +40,7 @@ const notes = await env[N].searchXiaohongshuNotes(keyword, {
   limit: requestedLimit,
 });
 
-return notes.map((note) => ({
+const results = notes.map((note) => ({
   id: note.id,
   url: note.url,
   title: note.extra.title,
@@ -52,9 +52,13 @@ return notes.map((note) => ({
   shares: note.extra.shared_count,
   publishedAt: note.extra.published_at ?? note.extra.timestamp ?? note.extra.publish_time,
 }));
+
+console.log(JSON.stringify(results, null, 2));
 ```
 
 其中 `requestedSort`、`requestedTime`、`requestedLimit` 来自用户请求；例如按点赞、最近一周、10 条分别是 `2`、`2`、`10`。单关键词任务到此只调用一次。适配器已经对明确的排序选项做最终排序，不要再次查询来调整顺序。
+
+代码执行器只把 `console.log` 的内容作为工具输出展示；不要用函数 `return` 输出查询结果。如果一次执行意外没有可见输出，先检查本次代码是否包含上面的 `console.log`，不要重新发起付费查询。
 
 `env[N]` 是本次对话中的 UGC Ads 绑定。不要把 `N` 当成固定值。
 
@@ -68,6 +72,7 @@ const groups = await Promise.all(
   )
 );
 const notes = [...new Map(groups.flat().map((note) => [note.id, note])).values()];
+console.log(JSON.stringify(notes, null, 2));
 ```
 
 ### 3. 读取返回字段
