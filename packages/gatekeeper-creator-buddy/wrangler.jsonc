@@ -7,7 +7,7 @@
     "watch_dir": "src",
   },
   "compatibility_date": "2026-02-02",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "allow_irrevocable_stub_storage"],
   // Renders self-contained vendored HTML templates (covers and diagrams) to images.
   "browser": {
     "binding": "BROWSER",

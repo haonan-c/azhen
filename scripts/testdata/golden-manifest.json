@@ -207,7 +207,8 @@
       ],
       "compatibilityDate": "2026-02-02",
       "compatibilityFlags": [
-        "nodejs_compat"
+        "nodejs_compat",
+        "allow_irrevocable_stub_storage"
       ],
       "inputs": [
         {
