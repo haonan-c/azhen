@@ -132,6 +132,8 @@ describe("TikHub Xiaohongshu API", () => {
 
     await expect(searchXiaohongshuNotes("", "example")).rejects
         .toThrow("TIKHUB_API_KEY is not configured");
+    await expect(searchXiaohongshuNotes(undefined as unknown as string, "example")).rejects
+        .toThrow("TIKHUB_API_KEY is not configured");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

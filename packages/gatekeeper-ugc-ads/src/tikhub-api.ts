@@ -28,7 +28,7 @@ type TikHubResult = {
 };
 
 function assertApiKey(apiKey: string): void {
-  if (!apiKey.trim()) throw new Error("TIKHUB_API_KEY is not configured.");
+  if (!apiKey?.trim()) throw new Error("TIKHUB_API_KEY is not configured.");
 }
 
 function assertResult(result: TikHubResult, operation: string): void {

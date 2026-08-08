@@ -5,9 +5,29 @@ description: 为 UGC 广告与社媒内容任务选择合适的 UGC Ads Skill �
 
 # Ask UGC Ads
 
-你不需要记住所有 Skill。先说清用户要发布的平台、已有素材和当前卡点，再推荐最短的可用路径。
+你不需要记住所有 Skill。先说清用户要发布的平台、已有素材和当前卡点，再选择最短的可用路径。
 
-本 Skill 只负责选择路径。不要代替专项 Skill 输出完整成品。一次最多问一个会改变路由的问题；信息足够时直接给出建议。
+本 Skill 负责选择路径，并在用户已经要求交付结果时加载对应的专项 Skill 继续执行。不要凭记忆代替专项 Skill。一次最多问一个会改变路由的问题；信息足够时直接执行。
+
+## 路由后继续执行
+
+- 用户只问“能做什么”或“该用哪个 Skill”时，只推荐路径，不启动专项任务。
+- 用户已经要求搜索、分析或生成具体结果，且输入足够时，读取目标 Skill 的完整说明，并在当前轮次继续执行。**不需要用户再次输入斜杠命令。**
+- 一次只读取当前要执行的一个 Skill。跨阶段工作流完成当前步骤后，再按需读取下一步。
+
+通过本次对话中的 UGC Ads 绑定读取目标 Skill。代码执行器只展示 `console.log` 的内容，所以必须打印读取结果，不能用函数 `return` 代替：
+
+```javascript
+export default async function(self, env, ctx) {
+  const routedSkill = await env[N].read("space-xhs-hotspot");
+  if (!routedSkill) throw new Error("Routed UGC Ads skill is unavailable.");
+  console.log(routedSkill.content);
+}
+```
+
+上例是“查热点、生成选题卡”的路由。其他任务把 id 换成表格中的目标 Skill 名称，例如 `space-xhs-writer`。`env[N]` 是当前对话实际提供的 UGC Ads 绑定；先从环境说明中确定名称，不要把 `N` 当成固定值。
+
+读取成功后，立即按输出的专项说明执行。读取失败时，说明目标 Skill 无法加载；不要自行猜测专项流程，也不要重复读取。
 
 ## 先判断任务
 
@@ -72,11 +92,11 @@ description: 为 UGC 广告与社媒内容任务选择合适的 UGC Ads Skill �
 
 ## 回复格式
 
-只输出用户当前需要的路径：
+用户只问路径时，输出：
 
 1. 推荐的 Skill 或工作流。
 2. 选择它的原因。
 3. 启动该 Skill 前需要准备的输入。
 4. 当前能力不支持的部分，如有。
 
-不要一次罗列全部 Skill。单项任务推荐一个 Skill；跨阶段任务给出最多五步的有序路径。
+不要一次罗列全部 Skill。单项任务推荐一个 Skill；跨阶段任务给出最多五步的有序路径。用户已经要求具体结果时，不要停在路径推荐；按“路由后继续执行”完成当前步骤。

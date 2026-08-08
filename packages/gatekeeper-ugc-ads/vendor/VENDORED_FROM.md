@@ -74,6 +74,12 @@ pattern-extraction methodology. These were vendored alongside their `SKILL.md` (
 the vendor-relative path (e.g. `"xhs-html/references/style-registry.md"`) — see
 `scripts/build-skills.mjs` and `UgcAdsSession.read()` in `src/ugc-ads.ts`.
 
+`UgcAdsSession.read()` also exposes a bundled Skill by either its Agent Catalog id or its
+vendor-relative path. The local `ask-ugc-ads` router uses this to load one selected specialist
+(for example, `"space-xhs-hotspot"`) and continue the user's task without requiring a second slash
+command. Catalog descriptions give the same `read(id)` handoff to agents handling plain-language
+requests.
+
 ## Unchanged (6 of the remaining 20)
 
 No script or CLI dependency to begin with: `baokuan-title-generator`, `space-video-cover`,

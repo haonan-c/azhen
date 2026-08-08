@@ -22,7 +22,8 @@ import type {
   SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult, ResourceConfiguratorFrame,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { parseSkillManifest, buildAgentSkillMessage } from "@gadgets/workshop-shared/agent-skill";
-import { UGC_ADS_SKILLS, UGC_ADS_DOCS } from "./generated/skills.js";
+import { UGC_ADS_SKILLS } from "./generated/skills.js";
+import { getBundledSkillCatalogEntries, resolveBundledContent } from "./bundled-skills.js";
 import {
   searchXiaohongshuNotes, getXiaohongshuNoteDetail, getXiaohongshuCreatorProfile,
   type XiaohongshuSearchOptions,
@@ -50,7 +51,8 @@ const UGC_ADS_TYPES = `
  */
 interface UgcAds {
   /**
-   * Read a skill's reference/asset document by id (a skill's own instructions supply the id, e.g.
+   * Read a bundled skill by its Agent Catalog id, or read a skill/reference/asset document by its
+   * vendor-relative path (for example, "space-xhs-hotspot" or
    * "xhs-html/references/style-registry.md"). Returns null if the id is unknown.
    */
   read(docId: string): Promise<{ id: string; content: string } | null>;
@@ -239,12 +241,7 @@ export class UgcAdsGatekeeper
   async getAgentCatalog(
       request: AgentCatalogRequest,
       authorizer: NativeRpcStub<ObservationAuthorizer>): Promise<AgentCatalog> {
-    let entries = UGC_ADS_SKILLS
-        .map(skill => ({
-          id: skill.name,
-          title: skill.name,
-          description: `Agent Skill. Invoke as a slash command. ${skill.description}`,
-        }))
+    let entries = getBundledSkillCatalogEntries()
         .toSorted((left, right) => left.title.localeCompare(right.title));
     let catalog = boundAgentCatalog(entries, request);
     await authorizer.authorizeObservation({
@@ -334,13 +331,13 @@ export class UgcAdsSession extends RpcTarget {
   }
 
   async read(docId: string) {
-    let doc = UGC_ADS_DOCS.find(entry => entry.id === docId);
-    if (!doc) return null;
+    let content = resolveBundledContent(docId);
+    if (!content) return null;
     await this.#approvalQueue.authorizeObservation({
-      title: "UGC Ads reference document",
-      description: `Read reference document: ${docId}`,
+      title: "UGC Ads bundled content",
+      description: `Read bundled content: ${docId}`,
     });
-    return doc;
+    return content;
   }
 
   async searchXiaohongshuNotes(keyword: string, opts?: XiaohongshuSearchOptions) {
