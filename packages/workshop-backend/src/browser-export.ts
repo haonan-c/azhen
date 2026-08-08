@@ -31,6 +31,20 @@ const EXPORT_DOCUMENT_CSP = "default-src 'none'; frame-src 'none'; script-src da
   "style-src data: 'unsafe-inline'; img-src data: blob:; media-src data: blob:; " +
   "font-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; " +
   "connect-src 'none'; sandbox allow-scripts;";
+// Chromium 126's PDF path can drop CJK glyphs resolved through virtual system font families.
+// Limit this fallback to CJK ranges so the Gadget's Latin typography stays unchanged.
+const CJK_PRINT_FONT_FAMILY = "Workshop CJK PDF Fallback";
+const CJK_PRINT_FONT_STYLE = `
+@font-face {
+  font-family: "${CJK_PRINT_FONT_FAMILY}";
+  src: local("Noto Sans CJK SC"), local("Noto Sans CJK TC"),
+    local("WenQuanYi Zen Hei"), local("PingFang SC"), local("Microsoft YaHei");
+  font-display: block;
+  unicode-range: U+1100-11FF, U+2E80-33FF, U+3400-4DBF, U+4E00-9FFF,
+    U+A960-A97F, U+AC00-D7FF, U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF,
+    U+20000-2FA1F;
+}`;
+const SYSTEM_FONT_PATTERN = String.raw`(^|,\s*)(?:"?)(?:BlinkMacSystemFont|-apple-system|system-ui)(?:"?)(?=\s*,|$)`;
 
 function createDeadline(ms: number, message: string) {
   let expired = Promise.withResolvers<never>();
@@ -233,6 +247,30 @@ async function waitForDomSettled(page: Page): Promise<void> {
   }, DOM_SETTLE_MS);
 }
 
+async function applyCjkPrintFontFallback(page: Page): Promise<void> {
+  await page.addStyleTag({ content: CJK_PRINT_FONT_STYLE });
+  await page.evaluate((fallbackFamily: string, systemFontPattern: string) => {
+    type BrowserElement = {
+      style: { setProperty(name: string, value: string, priority?: string): void };
+    };
+    const pageWindow = globalThis as unknown as {
+      document: { querySelectorAll(selector: string): Iterable<BrowserElement> };
+      getComputedStyle(element: BrowserElement): { fontFamily: string };
+    };
+    let vulnerableSystemFont = new RegExp(systemFontPattern, "i");
+    for (let element of pageWindow.document.querySelectorAll("*")) {
+      let fontFamily = pageWindow.getComputedStyle(element).fontFamily;
+      if (vulnerableSystemFont.test(fontFamily)) {
+        element.style.setProperty(
+          "font-family",
+          `"${fallbackFamily}", ${fontFamily}`,
+          "important",
+        );
+      }
+    }
+  }, CJK_PRINT_FONT_FAMILY, SYSTEM_FONT_PATTERN);
+}
+
 /**
  * Renders a Gadget's UI as PDF in a remote browser and streams the bytes back.
  *
@@ -311,6 +349,7 @@ export async function renderGadgetPdf(
       sessionCloser = rpcSession.getRemoteMain();
       await waitForDomSettled(page);
       await page.emulateMediaType("print");
+      await applyCjkPrintFontFallback(page);
       await page.evaluate(title => {
         let browser = globalThis as unknown as { document: { title: string } };
         browser.document.title = title;

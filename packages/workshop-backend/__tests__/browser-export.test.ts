@@ -28,6 +28,7 @@ function makeHarness(pdfChunks = ["%PDF-1.4"], closePdf = true) {
     goto: async () => {},
     mainFrame: () => ({}),
     emulateMediaType: async () => {},
+    addStyleTag: async () => {},
     evaluate: (fn: (...args: never[]) => unknown, ...args: unknown[]) => {
       if (fn.toString().includes("__workshopExportModulePromise")) {
         clientInitialized = true;
@@ -36,6 +37,9 @@ function makeHarness(pdfChunks = ["%PDF-1.4"], closePdf = true) {
       }
       if (fn.toString().includes("document.title")) {
         documentTitle = typeof args[0] === "string" ? args[0] : undefined;
+        return Promise.resolve();
+      }
+      if (fn.toString().includes("systemFontPattern")) {
         return Promise.resolve();
       }
       // The RPC transport polls this; the fake page never has a message to deliver.
