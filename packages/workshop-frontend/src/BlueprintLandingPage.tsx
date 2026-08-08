@@ -10,7 +10,6 @@ import { useAuth } from './useAuth'
 import LoginPage from './LoginPage'
 import { normalizeResourceUrl } from './resourceMatching'
 import {
-  BLUEPRINT_ARCHIVE_EXTENSION,
   makeBlueprintFilename,
   saveStreamToFile,
 } from './fileTransfers'
@@ -596,11 +595,6 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
       await saveStreamToFile(
         () => rpcStub.downloadBlueprint(id),
         makeBlueprintFilename(blueprint.metadata.title, blueprint.metadata.version),
-        {
-          description: 'Gadget Blueprint',
-          contentType: 'application/octet-stream',
-          extension: BLUEPRINT_ARCHIVE_EXTENSION,
-        },
       )
     } catch (err: any) {
       setError(err.message || 'Failed to download blueprint.')

@@ -3,8 +3,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { makeExportFilename, saveStreamToFile } from './fileTransfers'
 
+const createObjectUrlDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+const revokeObjectUrlDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
+
 afterEach(() => {
   delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker
+  vi.restoreAllMocks()
+  if (createObjectUrlDescriptor) {
+    Object.defineProperty(URL, 'createObjectURL', createObjectUrlDescriptor)
+  } else {
+    Reflect.deleteProperty(URL, 'createObjectURL')
+  }
+  if (revokeObjectUrlDescriptor) {
+    Object.defineProperty(URL, 'revokeObjectURL', revokeObjectUrlDescriptor)
+  } else {
+    Reflect.deleteProperty(URL, 'revokeObjectURL')
+  }
 })
 
 describe('export file transfers', () => {
@@ -13,78 +27,31 @@ describe('export file transfers', () => {
       .toBe('Quarterly-report-2026.csv')
   })
 
-  it('opens the picker before starting the export stream', async () => {
-    const order: string[] = []
-    const picker = vi.fn<(_options: unknown) => Promise<{
-      createWritable(): Promise<WritableStream<Uint8Array>>
-    }>>(async () => {
-      order.push('picker')
-      return {
-        async createWritable() {
-          order.push('writable')
-          return new WritableStream<Uint8Array>({
-            write(bytes) {
-              order.push(`write:${new TextDecoder().decode(bytes)}`)
-            },
-            close() {
-              order.push('close')
-            },
-          })
-        },
-      }
-    })
+  it('uses a standard browser download when a file picker API is available', async () => {
+    const picker = vi.fn<() => Promise<never>>()
+      .mockRejectedValue(new DOMException('Cancelled', 'AbortError'))
     Object.assign(window, { showSaveFilePicker: picker })
+    const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:export')
+    const revokeObjectURL = vi.fn<(url: string) => void>()
+    Object.assign(URL, { createObjectURL, revokeObjectURL })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>(async () => (
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('value'))
+          controller.close()
+        },
+      })
+    ))
 
     await saveStreamToFile(
-      async () => {
-        order.push('source')
-        return new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode('value'))
-            controller.close()
-          },
-        })
-      },
+      source,
       'report.csv',
-      { description: 'CSV', contentType: 'text/csv', extension: '.csv' },
     )
 
-    expect(order).toEqual(['picker', 'writable', 'source', 'write:value', 'close'])
-    expect(picker).toHaveBeenCalledWith({
-      suggestedName: 'report.csv',
-      types: [{ description: 'CSV', accept: { 'text/csv': ['.csv'] } }],
-    })
+    expect(picker).not.toHaveBeenCalled()
+    expect(source).toHaveBeenCalledOnce()
+    expect(createObjectURL).toHaveBeenCalledOnce()
+    expect(click).toHaveBeenCalledOnce()
   })
-
-  it('does not start a lazy export when the file picker is cancelled', async () => {
-    Object.assign(window, {
-      showSaveFilePicker: vi.fn<() => Promise<never>>()
-        .mockRejectedValue(new DOMException('Cancelled', 'AbortError')),
-    })
-    const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>()
-
-    await expect(saveStreamToFile(
-      source,
-      'report.pdf',
-      { description: 'PDF', contentType: 'application/pdf', extension: '.pdf' },
-    )).resolves.toBeUndefined()
-
-    expect(source).not.toHaveBeenCalled()
-  })
-
-  it('propagates file picker failures other than cancellation', async () => {
-    Object.assign(window, {
-      showSaveFilePicker: vi.fn<() => Promise<never>>().mockRejectedValue(new Error('picker failed')),
-    })
-    const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>()
-
-    await expect(saveStreamToFile(
-      source,
-      'report.pdf',
-      { description: 'PDF', contentType: 'application/pdf', extension: '.pdf' },
-    )).rejects.toThrow('picker failed')
-
-    expect(source).not.toHaveBeenCalled()
-  })
-
 })

@@ -65,10 +65,23 @@ vi.mock('./components/WorkshopControls', () => ({
 
 import GadgetExportMenu from './GadgetExportMenu'
 
+const createObjectUrlDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+const revokeObjectUrlDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
 let container: HTMLDivElement
+let downloads: Array<{ filename: string; href: string }>
 let root: Root
 
 beforeEach(() => {
+  downloads = []
+  Object.assign(URL, {
+    createObjectURL: vi.fn<(blob: Blob) => string>(() => 'blob:export'),
+    revokeObjectURL: vi.fn<(url: string) => void>(),
+  })
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function(
+    this: HTMLAnchorElement,
+  ) {
+    downloads.push({ filename: this.download, href: this.href })
+  })
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -77,7 +90,17 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount())
   container.remove()
-  delete (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker
+  vi.restoreAllMocks()
+  if (createObjectUrlDescriptor) {
+    Object.defineProperty(URL, 'createObjectURL', createObjectUrlDescriptor)
+  } else {
+    Reflect.deleteProperty(URL, 'createObjectURL')
+  }
+  if (revokeObjectUrlDescriptor) {
+    Object.defineProperty(URL, 'revokeObjectURL', revokeObjectUrlDescriptor)
+  } else {
+    Reflect.deleteProperty(URL, 'revokeObjectURL')
+  }
 })
 
 function buttonWithText(text: string): HTMLButtonElement | undefined {
@@ -112,14 +135,6 @@ describe('Gadget export menu', () => {
       },
     }))
     const gadget = { exportPdf, exportDocx } as unknown as RpcStub<GadgetClient>
-    const picker = vi.fn<() => Promise<{
-      createWritable(): Promise<WritableStream<Uint8Array>>
-    }>>(async () => ({
-      async createWritable() {
-        return new WritableStream<Uint8Array>()
-      },
-    }))
-    Object.assign(window, { showSaveFilePicker: picker })
 
     await act(async () => {
       root.render(<GadgetExportMenu gadget={gadget} gadgetTitle="Product brief" />)
@@ -129,18 +144,10 @@ describe('Gadget export menu', () => {
     })
     await act(async () => {
       buttonWithText('Word document')?.click()
-      await Promise.resolve()
+      await vi.waitFor(() => expect(downloads).toHaveLength(1))
     })
 
-    expect(picker).toHaveBeenCalledWith({
-      suggestedName: 'Product-brief.docx',
-      types: [{
-        description: 'Word document',
-        accept: {
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-        },
-      }],
-    })
+    expect(downloads).toEqual([{ filename: 'Product-brief.docx', href: 'blob:export' }])
     expect(exportDocx).toHaveBeenCalledWith(undefined)
     expect(exportPdf).not.toHaveBeenCalled()
   })
@@ -154,14 +161,6 @@ describe('Gadget export menu', () => {
     }))
     const exportDocx = vi.fn<GadgetClient['exportDocx']>()
     const gadget = { exportPdf, exportDocx } as unknown as RpcStub<GadgetClient>
-    const picker = vi.fn<() => Promise<{
-      createWritable(): Promise<WritableStream<Uint8Array>>
-    }>>(async () => ({
-      async createWritable() {
-        return new WritableStream<Uint8Array>()
-      },
-    }))
-    Object.assign(window, { showSaveFilePicker: picker })
 
     await act(async () => {
       root.render(<GadgetExportMenu gadget={gadget} gadgetTitle="Product brief" />)
@@ -171,16 +170,10 @@ describe('Gadget export menu', () => {
     })
     await act(async () => {
       buttonWithText('PDF document')?.click()
-      await Promise.resolve()
+      await vi.waitFor(() => expect(downloads).toHaveLength(1))
     })
 
-    expect(picker).toHaveBeenCalledWith({
-      suggestedName: 'Product-brief.pdf',
-      types: [{
-        description: 'PDF document',
-        accept: { 'application/pdf': ['.pdf'] },
-      }],
-    })
+    expect(downloads).toEqual([{ filename: 'Product-brief.pdf', href: 'blob:export' }])
     expect(exportPdf).toHaveBeenCalledWith(undefined)
     expect(exportDocx).not.toHaveBeenCalled()
   })

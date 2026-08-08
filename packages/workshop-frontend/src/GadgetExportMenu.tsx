@@ -16,16 +16,8 @@ type Props = {
 type ExportFormat = 'docx' | 'pdf'
 
 const EXPORT_FILE_TYPES = {
-  docx: {
-    description: 'Word document',
-    contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    extension: '.docx',
-  },
-  pdf: {
-    description: 'PDF document',
-    contentType: 'application/pdf',
-    extension: '.pdf',
-  },
+  docx: { extension: '.docx' },
+  pdf: { extension: '.pdf' },
 } as const
 
 export default function GadgetExportMenu({ gadget, gadgetTitle, chatId, disabled }: Props) {
@@ -41,7 +33,6 @@ export default function GadgetExportMenu({ gadget, gadgetTitle, chatId, disabled
       await saveStreamToFile(
         () => format === 'docx' ? gadget.exportDocx(chatId) : gadget.exportPdf(chatId),
         makeExportFilename(gadgetTitle, fileType.extension),
-        fileType,
       )
     } catch (error) {
       console.error(`Failed to export Gadget as ${format.toUpperCase()}:`, error)
