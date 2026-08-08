@@ -23,7 +23,8 @@ import GadgetExportMenu from './GadgetExportMenu'
 // Gadget/Code/Connections controls, workspace activity, and every editor-only control. The
 // overseer and gadget passed in here are the restricted capabilities returned by openGadget() for
 // "use" sessions; calling anything outside getMetadata()/subscribeToMetadata()/subscribeToPresence()/
-// subscribeToWorkpieces()/getGadget() (and, on the gadget, getUiBundle()/connectToGadget()/exportPdf())
+// subscribeToWorkpieces()/getGadget()
+// (and, on the gadget, getUiBundle()/connectToGadget()/exportPdf()/exportDocx())
 // would throw.
 //
 // When the workspace has more than one gadget, a simple picker in the top bar switches between

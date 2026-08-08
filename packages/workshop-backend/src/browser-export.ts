@@ -2,6 +2,7 @@ import { launch, type Page } from "@cloudflare/puppeteer";
 import { RpcSession, type RpcStub, type RpcTransport } from "capnweb";
 import { createLogger } from "@gadgets/backend-utils/logger";
 import BROWSER_EXPORT_RUNTIME from "./generated/browser-export-runtime.txt";
+import { createGadgetDocxStream } from "./docx-export";
 
 type BrowserExportLogFields = {
   event?: string;
@@ -271,18 +272,11 @@ async function applyCjkPrintFontFallback(page: Page): Promise<void> {
   }, CJK_PRINT_FONT_FAMILY, SYSTEM_FONT_PATTERN);
 }
 
-/**
- * Renders a Gadget's UI as PDF in a remote browser and streams the bytes back.
- *
- * Takes ownership of `gadget` and disposes it once the export settles. The
- * returned stream must be consumed or cancelled: the browser session stays open
- * until it settles or times out.
- */
-export async function renderGadgetPdf(
+async function renderGadgetStream(
   browserBinding: BrowserRun,
   clientCode: string,
-  documentTitle: string,
   gadget: RpcStub<any>,
+  render: (page: Page) => Promise<ReadableStream<Uint8Array>>,
 ): Promise<ReadableStream<Uint8Array>> {
   let deadline = createDeadline(MAX_EXPORT_DURATION_MS, "Browser export timed out.");
 
@@ -348,17 +342,7 @@ export async function renderGadgetPdf(
       let rpcSession = new RpcSession(transport, gadget);
       sessionCloser = rpcSession.getRemoteMain();
       await waitForDomSettled(page);
-      await page.emulateMediaType("print");
-      await applyCjkPrintFontFallback(page);
-      await page.evaluate(title => {
-        let browser = globalThis as unknown as { document: { title: string } };
-        browser.document.title = title;
-      }, documentTitle);
-      return page.createPDFStream({
-        preferCSSPageSize: true,
-        printBackground: true,
-        waitForFonts: true,
-      });
+      return render(page);
     })());
     return releaseWhenSettled(limitStream(source, MAX_EXPORT_BYTES), release);
   } catch (error) {
@@ -368,4 +352,45 @@ export async function renderGadgetPdf(
     await release();
     throw error;
   }
+}
+
+/**
+ * Renders a Gadget's UI as PDF in a remote browser and streams the bytes back.
+ *
+ * Takes ownership of `gadget` and disposes it once the export settles. The
+ * returned stream must be consumed or cancelled: the browser session stays open
+ * until it settles or times out.
+ */
+export function renderGadgetPdf(
+  browserBinding: BrowserRun,
+  clientCode: string,
+  documentTitle: string,
+  gadget: RpcStub<any>,
+): Promise<ReadableStream<Uint8Array>> {
+  return renderGadgetStream(browserBinding, clientCode, gadget, async page => {
+    await page.emulateMediaType("print");
+    await applyCjkPrintFontFallback(page);
+    await page.evaluate(title => {
+      let browser = globalThis as unknown as { document: { title: string } };
+      browser.document.title = title;
+    }, documentTitle);
+    return page.createPDFStream({
+      preferCSSPageSize: true,
+      printBackground: true,
+      waitForFonts: true,
+    });
+  });
+}
+
+/** Renders a Gadget's visible print content as an editable Word document. */
+export function renderGadgetDocx(
+  browserBinding: BrowserRun,
+  clientCode: string,
+  documentTitle: string,
+  gadget: RpcStub<any>,
+): Promise<ReadableStream<Uint8Array>> {
+  return renderGadgetStream(browserBinding, clientCode, gadget, async page => {
+    await page.emulateMediaType("print");
+    return createGadgetDocxStream(page, documentTitle);
+  });
 }

@@ -2763,6 +2763,12 @@ export interface GadgetClient extends WorkpieceClient {
    */
   exportPdf(chatId?: number): Promise<ReadableStream<Uint8Array>>;
 
+  /**
+   * Exports the Gadget's visible print content as an editable Word document. If `chatId` is
+   * specified, the document includes changes currently proposed in that chat.
+   */
+  exportDocx(chatId?: number): Promise<ReadableStream<Uint8Array>>;
+
   // --- Binding management ---
   //
   // A gadget's bindings are edges mapping a name (as it appears in the gadget worker's `env`) to
@@ -2841,7 +2847,7 @@ export interface GatekeeperClient<Session extends RpcCompatible<Session>> extend
 // - "build": full access -- edit code, use and participate in chats, manage bindings, etc. (the
 //   same access the owner has, modulo the owner-only exceptions documented in sharing.md).
 // - "use": may only render, interact with, and export the gadget's deployed UI (getUiBundle(),
-//   connectToGadget(), and exportPdf()), plus read basic metadata.
+//   connectToGadget(), exportPdf(), and exportDocx()), plus read basic metadata.
 //
 // Roles are ordered build > use. A collaborator's effective role is the maximum role reachable
 // from the owner through their valid permission edges, where each edge grants

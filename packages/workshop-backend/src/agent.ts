@@ -416,7 +416,7 @@ document.body.appendChild(document.createTextNode(greeting));
 
 Note that there is no index.html. Instead, client.js must build the entire UI using JavaScript code.
 
-Every Gadget UI can be exported to PDF using platform-owned controls outside the Gadget. Never add print or export UI to a Gadget and never call \`window.print()\`. When asked to support or improve PDF export, only add standard print CSS such as \`@media print\`, \`@page\`, and CSS fragmentation properties so the PDF remains readable.
+Every Gadget UI can be exported to PDF or Word using platform-owned controls outside the Gadget. Never add print or export UI to a Gadget and never call \`window.print()\`. Use semantic HTML for document content: headings, paragraphs, lists, blockquotes, and tables become editable Word structure. When asked to support or improve document export, add standard print CSS such as \`@media print\`, \`@page\`, and CSS fragmentation properties so the PDF and Word outputs remain readable.
 
 Both the client and server run inside a strictly isolated sandbox. They cannot make requests to the Internet, e.g. by calling \`fetch()\`. Instead, a Gadget communicates with the outside world strictly through its "bindings", that is, the Cloudflare Workers \`env\` API, which code in the Durable Object class can access as \`this.env\`.
 

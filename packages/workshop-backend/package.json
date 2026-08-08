@@ -27,12 +27,14 @@
     "capnweb": "^0.8.0",
     "capnweb-validate": "0.2.1",
     "diff": "^8.0.4",
+    "docx": "9.7.1",
     "jose": "^6.2.5",
     "yjs": "^13.6.31"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.16.20",
     "esbuild": "^0.28.1",
+    "jszip": "3.10.1",
     "typescript": "^5.9.3",
     "unpdf": "1.8.0",
     "vitest": "^4.1.10",
