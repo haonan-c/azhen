@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react'
-import { ServerConfig, AuthVendorInfo, resolveSiteName } from '@gadgets/workshop-shared/api'
+import type { ServerConfig, AuthVendorInfo } from '@gadgets/workshop-shared/api'
+import { m as messages } from './paraglide/messages.js'
 
 // Deployment-level configuration fetched once at boot via PublicApi.getServerConfig().
 // `null` while still loading.
@@ -19,7 +20,7 @@ export function useServerConfigError(): boolean {
 // Convenience: the admin-configured site name, falling back to the default while config is still
 // loading or when the admin hasn't set one.
 export function useSiteName(): string {
-  return resolveSiteName(useContext(ServerConfigContext)?.siteName)
+  return useContext(ServerConfigContext)?.siteName.trim() || messages.brand_name()
 }
 
 // Convenience: the gatekeeper vendors offered as sign-in methods (empty until config loads / none).

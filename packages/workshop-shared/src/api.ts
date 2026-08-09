@@ -669,12 +669,10 @@ export const MAX_INSTANCE_INSTRUCTIONS_LENGTH = 8000;
 // Maximum length (characters) of the admin-authored site name shown next to the top-bar logo.
 export const MAX_SITE_NAME_LENGTH = 40;
 
-// What this deployment calls itself when the admin has not set a custom `siteName`. Also the
-// product's own name, so it appears in prose the server and UI address to the user.
-export const DEFAULT_SITE_NAME = "Cloudflare OS";
+/** The English site name used when an administrator has not configured one. */
+export const DEFAULT_SITE_NAME = "azhen";
 
-// The name to display for this deployment. Accepts an unset or not-yet-loaded `siteName` so both
-// the server (reading admin config) and the client (reading ServerConfig) resolve it identically.
+/** Resolve the configured site name, with the English default used by server-owned text. */
 export function resolveSiteName(siteName: string | undefined): string {
   return (siteName ?? "").trim() || DEFAULT_SITE_NAME;
 }

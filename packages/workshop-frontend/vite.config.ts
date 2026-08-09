@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import tsconfigPaths from 'vite-tsconfig-paths'
 import { TanStackRouterVite } from '@tanstack/router-plugin/vite'
+import { paraglideVitePlugin } from '@inlang/paraglide-js'
+import { paraglideOptions } from './paraglide.config.mjs'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd())
@@ -11,6 +13,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [
       TanStackRouterVite({ target: 'react', autoCodeSplitting: true }),
+      paraglideVitePlugin(paraglideOptions),
       react(),
       tailwindcss(),
       tsconfigPaths(),

@@ -4,8 +4,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "paraglide:compile": "node compile-paraglide.mjs",
+    "prebuild": "pnpm paraglide:compile",
     "build": "tsc && vite build",
+    "pretypes:check": "pnpm paraglide:compile",
     "types:check": "tsc --noEmit",
+    "pretest": "pnpm paraglide:compile",
     "test": "vitest run",
     "preview": "vite preview",
     "clean": "rm -rf dist"
@@ -32,6 +36,7 @@
     "yjs": "^13.6.31"
   },
   "devDependencies": {
+    "@inlang/paraglide-js": "^2.23.2",
     "@tanstack/router-plugin": "^1.168.23",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",

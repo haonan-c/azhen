@@ -12,6 +12,7 @@ import { applyAccentColor, applyStoredThemeMode } from './theme'
 import './styles.css'
 import FrontendErrorBoundary from './FrontendErrorBoundary'
 import { installWorkshopErrorReporting, reportIssue } from './errorReporting'
+import { initializeLocale } from './locale'
 import { applySiteFavicon, cacheBustSiteLogoUrl } from './siteLogoUtils'
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ export function markConnectionRestored() {
 }
 
 // Current stub. handleBroken() will replace this on disconnect.
+initializeLocale()
 installWorkshopErrorReporting()
 let currentStub = startConnection();
 currentStub.onRpcBroken(handleBroken);
