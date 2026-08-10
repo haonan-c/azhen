@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-import { act } from 'react'
+import { act, useLayoutEffect } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import type { RpcStub } from 'capnweb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -16,13 +16,31 @@ import {
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
-function AuthProbe({ api }: { api: RpcStub<PublicApi> }) {
+type AuthPhase = 'pending' | 'retry' | 'authenticated' | 'signed-out'
+
+function AuthProbe({
+  api,
+  onCommit,
+}: {
+  api: RpcStub<PublicApi>
+  onCommit?: (api: RpcStub<PublicApi>, phase: AuthPhase) => void
+}) {
   const auth = useAuth(api)
+  const phase: AuthPhase = auth.isLoading
+    ? 'pending'
+    : auth.error
+      ? 'retry'
+      : auth.isAuthenticated
+        ? 'authenticated'
+        : 'signed-out'
+
+  useLayoutEffect(() => {
+    onCommit?.(api, phase)
+  }, [api, onCommit, phase])
+
   return (
     <>
-      <p data-state>
-        {auth.isLoading ? 'pending' : auth.error ? 'retry' : auth.isAuthenticated ? 'authenticated' : 'signed-out'}
-      </p>
+      <p data-state>{phase}</p>
       <button type="button" onClick={auth.retry}>retry</button>
       <button type="button" onClick={() => auth.login('replacement-token')}>replace</button>
     </>
@@ -42,15 +60,21 @@ describe('useAuth stored-session validation', () => {
     container = undefined
   })
 
-  async function render(api: RpcStub<PublicApi>) {
+  async function render(
+    api: RpcStub<PublicApi>,
+    onCommit?: (api: RpcStub<PublicApi>, phase: AuthPhase) => void,
+  ) {
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
-    await act(async () => root!.render(<AuthProbe api={api} />))
+    await act(async () => root!.render(<AuthProbe api={api} onCommit={onCommit} />))
   }
 
-  async function rerender(api: RpcStub<PublicApi>) {
-    await act(async () => root!.render(<AuthProbe api={api} />))
+  async function rerender(
+    api: RpcStub<PublicApi>,
+    onCommit?: (api: RpcStub<PublicApi>, phase: AuthPhase) => void,
+  ) {
+    await act(async () => root!.render(<AuthProbe api={api} onCommit={onCommit} />))
   }
 
   function state() {
@@ -146,13 +170,22 @@ describe('useAuth stored-session validation', () => {
   it('disposes the previous capability and validates again when the RPC session changes', async () => {
     localStorage.setItem('authToken', 'stored-token')
     const previous = createAuthenticatedApi(async () => AUTH_TEST_USER)
-    await render(createPublicApi(() => previous.stub))
+    const previousApi = createPublicApi(() => previous.stub)
+    const commits: Array<{ api: RpcStub<PublicApi>, phase: AuthPhase }> = []
+    const recordCommit = (api: RpcStub<PublicApi>, phase: AuthPhase) => {
+      commits.push({ api, phase })
+    }
+    await render(previousApi, recordCommit)
     expect(state()).toBe('authenticated')
 
     const nextIdentity = deferred<typeof AUTH_TEST_USER>()
     const next = createAuthenticatedApi(() => nextIdentity.promise)
-    await rerender(createPublicApi(() => next.stub))
+    const nextApi = createPublicApi(() => next.stub)
+    commits.length = 0
+    await rerender(nextApi, recordCommit)
 
+    expect(commits[0]).toEqual({ api: nextApi, phase: 'pending' })
+    expect(commits).not.toContainEqual({ api: nextApi, phase: 'authenticated' })
     expect(state()).toBe('pending')
     expect(previous.dispose).toHaveBeenCalledOnce()
 

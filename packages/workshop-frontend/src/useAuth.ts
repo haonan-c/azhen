@@ -5,17 +5,31 @@ import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
 const CF_ACCESS_MODE = import.meta.env.VITE_CF_ACCESS_MODE === 'true'
 
 interface AuthState {
+  publicApi: RpcStub<PublicApi>
   token: string | null
   authenticatedApi: RpcStub<AuthenticatedApi> | null
   isLoading: boolean
   error: string | null
 }
 
-const SIGNED_OUT_STATE: AuthState = {
-  token: null,
-  authenticatedApi: null,
-  isLoading: false,
-  error: null,
+function signedOutState(publicApi: RpcStub<PublicApi>): AuthState {
+  return {
+    publicApi,
+    token: null,
+    authenticatedApi: null,
+    isLoading: false,
+    error: null,
+  }
+}
+
+function pendingState(publicApi: RpcStub<PublicApi>, token: string | null): AuthState {
+  return {
+    publicApi,
+    token,
+    authenticatedApi: null,
+    isLoading: true,
+    error: null,
+  }
 }
 
 export { CF_ACCESS_MODE }
@@ -29,12 +43,7 @@ function isInvalidSession(error: unknown): boolean {
 }
 
 export function useAuth(publicApi: RpcStub<PublicApi>) {
-  const [authState, setAuthState] = useState<AuthState>({
-    token: null,
-    authenticatedApi: null,
-    isLoading: true,
-    error: null
-  })
+  const [authState, setAuthState] = useState<AuthState>(() => pendingState(publicApi, null))
 
   const requestIdRef = useRef(0)
   const validatingApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
@@ -50,8 +59,8 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   const resetToSignedOut = useCallback(() => {
     requestIdRef.current++
     disposeApis()
-    setAuthState(SIGNED_OUT_STATE)
-  }, [disposeApis])
+    setAuthState(signedOutState(publicApi))
+  }, [disposeApis, publicApi])
 
   const validate = useCallback((
     token: string | null,
@@ -59,7 +68,7 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   ) => {
     const requestId = ++requestIdRef.current
     disposeApis()
-    setAuthState({ token, authenticatedApi: null, isLoading: true, error: null })
+    setAuthState(pendingState(publicApi, token))
 
     let authenticatedApi: RpcStub<AuthenticatedApi> | null = null
     const fail = (error: unknown) => {
@@ -71,9 +80,10 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
 
       if (token !== null && isInvalidSession(error)) {
         if (localStorage.getItem('authToken') === token) localStorage.removeItem('authToken')
-        setAuthState(SIGNED_OUT_STATE)
+        setAuthState(signedOutState(publicApi))
       } else {
         setAuthState({
+          publicApi,
           token,
           authenticatedApi: null,
           isLoading: false,
@@ -97,12 +107,12 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
         }
         validatingApiRef.current = null
         authenticatedApiRef.current = authenticatedApi
-        setAuthState({ token, authenticatedApi, isLoading: false, error: null })
+        setAuthState({ publicApi, token, authenticatedApi, isLoading: false, error: null })
       }).catch(fail)
     } catch (error) {
       fail(error)
     }
-  }, [disposeApis])
+  }, [disposeApis, publicApi])
 
   const authenticateWithCfAccess = useCallback(() => {
     validate(null, () => publicApi.authenticateFromCfAccess())
@@ -120,14 +130,14 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       if (storedToken) {
         authenticateWithToken(storedToken)
       } else {
-        setAuthState(SIGNED_OUT_STATE)
+        setAuthState(signedOutState(publicApi))
       }
     }
     return () => {
       requestIdRef.current++
       disposeApis()
     }
-  }, [authenticateWithCfAccess, authenticateWithToken, disposeApis])
+  }, [authenticateWithCfAccess, authenticateWithToken, disposeApis, publicApi])
 
   const login = useCallback((token: string) => {
     authenticateWithToken(token)
@@ -158,11 +168,15 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     }
   }, [authenticateWithCfAccess, authenticateWithToken, resetToSignedOut])
 
+  const currentAuthState = authState.publicApi === publicApi
+    ? authState
+    : pendingState(publicApi, null)
+
   return {
-    ...authState,
+    ...currentAuthState,
     login,
     logout,
     retry,
-    isAuthenticated: !!authState.authenticatedApi
+    isAuthenticated: !!currentAuthState.authenticatedApi
   }
 }
