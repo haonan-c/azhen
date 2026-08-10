@@ -1,3 +1,5 @@
+import { getLocale } from '../paraglide/runtime.js'
+
 export function CountBadge({
   count,
   tone = 'tint',
@@ -19,7 +21,9 @@ export function CountBadge({
     <span
       className={`grid h-4 min-w-4 flex-shrink-0 place-items-center rounded-full px-1 text-[10px] font-semibold leading-none tabular-nums ${toneClassName} ${className}`}
     >
-      {count > max ? `${max}+` : count}
+      {count > max
+        ? `${new Intl.NumberFormat(getLocale()).format(max)}+`
+        : new Intl.NumberFormat(getLocale()).format(count)}
     </span>
   )
 }

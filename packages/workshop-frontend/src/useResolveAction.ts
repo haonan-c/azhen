@@ -2,6 +2,7 @@ import { useCallback, useRef, type Dispatch, type SetStateAction } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type { ActionState, Overseer } from '@gadgets/workshop-shared/api'
+import { m as messages } from './paraglide/messages.js'
 
 type ActionDecision = 'approve' | 'deny'
 
@@ -22,7 +23,12 @@ export function useResolveAction(
       onResolvedRef.current?.(actionId, decision === 'approve' ? 'approved' : 'rejected')
     } catch (error) {
       console.error(`Failed to ${decision} action:`, error)
-      toasts.add({ title: `Failed to ${decision} action`, variant: 'error' })
+      toasts.add({
+        title: decision === 'approve'
+          ? messages.approval_approve_error()
+          : messages.approval_deny_error(),
+        variant: 'error',
+      })
     } finally {
       setProcessing(previous => {
         const next = new Set(previous)

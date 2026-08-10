@@ -3,6 +3,7 @@ import { useKumoToastManager } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { Overseer } from '@gadgets/workshop-shared/api'
 import { ActionKind } from '@gadgets/workshop-shared/gatekeeper'
+import { m as messages } from './paraglide/messages.js'
 
 // Enables an auto-approval rule for the action's (gatekeeperId, actionKind.tag), and tracks
 // which tags were just enabled so callers can hide the affordance immediately on every same-tag
@@ -29,7 +30,7 @@ export function useAlwaysApproveTag(
       return true
     } catch (err) {
       console.error('Failed to enable auto-approval:', err)
-      toasts.add({ title: 'Failed to enable auto-approval', variant: 'error' })
+      toasts.add({ title: messages.activity_auto_update_enable_error(), variant: 'error' })
       return false
     } finally {
       setProcessingActions(prev => {

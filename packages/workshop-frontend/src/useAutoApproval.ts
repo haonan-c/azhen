@@ -3,6 +3,7 @@ import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type { Overseer, PreApprovableAction } from '@gadgets/workshop-shared/api'
 import type { ActionKind } from '@gadgets/workshop-shared/gatekeeper'
+import { m as messages } from './paraglide/messages.js'
 
 export interface AutoApprovalEntry {
   gatekeeperId: number
@@ -114,7 +115,9 @@ export function useAutoApproval(overseer: RpcStub<Overseer> | null) {
     } catch (err) {
       console.error('Failed to update auto-approval rule:', err)
       toasts.add({
-        title: `Failed to ${enabled ? 'enable' : 'disable'} auto-approval`,
+        title: enabled
+          ? messages.activity_auto_update_enable_error()
+          : messages.activity_auto_update_disable_error(),
         variant: 'error',
       })
     } finally {

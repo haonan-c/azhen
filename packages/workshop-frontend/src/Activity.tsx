@@ -17,6 +17,8 @@ import { useVendorBranding } from './useVendorBranding'
 import { useResolveAction } from './useResolveAction'
 import { safeExternalUrl } from './utils/safeExternalUrl'
 import AutoApproveConfirmDialog from './components/AutoApproveConfirmDialog'
+import { m as messages } from './paraglide/messages.js'
+import { getLocale } from './paraglide/runtime.js'
 
 export type ActivityView = 'review' | 'history' | 'auto'
 
@@ -34,23 +36,27 @@ interface ActivityProps {
   autoApproveReloadTrigger?: number
 }
 
-const HISTORY_FILTERS: { value: HistoryFilter; label: string }[] = [
-  { value: 'all', label: 'All' },
-  { value: 'action', label: 'Actions' },
-  { value: 'observation', label: 'Observations' },
-  { value: 'bindHook', label: 'Hooks' },
-]
+const HISTORY_FILTERS: HistoryFilter[] = ['all', 'action', 'observation', 'bindHook']
+
+function historyFilterLabel(filter: HistoryFilter): string {
+  switch (filter) {
+    case 'all': return messages.activity_filter_all()
+    case 'action': return messages.activity_filter_actions()
+    case 'observation': return messages.activity_filter_observations()
+    case 'bindHook': return messages.activity_filter_hooks()
+  }
+}
 
 function timeValue(date: Date | undefined): number {
   return date ? new Date(date).getTime() : 0
 }
 
 function formatClockTime(date: Date): string {
-  return new Date(date).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  return new Date(date).toLocaleTimeString(getLocale(), { hour: 'numeric', minute: '2-digit' })
 }
 
 function formatFullDate(date: Date): string {
-  return new Date(date).toLocaleString([], {
+  return new Date(date).toLocaleString(getLocale(), {
     month: 'short',
     day: 'numeric',
     hour: 'numeric',
@@ -60,46 +66,52 @@ function formatFullDate(date: Date): string {
 
 export function formatRelativeTime(date: Date): string {
   const minutes = Math.floor(Math.max(0, Date.now() - new Date(date).getTime()) / 60_000)
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes}m ago`
+  if (minutes < 1) return messages.activity_time_just_now()
+  if (minutes < 60) {
+    return messages.activity_time_minutes_ago({ count: new Intl.NumberFormat(getLocale()).format(minutes) })
+  }
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  return `${Math.floor(hours / 24)}d ago`
+  if (hours < 24) {
+    return messages.activity_time_hours_ago({ count: new Intl.NumberFormat(getLocale()).format(hours) })
+  }
+  return messages.activity_time_days_ago({
+    count: new Intl.NumberFormat(getLocale()).format(Math.floor(hours / 24)),
+  })
 }
 
 function startOfDay(date: Date): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
 }
 
-function dayLabel(date: Date): string {
+function dayLabel(date: Date, locale: string): string {
   const value = new Date(date)
   const days = Math.round((startOfDay(new Date()) - startOfDay(value)) / 86_400_000)
-  if (days === 0) return 'Today'
-  if (days === 1) return 'Yesterday'
-  return value.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' })
+  if (days === 0) return messages.activity_today()
+  if (days === 1) return messages.activity_yesterday()
+  return value.toLocaleDateString(locale, { month: 'long', day: 'numeric', year: 'numeric' })
 }
 
 function activityStatus(
   record: ActionLogEntry,
 ): { label: string; dotClass: string; textClass: string } {
   if (record.type === 'observation') {
-    return { label: 'Observed', dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
+    return { label: messages.activity_status_observed(), dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
   }
   if (record.type === 'bindHook') {
     if (record.hookId === undefined) {
-      return { label: 'Deleted', dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
+      return { label: messages.activity_status_deleted(), dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
     }
     return record.enabled
-      ? { label: 'Enabled', dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
-      : { label: 'Disabled', dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
+      ? { label: messages.activity_status_enabled(), dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
+      : { label: messages.activity_status_disabled(), dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
   }
   if (record.state === 'pending') {
-    return { label: 'Waiting', dotClass: 'bg-kumo-brand', textClass: 'text-kumo-strong' }
+    return { label: messages.activity_status_waiting(), dotClass: 'bg-kumo-brand', textClass: 'text-kumo-strong' }
   }
   if (record.state === 'rejected') {
-    return { label: 'Denied', dotClass: 'bg-kumo-danger', textClass: 'text-kumo-danger' }
+    return { label: messages.activity_status_denied(), dotClass: 'bg-kumo-danger', textClass: 'text-kumo-danger' }
   }
-  return { label: 'Approved', dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
+  return { label: messages.activity_status_approved(), dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
 }
 
 function TypeIcon({ record, className }: { record: ActionLogEntry; className?: string }) {
@@ -129,6 +141,7 @@ export default function Activity({
     actionLabel: string
   } | null>(null)
   const toasts = useKumoToastManager()
+  const locale = getLocale()
 
   const { pendingActions, historyGroups, historyTotal, historyShown } = useMemo(() => {
     const records = [...actionsById.values()]
@@ -142,7 +155,7 @@ export default function Activity({
         timeValue(b.appliedAt ?? b.createdAt) - timeValue(a.appliedAt ?? a.createdAt) || b.id - a.id)
     const groups: { label: string; records: ActionLogEntry[] }[] = []
     for (const record of filtered) {
-      const label = dayLabel(record.appliedAt ?? record.createdAt)
+      const label = dayLabel(record.appliedAt ?? record.createdAt, locale)
       const last = groups.at(-1)
       if (last?.label === label) last.records.push(record)
       else groups.push({ label, records: [record] })
@@ -153,7 +166,7 @@ export default function Activity({
       historyTotal: resolved.length,
       historyShown: filtered.length,
     }
-  }, [actionsById, historyFilter])
+  }, [actionsById, historyFilter, locale])
 
   const resolveAction = useResolveAction(overseer, setProcessingActions)
 
@@ -164,7 +177,10 @@ export default function Activity({
       else await overseer.disableHook(hookId)
     } catch (error) {
       console.error('Failed to toggle hook:', error)
-      toasts.add({ title: `Failed to ${enabled ? 'enable' : 'disable'} hook`, variant: 'error' })
+      toasts.add({
+        title: enabled ? messages.activity_hook_enable_error() : messages.activity_hook_disable_error(),
+        variant: 'error',
+      })
     } finally {
       setTogglingHooks(previous => {
         const next = new Set(previous)
@@ -184,7 +200,7 @@ export default function Activity({
   if (!isReady) {
     return (
       <div className="flex h-full items-center justify-center text-[13px] text-kumo-subtle">
-        Loading activity…
+        {messages.activity_loading()}
       </div>
     )
   }
@@ -198,22 +214,24 @@ export default function Activity({
               <Check size={17} weight="bold" />
             </span>
             <p className="mt-3 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-              Nothing to review
+              {messages.activity_no_review_title()}
             </p>
             <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-              Requests that need your approval show up here and in the workspace header.
+              {messages.activity_no_review_body()}
             </p>
             <WorkshopButton className="mt-4" onClick={() => onViewChange('history')}>
-              View history
+              {messages.activity_view_history()}
             </WorkshopButton>
           </div>
         ) : (
           <>
             <div className={`${PANE_BAR} gap-2 px-5`}>
               <span className="text-[12.5px] font-medium leading-[17px] tracking-[-0.15px] text-kumo-default">
-                {pendingActions.length} {pendingActions.length === 1 ? 'request' : 'requests'} waiting
+                {pendingActions.length === 1
+                  ? messages.activity_request_waiting_one({ count: new Intl.NumberFormat(getLocale()).format(pendingActions.length) })
+                  : messages.activity_request_waiting_many({ count: new Intl.NumberFormat(getLocale()).format(pendingActions.length) })}
               </span>
-              <span className="ml-auto text-[11.5px] leading-[17px] text-kumo-inactive">Oldest first</span>
+              <span className="ml-auto text-[11.5px] leading-[17px] text-kumo-inactive">{messages.activity_oldest_first()}</span>
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
               {pendingActions.map(record => {
@@ -255,20 +273,22 @@ export default function Activity({
           <div className={`${PANE_BAR} gap-1 px-3`}>
             {HISTORY_FILTERS.map(filter => (
               <button
-                key={filter.value}
+                key={filter}
                 type="button"
-                onClick={() => setHistoryFilter(filter.value)}
+                onClick={() => setHistoryFilter(filter)}
                 className={`flex h-6 cursor-pointer items-center rounded-md px-2 text-[12.5px] font-medium tracking-[-0.15px] transition-colors ${
-                  historyFilter === filter.value
+                  historyFilter === filter
                     ? 'bg-kumo-tint text-kumo-default'
                     : 'text-kumo-subtle hover:text-kumo-default'
                 }`}
               >
-                {filter.label}
+                {historyFilterLabel(filter)}
               </button>
             ))}
             <span className="ml-auto pr-2 text-[11.5px] leading-[17px] tabular-nums text-kumo-inactive">
-              {historyShown} {historyShown === 1 ? 'event' : 'events'}
+              {historyShown === 1
+                ? messages.activity_events_one({ count: new Intl.NumberFormat(getLocale()).format(historyShown) })
+                : messages.activity_events_many({ count: new Intl.NumberFormat(getLocale()).format(historyShown) })}
             </span>
 
           </div>
@@ -276,29 +296,29 @@ export default function Activity({
           {historyTotal === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
               <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-                No activity yet
+                {messages.activity_no_history_title()}
               </p>
               <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-                Every resource an agent reads or changes is recorded here.
+                {messages.activity_no_history_body()}
               </p>
             </div>
           ) : historyShown === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-              <p className="m-0 text-[13px] font-medium text-kumo-default">No matching events</p>
+              <p className="m-0 text-[13px] font-medium text-kumo-default">{messages.activity_no_events()}</p>
               <button
                 type="button"
                 onClick={() => setHistoryFilter('all')}
                 className="mt-1.5 cursor-pointer text-[12px] font-medium text-kumo-subtle hover:text-kumo-default"
               >
-                Show all activity
+                {messages.activity_view_all()}
               </button>
             </div>
           ) : (
             <div className="min-h-0 flex-1 overflow-auto">
               <div className="grid grid-cols-[54px_minmax(0,1fr)_auto_16px] items-center gap-3 border-b border-kumo-line bg-kumo-elevated/50 px-5 py-1.5 text-[11px] font-medium uppercase tracking-[0.06em] text-kumo-inactive">
-                <span>Time</span>
-                <span>Event</span>
-                <span>Status</span>
+                <span>{messages.activity_column_time()}</span>
+                <span>{messages.activity_column_event()}</span>
+                <span>{messages.activity_column_status()}</span>
                 <span />
               </div>
               {historyGroups.map(group => (
@@ -356,6 +376,7 @@ function AutoApprovalPanel({
   const { entries, isLoading, loadError, pending, refresh, setEnabled } = useAutoApproval(overseer)
   const { authenticatedApi } = useAuthenticatedApi()
   const vendorBranding = useVendorBranding(authenticatedApi)
+  const locale = getLocale()
 
   const previousReloadTrigger = useRef(reloadTrigger)
   useEffect(() => {
@@ -382,17 +403,17 @@ function AutoApprovalPanel({
       }
     }
     for (const group of byConnection.values()) {
-      group.title ||= 'Unavailable connection'
+      group.title ||= messages.activity_unavailable_connection()
       group.entries = group.entries.toSorted((a, b) =>
-        a.actionKind.label.localeCompare(b.actionKind.label))
+        a.actionKind.label.localeCompare(b.actionKind.label, locale))
     }
-    return [...byConnection.values()].toSorted((a, b) => a.title.localeCompare(b.title))
-  }, [entries])
+    return [...byConnection.values()].toSorted((a, b) => a.title.localeCompare(b.title, locale))
+  }, [entries, locale])
 
   if (isLoading) {
     return (
       <div className="flex h-full items-center justify-center text-[13px] text-kumo-subtle">
-        Loading auto-approval…
+        {messages.activity_loading_auto_approval()}
       </div>
     )
   }
@@ -401,16 +422,18 @@ function AutoApprovalPanel({
     return (
       <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
         <p className="m-0 text-[13px] font-medium leading-[18px] tracking-[-0.25px] text-kumo-default">
-          {loadError ? 'Could not load auto-approval' : 'Nothing can run automatically'}
+          {loadError
+            ? messages.activity_auto_load_error_title()
+            : messages.activity_auto_empty_title()}
         </p>
         <p className="mt-1 max-w-xs text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
           {loadError
-            ? 'The current rules may be incomplete. Try loading them again.'
-            : 'Action types appear here once a connected resource offers one its author marked safe to apply without review.'}
+            ? messages.activity_auto_load_error_body()
+            : messages.activity_auto_empty_body()}
         </p>
         {loadError && (
           <WorkshopButton className="mt-4" onClick={() => void refresh()}>
-            Retry
+            {messages.common_retry()}
           </WorkshopButton>
         )}
       </div>
@@ -422,8 +445,8 @@ function AutoApprovalPanel({
       <div className={`${PANE_BAR} gap-3 px-5`}>
         <p className="m-0 min-w-0 flex-1 truncate text-[12.5px] leading-[17px] tracking-[-0.2px] text-kumo-subtle">
           {loadError
-            ? 'Some auto-approval options could not be loaded.'
-            : 'Actions agents may take without asking. Everything else waits for your review.'}
+            ? messages.activity_auto_partial_error()
+            : messages.activity_auto_description()}
         </p>
         {loadError && (
           <button
@@ -431,7 +454,7 @@ function AutoApprovalPanel({
             onClick={() => void refresh()}
             className="cursor-pointer text-[12px] font-medium text-kumo-default hover:text-kumo-default-hover"
           >
-            Retry
+            {messages.common_retry()}
           </button>
         )}
       </div>
@@ -464,17 +487,19 @@ function AutoApprovalPanel({
                     </span>
                     <span className="mt-0.5 block text-[12px] leading-4 tracking-[-0.2px] text-kumo-inactive">
                       {entry.orphaned
-                        ? 'This connection no longer offers this action; the rule still applies.'
+                        ? messages.activity_auto_orphaned()
                         : entry.enabled
-                          ? 'Applied without asking'
-                          : 'Waits for your approval'}
+                          ? messages.activity_auto_applied()
+                          : messages.activity_auto_waiting()}
                     </span>
                   </span>
                   <Switch
                     size="sm"
                     checked={entry.enabled}
                     disabled={busy}
-                    aria-label={`${entry.enabled ? 'Disable' : 'Enable'} auto-approval for ${entry.actionKind.label}`}
+                    aria-label={entry.enabled
+                      ? messages.activity_auto_toggle_disable({ label: entry.actionKind.label })
+                      : messages.activity_auto_toggle_enable({ label: entry.actionKind.label })}
                     onCheckedChange={enabled => void setEnabled(entry, enabled)}
                   />
                 </div>
@@ -617,7 +642,9 @@ function HistoryRow({
             <span className="text-kumo-subtle">{record.resourceTitle}</span>
             {resolvedBy && (
               <ResolverBadge profileId={resolvedBy.id}>
-                {autoApproved ? `Auto-approved (${resolvedBy.name}'s rule)` : `By ${resolvedBy.name}`}
+                {autoApproved
+                  ? messages.activity_auto_approved_by_rule({ name: resolvedBy.name })
+                  : messages.activity_resolved_by({ name: resolvedBy.name })}
               </ResolverBadge>
             )}
             {resourceUrl && (
@@ -627,7 +654,7 @@ function HistoryRow({
                 rel="noopener noreferrer"
                 className="text-kumo-subtle hover:text-kumo-default hover:underline"
               >
-                Open resource
+                {messages.activity_open_resource()}
               </a>
             )}
             {record.type === 'bindHook' && record.hookId !== undefined && (

@@ -55,6 +55,8 @@ import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
 import { useWorkspaceOpen } from './useWorkspaceOpen'
 import { reportIssue } from './errorReporting'
 import GadgetExportMenu from './GadgetExportMenu'
+import { m as messages } from './paraglide/messages.js'
+import { getLocale } from './paraglide/runtime.js'
 
 const NO_GADGETS: ReadonlySet<WorkpieceId> = new Set()
 
@@ -154,9 +156,16 @@ type WorkspaceView =
   | { mode: 'activity' }
 
 function formatHeaderCost(cost: number) {
-  if (cost === 0) return '$0'
-  if (cost < 0.01) return '<$0.01'
-  return `$${cost.toFixed(2)}`
+  const formatter = new Intl.NumberFormat(getLocale(), {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: cost === 0 ? 0 : 2,
+    maximumFractionDigits: cost === 0 ? 0 : 2,
+  })
+  if (cost < 0.01 && cost !== 0) {
+    return messages.conversation_cost_less_than({ amount: formatter.format(0.01) })
+  }
+  return formatter.format(cost)
 }
 
 // The first tab is named after what the selected workpiece is ("Document" for a gadget built from
@@ -164,16 +173,18 @@ function formatHeaderCost(cost: number) {
 function rightTabs(output?: BlueprintOutput): { value: RightTab; label: string }[] {
   return [
     { value: 'app', label: formatOf(output).noun },
-    { value: 'code', label: 'Code' },
-    { value: 'connections', label: 'Connections' },
+    { value: 'code', label: messages.conversation_tool_code_label() },
+    { value: 'connections', label: messages.conversation_list_connections() },
   ]
 }
 
-const ACTIVITY_TABS: { value: ActivityView; label: string }[] = [
-  { value: 'review', label: 'Needs review' },
-  { value: 'auto', label: 'Auto-approval' },
-  { value: 'history', label: 'History' },
-]
+function activityTabs(): { value: ActivityView; label: string }[] {
+  return [
+    { value: 'review', label: messages.conversation_panel_needs_review() },
+    { value: 'auto', label: messages.conversation_panel_auto_approval() },
+    { value: 'history', label: messages.conversation_panel_history() },
+  ]
+}
 
 // Names what the pane is showing. `icon` is for the workspace-level views (Activity); a workpiece
 // passes its `output` instead, so a Doc gets a document glyph rather than the gadget hexagon.
@@ -1556,7 +1567,7 @@ export default function GadgetEditor() {
           >
             <div className="flex min-w-0 flex-1 items-center overflow-hidden">
               {paneShowsActivity ? (
-                <PaneLabel icon={Pulse} title="Activity" />
+                <PaneLabel icon={Pulse} title={messages.conversation_panel_activity()} />
               ) : visibleGadgets.length > 1 ? (
                 <PaneWorkpieceTabs
                   gadgets={visibleGadgets}
@@ -1567,7 +1578,9 @@ export default function GadgetEditor() {
                 <PaneLabel
                   output={selectedGadgetSummary.output}
                   title={selectedGadgetSummary.title}
-                  badge={selectedGadgetSummary.chatId !== undefined ? 'Draft' : undefined}
+                  badge={selectedGadgetSummary.chatId !== undefined
+                    ? messages.conversation_created_draft()
+                    : undefined}
                 />
               )}
             </div>
@@ -1575,7 +1588,7 @@ export default function GadgetEditor() {
             <div className="flex flex-shrink-0 items-center gap-1.5">
               <div className="flex items-center rounded-lg border border-kumo-line p-0.5">
                 {paneShowsActivity
-                  ? ACTIVITY_TABS.map(tab => (
+                  ? activityTabs().map(tab => (
                     <PaneTab
                       key={tab.value}
                       active={activityView === tab.value}

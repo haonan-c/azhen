@@ -1,17 +1,21 @@
 // Locale-aware timestamp formatting for chat UI tooltips.
 //
-// `Intl.DateTimeFormat(undefined, ...)` uses the browser's preferred locale, which already encodes
-// the user's 12h vs 24h preference (e.g. en-US -> 12h, en-GB -> 24h, en-US-u-hc-h23 -> 24h). We
-// intentionally do not pass `hour12` or `hourCycle` so the OS/browser setting wins.
+import { getLocale } from "../paraglide/runtime.js";
+
+// The application locale controls date ordering and localized labels. We intentionally do not
+// pass `hour12` or `hourCycle`, so the locale's default hour cycle still applies.
 //
 // The formatter instance is cached at module scope because constructing `Intl.DateTimeFormat` is
 // surprisingly expensive and a chat view can render hundreds of timestamps.
 
 let fullTimestampFormatter: Intl.DateTimeFormat | null = null;
+let fullTimestampLocale: string | null = null;
 
 function getFullTimestampFormatter(): Intl.DateTimeFormat {
-  if (fullTimestampFormatter === null) {
-    fullTimestampFormatter = new Intl.DateTimeFormat(undefined, {
+  const locale = getLocale();
+  if (fullTimestampFormatter === null || fullTimestampLocale !== locale) {
+    fullTimestampLocale = locale;
+    fullTimestampFormatter = new Intl.DateTimeFormat(locale, {
       dateStyle: "short",
       timeStyle: "short",
     });
