@@ -583,7 +583,7 @@ export default function GatekeeperModal({
           reportIssue('gatekeeper.configurator-start', error, {
             gatekeeperVendorId: selectedConnection?.vendorId,
           })
-          setConfiguratorError(messages.blueprint_configurator_error())
+          setConfiguratorError(messages.gatekeeper_modal_configurator_error())
         }
       })
       .finally(() => {
@@ -737,10 +737,10 @@ export default function GatekeeperModal({
     let transferred = false
     try {
       if (!configuratorFrameState?.frame || configuratorFrameState.accountId !== selectedAccountId || configuratorFrameState.resourceUrlPattern !== resourceUrlPattern) {
-        throw new Error('Configurator is not ready.')
+        throw new Error(messages.resource_configurator_not_ready())
       }
       const resourceUrl = await configuratorCollectResourceUrlRef.current?.()
-      if (!resourceUrl) throw new Error('Configurator did not provide a resource URL.')
+      if (!resourceUrl) throw new Error(messages.resource_configurator_no_url())
       const overseer = await getOverseer()
       gatekeeper = await overseer.newGatekeeper(selectedAccountId, resourceUrl)
       if (gatekeeper) {
@@ -752,10 +752,12 @@ export default function GatekeeperModal({
       }
     } catch (err) {
       console.error('Failed to create resource gatekeeper:', err)
-      reportIssue('gatekeeper.connection-create', err, {
-        gatekeeperVendorId: selectedConnection.vendorId,
+      toasts.add({
+        title: err instanceof Error && err.message
+          ? err.message
+          : messages.gatekeeper_modal_connection_create_failed(),
+        variant: 'error',
       })
-      toasts.add({ title: messages.gatekeeper_modal_connection_create_failed(), variant: 'error' })
     } finally {
       if (gatekeeper && !transferred) gatekeeper[Symbol.dispose]()
       setCreating(false)

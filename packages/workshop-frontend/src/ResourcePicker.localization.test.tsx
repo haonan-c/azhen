@@ -28,7 +28,10 @@ testState.authenticatedApi = {
     }],
   }],
   subscribeConnectedAccounts: async (subscriber: ConnectedAccountsSubscriber) => {
-    const vendor = { displayName: 'GitHub Vendor Original' }
+    const vendor = {
+      displayName: 'GitHub Vendor Original',
+      url: 'https://vendor.example',
+    }
     const resources = [{
       title: 'GitHub Repository Original',
       description: 'Vendor-owned resource description',
@@ -38,14 +41,17 @@ testState.authenticatedApi = {
     subscriber.add(1, {
       displayName: 'Seller Account Original',
       uniqueName: 'seller@example.com',
+      avatar: { url: 'https://vendor.example/seller.png' },
       grantedResourceUrlPatterns: [RESOURCE_PATTERN],
     }, vendor, resources, true, 'github')
     subscriber.add(2, {
       displayName: 'Expired Account Original',
+      avatar: { url: 'https://vendor.example/expired.png' },
       grantedResourceUrlPatterns: [RESOURCE_PATTERN],
     }, vendor, resources, false, 'github')
     subscriber.add(3, {
       displayName: 'Limited Account Original',
+      avatar: { url: 'https://vendor.example/limited.png' },
       grantedResourceUrlPatterns: [],
     }, vendor, resources, true, 'github')
     subscriber.ready()

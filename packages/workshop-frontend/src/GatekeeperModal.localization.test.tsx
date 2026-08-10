@@ -42,11 +42,22 @@ vi.mock('@cloudflare/kumo', () => {
     },
   )
   const Select = Object.assign(
-    ({ children, placeholder, 'aria-label': ariaLabel }: {
+    ({ children, placeholder, 'aria-label': ariaLabel, onValueChange }: {
       children: ReactNode
       placeholder?: string
       'aria-label'?: string
-    }) => <div aria-label={ariaLabel} data-placeholder={placeholder}>{children}</div>,
+      onValueChange?: (value: string) => void
+    }) => (
+      <div aria-label={ariaLabel} data-placeholder={placeholder}>
+        <button
+          type="button"
+          aria-label="Select test model"
+          data-testid="select-test-model"
+          onClick={() => onValueChange?.('model-original')}
+        />
+        {children}
+      </div>
+    ),
     { Option: ({ children }: { children: ReactNode }) => <div>{children}</div> },
   )
   return {
@@ -71,7 +82,7 @@ vi.mock('./components/WorkshopControls', () => ({
 }))
 vi.mock('./errorReporting', () => ({ reportIssue: () => {} }))
 
-import GatekeeperModal from './GatekeeperModal'
+import GatekeeperModal, { type GatekeeperModalProps } from './GatekeeperModal'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -90,15 +101,22 @@ describe('GatekeeperModal localization', () => {
 
   it('localizes connection discovery and AI model configuration', async () => {
     window.history.replaceState({}, '', '/zh/workspace/campaign')
+    type CreatedGatekeeper = Parameters<GatekeeperModalProps['onCreated']>[0]
+    const gatekeeper = {} as CreatedGatekeeper
+    const newAiModelGatekeeper = vi.fn<(modelId: string) => Promise<CreatedGatekeeper>>(
+      async () => gatekeeper,
+    )
+    const onCreated = vi.fn<GatekeeperModalProps['onCreated']>(async () => {})
+    const onClose = vi.fn<() => void>()
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
     await act(async () => root!.render(
       <GatekeeperModal
         open
-        onClose={() => {}}
-        getOverseer={() => ({} as RpcStub<Overseer>)}
-        onCreated={async () => {}}
+        onClose={onClose}
+        getOverseer={() => ({ newAiModelGatekeeper } as unknown as RpcStub<Overseer>)}
+        onCreated={onCreated}
       />,
     ))
 
@@ -129,5 +147,18 @@ describe('GatekeeperModal localization', () => {
     expect(container.textContent).toContain('创建连接')
     expect(container.textContent).not.toContain('Create New Connection')
     expect(container.textContent).not.toContain('Choose the model this connection can use.')
+
+    await act(async () => {
+      container!.querySelector<HTMLButtonElement>('[data-testid="select-test-model"]')!.click()
+    })
+    const create = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === '创建连接')!
+    await act(async () => {
+      create.click()
+      await Promise.resolve()
+    })
+    expect(newAiModelGatekeeper).toHaveBeenCalledWith('model-original')
+    expect(onCreated).toHaveBeenCalledWith(gatekeeper)
+    expect(onClose).toHaveBeenCalledOnce()
   })
 })

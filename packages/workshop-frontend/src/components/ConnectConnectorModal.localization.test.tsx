@@ -72,6 +72,7 @@ describe('ConnectConnectorModal localization', () => {
 
   it('localizes the connect flow while preserving vendor resource text', async () => {
     window.history.replaceState({}, '', '/zh/gatekeepers')
+    const onConfirm = vi.fn<(resourceUrlPatterns?: string[]) => void>()
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -82,7 +83,7 @@ describe('ConnectConnectorModal localization', () => {
         vendorDescription={VENDOR}
         supportedResources={[RESOURCE]}
         onOpenChange={() => {}}
-        onConfirm={() => {}}
+        onConfirm={onConfirm}
       />,
     ))
 
@@ -98,6 +99,37 @@ describe('ConnectConnectorModal localization', () => {
     expect(container.textContent).toContain('继续前往 GitHub Vendor Original')
     expect(container.querySelector('[aria-label="关闭"]')).not.toBeNull()
     expect(container.textContent).not.toContain('Resources to enable')
+
+    const continueButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === '继续前往 GitHub Vendor Original')!
+    await act(async () => continueButton.click())
+    expect(onConfirm).toHaveBeenCalledWith(undefined)
+  })
+
+  it('keeps the English connect flow operational', async () => {
+    window.history.replaceState({}, '', '/gatekeepers')
+    const onConfirm = vi.fn<(resourceUrlPatterns?: string[]) => void>()
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(
+      <ConnectConnectorModal
+        open
+        mode="connect"
+        vendorDescription={VENDOR}
+        supportedResources={[RESOURCE]}
+        onOpenChange={() => {}}
+        onConfirm={onConfirm}
+      />,
+    ))
+
+    expect(container.querySelector('h1')?.textContent).toBe('Connect GitHub Vendor Original')
+    expect(container.textContent).toContain('Resources to enable')
+    expect(container.textContent).toContain('Vendor-owned connector description')
+    const continueButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === 'Continue to GitHub Vendor Original')!
+    await act(async () => continueButton.click())
+    expect(onConfirm).toHaveBeenCalledWith(undefined)
   })
 
   it('localizes account management and disconnect confirmation', async () => {
@@ -115,6 +147,7 @@ describe('ConnectConnectorModal localization', () => {
         accountDescription={{
           displayName: 'Seller Account Original',
           uniqueName: 'seller@example.com',
+          avatar: { url: 'https://vendor.example/avatar.png' },
         }}
         grantedResourceUrlPatterns={[RESOURCE.urlPattern]}
         onOpenChange={() => {}}

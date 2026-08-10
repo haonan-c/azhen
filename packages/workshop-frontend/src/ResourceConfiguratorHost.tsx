@@ -27,9 +27,9 @@ export default function ResourceConfiguratorHost({
   resourceUrlPattern?: string
 }) {
   if (disabled) {
-    return <Placeholder>{messages.blueprint_configurator_choose_account()}</Placeholder>
+    return <Placeholder>{messages.resource_configurator_choose_account()}</Placeholder>
   }
-  if (loading) return <Placeholder>{messages.blueprint_configurator_loading()}</Placeholder>
+  if (loading) return <Placeholder>{messages.resource_configurator_loading()}</Placeholder>
   if (error) return <Placeholder>{error}</Placeholder>
   if (!frame) return null
 

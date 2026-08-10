@@ -91,24 +91,51 @@ describe('Connectors page localization', () => {
     container = undefined
   })
 
-  it('localizes discovery while preserving vendor and account text', async () => {
-    window.history.replaceState({}, '', '/zh/gatekeepers')
+  it.each([
+    {
+      path: '/gatekeepers',
+      heading: 'Gatekeepers',
+      description: 'Add the apps and accounts your workspaces can use. Connect once, then wire them into anything you build.',
+      search: 'Search gatekeepers…',
+      connected: 'Connected',
+      available: 'Available',
+      otherLocaleText: '添加工作空间可以使用的应用和账号。',
+    },
+    {
+      path: '/zh/gatekeepers',
+      heading: '安全连接器',
+      description: '添加工作空间可以使用的应用和账号。只需连接一次，即可用于你构建的任何内容。',
+      search: '搜索安全连接器…',
+      connected: '已连接',
+      available: '可用',
+      otherLocaleText: 'Add the apps and accounts',
+    },
+  ])('localizes discovery at $path while preserving vendor and account text', async ({
+    path,
+    heading,
+    description,
+    search,
+    connected,
+    available,
+    otherLocaleText,
+  }) => {
+    window.history.replaceState({}, '', path)
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
     await act(async () => root!.render(<ConnectorsPage />))
 
     await vi.waitFor(() => expect(container?.textContent).toContain('Seller Account Original'))
-    expect(container.querySelector('h1')?.textContent).toBe('安全连接器')
-    expect(container.textContent).toContain('添加工作空间可以使用的应用和账号。只需连接一次，即可用于你构建的任何内容。')
-    expect(container.querySelector<HTMLInputElement>('input')?.placeholder).toBe('搜索安全连接器…')
-    expect(container.textContent).toContain('已连接')
-    expect(container.textContent).toContain('可用')
+    expect(container.querySelector('h1')?.textContent).toBe(heading)
+    expect(container.textContent).toContain(description)
+    expect(container.querySelector<HTMLInputElement>('input')?.placeholder).toBe(search)
+    expect(container.textContent).toContain(connected)
+    expect(container.textContent).toContain(available)
     expect(container.textContent).toContain('Google Vendor Original')
     expect(container.textContent).toContain('Seller Account Original')
     expect(container.textContent).toContain('GitHub Vendor Original')
     expect(container.textContent).toContain('Vendor-owned tagline')
-    expect(testState.documentTitle).toHaveBeenCalledWith('安全连接器')
-    expect(container.textContent).not.toContain('Add the apps and accounts')
+    expect(testState.documentTitle).toHaveBeenCalledWith(heading)
+    expect(container.textContent).not.toContain(otherLocaleText)
   })
 })

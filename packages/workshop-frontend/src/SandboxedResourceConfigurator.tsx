@@ -248,16 +248,20 @@ export default function SandboxedResourceConfigurator({
   }
 
   const collectResourceUrl = () => {
-    if (iframeInvalidatedRef.current) return Promise.reject(new Error('Configurator is no longer available.'))
+    if (iframeInvalidatedRef.current) {
+      return Promise.reject(new Error(messages.resource_configurator_unavailable()))
+    }
     const iframe = iframeRpcRef.current
-    if (!iframe || !iframeConnectedRef.current) return Promise.reject(new Error('Configurator is not ready.'))
+    if (!iframe || !iframeConnectedRef.current) {
+      return Promise.reject(new Error(messages.resource_configurator_not_ready()))
+    }
 
     let timeout: number | null = null
     return Promise.race([
       iframe.collectResourceUrl(),
       new Promise<never>((_, reject) => {
         timeout = window.setTimeout(() => {
-          reject(new Error('Configurator did not provide its resource URL. Please try again.'))
+          reject(new Error(messages.resource_configurator_no_url()))
         }, COLLECT_VALUES_TIMEOUT_MS)
       }),
     ]).finally(() => {
@@ -390,7 +394,7 @@ export default function SandboxedResourceConfigurator({
         srcDoc={frame.iframeHtml}
         onLoad={handleIframeLoad}
         sandbox="allow-scripts"
-        title={messages.gatekeeper_modal_configurator_iframe_title()}
+        title={messages.resource_configurator_iframe_title()}
         scrolling="no"
         style={{
           position: 'fixed',

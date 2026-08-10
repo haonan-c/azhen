@@ -85,6 +85,9 @@ describe("SandboxedGatekeeperApp navigation", () => {
 
     const iframe = container.querySelector("iframe");
     if (!iframe) throw new Error("Missing gatekeeper iframe");
+    expect(iframe.getAttribute("sandbox")).toBe("allow-scripts allow-modals");
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(iframe.srcdoc).toBe(frame.iframeHtml);
     const { port1, port2 } = new MessageChannel();
     host = newMessagePortRpcSession<TestHost>(port1);
     window.dispatchEvent(
