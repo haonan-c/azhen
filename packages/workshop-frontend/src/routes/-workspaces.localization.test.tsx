@@ -14,7 +14,7 @@ const testState = vi.hoisted(() => ({
     pinned: false,
     owner: null,
     lastActive: new Date(Date.now() - 2 * 60 * 60 * 1000),
-    created: new Date('2026-08-09T16:30:00Z'),
+    created: new Date(2026, 7, 9, 12, 30),
     totalCost: 12.5,
   }]),
   authenticatedApi: null as unknown as {
@@ -86,6 +86,14 @@ describe('Workspaces library localization', () => {
   let root: Root | undefined
   let container: HTMLDivElement | undefined
 
+  async function render(path: string) {
+    window.history.replaceState({}, '', path)
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(<WorkspacesPage />))
+  }
+
   afterEach(() => {
     act(() => root?.unmount())
     container?.remove()
@@ -134,11 +142,7 @@ describe('Workspaces library localization', () => {
     deleteTitle,
     deleteDescription,
   }) => {
-    window.history.replaceState({}, '', path)
-    container = document.createElement('div')
-    document.body.append(container)
-    root = createRoot(container)
-    await act(async () => root!.render(<WorkspacesPage />))
+    await render(path)
 
     await vi.waitFor(() => expect(container?.textContent).toContain('季度复盘 原名'))
     expect(container?.querySelector('h1')?.textContent).toBe(heading)
@@ -169,11 +173,7 @@ describe('Workspaces library localization', () => {
     },
   ])('localizes the empty state at $path', async ({ path, title, description }) => {
     testState.listGadgets.mockResolvedValueOnce([])
-    window.history.replaceState({}, '', path)
-    container = document.createElement('div')
-    document.body.append(container)
-    root = createRoot(container)
-    await act(async () => root!.render(<WorkspacesPage />))
+    await render(path)
 
     await vi.waitFor(() => expect(container?.textContent).toContain(title))
     expect(container?.textContent).toContain(description)
@@ -216,11 +216,7 @@ describe('Workspaces library localization', () => {
     lastActive,
     close,
   }) => {
-    window.history.replaceState({}, '', path)
-    container = document.createElement('div')
-    document.body.append(container)
-    root = createRoot(container)
-    await act(async () => root!.render(<WorkspacesPage />))
+    await render(path)
     await vi.waitFor(() => expect(container?.textContent).toContain('季度复盘 原名'))
 
     const informationButton = [...container!.querySelectorAll<HTMLButtonElement>('button')]

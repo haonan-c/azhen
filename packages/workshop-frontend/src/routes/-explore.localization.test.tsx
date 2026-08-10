@@ -150,8 +150,6 @@ describe('Explore library localization', () => {
 
     act(() => root?.unmount())
     container?.remove()
-    root = undefined
-    container = undefined
     await render('/zh/explore')
 
     await vi.waitFor(() => expect(container?.textContent).toContain('Creator Campaign Kit'))

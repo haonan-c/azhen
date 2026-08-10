@@ -28,6 +28,7 @@ import ShareModal from '../../ShareModal'
 import DeleteConfirmationDialog from '../DeleteConfirmationDialog'
 import SidebarGadgetRow from './SidebarGadgetRow'
 import { m as messages } from '../../paraglide/messages.js'
+import { formatLocaleNumber } from '../../utils/formatNumber'
 
 // Cap on items shown in the Recent list before the user clicks through to /workspaces.
 const RECENT_INITIAL_LIMIT = 6
@@ -399,7 +400,7 @@ export function SidebarWorkspacesLists({ collapsed = false }: { collapsed?: bool
               className="mt-0.5 flex h-7 items-center gap-1 rounded-md px-2.5 text-[12px] font-medium tracking-[-0.2px] text-kumo-subtle transition-colors hover:bg-kumo-tint hover:text-kumo-default"
             >
               {recentHidden > 0
-                ? messages.shell_show_all_count({ count: recent.length })
+                ? messages.shell_show_all_count({ count: formatLocaleNumber(recent.length) })
                 : messages.shell_show_all()}
               <ArrowRight size={11} weight="bold" />
             </Link>
@@ -440,7 +441,9 @@ function SidebarSection({
         />
         {icon}
         <span>{label}</span>
-        {count !== undefined && <span className="ml-1 text-kumo-inactive">{count}</span>}
+        {count !== undefined && (
+          <span className="ml-1 text-kumo-inactive">{formatLocaleNumber(count)}</span>
+        )}
       </button>
       {open && <div className="mt-0.5">{children}</div>}
     </div>

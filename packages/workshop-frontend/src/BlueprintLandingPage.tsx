@@ -872,7 +872,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
                 <button
                   type="button"
                   aria-label={isAuthenticated
-                    ? messages.blueprint_add_library()
+                    ? messages.blueprint_add_library_label()
                     : messages.blueprint_login_add_library_label()}
                   onClick={handleAddToLibrary}
                   disabled={addingToLibrary || loadingLibraryState}

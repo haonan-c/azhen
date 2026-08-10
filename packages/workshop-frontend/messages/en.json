@@ -45,6 +45,7 @@
   "explore_no_match_title": "No blueprints match",
   "explore_open_featured": "Open featured blueprint {title}",
   "blueprint_add_library": "Add to library",
+  "blueprint_add_library_label": "Add blueprint to library",
   "blueprint_add_library_error": "Failed to add blueprint to library",
   "blueprint_added_library": "Blueprint added to library",
   "blueprint_agent": "Agent",

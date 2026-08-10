@@ -403,18 +403,7 @@ export default function GadgetList({ showHeader = true }: { showHeader?: boolean
               {messages.workspaces_no_match()}
             </div>
           ) : (
-            showHeader ? (
-              <FeaturedBlueprintsGallery />
-            ) : (
-              <div className="flex flex-col items-center gap-2 px-3 py-16 text-center">
-                <p className="text-sm font-medium text-kumo-default">
-                  {messages.workspaces_empty_title()}
-                </p>
-                <p className="max-w-sm text-[13px] leading-[18px] text-kumo-subtle">
-                  {messages.workspaces_empty_description()}
-                </p>
-              </div>
-            )
+            <FeaturedBlueprintsGallery />
           )
         ) : (
           filtered.map((gadget) => (
@@ -600,7 +589,16 @@ function FeaturedBlueprintsGallery() {
   }
 
   if (blueprints.length === 0) {
-    return null
+    return (
+      <div className="flex flex-col items-center gap-2 px-3 py-16 text-center">
+        <p className="text-sm font-medium text-kumo-default">
+          {messages.workspaces_empty_title()}
+        </p>
+        <p className="max-w-sm text-[13px] leading-[18px] text-kumo-subtle">
+          {messages.workspaces_empty_description()}
+        </p>
+      </div>
+    )
   }
 
   const shown = blueprints.slice(0, MAX_FEATURED_SHOWN)

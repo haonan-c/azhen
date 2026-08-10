@@ -32,6 +32,7 @@ vi.mock('@cloudflare/kumo', () => ({
 vi.mock('./main', () => ({ markConnectionRestored: vi.fn<() => void>() }));
 vi.mock('./AuthContext', () => ({
   AuthProvider: ({ children }: { children: ReactNode }) => children,
+  useOptionalAuthenticatedApi: () => null,
 }));
 vi.mock('./FeatureFlagsContext', () => ({
   FeatureFlagsProvider: ({ children }: { children: ReactNode }) => children,
@@ -39,7 +40,6 @@ vi.mock('./FeatureFlagsContext', () => ({
 vi.mock('./components/AppShell/AppShell', () => ({
   default: ({ children }: { children: ReactNode }) => children,
 }));
-vi.mock('./components/Header', () => ({ default: () => null }));
 vi.mock('./OnboardingWizard', () => ({ default: () => null }));
 vi.mock('./components/billing/AccountSelectionModal', () => ({ default: () => null }));
 vi.mock('./LoginPage', () => ({
@@ -192,13 +192,46 @@ describe('root session validation', () => {
     expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(href)
   })
 
-  it('keeps the existing signed-out Blueprint Landing Page behavior', async () => {
+  it.each([
+    {
+      href: '/blueprint/public-id',
+      home: 'Home',
+      gatekeepers: 'Gatekeepers',
+      explore: 'Explore',
+      language: 'Language',
+      locale: 'en',
+    },
+    {
+      href: '/zh/blueprint/public-id?tab=details#bindings',
+      home: '首页',
+      gatekeepers: '安全连接器',
+      explore: '探索',
+      language: '语言',
+      locale: 'zh',
+    },
+  ])('keeps signed-out Blueprint access and localizes its header at $href', async ({
+    href,
+    home,
+    gatekeepers,
+    explore,
+    language,
+    locale,
+  }) => {
+    window.history.replaceState({}, '', href)
     const api = createPublicApi(() => { throw new Error('unexpected authentication') })
 
-    await render('/blueprint/public-id', api)
+    await render('/blueprint/public-id?tab=details#bindings', api)
 
     expect(container?.querySelector('[data-destination="blueprint"]')).not.toBeNull()
     expect(container?.textContent).not.toContain('signed-out')
+    expect(container?.textContent).toContain(home)
+    expect(container?.textContent).toContain(gatekeepers)
+    expect(container?.textContent).toContain(explore)
+    const languageSelector = container?.querySelector<HTMLSelectElement>(
+      `select[aria-label="${language}"]`,
+    )
+    expect(languageSelector?.value).toBe(locale)
+    expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(href)
   })
 
   it('does not show the Blueprint Landing Page while a stored session is pending', async () => {

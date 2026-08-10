@@ -15,7 +15,7 @@ const testState = vi.hoisted(() => {
       description: 'Keep this creator-authored description.',
       author: { type: 'user', id: 'creator-1', name: 'Creator 原名' },
       version: 7,
-      lastUpdated: new Date('2026-08-09T16:30:00Z'),
+      lastUpdated: new Date(2026, 7, 9, 12, 30),
       bindings: {},
     },
   }

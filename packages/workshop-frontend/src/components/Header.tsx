@@ -7,6 +7,8 @@ import { useState, useEffect, useRef } from 'react'
 import UserMenu from './UserMenu'
 import TopBarNotice from '../TopBarNotice'
 import SiteLogo from './SiteLogo'
+import LanguageSelector from './LanguageSelector'
+import { m as messages } from '../paraglide/messages.js'
 
 export default function Header() {
   const auth = useOptionalAuthenticatedApi()
@@ -55,14 +57,14 @@ export default function Header() {
           </Link>
 
           {/* Desktop nav links */}
-          <nav className="hidden sm:flex items-center gap-1">
+          <nav aria-label={messages.shell_primary_navigation()} className="hidden sm:flex items-center gap-1">
             <Link
               to="/"
               className={navLinkClass}
               activeProps={{ className: navLinkActiveClass }}
               activeOptions={{ exact: true }}
             >
-              Home
+              {messages.shell_home()}
             </Link>
             <Link
               to="/gatekeepers"
@@ -70,14 +72,14 @@ export default function Header() {
               activeProps={{ className: navLinkActiveClass }}
               activeOptions={{ exact: true }}
             >
-              Gatekeepers
+              {messages.shell_gatekeepers()}
             </Link>
             <Link
               to="/explore"
               className={navLinkClass}
               activeProps={{ className: navLinkActiveClass }}
             >
-              Explore
+              {messages.shell_explore()}
             </Link>
             {gatekeeperApps.map((app) => (
               <Link
@@ -95,6 +97,8 @@ export default function Header() {
 
         {/* Right side */}
         <div className="flex items-center gap-2">
+          {!auth && <LanguageSelector className="hidden sm:flex" />}
+
           {/* Desktop avatar dropdown */}
           {auth && (
             <div className="hidden sm:block">
@@ -105,6 +109,8 @@ export default function Header() {
           {/* Mobile hamburger button */}
           <div className="sm:hidden">
             <button
+              type="button"
+              aria-label={mobileMenuOpen ? messages.shell_close_menu() : messages.shell_open_menu()}
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
               className="w-8 h-8 rounded-md flex items-center justify-center hover:bg-kumo-tint transition-colors text-kumo-default"
             >
@@ -117,7 +123,7 @@ export default function Header() {
       {/* Mobile dropdown menu */}
       {mobileMenuOpen && (
         <div className="sm:hidden border-t border-kumo-line bg-kumo-base">
-          <nav className="flex flex-col px-4 py-3 gap-1">
+          <nav aria-label={messages.shell_primary_navigation()} className="flex flex-col px-4 py-3 gap-1">
             <Link
               to="/"
               onClick={closeMobileMenu}
@@ -125,7 +131,7 @@ export default function Header() {
               activeProps={{ className: navLinkActiveClass }}
               activeOptions={{ exact: true }}
             >
-              Home
+              {messages.shell_home()}
             </Link>
             <Link
               to="/gatekeepers"
@@ -134,7 +140,7 @@ export default function Header() {
               activeProps={{ className: navLinkActiveClass }}
               activeOptions={{ exact: true }}
             >
-              Gatekeepers
+              {messages.shell_gatekeepers()}
             </Link>
             <Link
               to="/explore"
@@ -142,7 +148,7 @@ export default function Header() {
               className={navLinkClass}
               activeProps={{ className: navLinkActiveClass }}
             >
-              Explore
+              {messages.shell_explore()}
             </Link>
             {gatekeeperApps.map((app) => (
               <Link
@@ -157,6 +163,13 @@ export default function Header() {
               </Link>
             ))}
 
+            {!auth && (
+              <>
+                <hr className="my-2 border-kumo-line" />
+                <LanguageSelector className="px-3 py-1.5" />
+              </>
+            )}
+
             {auth && (
               <>
                 <hr className="my-2 border-kumo-line" />
@@ -167,7 +180,7 @@ export default function Header() {
                   className={navLinkClass}
                   activeProps={{ className: navLinkActiveClass }}
                 >
-                  Profile
+                  {messages.user_menu_profile()}
                 </Link>
                 <Link
                   to="/providers"
@@ -175,7 +188,7 @@ export default function Header() {
                   className={navLinkClass}
                   activeProps={{ className: navLinkActiveClass }}
                 >
-                  Providers
+                  {messages.user_menu_providers()}
                 </Link>
                 {auth.isAdmin && (
                   <Link
@@ -184,14 +197,14 @@ export default function Header() {
                     className={navLinkClass}
                     activeProps={{ className: navLinkActiveClass }}
                   >
-                    Admin
+                    {messages.user_menu_admin()}
                   </Link>
                 )}
                 <button
                   onClick={() => { closeMobileMenu(); auth.logout() }}
                   className="text-left text-sm px-3 py-1.5 rounded-md text-kumo-danger hover:bg-kumo-tint transition-colors"
                 >
-                  Sign out
+                  {messages.user_menu_sign_out()}
                 </button>
               </>
             )}

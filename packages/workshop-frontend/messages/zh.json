@@ -45,6 +45,7 @@
   "explore_no_match_title": "没有匹配的模板",
   "explore_open_featured": "打开精选模板 {title}",
   "blueprint_add_library": "添加到模板库",
+  "blueprint_add_library_label": "将模板添加到模板库",
   "blueprint_add_library_error": "将模板添加到模板库失败",
   "blueprint_added_library": "模板已添加到模板库",
   "blueprint_agent": "Agent",
