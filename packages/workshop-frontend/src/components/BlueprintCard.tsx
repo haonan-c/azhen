@@ -10,6 +10,7 @@ import {
   BlueprintMetadata,
 } from "@gadgets/workshop-shared/api";
 import { VendorDescription } from "@gadgets/workshop-shared/gatekeeper";
+import { m as messages } from "../paraglide/messages.js";
 
 const gradients = [
   "from-[#4A154B] to-[#7C3085]",
@@ -51,10 +52,10 @@ export function uniqueBindingBadges(
         b.gatekeeperName.charAt(0).toUpperCase() + b.gatekeeperName.slice(1);
     } else if (b.type === "aiModel") {
       key = "aiModel";
-      label = "AI Model";
+      label = messages.blueprint_ai_model();
     } else {
       key = "agentSpawner";
-      label = "Agent";
+      label = messages.blueprint_agent();
     }
     if (!seen.has(key)) {
       seen.add(key);
@@ -129,7 +130,7 @@ export function BlueprintCard({
       <Link
         to="/blueprint/$id"
         params={{ id }}
-        aria-label={`Open blueprint ${metadata.title}`}
+        aria-label={messages.blueprints_open({ title: metadata.title })}
         className="absolute inset-0 z-10 rounded-2xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kumo-brand"
       />
       <div className="pointer-events-none relative z-20 flex flex-1 flex-col p-4">
@@ -144,7 +145,7 @@ export function BlueprintCard({
               {metadata.title}
             </p>
             <p className={`mt-1.5 line-clamp-2 min-h-8 text-[12px] leading-4 font-normal tracking-[-0.2px] ${metadata.description ? "text-kumo-subtle" : "text-kumo-inactive italic"}`}>
-              {metadata.description || "No description"}
+              {metadata.description || messages.blueprints_no_description()}
             </p>
           </div>
         </div>

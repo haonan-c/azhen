@@ -12,6 +12,7 @@ import { useAuthenticatedApi } from "./AuthContext";
 import { BindingBadge, uniqueBindingBadges } from "./components/BlueprintCard";
 import { BlueprintPreviewPlaceholder } from "./components/BlueprintPreviewImage";
 import ViewToggle from "./components/ViewToggle";
+import { m as messages } from "./paraglide/messages.js";
 
 type VendorMap = Map<string, VendorDescription>;
 
@@ -29,11 +30,18 @@ export default function BlueprintsPage() {
     if (typeof window === "undefined") return "grid";
     return localStorage.getItem("explore-view") === "list" ? "list" : "grid";
   });
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => {
+    if (typeof window === "undefined") return "";
+    return sessionStorage.getItem("explore-search") ?? "";
+  });
 
   useEffect(() => {
     localStorage.setItem("explore-view", view);
   }, [view]);
+
+  useEffect(() => {
+    sessionStorage.setItem("explore-search", search);
+  }, [search]);
 
   useEffect(() => {
     let cancelled = false;
@@ -53,7 +61,7 @@ export default function BlueprintsPage() {
       .catch((err) => {
         console.error("Failed to load Explore data:", err);
         toastsRef.current.add({
-          title: "Failed to load featured blueprints",
+          title: messages.explore_load_error(),
           variant: "error",
         });
       })
@@ -79,10 +87,11 @@ export default function BlueprintsPage() {
     <div className="mx-auto flex h-full w-full max-w-5xl flex-col px-6 sm:px-10">
       <header className="flex items-end justify-between gap-4 px-3 pb-4 pt-10">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">Explore</h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
+            {messages.shell_explore()}
+          </h1>
           <p className="mt-1 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-            Discover featured blueprints to use as starting points. Open one to create a workspace
-            from it, or save it to reuse later.
+            {messages.explore_description()}
           </p>
         </div>
         <ViewToggle view={view} onChange={setView} />
@@ -91,7 +100,7 @@ export default function BlueprintsPage() {
       {/* Toolbar */}
       <div className="flex items-center justify-between gap-3 px-3 pb-3">
         <span className="text-[12px] font-medium uppercase tracking-[0.08em] text-kumo-inactive">
-          Featured
+          {messages.explore_featured()}
         </span>
         <div className="relative sm:w-64">
           <MagnifyingGlass
@@ -102,7 +111,8 @@ export default function BlueprintsPage() {
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search blueprints…"
+            placeholder={messages.blueprints_search()}
+            aria-label={messages.blueprints_search()}
             className="h-9 w-full rounded-lg border border-kumo-line bg-kumo-base pl-9 pr-4 text-[13px] tracking-[-0.25px] text-kumo-default placeholder:text-kumo-inactive transition-[border-color,box-shadow] duration-150 ease-out focus:border-kumo-ring focus:outline-none focus:ring-[3px] focus:ring-kumo-ring/15"
           />
         </div>
@@ -115,13 +125,13 @@ export default function BlueprintsPage() {
           <EmptySection
             title={
               search
-                ? "No blueprints match"
-                : "No featured blueprints yet"
+                ? messages.explore_no_match_title()
+                : messages.explore_empty_title()
             }
             message={
               search
-                ? "Try a different search term."
-                : "Featured blueprints will appear here when they’re published. You can still create blueprints from your own workspaces."
+                ? messages.explore_no_match_description()
+                : messages.explore_empty_description()
             }
           />
         ) : view === "grid" ? (
@@ -156,7 +166,7 @@ function BlueprintThumbnail({ blueprint }: { blueprint: BlueprintPublicInfo }) {
       {blueprint.screenshotUrl ? (
         <img
           src={blueprint.screenshotUrl}
-          alt={`Screenshot of ${blueprint.metadata.title}`}
+          alt={messages.blueprint_screenshot_alt({ title: blueprint.metadata.title })}
           className="h-full w-full object-cover"
           loading="lazy"
         />
@@ -181,7 +191,7 @@ function FeaturedBlueprintCard({
       <Link
         to="/blueprint/$id"
         params={{ id: blueprint.id }}
-        aria-label={`Open featured blueprint ${blueprint.metadata.title}`}
+        aria-label={messages.explore_open_featured({ title: blueprint.metadata.title })}
         className="absolute inset-0 z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-kumo-brand"
       />
 
@@ -200,7 +210,7 @@ function FeaturedBlueprintCard({
               blueprint.metadata.description ? "text-kumo-subtle" : "italic text-kumo-inactive"
             }`}
           >
-            {blueprint.metadata.description || "No description"}
+            {blueprint.metadata.description || messages.blueprints_no_description()}
           </p>
           {badges.length > 0 && (
             <div className="relative z-20 mt-2 flex flex-wrap gap-1">
@@ -246,7 +256,7 @@ function FeaturedBlueprintRow({
             blueprint.metadata.description ? "text-kumo-subtle" : "italic text-kumo-inactive"
           }`}
         >
-          {blueprint.metadata.description || "No description"}
+          {blueprint.metadata.description || messages.blueprints_no_description()}
         </p>
       </div>
       {badges.length > 0 && (

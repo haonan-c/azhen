@@ -28,6 +28,7 @@ import NewFormatRow from '../components/format/NewFormatRow'
 import DeleteConfirmationDialog from '../components/DeleteConfirmationDialog'
 import { WorkshopButton, WorkshopIconButton } from '../components/WorkshopControls'
 import { m as messages } from '../paraglide/messages.js'
+import { formatLocaleNumber } from '../utils/formatNumber'
 
 // The Outputs page: everything the user's workspaces have produced, in one place, so they don't
 // have to remember which workspace they made a thing in. Backed by an index in the user's own
@@ -41,11 +42,15 @@ function formatRelativeTime(date: Date): string {
   const diff = Date.now() - date.getTime()
   const minutes = Math.floor(diff / 60000)
   if (minutes < 1) return messages.outputs_time_just_now()
-  if (minutes < 60) return messages.outputs_time_minutes_ago({ count: minutes })
+  if (minutes < 60) {
+    return messages.outputs_time_minutes_ago({ count: formatLocaleNumber(minutes) })
+  }
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return messages.outputs_time_hours_ago({ count: hours })
+  if (hours < 24) {
+    return messages.outputs_time_hours_ago({ count: formatLocaleNumber(hours) })
+  }
   const days = Math.floor(hours / 24)
-  return messages.outputs_time_days_ago({ count: days })
+  return messages.outputs_time_days_ago({ count: formatLocaleNumber(days) })
 }
 
 function outputKey(output: OutputSummary): string {
@@ -241,7 +246,9 @@ function FilterChip({
       }`}
     >
       {label}
-      <span className={active ? 'text-kumo-subtle' : 'text-kumo-inactive'}>{count}</span>
+      <span className={active ? 'text-kumo-subtle' : 'text-kumo-inactive'}>
+        {formatLocaleNumber(count)}
+      </span>
     </button>
   )
 }
@@ -310,7 +317,7 @@ function ScopeSelect({
               <Icon size={13} className="mr-2 flex-shrink-0 text-kumo-subtle" />
               <span className="min-w-0 flex-1 truncate">{option.label}</span>
               <span className="ml-3 flex-shrink-0 tabular-nums text-kumo-inactive">
-                {counts[option.value]}
+                {formatLocaleNumber(counts[option.value])}
               </span>
               <Check
                 size={12}
@@ -413,9 +420,17 @@ function OutputsPage() {
     if (typeof window === 'undefined') return 'grid'
     return localStorage.getItem('outputs-view') === 'list' ? 'list' : 'grid'
   })
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all')
-  const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>('all')
-  const [search, setSearch] = useState('')
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>(() =>
+    typeof window === 'undefined' ? 'all' : sessionStorage.getItem('outputs-type-filter') ?? 'all')
+  const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>(() => {
+    if (typeof window === 'undefined') return 'all'
+    const stored = sessionStorage.getItem('outputs-owner-filter')
+    return stored === 'mine' || stored === 'shared' ? stored : 'all'
+  })
+  const [search, setSearch] = useState(() => {
+    if (typeof window === 'undefined') return ''
+    return sessionStorage.getItem('outputs-search') ?? ''
+  })
   const [outputs, setOutputs] = useState<OutputSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
@@ -429,6 +444,12 @@ function OutputsPage() {
   useEffect(() => {
     localStorage.setItem('outputs-view', view)
   }, [view])
+
+  useEffect(() => {
+    sessionStorage.setItem('outputs-type-filter', typeFilter)
+    sessionStorage.setItem('outputs-owner-filter', ownerFilter)
+    sessionStorage.setItem('outputs-search', search)
+  }, [typeFilter, ownerFilter, search])
 
   useEffect(() => {
     let cancelled = false

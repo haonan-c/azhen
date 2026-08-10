@@ -128,6 +128,7 @@ describe('Outputs library localization', () => {
     act(() => root?.unmount())
     container?.remove()
     localStorage.clear()
+    sessionStorage.clear()
     window.history.replaceState({}, '', '/')
     vi.clearAllMocks()
     root = undefined
