@@ -123,19 +123,19 @@ describe('locale browser integration', () => {
   })
 
   it('changes language while preserving the route, query, and hash', () => {
-    window.history.replaceState({}, '', '/workspace/123?panel=files#result')
+    window.history.replaceState({}, '', '/workspace/merchant-campaign?chat=5&w=17#result')
     const navigate = vi.fn<(href: string) => void>()
 
     changeLocale('zh', navigate)
 
-    expect(navigate).toHaveBeenCalledWith('/zh/workspace/123?panel=files#result')
+    expect(navigate).toHaveBeenCalledWith('/zh/workspace/merchant-campaign?chat=5&w=17#result')
     expect(localStorage.getItem('PARAGLIDE_LOCALE')).toBe('zh')
     expect(document.documentElement.lang).toBe('zh')
 
-    window.history.replaceState({}, '', '/zh/workspace/123?panel=files#result')
+    window.history.replaceState({}, '', '/zh/workspace/merchant-campaign?chat=5&w=17#result')
     changeLocale('en', navigate)
 
-    expect(navigate).toHaveBeenLastCalledWith('/workspace/123?panel=files#result')
+    expect(navigate).toHaveBeenLastCalledWith('/workspace/merchant-campaign?chat=5&w=17#result')
     expect(localStorage.getItem('PARAGLIDE_LOCALE')).toBe('en')
     expect(document.documentElement.lang).toBe('en')
   })

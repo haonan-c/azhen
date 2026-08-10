@@ -6,6 +6,7 @@ import { MonacoBinding } from 'y-monaco'
 import { defineGadgetsCodeTheme, getGadgetsCodeTheme, monoFont } from './components/monacoTheme'
 import { getLanguage } from './getLanguage'
 import { useTheme } from './ThemeContext'
+import { m as messages } from './paraglide/messages.js'
 
 interface CodeEditorProps {
   filename: string | null
@@ -68,7 +69,7 @@ export default function CodeEditor({ filename, ytext, isReady, height = '100%' }
         className="flex justify-center items-center bg-kumo-base text-kumo-subtle"
         style={{ height }}
       >
-        Select a file to start editing
+        {messages.workspace_code_select_file()}
       </div>
     )
   }

@@ -28,6 +28,7 @@ describe('WorkspaceOpenErrorPage', () => {
   afterEach(() => {
     act(() => root?.unmount())
     container?.remove()
+    window.history.replaceState({}, '', '/')
     root = undefined
     container = undefined
   })
@@ -70,6 +71,18 @@ describe('WorkspaceOpenErrorPage', () => {
     expect(renderedContainer.textContent).toContain('The link may be incorrect, or the workspace may have been deleted.')
     expect([...renderedContainer.querySelectorAll('button')].map(button => button.textContent))
       .toEqual(['Go to workspaces'])
+  })
+
+  it('localizes access denial without exposing or changing workspace metadata', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/private-campaign')
+
+    const { container: renderedContainer } = await render('access-denied')
+
+    expect(renderedContainer.querySelector('h1')?.textContent).toBe('你没有访问此工作空间的权限')
+    expect(renderedContainer.textContent).toContain('请让工作空间所有者授予你权限，然后重试。')
+    expect([...renderedContainer.querySelectorAll('button')].map(button => button.textContent))
+      .toEqual(['前往工作空间', '重试'])
+    expect(renderedContainer.textContent).not.toContain('private-campaign')
   })
 
   it('keeps unexpected failures retryable', async () => {

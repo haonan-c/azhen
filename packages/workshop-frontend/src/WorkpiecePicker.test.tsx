@@ -11,7 +11,10 @@ import WorkpiecePicker from './WorkpiecePicker'
 describe('WorkpiecePicker', () => {
   let root: Root | undefined
 
-  afterEach(() => act(() => root?.unmount()))
+  afterEach(() => {
+    act(() => root?.unmount())
+    window.history.replaceState({}, '', '/')
+  })
 
   async function render(expanded: boolean) {
     const container = document.createElement('div')
@@ -51,5 +54,20 @@ describe('WorkpiecePicker', () => {
 
     expect(container.textContent).not.toContain('Hooked')
     expect(container.querySelectorAll(HOOK_BADGE)).toHaveLength(1)
+  })
+
+  it('localizes output controls while preserving app titles', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+
+    const container = await render(true)
+
+    expect(container.textContent).toContain('成果')
+    expect(container.textContent).toContain('Hooked')
+    expect(container.textContent).toContain('Ordinary')
+    expect(container.querySelector('[aria-label="收起成果"]')).not.toBeNull()
+    expect(container.querySelector('[aria-label="已启用钩子"]')).not.toBeNull()
+    expect(container.querySelector('[aria-label="重命名 Hooked"]')).not.toBeNull()
+    expect(container.textContent).toContain('查看活动')
+    expect(container.textContent).not.toContain('View activity')
   })
 })

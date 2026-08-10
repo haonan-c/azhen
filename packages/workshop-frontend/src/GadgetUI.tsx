@@ -3,6 +3,7 @@ import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
 import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
+import { m as messages } from './paraglide/messages.js'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -280,7 +281,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       if (!isCurrent()) return
       loadGenerationRef.current++      // so a late reply can no longer write state
       setLoading(false)
-      setError('Timed out loading this view.')
+      setError(messages.workspace_preview_timed_out())
     }, UI_BUNDLE_LOAD_TIMEOUT_MS)
 
     const loadUiBundle = async () => {
@@ -301,7 +302,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       } catch (err) {
         if (!isCurrent()) return
         console.error('Failed to load UI bundle:', err)
-        setError('Failed to load UI bundle')
+        setError(messages.workspace_preview_load_failed())
       } finally {
         if (isCurrent()) setLoading(false)
         clearTimeout(giveUp)
@@ -370,7 +371,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           port.close()
           if (!isCurrent()) return
           console.error('Failed to establish RPC connection:', caught)
-          setError('Failed to connect gadget to server')
+          setError(messages.workspace_preview_connect_failed())
         } finally {
           if (handshakePendingRef.current === generation) handshakePendingRef.current = null
         }
@@ -401,7 +402,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         style={{ height }}
       >
         <Text variant="secondary">
-          Switch to this tab to load the Gadget UI
+          {messages.workspace_preview_switch_tab()}
         </Text>
       </div>
     )
@@ -409,12 +410,16 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
 
   if (loading) {
     return (
-      <div style={{
-        height,
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center'
-      }}>
+      <div
+        role="status"
+        aria-label={messages.workspace_preview_loading()}
+        style={{
+          height,
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center'
+        }}
+      >
         <Loader size="lg" />
       </div>
     )
@@ -431,7 +436,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       }}>
         <Banner
           variant="error"
-          title="Error"
+          title={messages.workspace_preview_error_title()}
           description={error}
           action={
             <Banner.Action
@@ -442,7 +447,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
                 setRetryNonce(n => n + 1)
               }}
             >
-              Try again
+              {messages.workspace_open_retry()}
             </Banner.Action>
           }
         />
@@ -474,10 +479,10 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           </div>
           <div className="space-y-1">
             <h2 className="text-[20px] leading-7 font-normal tracking-[-0.45px] text-kumo-default">
-              No gadget UI yet
+              {messages.workspace_preview_empty_title()}
             </h2>
             <p className="text-[15px] leading-5 font-normal tracking-[-0.3px] text-kumo-subtle">
-              When the gadget builds one, it will appear here.
+              {messages.workspace_preview_empty_description()}
             </p>
           </div>
         </div>
@@ -498,7 +503,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           border: 'none'
         }}
         sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
-        title="Gadget UI"
+        title={messages.workspace_preview_iframe_title()}
       />
     </div>
   )

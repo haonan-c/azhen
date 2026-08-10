@@ -5,6 +5,7 @@ import type { RpcStub } from 'capnweb'
 import type { GadgetClient } from '@gadgets/workshop-shared/api'
 import { WorkshopIconButton } from './components/WorkshopControls'
 import { makeExportFilename, saveStreamToFile } from './fileTransfers'
+import { m as messages } from './paraglide/messages.js'
 
 type Props = {
   gadget: RpcStub<GadgetClient> | null
@@ -36,20 +37,26 @@ export default function GadgetExportMenu({ gadget, gadgetTitle, chatId, disabled
       )
     } catch (error) {
       console.error(`Failed to export Gadget as ${format.toUpperCase()}:`, error)
-      toasts.add({ title: `Failed to export ${format.toUpperCase()}`, variant: 'error' })
+      toasts.add({
+        title: messages.workspace_export_failed({ format: format.toUpperCase() }),
+        variant: 'error',
+      })
     } finally {
       setExporting(false)
     }
   }
 
   return (
-    <Tooltip content={exporting ? 'Exporting document' : 'Export document'} asChild>
+    <Tooltip
+      content={exporting ? messages.workspace_export_exporting() : messages.workspace_export_document()}
+      asChild
+    >
       <span className="relative inline-flex">
         <DropdownMenu>
           <DropdownMenu.Trigger
             render={(
               <WorkshopIconButton
-                aria-label="Export document"
+                aria-label={messages.workspace_export_document()}
                 disabled={disabled || !gadget || exporting}
               >
                 <DownloadSimple size={17} />
@@ -65,13 +72,13 @@ export default function GadgetExportMenu({ gadget, gadgetTitle, chatId, disabled
               onClick={() => { void download('docx') }}
               className="!h-auto rounded-md !px-2.5 !py-1.5 text-[12px] leading-4 text-kumo-default transition-colors data-highlighted:bg-kumo-tint"
             >
-              Word document
+              {messages.workspace_export_word()}
             </DropdownMenu.Item>
             <DropdownMenu.Item
               onClick={() => { void download('pdf') }}
               className="!h-auto rounded-md !px-2.5 !py-1.5 text-[12px] leading-4 text-kumo-default transition-colors data-highlighted:bg-kumo-tint"
             >
-              PDF document
+              {messages.workspace_export_pdf()}
             </DropdownMenu.Item>
           </DropdownMenu.Content>
         </DropdownMenu>

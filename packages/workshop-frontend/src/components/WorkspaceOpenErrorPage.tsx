@@ -5,25 +5,26 @@ import {
   OPEN_GADGET_ERROR_CODES,
 } from '@gadgets/workshop-shared/api'
 import { WorkshopButton } from './WorkshopControls'
+import { m as messages } from '../paraglide/messages.js'
 
 export type WorkspaceOpenFailureKind = 'access-denied' | 'not-found' | 'unexpected'
 
 const CONTENT = {
   'access-denied': {
-    title: "You don't have access to this workspace",
-    message: 'Ask the workspace owner to grant you access, then try again.',
+    title: messages.workspace_open_access_denied_title,
+    message: messages.workspace_open_access_denied_message,
     Icon: Lock,
     retryable: true,
   },
   'not-found': {
-    title: 'Workspace not found',
-    message: 'The link may be incorrect, or the workspace may have been deleted.',
+    title: messages.workspace_open_not_found_title,
+    message: messages.workspace_open_not_found_message,
     Icon: MagnifyingGlass,
     retryable: false,
   },
   unexpected: {
-    title: "We couldn't load this workspace",
-    message: 'Try again. If the problem continues, return to your workspaces.',
+    title: messages.workspace_open_unexpected_title,
+    message: messages.workspace_open_unexpected_message,
     Icon: WarningCircle,
     retryable: true,
   },
@@ -47,7 +48,9 @@ type Props = {
 }
 
 export default function WorkspaceOpenErrorPage({ kind, onRetry, onGoToWorkspaces }: Props) {
-  const { title, message, Icon, retryable } = CONTENT[kind]
+  const { title: titleMessage, message: messageText, Icon, retryable } = CONTENT[kind]
+  const title = titleMessage()
+  const message = messageText()
   const titleId = useId()
   const descriptionId = useId()
   const titleRef = useRef<HTMLHeadingElement>(null)
@@ -88,11 +91,11 @@ export default function WorkspaceOpenErrorPage({ kind, onRetry, onGoToWorkspaces
             className="!h-9"
             onClick={onGoToWorkspaces}
           >
-            Go to workspaces
+            {messages.workspace_open_go_to_workspaces()}
           </WorkshopButton>
           {retryable && (
             <WorkshopButton tone="primary" onClick={onRetry}>
-              Try again
+              {messages.workspace_open_retry()}
             </WorkshopButton>
           )}
         </div>

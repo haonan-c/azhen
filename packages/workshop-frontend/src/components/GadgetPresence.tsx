@@ -3,12 +3,13 @@ import { Popover, Tooltip } from '@cloudflare/kumo'
 import { RpcStub, RpcTarget } from 'capnweb'
 import { Overseer, AuthenticatedApi, PresenceParticipant, PresenceSubscriber } from '@gadgets/workshop-shared/api'
 import { PersonAvatar } from './PersonAvatar'
+import { m as messages } from '../paraglide/messages.js'
 
 const MAX_VISIBLE = 3
 
-const ROLE_LABELS: Record<PresenceParticipant['role'], string> = {
-  build: 'Workspace',
-  use: 'App only',
+const ROLE_LABELS: Record<PresenceParticipant['role'], () => string> = {
+  build: messages.workspace_presence_role_workspace,
+  use: messages.workspace_presence_role_app_only,
 }
 
 export function GadgetPresence({
@@ -182,8 +183,12 @@ export function GadgetPresence({
   const visible = display.slice(0, MAX_VISIBLE)
   const overflow = display.length - visible.length
   const count = display.length
-  const label = `${count} ${count === 1 ? 'person' : 'people'} here now`
-  const ariaLabel = `${count} ${count === 1 ? 'person' : 'people'} viewing this workspace`
+  const label = count === 1
+    ? messages.workspace_presence_here_one({ count })
+    : messages.workspace_presence_here_many({ count })
+  const ariaLabel = count === 1
+    ? messages.workspace_presence_viewing_one({ count })
+    : messages.workspace_presence_viewing_many({ count })
 
   return (
     <Popover>
@@ -196,7 +201,7 @@ export function GadgetPresence({
           >
             <span ref={stackRef} className="relative flex -space-x-2">
               {visible.map((p) => (
-                <Tooltip key={p.user.id} content={`${p.user.name} · ${ROLE_LABELS[p.role]}`} asChild>
+                <Tooltip key={p.user.id} content={`${p.user.name} · ${ROLE_LABELS[p.role]()}`} asChild>
                   {/* Outer span = FLIP target (translateX slide). Inner span = scale/opacity pop.
                       Kept on separate elements so the two transforms don't overwrite each other. */}
                   <span data-flip-id={p.user.id} className="inline-flex cursor-pointer">
@@ -252,7 +257,7 @@ export function GadgetPresence({
                   {p.user.name}
                 </span>
                 <span className="mt-0.5 block text-[11px] leading-4 font-normal text-kumo-subtle">
-                  {ROLE_LABELS[p.role]}
+                  {ROLE_LABELS[p.role]()}
                 </span>
               </span>
             </div>

@@ -166,6 +166,7 @@ describe('GadgetUI RPC recovery', () => {
     for (const session of childSessions.splice(0)) session[Symbol.dispose]()
     await act(async () => root.unmount())
     container.remove()
+    window.history.replaceState({}, '', '/')
   })
 
   function connectIframe(iframe: HTMLIFrameElement) {
@@ -175,6 +176,21 @@ describe('GadgetUI RPC recovery', () => {
     dispatchIframeHandshake(iframe, port2)
     return child
   }
+
+  it('localizes the empty app preview', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+    const gadget = {
+      getUiBundle: vi.fn<GadgetClient['getUiBundle']>(async () => null),
+    } as unknown as RpcStub<GadgetClient>
+
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget} height="100px" />)
+    })
+
+    await vi.waitFor(() => expect(container.textContent).toContain('还没有应用界面'))
+    expect(container.textContent).toContain('应用构建界面后，它会显示在这里。')
+    expect(container.textContent).not.toContain('No gadget UI yet')
+  })
 
   it('keeps the iframe while redirecting calls to the replacement gadget client', async () => {
     const first = fakeGadget('first', 'document.body.textContent = "first"')

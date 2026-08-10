@@ -3,6 +3,7 @@ import type { RpcStub } from 'capnweb'
 import { GatekeeperIcon } from './GatekeeperIcon'
 import { WorkshopInput, WorkshopInputArea } from './WorkshopControls'
 import type { BlueprintBindingAnnotation, GadgetClient, GatekeeperCreationSpec } from '@gadgets/workshop-shared/api'
+import { m as messages } from '../paraglide/messages.js'
 
 export type BindingCardData = {
   bindingName: string
@@ -16,14 +17,20 @@ export function suggestValueLabel(spec: GatekeeperCreationSpec, title?: string):
   const displayTitle = title?.trim()
   switch (spec.type) {
     case 'gatekeeper':
-      return displayTitle ? `Suggest "${displayTitle}" by default` : 'Suggest this resource by default'
+      return displayTitle
+        ? messages.workspace_blueprint_binding_suggest_named({ title: displayTitle })
+        : messages.workspace_blueprint_binding_suggest_resource()
     case 'aiModel':
-      return displayTitle ? `Suggest "${displayTitle}" by default` : 'Suggest this model by default'
+      return displayTitle
+        ? messages.workspace_blueprint_binding_suggest_named({ title: displayTitle })
+        : messages.workspace_blueprint_binding_suggest_model()
     case 'agentSpawner':
-      return displayTitle ? `Suggest "${displayTitle}" by default` : 'Suggest this agent setup by default'
+      return displayTitle
+        ? messages.workspace_blueprint_binding_suggest_named({ title: displayTitle })
+        : messages.workspace_blueprint_binding_suggest_agent()
     case 'ambient':
       // Ambient resources are auto-provided and excluded from blueprints, so this never renders.
-      return 'Suggest this by default'
+      return messages.workspace_blueprint_binding_suggest_generic()
   }
 }
 
@@ -60,17 +67,20 @@ export function BlueprintBindingCard({
       <div className={headerClass}>
         <GatekeeperIcon vendorId={vendorId} fallbackText={resourceTitle || bindingName} />
         <div className="min-w-0 flex-1">
-          <label htmlFor={titleId} className="sr-only">Connection name</label>
+          <label htmlFor={titleId} className="sr-only">
+            {messages.workspace_blueprint_binding_name()}
+          </label>
           <WorkshopInput
             id={titleId}
-            aria-label={`Name for ${bindingName}`}
+            aria-label={messages.workspace_blueprint_binding_name_for({ bindingName })}
             value={annotation.title}
             onChange={(e) => onChange({ ...annotation, title: e.target.value })}
-            placeholder="Connection name"
+            placeholder={messages.workspace_blueprint_binding_name()}
             className="!h-8 w-full bg-kumo-base text-[13px] leading-5 font-medium tracking-[-0.25px]"
           />
           <p className="mt-1 text-[11px] leading-4 tracking-[-0.1px] text-kumo-inactive">
-            Referenced in code as: <span className="font-mono text-kumo-subtle">{bindingName}</span>
+            {messages.workspace_blueprint_binding_referenced_as()}{' '}
+            <span className="font-mono text-kumo-subtle">{bindingName}</span>
           </p>
         </div>
       </div>
@@ -78,10 +88,10 @@ export function BlueprintBindingCard({
       <div className={descriptionWrapperClass}>
         <WorkshopInputArea
           id={descriptionId}
-          aria-label={`Help text for ${displayTitle}`}
+          aria-label={messages.workspace_blueprint_binding_help({ title: displayTitle })}
           value={annotation.description}
           onChange={(e) => onChange({ ...annotation, description: e.target.value })}
-          placeholder="What should people connect here?"
+          placeholder={messages.workspace_blueprint_binding_what_to_connect()}
           rows={2}
           autoFocus={autoFocusDescription}
           className="w-full resize-none"

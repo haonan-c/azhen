@@ -9,6 +9,7 @@ import { buildDiffModel, type DiffModel } from './diff/diffModel'
 import { renderDiffLayer, renderSplitDiffLayer } from './diff/diffRenderer'
 import { getLanguage } from './getLanguage'
 import { useTheme } from './ThemeContext'
+import { m as messages } from './paraglide/messages.js'
 import './CodeDiffEditor.css'
 
 interface CodeDiffEditorProps {
@@ -20,6 +21,13 @@ interface CodeDiffEditorProps {
 }
 
 type DiffLayoutPreference = 'stacked' | 'split'
+
+const DIFF_STATUS_LABELS: Record<DiffModel['status'], () => string> = {
+  Added: messages.workspace_code_diff_added,
+  Deleted: messages.workspace_code_diff_deleted,
+  Modified: messages.workspace_code_diff_modified,
+  Unchanged: messages.workspace_code_diff_unchanged,
+}
 
 const DIFF_LAYOUT_STORAGE_KEY = 'gadgets:workshop:diffLayout'
 const SPLIT_DIFF_MIN_WIDTH = 1100
@@ -407,7 +415,7 @@ export default function CodeDiffEditor({
         className="flex items-center justify-center bg-kumo-base text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle"
         style={{ height }}
       >
-        {!filename ? 'Select a file to view changes' : 'Loading diff...'}
+        {!filename ? messages.workspace_code_diff_select_file() : messages.workspace_code_diff_loading()}
       </div>
     )
   }
@@ -423,8 +431,8 @@ export default function CodeDiffEditor({
             <button
               type="button"
               className={layoutButtonClass(diffLayoutPreference === 'stacked')}
-              title="Stacked diff"
-              aria-label="Use stacked diff layout"
+              title={messages.workspace_code_diff_stacked()}
+              aria-label={messages.workspace_code_diff_use_stacked()}
               aria-pressed={diffLayoutPreference === 'stacked'}
               onClick={() => setDiffLayoutPreference('stacked')}
             >
@@ -433,8 +441,10 @@ export default function CodeDiffEditor({
             <button
               type="button"
               className={layoutButtonClass(diffLayoutPreference === 'split' && canSplitDiff, !canSplitDiff)}
-              title={canSplitDiff ? 'Split diff' : 'Split diff needs more space'}
-              aria-label="Use split diff layout"
+              title={canSplitDiff
+                ? messages.workspace_code_diff_split()
+                : messages.workspace_code_diff_split_needs_space()}
+              aria-label={messages.workspace_code_diff_use_split()}
               aria-pressed={diffLayoutPreference === 'split' && canSplitDiff}
               disabled={!canSplitDiff}
               onClick={() => setDiffLayoutPreference('split')}
@@ -447,7 +457,9 @@ export default function CodeDiffEditor({
             style={{ fontFamily: monoFont }}
           >
             {model.status !== 'Modified' && (
-              <span className="text-[10px] font-medium text-kumo-subtle">{model.status}</span>
+              <span className="text-[10px] font-medium text-kumo-subtle">
+                {DIFF_STATUS_LABELS[model.status]()}
+              </span>
             )}
             <span className="text-kumo-danger">-{model.deletions}</span>
             <span className="text-kumo-success">+{model.additions}</span>

@@ -90,6 +90,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount())
   container.remove()
+  window.history.replaceState({}, '', '/')
   vi.restoreAllMocks()
   if (createObjectUrlDescriptor) {
     Object.defineProperty(URL, 'createObjectURL', createObjectUrlDescriptor)
@@ -176,5 +177,33 @@ describe('Gadget export menu', () => {
     expect(downloads).toEqual([{ filename: 'Product-brief.pdf', href: 'blob:export' }])
     expect(exportPdf).toHaveBeenCalledWith(undefined)
     expect(exportDocx).not.toHaveBeenCalled()
+  })
+
+  it('localizes export controls without changing the exported app title', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+    const exportDocx = vi.fn<GadgetClient['exportDocx']>(async () => new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([0x50, 0x4b]))
+        controller.close()
+      },
+    }))
+    const gadget = { exportDocx } as unknown as RpcStub<GadgetClient>
+
+    await act(async () => {
+      root.render(<GadgetExportMenu gadget={gadget} gadgetTitle="Product brief" />)
+    })
+
+    const trigger = container.querySelector<HTMLButtonElement>('[aria-label="导出文档"]')
+    expect(trigger).not.toBeNull()
+    await act(async () => trigger?.click())
+    expect(buttonWithText('Word 文档')).toBeDefined()
+    expect(buttonWithText('PDF 文档')).toBeDefined()
+
+    await act(async () => {
+      buttonWithText('Word 文档')?.click()
+      await vi.waitFor(() => expect(downloads).toHaveLength(1))
+    })
+
+    expect(downloads[0]?.filename).toBe('Product-brief.docx')
   })
 })
