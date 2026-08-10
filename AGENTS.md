@@ -121,6 +121,22 @@ IMPORTANT: Frontend error reporting is a separate, opt-in path:
   Exception messages and stacks reach the external Reporter, so never intentionally put secrets,
   prompts, tokens, headers, or request/response bodies in thrown errors or report metadata.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `haonan-c/azhen`.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels defined in `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context layout with `CONTEXT.md` at the repository root and
+system-wide decisions under `docs/adr/`. See `docs/agents/domain.md`.
+
 # CLAUDE.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
