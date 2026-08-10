@@ -60,3 +60,99 @@ Copied once from an upstream repository at a specific commit, then maintained in
 a live sync, not a git submodule. See `packages/gatekeeper-ugc-ads/vendor/VENDORED_FROM.md`
 for the pattern: record the source commit, list what was excluded and why, and don't push changes
 back upstream.
+
+## Workshop Surfaces
+
+**azhen / 阿珍**:
+The product brand and its user-facing AI e-commerce operations partner. Use `azhen` in English
+and `阿珍` in Chinese. The partner persona may speak in marketing, onboarding, and empty states,
+but it does not replace the explicit identity of a selected model or another Agent.
+_Avoid_: Cloudflare OS, Azhen
+
+**E-commerce Operations AI Workspace**:
+The product category used to position azhen for individual merchants, e-commerce operators, and
+small teams. Its first proof points are content insight, content creation, and user-specific
+operational tools; it is not a claim that every e-commerce workflow is already automated.
+_Avoid_: Full-process e-commerce automation, content-only tool
+
+**Marketing Landing Page**:
+The public introduction to a Workshop deployment for signed-out visitors. It is distinct from the
+authenticated Workshop Home and from a Blueprint Landing Page.
+_Avoid_: Home page, login page
+
+**Marketing Demo Workspace**:
+A real Workshop workspace created for the Marketing Landing Page with a fictional e-commerce
+brand. It demonstrates Xiaohongshu benchmark-content analysis and an editable result in separate
+English and Chinese captures; it is product evidence, not a customer case study.
+_Avoid_: Mockup, customer story
+
+**Workshop Home**:
+The authenticated starting surface where a user begins a new workspace.
+_Avoid_: Marketing Landing Page
+
+**Blueprint Landing Page**:
+The public presentation of one Blueprint. It is not the deployment's Marketing Landing Page.
+_Avoid_: Marketing Landing Page
+
+**First-party Workshop UI**:
+The user interface owned by the Workshop frontend, including its public, authenticated, and admin
+surfaces. It excludes Gadget content, AI output, user-authored content, embedded Gatekeeper UIs,
+connector-provided text, and other third-party text.
+_Avoid_: All visible content
+
+**Long-tail Intent**:
+A curated search intent that represents a distinct audience, problem, and use case. Synonymous
+queries are signals for the same intent, not separate intents.
+_Avoid_: Keyword variant, search phrase
+
+**Tool Landing Page**:
+A public, indexable surface for one Long-tail Intent and its focused tool experience. It is distinct
+from the deployment's Marketing Landing Page.
+_Avoid_: Keyword page, Marketing Landing Page
+
+**Workshop Deployment**:
+An independently configured running installation of the Workshop, with its own public origin,
+users, data, and settings. One codebase can produce more than one Workshop Deployment.
+_Avoid_: Repository, website page
+
+**Production Site**:
+The single public Workshop Deployment operated as this product's website. Local development and
+staging deployments are not additional Production Sites.
+_Avoid_: Repository, local environment
+
+**Public Base URL**:
+The canonical origin of the Production Site. It is the source for canonical links, localized
+alternates, and sitemaps. Only requests on this origin are indexable; alternate development or
+preview origins are not.
+_Avoid_: Current request origin, preview URL
+
+**Indexable Public Page**:
+A curated public page with unique user value, an explicit sitemap entry, and complete English and
+Chinese versions.
+_Avoid_: Every public route, placeholder SEO page
+
+## Chinese UI Language
+
+**工作台 (Workshop)**:
+The product environment that contains the user's work and applications.
+_Avoid_: 工作坊
+
+**工作空间 (Workspace)**:
+One unit of work in the Workshop, including its conversation and workpieces.
+_Avoid_: 工作区, 工作台
+
+**应用 (Gadget)**:
+The Chinese UI name for a Gadget.
+_Avoid_: 小工具
+
+**安全连接器 (Gatekeeper)**:
+The Chinese UI name for a Gatekeeper, emphasizing its controlled external-service boundary.
+_Avoid_: 守门人, 连接器
+
+**模板 (Blueprint)**:
+The Chinese UI name for a Blueprint.
+_Avoid_: 蓝图
+
+**成果 (Output)**:
+The Chinese UI name for an Output.
+_Avoid_: 输出
