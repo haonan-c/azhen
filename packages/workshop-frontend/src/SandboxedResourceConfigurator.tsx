@@ -5,6 +5,7 @@ import { ResourceConfiguratorFrame, ResourceConfiguratorHost, ResourceConfigurat
 import { createRateLimitedCapability } from './rateLimitedCapability'
 import { useTheme } from './ThemeContext'
 import { forwardTrustedFrameError } from './errorReporting'
+import { m as messages } from './paraglide/messages.js'
 
 // Upper bound on iframe height. Sized to leave room for a typical configurator form plus an open
 // autocomplete popup, while staying within a reasonable viewport even on short screens.
@@ -389,7 +390,7 @@ export default function SandboxedResourceConfigurator({
         srcDoc={frame.iframeHtml}
         onLoad={handleIframeLoad}
         sandbox="allow-scripts"
-        title="Resource configurator"
+        title={messages.gatekeeper_modal_configurator_iframe_title()}
         scrolling="no"
         style={{
           position: 'fixed',

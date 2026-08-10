@@ -2,6 +2,7 @@ import { Checkbox, Select, type PortalContainer } from '@cloudflare/kumo'
 import { AiChatAuthorInfo, WorkpieceId, validateBindingName } from '@gadgets/workshop-shared/api'
 import { WorkshopInput } from '../components/WorkshopControls'
 import { ConnectionConfigField } from './ConnectionConfigField'
+import { m as messages } from '../paraglide/messages.js'
 
 // One prospective entry of AgentSpawnerConfig.env: a workpiece the spawned agents may use, and
 // the name they see it under. Candidates are prefilled from the gadget the spawner is being
@@ -29,11 +30,11 @@ export function validateSpawnerEnv(rows: SpawnerEnvRow[]): string | null {
     if (!row.enabled) continue
     try {
       validateBindingName(row.name)
-    } catch (err) {
-      return err instanceof Error ? err.message : String(err)
+    } catch {
+      return messages.gatekeeper_modal_agent_binding_invalid({ name: row.name })
     }
     if (seen.has(row.name)) {
-      return `Two bindings are both named "${row.name}".`
+      return messages.gatekeeper_modal_binding_duplicate({ name: row.name })
     }
     seen.add(row.name)
   }
@@ -79,12 +80,12 @@ export function AgentSpawnerConfigForm({
   return (
     <section className="grid gap-4">
       <ConnectionConfigField
-        label="Display name"
-        description="Name this agent capability for this connection."
+        label={messages.gatekeeper_modal_agent_display_name()}
+        description={messages.gatekeeper_modal_agent_display_name_description()}
       >
         <WorkshopInput
-          aria-label="Agent display name"
-          placeholder="e.g. Email Responder"
+          aria-label={messages.gatekeeper_modal_agent_display_name_aria()}
+          placeholder={messages.gatekeeper_modal_agent_display_name_placeholder()}
           value={displayName}
           onChange={(e) => onDisplayNameChange(e.target.value)}
           className="w-full"
@@ -92,23 +93,23 @@ export function AgentSpawnerConfigForm({
       </ConnectionConfigField>
 
       <ConnectionConfigField
-        label="Model"
-        description="Choose the model spawned agents will use."
+        label={messages.gatekeeper_modal_model()}
+        description={messages.gatekeeper_modal_agent_model_description()}
       >
         <Select
-          aria-label="Agent model"
+          aria-label={messages.gatekeeper_modal_agent_model_aria()}
           className="w-full text-sm [&_button]:!h-9"
           container={selectContainer}
-          placeholder="Select a model"
+          placeholder={messages.gatekeeper_modal_select_model()}
           value={modelId}
           onValueChange={(v) => onModelIdChange(v as string | null)}
           renderValue={(id) => {
-            if (id === null) return 'None (no agent)'
+            if (id === null) return messages.gatekeeper_modal_no_agent()
             return availableModels.find((m) => m.id === id)?.name ?? String(id)
           }}
         >
           <Select.Option value={null as any}>
-            None (no agent)
+            {messages.gatekeeper_modal_no_agent()}
           </Select.Option>
           {availableModels.map(model => (
             <Select.Option key={model.id} value={model.id}>
@@ -117,30 +118,33 @@ export function AgentSpawnerConfigForm({
           ))}
         </Select>
         <p className="mt-1 text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
-          Choose "None" to create conversations without an agent.
+          {messages.gatekeeper_modal_agent_model_help()}
         </p>
       </ConnectionConfigField>
 
       <ConnectionConfigField
-        label="Agent bindings"
-        description="What spawned agents may use, and the names they see it under."
+        label={messages.gatekeeper_modal_agent_bindings()}
+        description={messages.gatekeeper_modal_agent_bindings_description()}
       >
         {env.length === 0 ? (
           <p className="text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
-            Nothing is available to offer spawned agents here. Create the agent from a gadget's
-            Connections tab to give it access to that gadget and its resources.
+            {messages.gatekeeper_modal_agent_binding_empty()}
           </p>
         ) : (
           <div className="grid gap-2">
             {env.map((row, index) => (
               <div key={`${row.target}:${index}`} className="flex items-center gap-2">
                 <Checkbox
-                  aria-label={`Give spawned agents access to ${row.targetTitle}`}
+                  aria-label={messages.gatekeeper_modal_agent_binding_access({
+                    title: row.targetTitle,
+                  })}
                   checked={row.enabled}
                   onCheckedChange={(checked) => updateRow(index, { enabled: checked === true })}
                 />
                 <WorkshopInput
-                  aria-label={`Binding name for ${row.targetTitle}`}
+                  aria-label={messages.gatekeeper_modal_agent_binding_name({
+                    title: row.targetTitle,
+                  })}
                   value={row.name}
                   disabled={!row.enabled}
                   onChange={(e) => updateRow(index, { name: e.target.value })}

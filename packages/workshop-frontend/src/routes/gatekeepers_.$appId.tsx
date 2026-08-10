@@ -2,6 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import GatekeeperAppPage from '../GatekeeperAppPage'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { useGatekeeperApps } from '../useGatekeeperApps'
+import { m as messages } from '../paraglide/messages.js'
 
 // Generic host for any gatekeeper-served management app (VendorDescription.providesUi). The set of
 // apps and their nav entries come from the backend (useGatekeeperApps); nothing about a specific
@@ -16,6 +17,6 @@ export const Route = createFileRoute('/gatekeepers_/$appId')({
 function GatekeeperApp() {
   const { appId } = Route.useParams()
   const app = useGatekeeperApps().find((a) => a.id === appId)
-  useDocumentTitle(app?.title ?? 'App')
+  useDocumentTitle(app?.title ?? messages.gatekeeper_app_document_fallback())
   return <GatekeeperAppPage appId={appId} />
 }
