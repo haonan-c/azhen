@@ -223,6 +223,7 @@ export class UgcAdsGatekeeper
       suggestedBindingName: "UGC_ADS",
       tsType: "UgcAds",
       hasSlashCommands: true,
+      hasAgentSkills: true,
     };
   }
 

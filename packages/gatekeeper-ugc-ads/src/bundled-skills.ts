@@ -1,21 +1,17 @@
+import type { AgentCatalogEntry } from "@gadgets/workshop-shared/gatekeeper";
 import { UGC_ADS_DOCS, UGC_ADS_SKILLS } from "./generated/skills.js";
 
 /** One Agent Catalog entry for a bundled UGC Ads Skill. */
-export type BundledSkillCatalogEntry = {
-  id: string;
-  title: string;
-  description: string;
-};
+export type BundledSkillCatalogEntry =
+  AgentCatalogEntry & {kind: "agent-skill"};
 
 /** Builds actionable Agent Catalog entries whose ids can be passed directly to read(). */
 export function getBundledSkillCatalogEntries(): BundledSkillCatalogEntry[] {
   return UGC_ADS_SKILLS.map(skill => ({
     id: skill.name,
     title: skill.name,
-    description:
-      `Agent Skill. When relevant, call this UGC Ads binding's read(${JSON.stringify(skill.name)}) ` +
-      `method, print the returned content with console.log, and follow those instructions. ` +
-      skill.description,
+    description: skill.description,
+    kind: "agent-skill",
   }));
 }
 

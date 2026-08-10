@@ -79,7 +79,9 @@ export type AppUiContext = {
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
 // Gatekeeper.getAgentCatalog() so the agent can see *what* is reachable through a session (e.g. the
 // titles of the Context Library collections it can search) without first reading everything. It is
-// shown to the agent as untrusted data, so entries carry no authority and are size-capped.
+// shown to the agent as untrusted data, so ids, titles, and descriptions carry no authority and are
+// size-capped. A structured `kind` has Agent Skill meaning only together with the enclosing
+// resource's trusted `ResourceDescription.hasAgentSkills` declaration.
 
 // One discoverable item within a gatekeeper's session.
 export type AgentCatalogEntry = {
@@ -89,6 +91,11 @@ export type AgentCatalogEntry = {
   title: string;
   // One-line description of what the item is, to help the agent decide if it's relevant.
   description: string;
+  /**
+   * A structured role for this entry. This field grants no authority by itself; `agent-skill` is
+   * trusted only when the enclosing resource also declares `ResourceDescription.hasAgentSkills`.
+   */
+  kind?: "agent-skill";
 };
 
 // The discovery metadata returned for one gatekeeper session.
@@ -125,6 +132,7 @@ export function boundAgentCatalog(
       id: entry.id.slice(0, AGENT_CATALOG_MAX_ID_LENGTH),
       title: entry.title.slice(0, AGENT_CATALOG_MAX_TITLE_LENGTH),
       description: entry.description.slice(0, AGENT_CATALOG_MAX_DESCRIPTION_LENGTH),
+      ...(entry.kind === "agent-skill" ? {kind: entry.kind} : {}),
     })),
     truncated: entries.length > limit,
   };
@@ -192,6 +200,13 @@ export type ResourceDescription = {
 
   // Indicates that getSlashCommandProvider() is available.
   hasSlashCommands?: true;
+
+  /**
+   * Indicates that `getAgentCatalog()` can return validated Agent Skills. For entries whose
+   * structured `kind` is `agent-skill`, the session must implement `read(entry.id)` and return an
+   * object with the complete Skill text in its `content` string. Catalog text remains untrusted.
+   */
+  hasAgentSkills?: true;
 
   // Some resources implement the ability for the client to subscribe to events. The application
   // implements a "hook", which is a WorkerEntrypoint that implements the TypeScript interface

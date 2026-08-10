@@ -1,4 +1,6 @@
-import type { SlashCommandDescriptor } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  AgentCatalogEntry, SlashCommandDescriptor,
+} from "@gadgets/workshop-shared/gatekeeper";
 import type { EnabledCollectionInfo } from "./context-types.js";
 import { encodeDocId } from "./context-types.js";
 
@@ -22,6 +24,8 @@ export type CollectionSkills = {
   skills: SkillIndexEntry[];
 };
 
+type AgentSkillCatalogEntry = AgentCatalogEntry & {kind: "agent-skill"};
+
 // Build slash command entries for the picker.
 export function buildAgentSkillCommands(
     loaded: CollectionSkills[]): SlashCommandDescriptor[] {
@@ -42,15 +46,15 @@ export function buildAgentSkillCommands(
 
 // Build Agent Catalog entries. Their IDs can be passed to ContextLibrary.read().
 export function buildAgentSkillCatalogEntries(
-    loaded: CollectionSkills[]): Array<{id: string, title: string, description: string}> {
-  let entries: Array<{id: string, title: string, description: string}> = [];
+    loaded: CollectionSkills[]): AgentSkillCatalogEntry[] {
+  let entries: AgentSkillCatalogEntry[] = [];
   for (let {collection, skills} of loaded) {
     for (let skill of skills) {
       entries.push({
         id: encodeDocId(collection.id, skill.path),
         title: skill.skillName,
-        description: `Agent Skill. Read with env[N].read(id) and ` +
-          `console.log(document.content). ${skill.description}`,
+        description: skill.description,
+        kind: "agent-skill",
       });
     }
   }

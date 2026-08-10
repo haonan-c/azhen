@@ -180,6 +180,7 @@ type GatekeeperRecord = {
   resourceTitle?: string,   // denormalized to avoid gatekeeper query
   resourceUrl?: string;     // denormalized to avoid gatekeeper query
   hasSlashCommands?: true;  // denormalized from ResourceDescription
+  hasAgentSkills?: boolean; // undefined only on records created before this field existed
   class: GatekeeperClass,
   hook?: string,  // export name to which the gatekeeper's hook is connected
 
@@ -2546,6 +2547,7 @@ class OverseerImpl implements AgentHooks {
       gatekeeperRecord.resourceTitle = description.title;
       gatekeeperRecord.resourceUrl = description.url;
       gatekeeperRecord.hasSlashCommands = description.hasSlashCommands;
+      gatekeeperRecord.hasAgentSkills = description.hasAgentSkills === true;
       this.storage.gatekeepers.put(gatekeeperRecord);
     } catch (error) {
       this.removeGatekeeper(id);
@@ -4552,6 +4554,30 @@ class OverseerImpl implements AgentHooks {
     }
     let ambientIds = context.alwaysAvailableCapsuleIds;
 
+    // Records created before Agent Skill discovery was introduced have no cached capability bit.
+    // Backfill it once from the installed gatekeeper's trusted description. A failed describe is
+    // safe: this turn does not grant Skill semantics, and the next turn retries.
+    for (let id of ambientIds) {
+      let gatekeeper = this.storage.gatekeepers.get(id);
+      if (!gatekeeper || gatekeeper.hasAgentSkills !== undefined) continue;
+      try {
+        let description = await this.getGatekeeperFacet(id).describe();
+        // The connection may have been removed or changed while describe() was in flight. Re-read
+        // it so this migration cannot resurrect a deleted record or overwrite newer metadata.
+        let current = this.storage.gatekeepers.get(id);
+        if (current && current.hasAgentSkills === undefined) {
+          current.hasAgentSkills = description.hasAgentSkills === true;
+          this.storage.gatekeepers.put(current);
+        }
+      } catch (error) {
+        this.logger.warn("failed to refresh Agent Skill capability for ambient resource", {
+          event: "chat.binding.ambient.agent-skills.describe.failed",
+          gatekeeperId: id,
+          error,
+        });
+      }
+    }
+
     if (context.bindings === undefined) {
       let seed: Record<string, WorkpieceId> = Object.create(null);
       if (context.spawnerConfig) {
@@ -4770,7 +4796,7 @@ class OverseerImpl implements AgentHooks {
               event: "agent.catalog.load.failed",
               gatekeeperId, resourceTitle: record.resourceTitle, error,
             });
-            return null;
+            return undefined;
           }
         });
     if (changed) {
@@ -4801,7 +4827,10 @@ class OverseerImpl implements AgentHooks {
       if (!gk) continue;
       let info: SeedBindingInfo =
           {name, target, title: gk.resourceTitle || "(untitled resource)", isGadget: false};
-      if (ambientSet.has(target)) info.catalog = catalogs.get(target) ?? null;
+      if (ambientSet.has(target)) {
+        info.catalog = catalogs.get(target) ?? null;
+        if (gk.hasAgentSkills) info.hasAgentSkills = true;
+      }
       result.push(info);
     }
     return result;

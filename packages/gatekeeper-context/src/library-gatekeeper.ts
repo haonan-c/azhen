@@ -260,6 +260,7 @@ export class ContextGatekeeper
       suggestedBindingName: "CONTEXT",
       tsType: "ContextLibrary",
       hasSlashCommands: true,
+      hasAgentSkills: true,
     };
   }
 

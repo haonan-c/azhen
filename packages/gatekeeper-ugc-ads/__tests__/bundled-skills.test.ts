@@ -10,7 +10,8 @@ describe("UGC Ads bundled skill discovery", () => {
         .find(candidate => candidate.id === "space-xhs-hotspot");
 
     expect(entry).toBeDefined();
-    expect(entry?.description).toContain('read("space-xhs-hotspot")');
+    expect(entry?.kind).toBe("agent-skill");
+    expect(entry?.description).not.toContain("read(");
     expect(resolveBundledContent(entry!.id)?.content)
         .toContain("name: space-xhs-hotspot");
   });

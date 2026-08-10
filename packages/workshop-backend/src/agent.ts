@@ -82,6 +82,10 @@ export type SeedBindingInfo = {
   // connected account that provides a singleton; carries its progressive-discovery catalog (null
   // when the gatekeeper provides none). Such entries get their own system-prompt section.
   catalog?: AgentCatalog | null;
+
+  // Present only when the ambient resource declares that its structured catalog can identify
+  // validated Agent Skills.
+  hasAgentSkills?: true;
 };
 
 // One entry of the chat's binding map: what a name in the agent's executeCode `env` resolves to.
@@ -1370,7 +1374,12 @@ export async function runAgent(
   let alwaysAvailable = seedBindings.filter(seed => seed.catalog !== undefined);
   let alwaysAvailableResourcesPrompt = alwaysAvailable.length > 0
       ? formatAlwaysAvailableResourcesPrompt(alwaysAvailable.map(seed =>
-          ({title: seed.title, name: seed.name, catalog: seed.catalog!})))
+          ({
+            title: seed.title,
+            name: seed.name,
+            catalog: seed.catalog!,
+            hasAgentSkills: seed.hasAgentSkills,
+          })))
       : "";
 
   // Agent-callback bindings are named PARAMS_1, PARAMS_2, ... in replay order, skipping any name
