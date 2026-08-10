@@ -3,7 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { RpcStub } from "capnweb";
 import { PublicApi } from "@gadgets/workshop-shared/api";
 import { Hexagon } from "@phosphor-icons/react";
-import { Input, Button, Banner, Loader } from "@cloudflare/kumo";
+import { Input, Button, Banner } from "@cloudflare/kumo";
 import { hashPassword } from "./passwordHash";
 import { useServerConfig, useServerConfigError, useSiteName } from "./ServerConfigContext";
 import { useDocumentTitle } from "./useDocumentTitle";
@@ -11,15 +11,17 @@ import OAuthButtons from "./components/auth/OAuthButtons";
 import SiteLogo from "./components/SiteLogo";
 import { useConnectionLost } from "./RpcContext";
 import LanguageSelector from "./components/LanguageSelector";
+import AuthConfigStatus from "./components/auth/AuthConfigStatus";
 import { m as messages } from "./paraglide/messages.js";
-import { getWorkshopHomeHref } from "./locale";
+import { extractLocaleFromUrl, localizeHref } from "./paraglide/runtime.js";
 
 interface SignupPageProps {
   rpcStub: RpcStub<PublicApi>;
 }
 
 function continueToWorkshop() {
-  window.location.href = getWorkshopHomeHref();
+  const locale = extractLocaleFromUrl(new URL(window.location.href)) ?? "en";
+  window.location.assign(localizeHref("/", { locale }));
 }
 
 export default function SignupPage({ rpcStub }: SignupPageProps) {
@@ -88,31 +90,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
   };
 
   if (!serverConfig) {
-    if (serverConfigError && !connectionLost) {
-      return (
-        <div
-          role="alert"
-          className="relative min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4"
-        >
-          <LanguageSelector className="absolute right-4 top-4" />
-          <p className="text-sm text-kumo-danger text-center">
-            {messages.auth_deployment_settings_error()}
-          </p>
-          <Button variant="secondary" onClick={() => window.location.reload()}>
-            {messages.auth_reload()}
-          </Button>
-        </div>
-      );
-    }
-    return (
-      <div className="relative min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4">
-        <LanguageSelector className="absolute right-4 top-4" />
-        <Loader size="lg" />
-        <p className="text-sm text-kumo-subtle text-center">
-          {connectionLost ? messages.auth_server_retrying() : messages.auth_loading()}
-        </p>
-      </div>
-    );
+    return <AuthConfigStatus connectionLost={connectionLost} hasError={serverConfigError} />;
   }
 
   const authVendors = serverConfig.authVendors ?? [];

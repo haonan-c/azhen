@@ -5,8 +5,6 @@ import { useAuth, CF_ACCESS_MODE } from './useAuth'
 import { AuthProvider } from './AuthContext'
 import LoginPage from './LoginPage'
 import { Loader, Banner, Button } from '@cloudflare/kumo'
-import LanguageSelector from './components/LanguageSelector'
-import { m as messages } from './paraglide/messages.js'
 
 interface ProtectedRouteProps {
   children: ReactNode
@@ -34,13 +32,11 @@ export default function ProtectedRoute({ children, rpcStub }: ProtectedRouteProp
           justifyContent: 'center',
           flexDirection: 'column',
           gap: 16,
-          position: 'relative',
         }}
       >
-        <LanguageSelector className="absolute right-4 top-4" />
         <Loader size="lg" />
         <div style={{ textAlign: 'center' }}>
-          {messages.auth_session_checking()}
+          Loading...
         </div>
       </div>
     )
@@ -57,18 +53,15 @@ export default function ProtectedRoute({ children, rpcStub }: ProtectedRouteProp
           flexDirection: 'column',
           gap: 16,
           padding: 24,
-          position: 'relative',
         }}
       >
-        <LanguageSelector className="absolute right-4 top-4" />
         <Banner
           variant="error"
-          title={messages.auth_session_retry()}
-          description={error}
+          title={`Authentication error: ${error}`}
           className="mb-4"
         />
         <Button variant="primary" onClick={() => window.location.reload()}>
-          {messages.auth_retry()}
+          Retry
         </Button>
       </div>
     )
@@ -88,13 +81,11 @@ export default function ProtectedRoute({ children, rpcStub }: ProtectedRouteProp
             justifyContent: 'center',
             flexDirection: 'column',
             gap: 16,
-            position: 'relative',
           }}
         >
-          <LanguageSelector className="absolute right-4 top-4" />
           <Loader size="lg" />
           <div style={{ textAlign: 'center' }}>
-            {messages.auth_session_checking()}
+            Authenticating...
           </div>
         </div>
       )

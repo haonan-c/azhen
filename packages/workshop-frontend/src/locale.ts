@@ -81,12 +81,6 @@ export function initializeLocale(): Locale {
   return result.locale
 }
 
-/** Return the localized Workshop Home URL for a completed sign-up. */
-export function getWorkshopHomeHref(href: string = window.location.href): string {
-  const locale = extractLocaleFromUrl(new URL(href)) ?? 'en'
-  return localizeHref('/', { locale })
-}
-
 /** Save an explicit locale choice and navigate to the equivalent localized URL. */
 export function changeLocale(
   locale: Locale,

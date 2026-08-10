@@ -160,6 +160,8 @@ describe('localized authentication surfaces', () => {
     await renderPage(page, null, publicApi, true)
 
     expect(container?.textContent).toContain('无法连接服务器，正在重试…')
+    expect(container?.querySelector('[role="status"]')?.getAttribute('aria-label'))
+      .toBe('正在加载…')
     expect(container?.querySelector('select[aria-label="语言"]')).not.toBeNull()
   })
 
@@ -203,6 +205,29 @@ describe('localized authentication surfaces', () => {
       ?.getAttribute('placeholder')).toBe('再次输入密码')
     expect(container?.querySelector('button[type="submit"]')?.textContent).toContain('创建账户')
     expect(container?.querySelector('select[aria-label="语言"]')).not.toBeNull()
+  })
+
+  it('continues a successful Chinese sign-up to the Chinese Workshop Home', async () => {
+    window.history.replaceState({}, '', '/zh/signup')
+    const createAccount = vi.fn<PublicApi['createAccount']>(async () => 'new-token')
+    const api = { createAccount } as unknown as RpcStub<PublicApi>
+    const assign = mockLocationAssign()
+    await renderPage(<SignupPage rpcStub={api} />, serverConfig, api)
+    const username = container!.querySelector<HTMLInputElement>('input[autocomplete="username"]')!
+    const passwords = container!.querySelectorAll<HTMLInputElement>('input[autocomplete="new-password"]')
+
+    await act(async () => {
+      setInput(username, 'merchant_1')
+      setInput(passwords[0], 'valid-password')
+      setInput(passwords[1], 'valid-password')
+    })
+    await act(async () => {
+      container!.querySelector<HTMLButtonElement>('button[type="submit"]')!.click()
+    })
+
+    await vi.waitFor(() => expect(createAccount).toHaveBeenCalledOnce())
+    expect(localStorage.getItem('authToken')).toBe('new-token')
+    expect(assign).toHaveBeenCalledWith('/zh')
   })
 
   it('localizes sign-up validation guidance', async () => {
