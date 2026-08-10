@@ -42,7 +42,7 @@ import WorkpiecePicker, {
   WORKPIECE_RAIL_EXPANDED_WIDTH,
 } from './WorkpiecePicker'
 import ChatInterface, { type StreamingProposedChanges, type ActiveFileTarget } from './ChatInterface'
-import { formatOf } from './components/format/formats'
+import { formatNoun } from './components/format/formats'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import ShareModal from './ShareModal'
 import { GadgetPresence } from './components/GadgetPresence'
@@ -172,7 +172,7 @@ function formatHeaderCost(cost: number) {
 // a document blueprint), falling back to "App" when it declares no format.
 function rightTabs(output?: BlueprintOutput): { value: RightTab; label: string }[] {
   return [
-    { value: 'app', label: output ? formatOf(output).noun : messages.workspace_generic_app() },
+    { value: 'app', label: formatNoun(output) },
     { value: 'code', label: messages.conversation_tool_code_label() },
     { value: 'connections', label: messages.conversation_list_connections() },
   ]
@@ -1624,9 +1624,7 @@ export default function GadgetEditor() {
                   title={activeTab === 'app' && !previewMode
                     ? messages.workspace_fullscreen_title()
                     : messages.workspace_fullscreen_unavailable({
-                        format: selectedGadgetSummary?.output
-                          ? formatOf(selectedGadgetSummary.output).noun
-                          : messages.workspace_generic_app(),
+                        format: formatNoun(selectedGadgetSummary?.output),
                       })}
                   onClick={enterGadgetFullscreen}
                   disabled={activeTab !== 'app' || previewMode}

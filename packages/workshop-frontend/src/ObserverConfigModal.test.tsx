@@ -23,7 +23,9 @@ vi.mock('@cloudflare/kumo', () => {
     },
   )
   const Select = Object.assign(
-    ({ children }: { children: ReactNode }) => <div data-testid="account-select">{children}</div>,
+    ({ children, placeholder }: { children: ReactNode; placeholder?: string }) => (
+      <div data-testid="account-select" data-placeholder={placeholder}>{children}</div>
+    ),
     { Option: ({ children }: { children: ReactNode }) => <div>{children}</div> },
   )
   return {
@@ -85,6 +87,7 @@ describe('ObserverConfigModal account selection', () => {
   afterEach(() => {
     act(() => root?.unmount())
     container?.remove()
+    window.history.replaceState({}, '', '/')
     root = undefined
     container = undefined
   })
@@ -121,5 +124,24 @@ describe('ObserverConfigModal account selection', () => {
     ])
 
     expect(rendered.querySelectorAll('[data-testid="account-select"]')).toHaveLength(1)
+  })
+
+  it('localizes shared-workspace verification while preserving resource, vendor, and account names', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+    const rendered = await render([
+      account(1, 'dan@cloudflare.com'),
+      account(2, 'dan.personal@gmail.com'),
+    ])
+
+    expect(rendered.textContent).toContain('验证你的访问权限')
+    expect(rendered.textContent).toContain('打开此工作空间前，请确认你自己的账户可以访问该工作空间使用的连接数据。')
+    expect(rendered.textContent).toContain('Q3 planning')
+    expect(rendered.textContent).toContain('dan@cloudflare.com')
+    expect(rendered.textContent).toContain('dan.personal@gmail.com')
+    expect(rendered.querySelector('[data-placeholder="选择 Google 账户…"]')).not.toBeNull()
+    expect(rendered.textContent).toContain('取消')
+    expect(rendered.textContent).toContain('验证并打开')
+    expect(rendered.textContent).not.toContain('Verify your access')
+    expect(rendered.textContent).not.toContain('Choose a Google account')
   })
 })

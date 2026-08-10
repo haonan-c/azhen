@@ -60,10 +60,67 @@ export const GENERIC_OUTPUT: BlueprintOutput = {
   icon: 'appWindow',
 }
 
+const BUNDLED_FORMATS: Record<string, {
+  noun: string
+  plural: string
+  icon: OutputIcon
+  localizedNoun: () => string
+  localizedPlural: () => string
+}> = {
+  document: {
+    noun: 'Doc',
+    plural: 'Docs',
+    icon: 'fileText',
+    localizedNoun: messages.output_format_document,
+    localizedPlural: messages.output_format_document_plural,
+  },
+  presentation: {
+    noun: 'Slides',
+    plural: 'Slides',
+    icon: 'presentation',
+    localizedNoun: messages.output_format_slides,
+    localizedPlural: messages.output_format_slides_plural,
+  },
+  spreadsheet: {
+    noun: 'Sheet',
+    plural: 'Sheets',
+    icon: 'table',
+    localizedNoun: messages.output_format_spreadsheet,
+    localizedPlural: messages.output_format_spreadsheet_plural,
+  },
+}
+
+function bundledFormat(output: BlueprintOutput) {
+  const bundled = BUNDLED_FORMATS[output.id]
+  return bundled?.noun === output.noun
+      && bundled.plural === output.plural
+      && bundled.icon === output.icon
+    ? bundled
+    : undefined
+}
+
 // Resolve what to draw for a (possibly absent, possibly unrecognized) declared format.
 export function formatOf(output?: BlueprintOutput): BlueprintOutput {
   if (!output || !Object.hasOwn(FORMAT_ICONS, output.icon)) return GENERIC_OUTPUT
   return output
+}
+
+// The bundled declarations are first-party copy. Match their full presentation signature so a
+// custom format that merely shares a grouping id keeps its author-provided name unchanged.
+export function formatNoun(output?: BlueprintOutput): string {
+  if (!output) return messages.workspace_generic_app()
+  const bundled = bundledFormat(output)
+  if (bundled) return bundled.localizedNoun()
+  const format = formatOf(output)
+  return format === GENERIC_OUTPUT ? messages.workspace_generic_app() : format.noun
+}
+
+export function formatPlural(output?: BlueprintOutput): string {
+  if (!output) return messages.output_format_app_plural()
+  const bundled = bundledFormat(output)
+  if (bundled) return bundled.localizedPlural()
+  const format = formatOf(output)
+  return format === GENERIC_OUTPUT ? messages.output_format_app_plural() : format.plural
 }
 
 export function wireframeOf(output?: BlueprintOutput): FormatWireframe {

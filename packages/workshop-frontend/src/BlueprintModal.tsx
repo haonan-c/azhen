@@ -281,6 +281,26 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
     ? editingBlueprint.screenshotUrl
     : null
   const screenshotPreviewUrl = newScreenshotUrl ?? savedScreenshotUrl
+  const formCopy = {
+    list: {
+      title: messages.workspace_blueprints(),
+      description: messages.workspace_blueprint_list_description(),
+      action: '',
+      pendingAction: '',
+    },
+    create: {
+      title: messages.workspace_blueprint_create_title(),
+      description: messages.workspace_blueprint_create_description(),
+      action: messages.workspace_blueprint_create(),
+      pendingAction: messages.workspace_blueprint_creating(),
+    },
+    edit: {
+      title: messages.workspace_blueprint_edit_title(),
+      description: messages.workspace_blueprint_edit_description(),
+      action: messages.workspace_blueprint_save(),
+      pendingAction: messages.workspace_blueprint_saving(),
+    },
+  }[formMode]
 
   return (
     <Dialog.Root open={open} onOpenChange={(o) => { if (!o) onClose() }}>
@@ -289,18 +309,10 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
             <div className="flex min-w-0 items-start gap-3">
               <div className="min-w-0">
               <Dialog.Title className="text-[17px] leading-6 font-medium tracking-[-0.35px] text-kumo-default">
-                {formMode === 'create'
-                  ? messages.workspace_blueprint_create_title()
-                  : formMode === 'edit'
-                    ? messages.workspace_blueprint_edit_title()
-                    : messages.workspace_blueprints()}
+                {formCopy.title}
               </Dialog.Title>
               <Dialog.Description className="mt-1 text-[13px] leading-[18px] font-normal tracking-[-0.25px] text-kumo-subtle">
-                {formMode === 'create'
-                  ? messages.workspace_blueprint_create_description()
-                  : formMode === 'edit'
-                    ? messages.workspace_blueprint_edit_description()
-                    : messages.workspace_blueprint_list_description()}
+                {formCopy.description}
               </Dialog.Description>
               </div>
             </div>
@@ -461,16 +473,12 @@ export default function BlueprintModal({ open, onClose, overseer, gadget, metada
                       disabled={creating || bindingsLoading || processingScreenshot}
                     >
                       {creating
-                        ? formMode === 'create'
-                          ? messages.workspace_blueprint_creating()
-                          : messages.workspace_blueprint_saving()
+                        ? formCopy.pendingAction
                         : processingScreenshot
                           ? messages.workspace_blueprint_screenshot_processing()
                           : bindingsLoading
                             ? messages.workspace_blueprint_bindings_loading()
-                            : formMode === 'create'
-                              ? messages.workspace_blueprint_create()
-                              : messages.workspace_blueprint_save()}
+                            : formCopy.action}
                     </WorkshopButton>
                   </div>
                 </div>

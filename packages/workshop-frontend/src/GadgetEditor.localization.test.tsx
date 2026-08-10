@@ -98,6 +98,7 @@ const WORKPIECE = {
   id: 1,
   type: 'gadget',
   title: 'Campaign result',
+  output: { id: 'document', noun: 'Doc', plural: 'Docs', icon: 'fileText' },
   filesRoot: 'app-1',
 } as WorkpieceSummary
 
@@ -165,6 +166,8 @@ describe('GadgetEditor localization', () => {
     await vi.waitFor(() => expect(container?.querySelector('[aria-label="进入全屏"]')).not.toBeNull())
     expect(container.textContent).toContain('Campaign workspace')
     expect(container.textContent).toContain('由 Ada Lovelace 创建')
+    expect(container.textContent).toContain('文档')
+    expect(container.textContent).not.toContain('Doc')
     expect(container.querySelector('[aria-label="首页"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="重命名工作空间"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="共享工作空间"]')).not.toBeNull()
