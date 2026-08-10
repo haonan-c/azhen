@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { RpcStub } from "capnweb";
 import type { Overseer, SlashCommandChoice, SlashCommandId } from "@gadgets/workshop-shared/api";
+import { m as messages } from "../../paraglide/messages.js";
 
 // How a consumer reaches the Overseer. Identity matters: it keys the cache below, and callers
 // already hold it steady for as long as the chat they belong to.
@@ -10,6 +11,19 @@ export type OverseerSource = () => Promise<RpcStub<Overseer>> | RpcStub<Overseer
 // commands in the transcript want it, so it is fetched once and shared. A failed load is dropped so
 // the next caller retries.
 const catalogs = new WeakMap<OverseerSource, Promise<SlashCommandChoice[]>>();
+
+// Built-in command copy belongs to the Workshop. Gatekeeper-provided copy is returned unchanged.
+export function presentSlashCommandChoice(
+  choice: SlashCommandChoice,
+  siteName: string,
+): SlashCommandChoice {
+  if (choice.selection.builtin !== true) return choice;
+  return {
+    ...choice,
+    description: messages.slash_builtin_compact_description(),
+    providerLabel: siteName,
+  };
+}
 
 export function loadSlashCommandCatalog(source: OverseerSource): Promise<SlashCommandChoice[]> {
   let cached = catalogs.get(source);

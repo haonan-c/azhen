@@ -30,7 +30,7 @@ const compact: SlashCommandChoice = {
   selection: {builtin: true, commandId: "compact"},
   name: "compact",
   description: "Summarize older context while preserving recent messages.",
-  providerLabel: "Workshop",
+  providerLabel: "azhen",
 };
 
 function pickerOverseer(result: SlashCommandChoice[]) {
@@ -81,6 +81,7 @@ function Harness({
       }
     }} />
     <div data-testid="active-command">{picker.activeChoice?.selection.commandId}</div>
+    <div data-testid="picker-status">{picker.status}</div>
     <button
       type="button"
       data-testid="choose-second"
@@ -106,6 +107,7 @@ describe("SlashCommandPicker", () => {
   afterEach(async () => {
     if (root) await act(async () => root.unmount());
     container?.remove();
+    window.history.replaceState({}, "", "/");
   });
 
   it("loads once, filters locally, positions above, and dismisses outside", async () => {
@@ -257,6 +259,40 @@ describe("SlashCommandPicker", () => {
     ));
     await act(async () => { await Promise.resolve(); });
     expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("localizes Chinese picker chrome and built-in descriptions only", async () => {
+    window.history.replaceState({}, "", "/zh/workspace/one");
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    let getOverseer = () => pickerOverseer([compact, choices[0]]);
+    const onSelect = vi.fn<(
+      choice: SlashCommandChoice, tokenStart: number, tokenEnd: number,
+    ) => void>();
+
+    await act(async () => root.render(
+      <Harness inputValue="/" getOverseer={getOverseer} onSelect={onSelect} />,
+    ));
+    await waitFor(() => document.querySelectorAll('[role="option"]').length === 2);
+
+    expect(document.querySelector('[role="listbox"]')?.getAttribute("aria-label"))
+      .toBe("斜杠命令");
+    expect(document.body.textContent).toContain("在保留最近消息的同时总结较早的上下文。")
+    expect(document.body.textContent).toContain("阿珍")
+    expect(document.body.textContent).toContain("Deploy the current project.")
+    expect(document.body.textContent).toContain("Context")
+    expect(document.querySelector('[data-testid="picker-status"]')?.textContent)
+      .toBe("找到 2 个斜杠命令")
+
+    await act(async () => root.render(
+      <Harness inputValue="/较早" getOverseer={getOverseer} onSelect={onSelect} />,
+    ));
+    await waitFor(() => document.querySelectorAll('[role="option"]').length === 1);
+    expect(document.body.textContent).toContain("/compact")
+    await act(async () => document.querySelector<HTMLButtonElement>('[role="option"]')!.click());
+    expect(onSelect).toHaveBeenCalledWith(compact, 0, 3)
+    expect(onSelect.mock.calls[0][0].providerLabel).toBe("azhen")
   });
 
 });

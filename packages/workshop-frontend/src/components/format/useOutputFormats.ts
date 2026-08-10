@@ -7,6 +7,8 @@ import { useKumoToastManager } from '@cloudflare/kumo'
 import type { RpcStub } from 'capnweb'
 import type { Overseer, OutputFormatOffer } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
+import { formatOfferNoun } from './formats'
+import { m as messages } from '../../paraglide/messages.js'
 
 type AuthenticatedApiStub = ReturnType<typeof useAuthenticatedApi>['authenticatedApi']
 type Navigate = ReturnType<typeof useNavigate>
@@ -68,7 +70,10 @@ export async function createFromFormat(
     navigate({ to: '/workspace/$id', params: { id } })
   } catch (err) {
     console.error('Failed to create from format:', err)
-    toasts.add({ title: `Couldn't create a new ${format.output.noun}`, variant: 'error' })
+    toasts.add({
+      title: messages.output_format_create_error({ format: formatOfferNoun(format) }),
+      variant: 'error',
+    })
     throw err
   } finally {
     overseer?.[Symbol.dispose]()

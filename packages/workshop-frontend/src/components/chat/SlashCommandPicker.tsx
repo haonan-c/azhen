@@ -12,7 +12,12 @@ import {
   exactSlashCommandMatches, filterSlashCommandCatalog, parseSlashCommandInput,
   slashCommandTokenKey, type ParsedSlashCommandInput,
 } from "./slash-command-input";
-import { loadSlashCommandCatalog, slashCommandKey } from "./slash-command-catalog";
+import {
+  loadSlashCommandCatalog, presentSlashCommandChoice, slashCommandKey,
+} from "./slash-command-catalog";
+import { useSiteName } from "../../ServerConfigContext";
+import { m as messages } from "../../paraglide/messages.js";
+import { getLocale } from "../../paraglide/runtime.js";
 
 type SlashCommandPopupLayout = {
   left: number;
@@ -77,6 +82,7 @@ export function useSlashCommandPicker({
   const [explicitChoiceToken, setExplicitChoiceToken] = useState<string | null>(null);
   const [index, setIndex] = useState(0);
   const [layout, setLayout] = useState<SlashCommandPopupLayout | null>(null);
+  const siteName = useSiteName();
   // Catalog for this mounted Gadget editor. Loaded when the picker first opens and filtered locally.
   const catalogRef = useRef<SlashCommandChoice[] | null>(null);
   const catalogSourceRef = useRef(getOverseer);
@@ -88,6 +94,11 @@ export function useSlashCommandPicker({
   const offerable = useCallback((catalog: SlashCommandChoice[]) =>
       chatExists ? catalog : catalog.filter(choice => choice.selection.builtin !== true),
     [chatExists]);
+  const filterCatalog = useCallback((catalog: SlashCommandChoice[], value: string) =>
+      catalog.filter(choice => filterSlashCommandCatalog(
+        [presentSlashCommandChoice(choice, siteName)], value,
+      ).length > 0),
+    [siteName]);
 
   const parsed = selectedCommand || disabled
     ? null
@@ -155,7 +166,7 @@ export function useSlashCommandPicker({
     loadCatalog()
       .then((catalog) => {
         if (cancelled) return;
-        setChoices(filterSlashCommandCatalog(offerable(catalog), query));
+        setChoices(filterCatalog(offerable(catalog), query));
         setChoicesQuery(query);
         setIndex(0);
         setLoading(false);
@@ -169,7 +180,7 @@ export function useSlashCommandPicker({
     return () => {
       cancelled = true;
     };
-  }, [loadCatalog, offerable, parsed !== null, query]);
+  }, [filterCatalog, loadCatalog, offerable, parsed !== null, query]);
 
   useEffect(() => {
     if (!parsed || !selectable || selectedCommand ||
@@ -229,53 +240,60 @@ export function useSlashCommandPicker({
         maxHeight: layout.maxHeight,
       }}
     >
-      <p className={`m-0 shrink-0 px-3.5 pb-1 pt-2.5 ${PICKER_CAPTION}`}>Commands</p>
+      <p className={`m-0 shrink-0 px-3.5 pb-1 pt-2.5 ${PICKER_CAPTION}`}>
+        {messages.slash_commands_caption()}
+      </p>
       <div
         ref={listRef}
         id={listboxId}
         role="listbox"
-        aria-label="Slash commands"
+        aria-label={messages.slash_commands_aria_label()}
         aria-busy={loading}
         className="sidebar-scroll min-h-0 flex-1 overflow-y-auto"
       >
         {loading && choices.length === 0 ? (
-          <p className={PICKER_EMPTY}>Loading commands…</p>
+          <p className={PICKER_EMPTY}>{messages.slash_commands_loading()}</p>
         ) : choices.length > 0 ? (
-          choices.map((choice, optionIndex) => (
-            <button
-              key={slashCommandKey(choice.selection)}
-              id={`${listboxId}-option-${optionIndex}`}
-              data-index={optionIndex}
-              type="button"
-              role="option"
-              aria-selected={optionIndex === index && activeChoice !== undefined}
-              disabled={!selectable}
-              title={[
-                `/${choice.name}`,
-                choice.description,
-                [choice.providerLabel, choice.resourceLabel].filter(Boolean).join(" · "),
-              ].join("\n")}
-              className={`${PICKER_ROW} w-full text-left text-[13px] leading-[18px] tracking-[-0.25px] disabled:cursor-wait disabled:opacity-60 ${optionIndex === index ? `${PICKER_ROW_ACTIVE} text-kumo-strong` : "text-kumo-default"}`}
-              onMouseMove={() => setIndex(optionIndex)}
-              onClick={() => select(choice)}
-            >
-              <span className="max-w-[45%] shrink-0 truncate">
-                <span className="text-kumo-inactive">/</span>{choice.name}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-kumo-subtle">{choice.description}</span>
-              <span className="max-w-[30%] shrink-0 truncate text-[11.5px] leading-4 text-kumo-inactive">
-                {choice.providerLabel}
-              </span>
-              {optionIndex === index && selectable && <TabHint />}
-            </button>
-          ))
+          choices.map((choice, optionIndex) => {
+            const presentation = presentSlashCommandChoice(choice, siteName);
+            return (
+              <button
+                key={slashCommandKey(choice.selection)}
+                id={`${listboxId}-option-${optionIndex}`}
+                data-index={optionIndex}
+                type="button"
+                role="option"
+                aria-selected={optionIndex === index && activeChoice !== undefined}
+                disabled={!selectable}
+                title={[
+                  `/${presentation.name}`,
+                  presentation.description,
+                  [presentation.providerLabel, presentation.resourceLabel].filter(Boolean).join(" · "),
+                ].join("\n")}
+                className={`${PICKER_ROW} w-full text-left text-[13px] leading-[18px] tracking-[-0.25px] disabled:cursor-wait disabled:opacity-60 ${optionIndex === index ? `${PICKER_ROW_ACTIVE} text-kumo-strong` : "text-kumo-default"}`}
+                onMouseMove={() => setIndex(optionIndex)}
+                onClick={() => select(choice)}
+              >
+                <span className="max-w-[45%] shrink-0 truncate">
+                  <span className="text-kumo-inactive">/</span>{choice.name}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-kumo-subtle">
+                  {presentation.description}
+                </span>
+                <span className="max-w-[30%] shrink-0 truncate text-[11.5px] leading-4 text-kumo-inactive">
+                  {presentation.providerLabel}
+                </span>
+                {optionIndex === index && selectable && <TabHint />}
+              </button>
+            );
+          })
         ) : (
           <p className={PICKER_EMPTY}>
             {error
-              ? `Couldn’t load commands. ${error}`
+              ? messages.slash_commands_load_error({ detail: error })
               : query
-                ? "No commands match your search."
-                : "No commands are available."}
+                ? messages.slash_commands_no_match()
+                : messages.slash_commands_none()}
           </p>
         )}
       </div>
@@ -299,10 +317,14 @@ export function useSlashCommandPicker({
     setIndex: selectIndex,
     status: open
       ? loading
-        ? "Loading slash commands"
+        ? messages.slash_commands_status_loading()
         : error
-          ? `Slash commands unavailable: ${error}`
-          : `${choices.length} slash command${choices.length === 1 ? "" : "s"} found`
+          ? messages.slash_commands_status_unavailable({ detail: error })
+          : choices.length === 1
+            ? messages.slash_commands_status_found_one()
+            : messages.slash_commands_status_found_many({
+                count: new Intl.NumberFormat(getLocale()).format(choices.length),
+              })
       : "",
   };
 }

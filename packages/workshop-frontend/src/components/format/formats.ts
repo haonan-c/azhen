@@ -17,7 +17,8 @@ import {
   ListChecks,
   type Icon as PhosphorIcon,
 } from '@phosphor-icons/react'
-import type { BlueprintOutput, OutputIcon } from '@gadgets/workshop-shared/api'
+import type { BlueprintOutput, OutputFormatOffer, OutputIcon } from '@gadgets/workshop-shared/api'
+import { m as messages } from '../../paraglide/messages.js'
 
 // The glyph for each key in the shared `OUTPUT_ICONS` vocabulary.
 export const FORMAT_ICONS = {
@@ -67,4 +68,19 @@ export function formatOf(output?: BlueprintOutput): BlueprintOutput {
 
 export function wireframeOf(output?: BlueprintOutput): FormatWireframe {
   return WIREFRAME_FOR_ICON[formatOf(output).icon]
+}
+
+// The bundled formats have localized first-party names. Deployment overrides and custom formats
+// keep the exact name supplied by their author.
+export function formatOfferNoun(format: OutputFormatOffer): string {
+  if (format.blueprintId === 'format.document' && format.output.noun === 'Doc') {
+    return messages.output_format_document()
+  }
+  if (format.blueprintId === 'format.slides' && format.output.noun === 'Slides') {
+    return messages.output_format_slides()
+  }
+  if (format.blueprintId === 'format.spreadsheet' && format.output.noun === 'Sheet') {
+    return messages.output_format_spreadsheet()
+  }
+  return format.output.noun
 }

@@ -20,6 +20,7 @@ import {
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
 import { homePromptFromSearch } from "../homePrompt";
+import { m as messages } from "../paraglide/messages.js";
 
 type HomeSearch = { prompt?: string };
 
@@ -66,7 +67,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
       })
       .catch((err) => {
         console.error("Failed to fetch models:", err);
-        toasts.add({ title: "Couldn't load AI models", variant: "error" });
+        toasts.add({ title: messages.home_model_load_error(), variant: "error" });
       });
     return () => {
       cancelled = true;
@@ -123,7 +124,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
           provisionalOverseerRef.current?.stub[Symbol.dispose]();
           provisionalOverseerRef.current = null;
         }
-        toasts.add({ title: "Failed to create workspace", variant: "error" });
+        toasts.add({ title: messages.home_workspace_create_error(), variant: "error" });
         throw err;
       }
     },

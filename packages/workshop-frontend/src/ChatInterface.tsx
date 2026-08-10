@@ -90,7 +90,7 @@ import {
   ComposerMirror, composerTextareaClass, type ComposerMirrorHandle, type MirrorToken,
 } from "./components/chat/ComposerMirror";
 import {
-  useSlashCommandChoice, type OverseerSource,
+  presentSlashCommandChoice, useSlashCommandChoice, type OverseerSource,
 } from "./components/chat/slash-command-catalog";
 import {
   removeComposerToken, snapCaretOutOfRanges, spliceComposerToken, type ComposerRange,
@@ -99,7 +99,7 @@ import CapsuleOverlay, { CAPSULE_OVERLAY_GAP } from "./CapsuleOverlay";
 import type { SelectableItem } from "./ResourcePicker";
 import GatekeeperModal from "./GatekeeperModal";
 import { GatekeeperIcon } from "./components/GatekeeperIcon";
-import { formatOf, FORMAT_ICONS } from "./components/format/formats";
+import { formatOf, formatOfferNoun, FORMAT_ICONS } from "./components/format/formats";
 import { FormatMiniature } from "./components/format/FormatVisuals";
 import { formatIconDataUrl } from "./components/format/formatIconImage";
 import { locateMessageFormatRefs } from "./components/format/messageFormatRefs";
@@ -121,6 +121,9 @@ import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { useSlashCommandPicker } from "./components/chat/SlashCommandPicker";
 import { formatFullTimestamp } from "./utils/formatTimestamp";
 import { copyToClipboard } from "./clipboard";
+import { m as uiMessages } from "./paraglide/messages.js";
+import { getLocale } from "./paraglide/runtime.js";
+import { useSiteName } from "./ServerConfigContext";
 
 export interface StreamingProposedChanges {
   updates: Uint8Array[];
@@ -313,6 +316,7 @@ const CAPSULE_LOGO_SLOT = "\u2003\u2060\u00a0";
 // The format a new workspace will be made from, as a token in the composer's text.
 type FormatToken = ComposerRange & {
   format: OutputFormatOffer;
+  noun: string;
   // Data URL for the format's icon, painted into the token's logo slot. Absent if it couldn't be
   // rendered, in which case the token carries no slot either.
   logo?: string;
@@ -366,19 +370,25 @@ const CHAT_ATTACHMENT_IMAGE_MAX_EDGE = 1568;
 
 function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("Failed to encode image.")), type, quality);
+    canvas.toBlob((blob) => blob
+      ? resolve(blob)
+      : reject(new Error(uiMessages.composer_image_encode_failed())), type, quality);
   });
 }
 
 async function prepareChatAttachment(file: File): Promise<{blob: Blob, mimeType: string}> {
   if (!file.type.startsWith("image/")) {
     if (file.size > MAX_CHAT_ATTACHMENT_BYTES) {
-      throw new Error(`Attachments must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} or smaller.`);
+      throw new Error(uiMessages.composer_attachment_too_large({
+        size: formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES) ?? "",
+      }));
     }
     return { blob: file, mimeType: file.type || "application/octet-stream" };
   }
   if (file.size > MAX_CHAT_ATTACHMENT_SOURCE_IMAGE_BYTES) {
-    throw new Error(`Images must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_IMAGE_BYTES)} or smaller before resizing.`);
+    throw new Error(uiMessages.composer_image_too_large({
+      size: formatAttachmentSize(MAX_CHAT_ATTACHMENT_SOURCE_IMAGE_BYTES) ?? "",
+    }));
   }
 
   const bitmap = await createImageBitmap(file);
@@ -395,7 +405,7 @@ async function prepareChatAttachment(file: File): Promise<{blob: Blob, mimeType:
     canvas.width = width;
     canvas.height = height;
     const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Failed to get 2D canvas context.");
+    if (!ctx) throw new Error(uiMessages.composer_canvas_unavailable());
     ctx.drawImage(bitmap, 0, 0, width, height);
 
     // Preserve supported source formats when resizing. In particular, converting PNG to JPEG would
@@ -405,7 +415,9 @@ async function prepareChatAttachment(file: File): Promise<{blob: Blob, mimeType:
     const quality = outputMimeType === "image/png" ? undefined : 0.85;
     const blob = await canvasToBlob(canvas, outputMimeType, quality);
     if (blob.size > MAX_CHAT_ATTACHMENT_BYTES) {
-      throw new Error(`Attachments must be ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES)} or smaller.`);
+      throw new Error(uiMessages.composer_attachment_too_large({
+        size: formatAttachmentSize(MAX_CHAT_ATTACHMENT_BYTES) ?? "",
+      }));
     }
     return { blob, mimeType: outputMimeType };
   } finally {
@@ -1044,8 +1056,10 @@ function SlashCommandMention(
   },
 ) {
   const choice = useSlashCommandChoice(getOverseer, name ? id : undefined);
+  const siteName = useSiteName();
+  const presentation = choice && presentSlashCommandChoice(choice, siteName);
   const mention = name ? <span className="text-kumo-brand">/{name}</span> : null;
-  const command = choice
+  const command = presentation
     ? (
       <Tooltip
         content={
@@ -1055,11 +1069,11 @@ function SlashCommandMention(
                 the *inherited* line height, so without one the reserved box and the rendered
                 lines disagree and the last line is sliced through the middle. Two lines rather
                 than three keeps the whole tooltip inside its own height budget. */}
-            <span className="line-clamp-2 leading-[18px]">{choice.description}</span>
+            <span className="line-clamp-2 leading-[18px]">{presentation.description}</span>
             {/* Provider, then whatever identifies the command within it: for a skill that is
                 its collection and path. Same line the picker shows. */}
             <span className="mt-0.5 block truncate text-kumo-subtle">
-              {[choice.providerLabel, choice.resourceLabel].filter(Boolean).join(" · ")}
+              {[presentation.providerLabel, presentation.resourceLabel].filter(Boolean).join(" · ")}
             </span>
           </span>
         }
@@ -1221,9 +1235,14 @@ export const MarkdownMessage = memo(function MarkdownMessage(
 
 function formatAttachmentSize(size: number | undefined): string | null {
   if (size === undefined) return null;
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  const options: Intl.NumberFormatOptions = { maximumFractionDigits: 1 };
+  if (size < 1024) return `${formatLocaleNumber(size, options)} B`;
+  if (size < 1024 * 1024) return `${formatLocaleNumber(size / 1024, options)} KB`;
+  return `${formatLocaleNumber(size / (1024 * 1024), options)} MB`;
+}
+
+function formatLocaleNumber(value: number, options?: Intl.NumberFormatOptions): string {
+  return new Intl.NumberFormat(getLocale(), options).format(value);
 }
 
 // Build a temporary object URL for inlined attachment bytes, revoking it when no longer needed.
@@ -1834,6 +1853,7 @@ export const ChatInput = ({
    * pre-approval catalog and proactively offer to pre-approve its actions. */
 }) => {
   const toasts = useKumoToastManager();
+  const siteName = useSiteName();
   const [inputValue, setInputValue] = useState("");
   const [capsules, setCapsules] = useState<InputCapsule[]>([]);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -2048,12 +2068,18 @@ export const ChatInput = ({
       console.error("Failed to upload chat attachment:", err);
       if (!mountedRef.current) return;
       reportIssue('chat.attachment-upload', err)
+      const detail = typeof err?.message === "string" ? err.message : "";
       setPendingAttachments((prev) => prev.map((attachment) => attachment.id === id ? {
         ...attachment,
         uploadState: "error",
-        error: err?.message || "Upload failed",
+        error: detail || uiMessages.composer_attachment_upload_failed(),
       } : attachment));
-      toasts.add({ title: err?.message || "Failed to upload attachment", variant: "error" });
+      toasts.add({
+        title: detail
+          ? uiMessages.composer_attachment_upload_failed_detail({ detail })
+          : uiMessages.composer_attachment_upload_failed(),
+        variant: "error",
+      });
     }
   };
 
@@ -2062,14 +2088,21 @@ export const ChatInput = ({
 
     const initialRoom = MAX_PENDING_ATTACHMENTS - pendingAttachmentsRef.current.length;
     if (initialRoom <= 0) {
-      toasts.add({ title: `You can attach up to ${MAX_PENDING_ATTACHMENTS} attachments`, variant: "error" });
+      toasts.add({
+        title: uiMessages.composer_attachment_max_count({
+          count: formatLocaleNumber(MAX_PENDING_ATTACHMENTS),
+        }),
+        variant: "error",
+      });
       return;
     }
     const accepted = attachmentFiles.slice(0, initialRoom);
     if (attachmentFiles.length > initialRoom) {
       const title = initialRoom === 1
-        ? "Only the first attachment was attached"
-        : `Only the first ${initialRoom} attachments were attached`;
+        ? uiMessages.composer_attachment_only_first_one()
+        : uiMessages.composer_attachment_only_first_many({
+            count: formatLocaleNumber(initialRoom),
+          });
       toasts.add({ title, variant: "error" });
     }
 
@@ -2082,18 +2115,31 @@ export const ChatInput = ({
     for (const result of prepared) {
       if (result.status === "rejected") {
         console.error("Failed to process chat attachment:", result.reason);
-        toasts.add({ title: result.reason?.message || "Failed to process attachment", variant: "error" });
+        toasts.add({
+          title: result.reason?.message || uiMessages.composer_attachment_process_failed(),
+          variant: "error",
+        });
         continue;
       }
 
       const { file, blob, mimeType } = result.value;
       if (pendingAttachmentsRef.current.length >= MAX_PENDING_ATTACHMENTS) {
-        toasts.add({ title: `You can attach up to ${MAX_PENDING_ATTACHMENTS} attachments`, variant: "error" });
+        toasts.add({
+          title: uiMessages.composer_attachment_max_count({
+            count: formatLocaleNumber(MAX_PENDING_ATTACHMENTS),
+          }),
+          variant: "error",
+        });
         continue;
       }
       const totalPendingBytes = pendingAttachmentsRef.current.reduce((sum, attachment) => sum + attachment.blob.size, 0);
       if (totalPendingBytes + blob.size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
-        toasts.add({ title: `Attached files must total ${formatAttachmentSize(MAX_CHAT_ATTACHMENT_TOTAL_BYTES)} or less`, variant: "error" });
+        toasts.add({
+          title: uiMessages.composer_attachment_total_too_large({
+            size: formatAttachmentSize(MAX_CHAT_ATTACHMENT_TOTAL_BYTES) ?? "",
+          }),
+          variant: "error",
+        });
         continue;
       }
       const id = crypto.randomUUID();
@@ -2285,11 +2331,11 @@ export const ChatInput = ({
 
     if (!inputValue.trim() && !selectedSlashCommand && readyAttachments.length === 0) return;
     if (hasUploadingAttachment) {
-      toasts.add({ title: "Please wait for attachment uploads to finish", variant: "error" });
+      toasts.add({ title: uiMessages.composer_wait_for_uploads(), variant: "error" });
       return;
     }
     if (hasFailedAttachment) {
-      toasts.add({ title: "Remove failed attachment uploads before sending", variant: "error" });
+      toasts.add({ title: uiMessages.composer_remove_failed_uploads(), variant: "error" });
       return;
     }
 
@@ -2313,10 +2359,10 @@ export const ChatInput = ({
       };
 
       if (formatTokens.length > 0) {
-        // A format token sends the word the user saw: the noun is the request, and the agent's
-        // catalog already lists the deployment's formats by these nouns. Only the logo slot is
-        // removed, since it exists purely so the mirror has somewhere to paint the icon. Applied
-        // back-to-front so earlier offsets stay valid while the text is rewritten.
+        // The token uses a localized noun in the composer, but the message sends the catalog noun
+        // that identifies the format to the agent. The logo slot also goes away because it exists
+        // only so the mirror has somewhere to paint the icon. Applied back-to-front so earlier
+        // offsets stay valid while the text is rewritten.
         let text = messageInput;
         for (const token of [...formatTokens].toSorted((a, b) => b.start - a.start)) {
           text = text.slice(0, token.start) + token.format.output.noun +
@@ -2345,7 +2391,7 @@ export const ChatInput = ({
         // position 0 would mean the text no longer starts with "/".
         let parsed = parseSlashCommandInput(messageInput, 1);
         if (!parsed) {
-          toasts.add({ title: "Slash command is invalid", variant: "error" });
+          toasts.add({ title: uiMessages.composer_slash_invalid(), variant: "error" });
           return;
         }
         let match: SlashCommandChoice | null;
@@ -2353,11 +2399,11 @@ export const ChatInput = ({
           match = await slashCommandPicker.resolveExact(parsed);
         } catch (error) {
           console.error("Failed to resolve slash command:", error);
-          toasts.add({ title: "Couldn't load slash commands", variant: "error" });
+          toasts.add({ title: uiMessages.composer_slash_load_error(), variant: "error" });
           return;
         }
         if (!match) {
-          toasts.add({ title: "Choose a slash command", variant: "error" });
+          toasts.add({ title: uiMessages.composer_slash_choose(), variant: "error" });
           return;
         }
         slashCommand = match;
@@ -2375,7 +2421,7 @@ export const ChatInput = ({
       }
 
       if (slashCommand && (inputCapsules.length > 0 || readyAttachments.length > 0)) {
-        toasts.add({ title: "Slash commands cannot include resources or attachments", variant: "error" });
+        toasts.add({ title: uiMessages.composer_slash_no_attachments(), variant: "error" });
         return;
       }
       let message: string | SlashCommandRequest = messageInput;
@@ -2892,13 +2938,14 @@ export const ChatInput = ({
   // Inserted at the caret, like a capsule, so the noun lands in the sentence that needs it.
   const chooseFormat = async (format: OutputFormatOffer) => {
     const logo = await formatIconDataUrl(format.output.icon);
+    const noun = formatOfferNoun(format);
     const value = inputValueRef.current;
     // The menu takes focus, but the textarea keeps its last selection; falling back to the end is
     // right for the case where it was never focused at all.
     const caret = Math.min(composerTextareaRef.current?.selectionStart ?? value.length, value.length);
     const at = snapCaretOutOfRanges(caret, currentTokenRanges(), "nearest");
     const splice = spliceComposerToken(
-        value, at, at, (logo ? CAPSULE_LOGO_SLOT : "") + format.output.noun);
+        value, at, at, (logo ? CAPSULE_LOGO_SLOT : "") + noun);
     setInputValue(splice.value);
     setCapsules(previous => previous.map(capsule => capsule.start >= at
       ? {...capsule, start: capsule.start + splice.delta}
@@ -2908,7 +2955,7 @@ export const ChatInput = ({
       ...previous.map(token => token.start >= at
         ? {...token, start: token.start + splice.delta}
         : token),
-      {format, logo, start: splice.start, length: splice.length},
+      {format, noun, logo, start: splice.start, length: splice.length},
     ]);
     requestAnimationFrame(() => {
       composerTextareaRef.current?.focus();
@@ -2951,14 +2998,24 @@ export const ChatInput = ({
       : consoleLogSeverity === "warn"
         ? "bg-kumo-warning"
         : "bg-kumo-inactive";
+  const oneCapturedLog = pendingConsoleLogCount === 1;
   const logKind = consoleLogSeverity === "error"
-    ? "error"
+    ? oneCapturedLog
+      ? uiMessages.composer_captured_error_one()
+      : uiMessages.composer_captured_error_many()
     : consoleLogSeverity === "warn"
-      ? "warning"
-      : "log";
+      ? oneCapturedLog
+        ? uiMessages.composer_captured_warning_one()
+        : uiMessages.composer_captured_warning_many()
+      : oneCapturedLog
+        ? uiMessages.composer_captured_log_one()
+        : uiMessages.composer_captured_log_many();
   const selectedModelLabel = selectedModel == null
-    ? "No agent"
+    ? uiMessages.composer_no_agent()
     : models.find((model) => model.id === selectedModel)?.name ?? selectedModel;
+  const selectedSlashCommandPresentation = selectedSlashCommand
+    ? presentSlashCommandChoice(selectedSlashCommand.choice, siteName)
+    : null;
 
   const hasReadyAttachment = pendingAttachments.some(
     (attachment) => attachment.uploadState === "ready" && attachment.ref,
@@ -3011,8 +3068,10 @@ export const ChatInput = ({
               >
                 <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${logDotClass}`} />
                 <span className="truncate">
-                  Send {pendingConsoleLogCount} captured {logKind}
-                  {pendingConsoleLogCount !== 1 ? "s" : ""} to chat
+                  {uiMessages.composer_send_captured_logs({
+                    count: formatLocaleNumber(pendingConsoleLogCount),
+                    kind: logKind,
+                  })}
                 </span>
               </button>
             </Tooltip>
@@ -3020,7 +3079,7 @@ export const ChatInput = ({
               type="button"
               onClick={onDiscardConsoleLogs}
               className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full opacity-60 transition-opacity hover:bg-kumo-tint hover:opacity-100"
-              aria-label="Discard captured logs"
+              aria-label={uiMessages.composer_discard_captured_logs()}
             >
               <X size={10} />
             </button>
@@ -3045,7 +3104,9 @@ export const ChatInput = ({
               <span className={`grid h-7 w-7 place-items-center rounded-full ${canAttachMore ? "bg-kumo-brand/12 text-kumo-brand" : "bg-kumo-warning/15 text-kumo-warning"}`}>
                 <FileIcon size={16} weight="duotone" />
               </span>
-              {canAttachMore ? "Drop files to attach" : "Messages are limited to 5 attachments"}
+              {canAttachMore
+                ? uiMessages.composer_drop_files()
+                : uiMessages.composer_attachment_limit({ count: MAX_PENDING_ATTACHMENTS })}
             </div>
           </div>
         )}
@@ -3056,8 +3117,11 @@ export const ChatInput = ({
           {/* The resolved command is marked by color alone, so announce it for screen readers. */}
           <div className="sr-only" aria-live="polite">
             {slashCommandPicker.status ||
-              (selectedSlashCommand
-                ? `Slash command /${selectedSlashCommand.choice.name} from ${selectedSlashCommand.choice.providerLabel} is ready to send`
+              (selectedSlashCommandPresentation
+                ? uiMessages.composer_slash_ready({
+                    name: selectedSlashCommandPresentation.name,
+                    provider: selectedSlashCommandPresentation.providerLabel,
+                  })
                 : "")}
           </div>
           <div ref={wrapperRef} className={styles.capsuleInputWrapper}>
@@ -3128,10 +3192,10 @@ export const ChatInput = ({
                 isBlocked
                   ? blockedReason
                   : isAgentActive
-                    ? "Waiting for agent…"
+                    ? uiMessages.composer_placeholder_waiting()
                     : newChat
-                      ? "Start a new conversation…"
-                      : "Ask a follow-up…"
+                      ? uiMessages.composer_placeholder_new()
+                      : uiMessages.composer_placeholder_follow_up()
               }
               autoFocus={autoFocus}
               rows={minRows}
@@ -3235,19 +3299,23 @@ export const ChatInput = ({
             {pendingAttachments.map((attachment) => (
               <div key={attachment.id} className="relative flex h-14 w-14 items-center justify-center overflow-hidden rounded-lg border border-kumo-line/70 bg-kumo-elevated">
                 {attachment.previewUrl ? (
-                  <img src={attachment.previewUrl} alt={attachment.name ?? "Attached file"} className="h-full w-full object-cover" />
+                  <img src={attachment.previewUrl} alt={attachment.name ?? uiMessages.composer_attached_file()} className="h-full w-full object-cover" />
                 ) : (
                   <FileIcon size={22} className="text-kumo-inactive" />
                 )}
                 {attachment.uploadState === "uploading" && (
-                  <div className="absolute inset-0 grid place-items-center rounded-lg bg-black/35 text-[10px] text-white">Uploading</div>
+                  <div className="absolute inset-0 grid place-items-center rounded-lg bg-black/35 text-[10px] text-white">
+                    {uiMessages.composer_attachment_uploading()}
+                  </div>
                 )}
                 {attachment.uploadState === "error" && (
-                  <div className="absolute inset-0 grid place-items-center rounded-lg bg-kumo-danger/80 px-1 text-center text-[9px] leading-3 text-white">Failed</div>
+                  <div className="absolute inset-0 grid place-items-center rounded-lg bg-kumo-danger/80 px-1 text-center text-[9px] leading-3 text-white">
+                    {uiMessages.composer_attachment_failed()}
+                  </div>
                 )}
                 <button
                   type="button"
-                  aria-label="Remove attachment"
+                  aria-label={uiMessages.composer_remove_attachment()}
                   onClick={() => removeAttachment(attachment.id)}
                   className="absolute right-0.5 top-0.5 flex h-4 w-4 cursor-pointer items-center justify-center rounded-full bg-black/55 text-white hover:bg-black/75 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/80"
                 >
@@ -3267,7 +3335,7 @@ export const ChatInput = ({
                   <button
                     type="button"
                     className="group flex h-8 w-8 flex-shrink-0 cursor-pointer items-center justify-center rounded-lg text-kumo-inactive transition-[background-color,color,transform] duration-150 ease-out hover:bg-kumo-tint hover:text-kumo-subtle focus-visible:bg-kumo-tint focus-visible:text-kumo-subtle focus-visible:outline-none active:scale-[0.96] data-[popup-open]:bg-kumo-tint data-[popup-open]:text-kumo-subtle"
-                    aria-label="Open chat options"
+                    aria-label={uiMessages.composer_open_chat_options()}
                   >
                     <Plus size={18} />
                   </button>
@@ -3288,7 +3356,9 @@ export const ChatInput = ({
                       <Brain size={14} />
                     </span>
                     <span className="flex-1">
-                      {showThinkingTraces ? "Hide thinking" : "Show thinking"}
+                      {showThinkingTraces
+                        ? uiMessages.composer_hide_thinking()
+                        : uiMessages.composer_show_thinking()}
                     </span>
                   </DropdownMenu.Item>
                 )}
@@ -3299,7 +3369,7 @@ export const ChatInput = ({
                   <span className="mr-2 inline-flex h-4 w-4 items-center justify-center text-kumo-inactive">
                     <FileIcon size={14} />
                   </span>
-                  <span className="flex-1">Upload file</span>
+                  <span className="flex-1">{uiMessages.composer_upload_file()}</span>
                 </DropdownMenu.Item>
               </DropdownMenu.Content>
             </DropdownMenu>
@@ -3309,7 +3379,9 @@ export const ChatInput = ({
               className="inline-flex h-8 flex-shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 text-[13px] leading-none tracking-[-0.25px] text-kumo-inactive transition-[background-color,color,transform] duration-150 ease-out hover:bg-kumo-tint hover:text-kumo-subtle focus-visible:bg-kumo-tint focus-visible:text-kumo-subtle focus-visible:outline-none active:scale-[0.97]"
             >
               <Plug size={15} className="flex-shrink-0" />
-              <span className={`leading-none ${styles.attachLabelText}`}>{attachLabel ?? "Add resource"}</span>
+              <span className={`leading-none ${styles.attachLabelText}`}>
+                {attachLabel ?? uiMessages.composer_add_resource()}
+              </span>
             </button>
           </div>
 
@@ -3321,7 +3393,7 @@ export const ChatInput = ({
                     <button
                       type="button"
                       className="group inline-flex h-8 min-w-0 max-w-[180px] cursor-pointer items-center gap-1.5 rounded-lg px-2 text-[13px] leading-5 tracking-[-0.25px] text-kumo-subtle transition-[background-color,color,transform] duration-150 ease-out hover:bg-kumo-tint hover:text-kumo-default focus-visible:bg-kumo-tint focus-visible:text-kumo-default focus-visible:outline-none active:scale-[0.97] data-[popup-open]:bg-kumo-tint data-[popup-open]:text-kumo-default"
-                      aria-label="Select model"
+                      aria-label={uiMessages.composer_select_model()}
                     >
                       <span className="min-w-0 truncate">{selectedModelLabel}</span>
                       <CaretDown
@@ -3353,7 +3425,7 @@ export const ChatInput = ({
                     onClick={() => onModelChange(null)}
                     className="!h-auto rounded-xl !px-2 !py-1.5 text-[12px] leading-4 font-normal tracking-[-0.15px] text-kumo-subtle transition-colors data-highlighted:bg-kumo-tint/70 data-highlighted:text-kumo-default"
                   >
-                    <span className="min-w-0 flex-1 truncate">No agent</span>
+                    <span className="min-w-0 flex-1 truncate">{uiMessages.composer_no_agent()}</span>
                     {selectedModel == null && (
                       <Check size={12} weight="bold" className="ml-3 flex-shrink-0 text-kumo-inactive" />
                     )}
@@ -3365,7 +3437,7 @@ export const ChatInput = ({
                   onClick={onStop}
                   tone="primary"
                   className="!h-8 !w-8"
-                  aria-label="Stop agent"
+                  aria-label={uiMessages.composer_stop_agent()}
                 >
                   <svg
                     width="14"
@@ -3382,7 +3454,7 @@ export const ChatInput = ({
                   disabled={!canSend}
                   tone="primary"
                   className="!h-8 !w-8 disabled:cursor-not-allowed disabled:opacity-30"
-                  aria-label="Send message"
+                  aria-label={uiMessages.composer_send_message()}
                 >
                   {/* Arrow-up icon */}
                   <svg
@@ -5367,7 +5439,7 @@ function ChatInterface({
       }
     } catch (err) {
       console.error("Failed to send message:", err);
-      toasts.add({ title: "Failed to send message", variant: "error" });
+      toasts.add({ title: uiMessages.composer_send_error(), variant: "error" });
       throw err;
     }
   };
@@ -5389,7 +5461,7 @@ function ChatInterface({
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       console.error("Failed to create new chat:", err);
-      toasts.add({ title: "Failed to start conversation", variant: "error" });
+      toasts.add({ title: uiMessages.composer_start_conversation_error(), variant: "error" });
       throw err;
     }
   };
@@ -5408,7 +5480,7 @@ function ChatInterface({
       await overseer.stopAgent(selectedChatId);
     } catch (err) {
       console.error("Failed to stop agent:", err);
-      toasts.add({ title: "Failed to stop agent", variant: "error" });
+      toasts.add({ title: uiMessages.composer_stop_error(), variant: "error" });
     }
   };
 

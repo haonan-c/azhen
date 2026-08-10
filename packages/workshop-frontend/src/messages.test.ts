@@ -51,6 +51,75 @@ const requiredAuthMessages = [
   'user_menu_sign_out',
 ] as const
 
+const requiredWorkspaceCreationMessages = [
+  'composer_add_resource',
+  'composer_attached_file',
+  'composer_attachment_failed',
+  'composer_attachment_limit',
+  'composer_attachment_max_count',
+  'composer_attachment_only_first_many',
+  'composer_attachment_only_first_one',
+  'composer_attachment_process_failed',
+  'composer_attachment_too_large',
+  'composer_attachment_total_too_large',
+  'composer_attachment_upload_failed',
+  'composer_attachment_upload_failed_detail',
+  'composer_attachment_uploading',
+  'composer_canvas_unavailable',
+  'composer_captured_error_many',
+  'composer_captured_error_one',
+  'composer_captured_log_many',
+  'composer_captured_log_one',
+  'composer_captured_warning_many',
+  'composer_captured_warning_one',
+  'composer_discard_captured_logs',
+  'composer_drop_files',
+  'composer_hide_thinking',
+  'composer_image_encode_failed',
+  'composer_image_too_large',
+  'composer_no_agent',
+  'composer_open_chat_options',
+  'composer_placeholder_follow_up',
+  'composer_placeholder_new',
+  'composer_placeholder_waiting',
+  'composer_remove_attachment',
+  'composer_remove_failed_uploads',
+  'composer_select_model',
+  'composer_send_captured_logs',
+  'composer_send_error',
+  'composer_send_message',
+  'composer_show_thinking',
+  'composer_slash_choose',
+  'composer_slash_invalid',
+  'composer_slash_load_error',
+  'composer_slash_no_attachments',
+  'composer_slash_ready',
+  'composer_stop_agent',
+  'composer_stop_error',
+  'composer_start_conversation_error',
+  'composer_upload_file',
+  'composer_wait_for_uploads',
+  'home_model_load_error',
+  'home_workspace_create_error',
+  'output_format_create_error',
+  'output_format_creating',
+  'output_format_document',
+  'output_format_slides',
+  'output_format_spreadsheet',
+  'output_format_start_with',
+  'slash_builtin_compact_description',
+  'slash_commands_aria_label',
+  'slash_commands_caption',
+  'slash_commands_load_error',
+  'slash_commands_loading',
+  'slash_commands_no_match',
+  'slash_commands_none',
+  'slash_commands_status_found_many',
+  'slash_commands_status_found_one',
+  'slash_commands_status_loading',
+  'slash_commands_status_unavailable',
+] as const
+
 describe('message catalogs', () => {
   it('defines the same non-empty messages in English and Simplified Chinese', () => {
     expect(messageKeys(chinese)).toEqual(messageKeys(english))
@@ -62,5 +131,10 @@ describe('message catalogs', () => {
 
   it('includes every authentication and global language-control message', () => {
     expect(messageKeys(english)).toEqual(expect.arrayContaining([...requiredAuthMessages]))
+  })
+
+  it('includes every Prompt Composer and Workspace creation message', () => {
+    expect(messageKeys(english))
+      .toEqual(expect.arrayContaining([...requiredWorkspaceCreationMessages]))
   })
 })

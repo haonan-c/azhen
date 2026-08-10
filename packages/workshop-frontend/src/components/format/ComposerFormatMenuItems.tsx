@@ -9,7 +9,9 @@
 import { DropdownMenu } from '@cloudflare/kumo'
 import type { OutputFormatOffer } from '@gadgets/workshop-shared/api'
 import { FormatGlyph } from './FormatVisuals'
+import { formatOfferNoun } from './formats'
 import { useOutputFormats } from './useOutputFormats'
+import { m as messages } from '../../paraglide/messages.js'
 
 // Matches the surrounding items in the composer menu, which are quieter and rounder than the
 // app-wide MENU_ITEM.
@@ -32,27 +34,32 @@ export default function ComposerFormatMenuItems({
   return (
     <>
       <p className="px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase leading-4 tracking-[0.06em] text-kumo-inactive">
-        Start with
+        {messages.output_format_start_with()}
       </p>
-      {formats.map((format) => (
-        <DropdownMenu.Item
-          key={format.blueprintId}
-          className={COMPOSER_MENU_ITEM}
-          disabled={creating !== null}
-          onClick={() => choose(format)}
-        >
-          <span className="mr-2 inline-flex h-4 w-4 items-center justify-center text-kumo-inactive">
-            <FormatGlyph
-              output={format.output}
-              size="md"
-              className={creating === format.blueprintId ? 'animate-pulse' : undefined}
-            />
-          </span>
-          <span className="flex-1 truncate">
-            {creating === format.blueprintId ? 'Creating…' : format.output.noun}
-          </span>
-        </DropdownMenu.Item>
-      ))}
+      {formats.map((format) => {
+        const noun = formatOfferNoun(format)
+        return (
+          <DropdownMenu.Item
+            key={format.blueprintId}
+            className={COMPOSER_MENU_ITEM}
+            disabled={creating !== null}
+            onClick={() => choose(format)}
+          >
+            <span className="mr-2 inline-flex h-4 w-4 items-center justify-center text-kumo-inactive">
+              <FormatGlyph
+                output={format.output}
+                size="md"
+                className={creating === format.blueprintId ? 'animate-pulse' : undefined}
+              />
+            </span>
+            <span className="flex-1 truncate">
+              {creating === format.blueprintId
+                ? messages.output_format_creating({ format: noun })
+                : noun}
+            </span>
+          </DropdownMenu.Item>
+        )
+      })}
       <div className="my-1 border-t border-kumo-line/70" />
     </>
   )
