@@ -15,6 +15,8 @@ import type {
   ShareLinkInfo,
 } from '@gadgets/workshop-shared/api'
 
+const addToast = vi.hoisted(() => vi.fn<(toast: unknown) => void>())
+
 const testGlobal = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
 const previousActEnvironment = testGlobal.IS_REACT_ACT_ENVIRONMENT
 testGlobal.IS_REACT_ACT_ENVIRONMENT = true
@@ -48,7 +50,7 @@ vi.mock('@cloudflare/kumo', () => {
     Checkbox: ({ label }: { label: ReactNode }) => <label>{label}</label>,
     Dialog,
     DropdownMenu,
-    useKumoToastManager: () => ({ add: vi.fn<(toast: unknown) => void>() }),
+    useKumoToastManager: () => ({ add: addToast }),
   }
 })
 
@@ -97,6 +99,7 @@ const SHARE_LINK: ShareLinkInfo = {
 }
 
 type OverseerOverrides = {
+  addCollaboratorError?: Error
   requirements?: Partial<Record<CollaboratorRole, ObserverBindingNeed[]>>
   listObserverRequirements?: (role: CollaboratorRole) => Promise<ObserverBindingNeed[]>
   shareLinks?: ShareLinkInfo[]
@@ -111,11 +114,14 @@ function fakeOverseer(overrides: OverseerOverrides = {}): RpcStub<Overseer> {
     listObserverRequirements:
       overrides.listObserverRequirements ??
       (async (role: CollaboratorRole) => requirements[role] ?? []),
-    addCollaborator: async () => ({
-      profile: { type: 'user', id: 'ada@cloudflare.com', name: 'Ada' },
-      role: 'use',
-      addedBy: [],
-    }),
+    addCollaborator: async () => {
+      if (overrides.addCollaboratorError) throw overrides.addCollaboratorError
+      return {
+        profile: { type: 'user', id: 'ada@cloudflare.com', name: 'Ada' },
+        role: 'use',
+        addedBy: [],
+      }
+    },
     createShareLink: async () => ({ key: 'secret', linkId: 'link-1' }),
     updateShareLink: overrides.updateShareLink ?? (async () => {}),
   } as unknown as RpcStub<Overseer>
@@ -150,13 +156,13 @@ function verificationSection(rendered: HTMLElement, headingId: string): HTMLElem
 }
 
 async function invite(rendered: HTMLElement, username: string) {
-  const input = rendered.querySelector<HTMLInputElement>('input[aria-label="Username or email"]')!
+  const input = rendered.querySelector<HTMLInputElement>('input[name="gadget-share-people-search"]')!
   const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
   await act(async () => {
     setValue.call(input, username)
     input.dispatchEvent(new Event('input', { bubbles: true }))
   })
-  await click(button(rendered, 'Invite'))
+  await click(button(rendered, window.location.pathname.startsWith('/zh') ? '邀请' : 'Invite'))
 }
 
 describe('ShareModal', () => {
@@ -164,12 +170,14 @@ describe('ShareModal', () => {
   let container: HTMLDivElement | undefined
 
   beforeEach(() => {
+    addToast.mockClear()
     copyToClipboard.mockClear()
   })
 
   afterEach(() => {
     act(() => root?.unmount())
     container?.remove()
+    window.history.replaceState({}, '', '/')
     root = undefined
     container = undefined
   })
@@ -297,5 +305,37 @@ describe('ShareModal', () => {
 
     expect(updateShareLink).not.toHaveBeenCalled()
     expect(rendered.querySelector('input[aria-label="Share link name"]')).toBeNull()
+  })
+
+  it('localizes the Chinese sharing utility without changing names', async () => {
+    window.history.replaceState({}, '', '/zh')
+    const rendered = await render(fakeOverseer({ shareLinks: [SHARE_LINK] }))
+
+    expect(rendered.textContent).toContain('共享“Trip planner”')
+    expect(rendered.textContent).toContain('邀请他人或共享链接。')
+    expect(rendered.textContent).toContain('有权限的人员')
+    expect(rendered.textContent).toContain('共享链接')
+    expect(rendered.textContent).toContain('Team link')
+    expect(rendered.querySelector('input[aria-label="用户名或邮箱"]')).not.toBeNull()
+    expect(button(rendered, '邀请')).not.toBeNull()
+    expect(button(rendered, '复制 Team link')).not.toBeNull()
+    expect(rendered.textContent).not.toContain('People with access')
+  })
+
+  it('keeps English backend errors out of Chinese sharing status messages', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    window.history.replaceState({}, '', '/zh')
+    const overseer = fakeOverseer({
+      addCollaboratorError: new Error('Cannot add the workspace owner as a collaborator.'),
+    })
+    const rendered = await render(overseer)
+
+    await invite(rendered, 'owner')
+
+    expect(addToast).toHaveBeenCalledWith({ title: '添加协作者失败。', variant: 'error' })
+    expect(addToast).not.toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Cannot add the workspace owner as a collaborator.',
+    }))
+    consoleError.mockRestore()
   })
 })

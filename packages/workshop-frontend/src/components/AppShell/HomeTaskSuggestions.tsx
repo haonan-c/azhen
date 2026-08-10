@@ -7,6 +7,7 @@ import {
   Presentation,
   type Icon,
 } from '@phosphor-icons/react'
+import { m as messages } from '../../paraglide/messages.js'
 
 // A few example work tasks shown under the Home composer, so a new user immediately sees the kind
 // of thing they can ask for. Picking one drops a starter prompt into the composer (it does not
@@ -21,48 +22,45 @@ type TaskSuggestion = {
 
 // Formats are advertised by example rather than by a row of "Start with Docs" buttons, so the
 // first move isn't "pick a file type". The formats themselves are in the composer's `+` menu.
-const SUGGESTIONS: TaskSuggestion[] = [
-  {
-    id: 'one-on-one',
-    label: 'Write a 1:1 pre-read',
-    description: 'A doc with a snapshot, things to inspect, and one ask',
-    icon: FileText,
-    prompt:
-      'Create a document to prepare for my next 1:1 with a direct report: a current snapshot, a coaching frame, things to inspect, carryover items from last time, and one clear ask.',
-  },
-  {
-    id: 'team-meeting',
-    label: 'Build a team meeting deck',
-    description: 'Slides with progress, risks, and what needs a decision',
-    icon: Presentation,
-    prompt:
-      'Create a slide deck for my next team meeting: where things stand, what shipped, risks and blockers, and the decisions I need from the room. Ask me what the team is working on first.',
-  },
-  {
-    id: 'insights',
-    label: 'Find insights in my data',
-    description: 'Turn a spreadsheet or CSV into trends and recommendations',
-    icon: ChartLineUp,
-    prompt:
-      'Turn a dataset I will share (a spreadsheet, CSV, or pasted table) into a narrative analysis: key trends, anomalies, the "so what", and concrete recommendations.',
-  },
-  {
-    id: 'workflow',
-    label: 'Automate a workflow',
-    description: 'Trigger an agent when a new email arrives',
-    icon: Lightning,
-    prompt:
-      'Create an agent workflow that runs automatically when a new email arrives: read the message, decide what to do, and take action or draft a reply. Ask me which inbox to watch and what it should handle.',
-  },
-  {
-    id: 'app',
-    label: 'Build a quick tool',
-    description: 'A small interactive app, calculator, or dashboard',
-    icon: AppWindow,
-    prompt:
-      'Build a small interactive tool I can use right here — a calculator, dashboard, or explorer. Ask me what it should do, then create it.',
-  },
-]
+function taskSuggestions(): TaskSuggestion[] {
+  return [
+    {
+      id: 'one-on-one',
+      label: messages.home_suggestion_one_on_one_label(),
+      description: messages.home_suggestion_one_on_one_description(),
+      icon: FileText,
+      prompt: messages.home_suggestion_one_on_one_prompt(),
+    },
+    {
+      id: 'team-meeting',
+      label: messages.home_suggestion_deck_label(),
+      description: messages.home_suggestion_deck_description(),
+      icon: Presentation,
+      prompt: messages.home_suggestion_deck_prompt(),
+    },
+    {
+      id: 'insights',
+      label: messages.home_suggestion_data_label(),
+      description: messages.home_suggestion_data_description(),
+      icon: ChartLineUp,
+      prompt: messages.home_suggestion_data_prompt(),
+    },
+    {
+      id: 'workflow',
+      label: messages.home_suggestion_workflow_label(),
+      description: messages.home_suggestion_workflow_description(),
+      icon: Lightning,
+      prompt: messages.home_suggestion_workflow_prompt(),
+    },
+    {
+      id: 'app',
+      label: messages.home_suggestion_app_label(),
+      description: messages.home_suggestion_app_description(),
+      icon: AppWindow,
+      prompt: messages.home_suggestion_app_prompt(),
+    },
+  ]
+}
 
 // One row, shared by every suggestion so the list reads as one kind of offer.
 function SuggestionRow({
@@ -105,7 +103,7 @@ function SuggestionRow({
 const VISIBLE_SUGGESTIONS = 3
 
 function pickSuggestions(): TaskSuggestion[] {
-  let shuffled = [...SUGGESTIONS]
+  let shuffled = taskSuggestions()
   for (let i = shuffled.length - 1; i > 0; i--) {
     let j = Math.floor(Math.random() * (i + 1))
     ;[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]
@@ -122,9 +120,9 @@ export default function HomeTaskSuggestions({
   const visible = useMemo(pickSuggestions, [])
 
   return (
-    <section aria-label="Example tasks" className="flex flex-col gap-1">
+    <section aria-label={messages.home_example_tasks()} className="flex flex-col gap-1">
       <h3 className="px-1 pb-1 text-[12px] font-medium uppercase tracking-[0.06em] text-kumo-inactive">
-        Get started
+        {messages.home_get_started()}
       </h3>
       <ul className="flex flex-col gap-0.5">
         {visible.map((suggestion) => (

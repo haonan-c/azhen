@@ -2,6 +2,7 @@ import { Dialog } from '@cloudflare/kumo'
 import { X } from '@phosphor-icons/react'
 import type { ReactNode } from 'react'
 import { WorkshopButton, WorkshopIconButton } from './WorkshopControls'
+import { m as messages } from '../paraglide/messages.js'
 
 interface DeleteConfirmationDialogProps {
   open: boolean
@@ -52,7 +53,7 @@ export default function DeleteConfirmationDialog({
                 {...props}
                 className="!h-7 !w-7"
                 disabled={isDeleting}
-                aria-label="Close"
+                aria-label={messages.common_close()}
               >
                 <X size={16} />
               </WorkshopIconButton>
@@ -68,7 +69,7 @@ export default function DeleteConfirmationDialog({
                 className="!h-9"
                 disabled={isDeleting}
               >
-                Cancel
+                {messages.common_cancel()}
               </WorkshopButton>
             )}
           />

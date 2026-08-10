@@ -11,6 +11,8 @@ import { useAuthenticatedApi } from '../../AuthContext'
 import type { GadgetMetadataWithTimestamps, OutputFormatOffer } from '@gadgets/workshop-shared/api'
 import { FormatGlyph } from '../format/FormatVisuals'
 import { createFromFormat } from '../format/useOutputFormats'
+import { formatOfferNoun } from '../format/formats'
+import { m as messages } from '../../paraglide/messages.js'
 
 // A ⌘K command palette: jump to a workspace or a primary destination. Because it's keyboard-driven
 // and opened many times a day, it deliberately has *no* open/close animation (instant feels faster
@@ -48,7 +50,7 @@ function mergeBlueprints(
   for (const b of library) {
     map.set(b.id, {
       id: b.id,
-      title: b.metadata.title || 'Untitled blueprint',
+      title: b.metadata.title || messages.shell_blueprint_untitled(),
       recency: b.addedAt.getTime(),
     })
   }
@@ -56,7 +58,7 @@ function mergeBlueprints(
     const prev = map.get(b.id)
     map.set(b.id, {
       id: b.id,
-      title: b.title || prev?.title || 'Untitled blueprint',
+      title: b.title || prev?.title || messages.shell_blueprint_untitled(),
       recency: Math.max(prev?.recency ?? 0, b.lastUpdated.getTime()),
     })
   }
@@ -227,8 +229,10 @@ export default function CommandPalette({
     // general starting point; the format shortcuts follow it in the admin's configured order.
     const formatCommands: Command[] = formats.map((format) => ({
       id: `format-${format.blueprintId}`,
-      label: `New ${format.output.noun}`,
-      hint: 'Format',
+      label: messages.command_palette_new_format({
+        format: formatOfferNoun(format),
+      }),
+      hint: messages.command_palette_format_hint(),
       icon: <FormatGlyph output={format.output} size="md" />,
       run: () => { void createFormat(format) },
     }))
@@ -236,20 +240,20 @@ export default function CommandPalette({
     const nav: Command[] = [
       {
         id: 'nav-new',
-        label: 'New workspace',
+        label: messages.command_palette_new_workspace(),
         icon: <Plus size={15} weight="bold" />,
         run: () => navigate({ to: '/' }),
       },
       ...formatCommands,
       {
         id: 'nav-workspaces',
-        label: 'Workspaces',
+        label: messages.shell_workspaces(),
         icon: <SquaresFour size={15} />,
         run: () => navigate({ to: '/workspaces' }),
       },
       {
         id: 'nav-blueprints',
-        label: 'Blueprints',
+        label: messages.shell_blueprints(),
         icon: <Blueprint size={15} />,
         run: () => navigate({ to: '/explore' }),
       },
@@ -259,8 +263,8 @@ export default function CommandPalette({
       .toSorted((a, b) => b.lastActive.getTime() - a.lastActive.getTime())
       .map((g) => ({
         id: `ws-${g.id}`,
-        label: g.title || 'Untitled workspace',
-        hint: 'Workspace',
+        label: g.title || messages.shell_workspace_untitled(),
+        hint: messages.command_palette_workspace_hint(),
         icon: <SquaresFour size={15} className="text-kumo-inactive" />,
         run: () => navigate({ to: '/workspace/$id', params: { id: g.id } }),
       }))
@@ -270,7 +274,7 @@ export default function CommandPalette({
       .map((b) => ({
         id: `bp-${b.id}`,
         label: b.title,
-        hint: 'Blueprint',
+        hint: messages.command_palette_blueprint_hint(),
         icon: <Blueprint size={15} className="text-kumo-inactive" />,
         run: () => navigate({ to: '/blueprint/$id', params: { id: b.id } }),
       }))
@@ -290,13 +294,13 @@ export default function CommandPalette({
 
     const built: Group[] = searching
       ? [
-          { heading: 'Actions', items: refine(nav, nav.length) },
-          { heading: 'Workspaces', items: refine(wsBase, 8) },
-          { heading: 'Blueprints', items: refine(bpBase, 8) },
+          { heading: messages.command_palette_actions(), items: refine(nav, nav.length) },
+          { heading: messages.shell_workspaces(), items: refine(wsBase, 8) },
+          { heading: messages.shell_blueprints(), items: refine(bpBase, 8) },
         ]
       : [
-          { heading: 'Actions', items: refine(nav, nav.length) },
-          { heading: 'Recent workspaces', items: refine(wsBase, 4) },
+          { heading: messages.command_palette_actions(), items: refine(nav, nav.length) },
+          { heading: messages.command_palette_recent_workspaces(), items: refine(wsBase, 4) },
         ]
 
     const groups = built.filter((g) => g.items.length > 0)
@@ -342,7 +346,7 @@ export default function CommandPalette({
       className="fixed inset-0 z-[1500] flex items-start justify-center px-4 pt-[12vh]"
       role="dialog"
       aria-modal="true"
-      aria-label="Command palette"
+      aria-label={messages.command_palette_label()}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose()
       }}
@@ -356,7 +360,8 @@ export default function CommandPalette({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="Search workspaces and actions…"
+            aria-label={messages.command_palette_search_label()}
+            placeholder={messages.command_palette_search_placeholder()}
             className="h-12 w-full bg-transparent text-[14px] leading-5 tracking-[-0.25px] text-kumo-default placeholder:text-kumo-inactive focus:outline-none"
           />
           <kbd className="shrink-0 rounded border border-kumo-line px-1.5 py-0.5 font-sans text-[10px] leading-none text-kumo-inactive">
@@ -366,7 +371,9 @@ export default function CommandPalette({
 
         <div ref={listRef} className="sidebar-scroll max-h-[min(60vh,420px)] overflow-y-auto p-1.5">
           {flat.length === 0 ? (
-            <p className="px-3 py-6 text-center text-[13px] text-kumo-inactive">No results.</p>
+            <p className="px-3 py-6 text-center text-[13px] text-kumo-inactive">
+              {messages.command_palette_no_results()}
+            </p>
           ) : (
             groups.map((group, gi) => {
               // Compute the flat index offset for this group so keyboard nav stays in sync.
@@ -411,15 +418,15 @@ export default function CommandPalette({
           <span className="flex items-center gap-1">
             <kbd className="rounded border border-kumo-line px-1 py-0.5 font-sans leading-none">↑</kbd>
             <kbd className="rounded border border-kumo-line px-1 py-0.5 font-sans leading-none">↓</kbd>
-            navigate
+            {messages.command_palette_navigate()}
           </span>
           <span className="flex items-center gap-1">
             <kbd className="rounded border border-kumo-line px-1 py-0.5 font-sans leading-none">↵</kbd>
-            open
+            {messages.command_palette_open()}
           </span>
           <span className="flex items-center gap-1">
             <kbd className="rounded border border-kumo-line px-1 py-0.5 font-sans leading-none">esc</kbd>
-            close
+            {messages.command_palette_close()}
           </span>
         </div>
       </div>

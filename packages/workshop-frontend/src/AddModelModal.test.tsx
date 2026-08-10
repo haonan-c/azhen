@@ -96,6 +96,7 @@ describe('AddModelModal direct-only providers in Gateway mode', () => {
   afterEach(() => {
     act(() => root?.unmount())
     container?.remove()
+    window.history.replaceState({}, '', '/')
     root = undefined
     container = undefined
   })
@@ -178,5 +179,29 @@ describe('AddModelModal direct-only providers in Gateway mode', () => {
       { type: 'agent', id: 'claude-custom', name: 'Claude Custom' },
       { provider: 'anthropic', model: 'claude-custom', apiToken: '' },
     )
+  })
+
+  it('localizes the Chinese onboarding dialog without changing provider and model names', async () => {
+    window.history.replaceState({}, '', '/zh')
+    const rendered = await render()
+
+    expect(rendered.container.textContent).toContain('添加 AI 模型')
+    expect(rendered.container.querySelector('[aria-label="选择服务商"]')).not.toBeNull()
+    expect(rendered.container.textContent).toContain('DeepSeek V4 Flash')
+    expect(rendered.container.textContent).toContain('其他 Anthropic 模型…')
+
+    await act(async () => {
+      rendered.container.querySelector<HTMLButtonElement>(
+        '[data-select-value="other-anthropic"]')!.click()
+    })
+    expect(rendered.container.querySelector('[aria-label="模型 ID"]')).not.toBeNull()
+    expect(rendered.container.querySelector('[aria-label="显示名称"]')).not.toBeNull()
+
+    await act(async () => {
+      [...rendered.container.querySelectorAll('button')]
+        .find(button => button.textContent === '添加模型')!.click()
+    })
+    expect(rendered.container.textContent).toContain('请输入模型 ID')
+    expect(rendered.container.textContent).toContain('请输入显示名称')
   })
 })
