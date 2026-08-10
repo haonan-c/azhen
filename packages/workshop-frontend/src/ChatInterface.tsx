@@ -99,7 +99,7 @@ import CapsuleOverlay, { CAPSULE_OVERLAY_GAP } from "./CapsuleOverlay";
 import type { SelectableItem } from "./ResourcePicker";
 import GatekeeperModal from "./GatekeeperModal";
 import { GatekeeperIcon } from "./components/GatekeeperIcon";
-import { formatOf, formatOfferNoun, FORMAT_ICONS } from "./components/format/formats";
+import { formatNoun, formatOfferNoun, FORMAT_ICONS } from "./components/format/formats";
 import { FormatMiniature } from "./components/format/FormatVisuals";
 import { formatIconDataUrl } from "./components/format/formatIconImage";
 import { locateMessageFormatRefs } from "./components/format/messageFormatRefs";
@@ -147,7 +147,7 @@ function CreatedGadgetChatCard({
   gadget: CreatedGadgetCardInfo;
   onOpen: () => void;
 }) {
-  const noun = gadget.output ? formatOf(gadget.output).noun : uiMessages.conversation_gadget();
+  const noun = gadget.output ? formatNoun(gadget.output) : uiMessages.conversation_gadget();
   return (
     <div className="group/createdApp relative w-full max-w-[440px]">
       <button
@@ -674,7 +674,7 @@ function getToolCallSummary(
       const output = outputOf?.(tc);
       return {
         verb: uiMessages.conversation_tool_created_noun({
-          noun: output?.noun ?? uiMessages.conversation_gadget(),
+          noun: output ? formatNoun(output) : uiMessages.conversation_gadget(),
         }),
         target: tc.input.title,
       };

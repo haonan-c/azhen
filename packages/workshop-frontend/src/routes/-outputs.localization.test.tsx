@@ -114,7 +114,9 @@ vi.mock('../components/DeleteConfirmationDialog', () => ({
   }) => open ? <div><h2>{title}</h2><div>{description}</div><button>{confirmLabel}</button></div> : null,
 }))
 
-import OutputsPage from './-OutputsPage'
+// Exercise the component module produced by the same router code-splitting transform as production.
+// @ts-expect-error Vite resolves this TanStack Router virtual module during the test transform.
+import { component as OutputsPage } from './outputs?tsr-split=component'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 

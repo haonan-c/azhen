@@ -60,43 +60,49 @@ export const GENERIC_OUTPUT: BlueprintOutput = {
   icon: 'appWindow',
 }
 
-const BUNDLED_FORMATS: Record<string, {
+const BUNDLED_FORMATS: Array<{
+  id: string
+  blueprintId: string
   noun: string
   plural: string
   icon: OutputIcon
   localizedNoun: () => string
   localizedPlural: () => string
-}> = {
-  document: {
+}> = [
+  {
+    id: 'document',
+    blueprintId: 'format.document',
     noun: 'Doc',
     plural: 'Docs',
     icon: 'fileText',
     localizedNoun: messages.output_format_document,
     localizedPlural: messages.output_format_document_plural,
   },
-  presentation: {
+  {
+    id: 'presentation',
+    blueprintId: 'format.slides',
     noun: 'Slides',
     plural: 'Slides',
     icon: 'presentation',
     localizedNoun: messages.output_format_slides,
     localizedPlural: messages.output_format_slides_plural,
   },
-  spreadsheet: {
+  {
+    id: 'spreadsheet',
+    blueprintId: 'format.spreadsheet',
     noun: 'Sheet',
     plural: 'Sheets',
     icon: 'table',
     localizedNoun: messages.output_format_spreadsheet,
     localizedPlural: messages.output_format_spreadsheet_plural,
   },
-}
+]
 
 function bundledFormat(output: BlueprintOutput) {
-  const bundled = BUNDLED_FORMATS[output.id]
-  return bundled?.noun === output.noun
-      && bundled.plural === output.plural
-      && bundled.icon === output.icon
-    ? bundled
-    : undefined
+  return BUNDLED_FORMATS.find((bundled) => bundled.id === output.id
+    && bundled.noun === output.noun
+    && bundled.plural === output.plural
+    && bundled.icon === output.icon)
 }
 
 // Resolve what to draw for a (possibly absent, possibly unrecognized) declared format.
@@ -130,14 +136,7 @@ export function wireframeOf(output?: BlueprintOutput): FormatWireframe {
 // The bundled formats have localized first-party names. Deployment overrides and custom formats
 // keep the exact name supplied by their author.
 export function formatOfferNoun(format: OutputFormatOffer): string {
-  if (format.blueprintId === 'format.document' && format.output.noun === 'Doc') {
-    return messages.output_format_document()
-  }
-  if (format.blueprintId === 'format.slides' && format.output.noun === 'Slides') {
-    return messages.output_format_slides()
-  }
-  if (format.blueprintId === 'format.spreadsheet' && format.output.noun === 'Sheet') {
-    return messages.output_format_spreadsheet()
-  }
-  return format.output.noun
+  const bundled = BUNDLED_FORMATS.find((candidate) =>
+    candidate.blueprintId === format.blueprintId && candidate.noun === format.output.noun)
+  return bundled?.localizedNoun() ?? format.output.noun
 }

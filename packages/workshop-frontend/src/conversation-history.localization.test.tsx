@@ -9,6 +9,7 @@ import type {
   ActionsSubscriber,
   AiChatMessage,
   AiChatSubscriber,
+  BlueprintOutput,
   Overseer,
 } from '@gadgets/workshop-shared/api'
 
@@ -60,6 +61,18 @@ const stableOutputOfWorkpiece = () => undefined
 const USER = { type: 'user', id: 'user-1', name: 'Owner' } as const
 const AGENT = { type: 'agent', id: 'model-1', name: 'Agent Original Name' } as const
 const AT = new Date('2026-08-10T12:34:00Z')
+const DOCUMENT_OUTPUT: BlueprintOutput = {
+  id: 'document', noun: 'Doc', plural: 'Docs', icon: 'fileText',
+}
+const CUSTOM_OUTPUT: BlueprintOutput = {
+  id: 'custom-board', noun: 'Launch Board', plural: 'Launch Boards', icon: 'kanban',
+}
+const FUTURE_OUTPUT: BlueprintOutput = {
+  id: 'future-format',
+  noun: 'Future Item',
+  plural: 'Future Items',
+  icon: 'futureIcon' as BlueprintOutput['icon'],
+}
 
 const messages: AiChatMessage[] = [
   {
@@ -104,6 +117,18 @@ const messages: AiChatMessage[] = [
     sequence: 2,
     timestamp: AT,
     author: AGENT,
+    type: 'changes',
+    createdGadgets: [
+      { gadgetId: 11, title: 'RESULT TITLE VERBATIM', bindingName: 'document' },
+      { gadgetId: 12, title: 'CUSTOM RESULT VERBATIM', bindingName: 'custom' },
+      { gadgetId: 13, title: 'FUTURE RESULT VERBATIM', bindingName: 'future' },
+    ],
+  },
+  {
+    chatId: 7,
+    sequence: 3,
+    timestamp: AT,
+    author: AGENT,
     type: 'action',
     actionId: 42,
     actionLog: {
@@ -124,7 +149,7 @@ const messages: AiChatMessage[] = [
   },
   {
     chatId: 7,
-    sequence: 3,
+    sequence: 4,
     timestamp: AT,
     author: AGENT,
     type: 'connectionRequest',
@@ -134,14 +159,6 @@ const messages: AiChatMessage[] = [
     resourceTitle: 'CONNECTION SCOPE VERBATIM',
     reason: 'CONNECTION REASON VERBATIM',
     state: 'pending',
-  },
-  {
-    chatId: 7,
-    sequence: 4,
-    timestamp: AT,
-    author: AGENT,
-    type: 'changes',
-    createdGadgets: [{ gadgetId: 11, title: 'RESULT TITLE VERBATIM', bindingName: 'result' }],
   },
   {
     chatId: 7,
@@ -180,6 +197,12 @@ describe('localized conversation history', () => {
     const approveAction = vi.fn<(actionId: number) => Promise<void>>(async () => {})
     const denyConnectionRequest = vi.fn<(requestId: string) => Promise<void>>(async () => {})
     const onOpenGadget = vi.fn<(gadgetId: number) => void>()
+    const outputOfWorkpiece = (gadgetId: number) => {
+      if (gadgetId === 11) return DOCUMENT_OUTPUT
+      if (gadgetId === 12) return CUSTOM_OUTPUT
+      if (gadgetId === 13) return FUTURE_OUTPUT
+      return undefined
+    }
     const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
     const overseer = {
       subscribeToChat: (_subscriber: AiChatSubscriber) => disposable,
@@ -216,7 +239,7 @@ describe('localized conversation history', () => {
         onConsumeConsoleLogs={() => ''}
         onDiscardConsoleLogs={() => {}}
         onOpenGadget={onOpenGadget}
-        outputOfWorkpiece={() => undefined}
+        outputOfWorkpiece={outputOfWorkpiece}
       />,
     ))
 
@@ -234,6 +257,10 @@ describe('localized conversation history', () => {
     await act(async () => document.body.querySelector<HTMLButtonElement>('[aria-label="关闭预览"]')!.click())
     expect(container.textContent).toContain('运行代码')
     expect(container.textContent).toContain('读取了 2 个文件')
+    expect(container.textContent).toContain('新文档 · 点击预览')
+    expect(container.textContent).toContain('新Launch Board · 点击预览')
+    expect(container.textContent).toContain('新应用 · 点击预览')
+    expect(container.textContent).not.toContain('新Future Item')
     expect(container.textContent).toContain('RAW-FILE-A.txt')
 
     const toolCall = [...container.querySelectorAll<HTMLButtonElement>('button')]
