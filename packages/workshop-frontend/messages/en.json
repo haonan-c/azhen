@@ -1064,6 +1064,7 @@
   "common_reset": "Reset",
   "common_save": "Save",
   "error_boundary_description": "Reload the Workshop to start again.",
+  "error_boundary_diagnostic": "Diagnostic: {detail}",
   "error_boundary_reload": "Reload",
   "error_boundary_title": "Something went wrong",
   "context_collection": "Collection",

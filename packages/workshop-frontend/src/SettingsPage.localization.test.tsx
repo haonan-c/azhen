@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 const testState = vi.hoisted(() => ({
   addToast: vi.fn<(toast: unknown) => void>(),
   whoami: vi.fn<() => Promise<{ id: string; name: string }>>(),
+  hasPasswordLogin: vi.fn<() => Promise<boolean>>(),
 }))
 
 vi.mock('@cloudflare/kumo', async (importOriginal) => ({
@@ -18,7 +19,7 @@ vi.mock('./AuthContext', () => ({
   useAuthenticatedApi: () => ({
     authenticatedApi: {
       whoami: testState.whoami,
-      hasPasswordLogin: async () => false,
+      hasPasswordLogin: testState.hasPasswordLogin,
     },
   }),
 }))
@@ -48,9 +49,10 @@ describe('Profile localization', () => {
     container = undefined
   })
 
-  async function render(path: string) {
+  async function render(path: string, hasPassword = false) {
     window.history.replaceState({}, '', path)
     testState.whoami.mockResolvedValue({ id: 'USER-ID-原样', name: 'USER NAME 原样' })
+    testState.hasPasswordLogin.mockResolvedValue(hasPassword)
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -111,5 +113,20 @@ describe('Profile localization', () => {
       description: 'PROFILE-DIAGNOSTIC-原样',
       variant: 'error',
     }))
+  })
+
+  it('gives Chinese password fields localized names and descriptions', async () => {
+    await render('/zh/profile', true)
+    await vi.waitFor(() => expect(container?.textContent).toContain('安全'))
+
+    const current = container?.querySelector<HTMLInputElement>('input[autocomplete="current-password"]')
+    const next = container?.querySelector<HTMLInputElement>('input[placeholder="输入新密码"]')
+    const confirm = container?.querySelector<HTMLInputElement>('input[placeholder="再次输入新密码"]')
+    expect(current?.getAttribute('aria-label')).toBe('当前密码')
+    expect(next?.getAttribute('aria-label')).toBe('新密码')
+    expect(confirm?.getAttribute('aria-label')).toBe('确认新密码')
+    expect(next?.getAttribute('aria-describedby')).not.toBeNull()
+    expect(document.getElementById(next!.getAttribute('aria-describedby')!)?.textContent)
+      .toBe('至少需要 8 个字符')
   })
 })

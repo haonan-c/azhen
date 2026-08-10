@@ -32,7 +32,9 @@ vi.mock('@cloudflare/kumo', () => {
       <button type="button" {...props}>{children}</button>
     ),
     Dialog,
-    Loader: () => <output />,
+    Loader: ({ 'aria-label': ariaLabel }: { 'aria-label'?: string }) => (
+      <output aria-label={ariaLabel} />
+    ),
     Radio,
     useKumoToastManager: () => ({ add: testState.addToast }),
   }
@@ -109,6 +111,13 @@ describe('account and billing localization', () => {
     expect(container?.textContent).toContain('你的 Cloudflare 连接可以访问多个账户。')
     expect(container?.textContent).toContain('保存')
     expect(container?.textContent).toContain('ACCOUNT NAME 原样')
+  })
+
+  it('gives the Chinese billing loader a localized live status name', async () => {
+    testState.getUsage.mockReturnValue(new Promise(() => {}))
+    await render(<OutOfCreditsModal open onClose={() => {}} />, '/zh/workspace/1')
+
+    expect(container?.querySelector('output[aria-label="正在加载用量…"]')).not.toBeNull()
   })
 
   it.each([

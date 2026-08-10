@@ -104,7 +104,9 @@ export default function OutOfCreditsModal({ open, onClose }: OutOfCreditsModalPr
         </Dialog.Title>
 
         {usage === null ? (
-          <div className="flex justify-center py-8"><Loader size="base" /></div>
+          <div className="flex justify-center py-8">
+            <Loader size="base" aria-label={messages.billing_loading_usage()} />
+          </div>
         ) : (
           <div className="space-y-4">
             {!connected ? (

@@ -1064,6 +1064,7 @@
   "common_reset": "重置",
   "common_save": "保存",
   "error_boundary_description": "重新加载工作台以重新开始。",
+  "error_boundary_diagnostic": "诊断信息：{detail}",
   "error_boundary_reload": "重新加载",
   "error_boundary_title": "出现问题",
   "context_collection": "知识集",

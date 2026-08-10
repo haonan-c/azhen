@@ -35,6 +35,7 @@ describe('FrontendErrorBoundary', () => {
     ))
     expect(container.textContent).toContain(title)
     expect(container.querySelector('button')?.textContent).toContain(reload)
+    expect(container.textContent).toContain('render failed')
     expect(reportIssue).toHaveBeenCalledWith('workshop.react-render', expect.any(Error),
       expect.objectContaining({ captureMechanism: 'react', handled: false }))
     container.remove()

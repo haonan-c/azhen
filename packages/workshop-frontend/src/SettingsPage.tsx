@@ -1,6 +1,6 @@
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useId, useRef } from 'react'
 import { AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
 import { hashPassword } from './passwordHash'
 import { CF_ACCESS_MODE } from './useAuth'
@@ -55,6 +55,8 @@ function PasswordField({
   autoComplete?: string
 }) {
   const [show, setShow] = useState(false)
+  const descriptionId = useId()
+  const hasDescription = Boolean(error || description)
   return (
     <div>
       <FieldLabel>{label}</FieldLabel>
@@ -65,6 +67,8 @@ function PasswordField({
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
           autoComplete={autoComplete}
+          aria-label={label}
+          aria-describedby={hasDescription ? descriptionId : undefined}
           className={`${INPUT} pr-10 ${error ? 'border-kumo-danger focus:border-kumo-danger' : ''}`}
         />
         <button
@@ -77,9 +81,9 @@ function PasswordField({
         </button>
       </div>
       {error ? (
-        <p className="mt-1 text-[12px] tracking-[-0.1px] text-kumo-danger">{error}</p>
+        <p id={descriptionId} className="mt-1 text-[12px] tracking-[-0.1px] text-kumo-danger">{error}</p>
       ) : description ? (
-        <p className="mt-1 text-[12px] tracking-[-0.1px] text-kumo-subtle">{description}</p>
+        <p id={descriptionId} className="mt-1 text-[12px] tracking-[-0.1px] text-kumo-subtle">{description}</p>
       ) : null}
     </div>
   )
@@ -343,6 +347,7 @@ export default function SettingsPage() {
                 {isEditingName ? (
                   <input
                     value={nameInput}
+                    aria-label={messages.profile_display_name()}
                     onChange={(e) => setNameInput(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') handleSaveName()

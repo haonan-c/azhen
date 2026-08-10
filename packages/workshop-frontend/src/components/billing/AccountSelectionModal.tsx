@@ -84,7 +84,9 @@ export default function AccountSelectionModal() {
           </p>
 
           {accounts === null ? (
-            <div className="flex justify-center py-6"><Loader size="base" /></div>
+            <div className="flex justify-center py-6">
+              <Loader size="base" aria-label={messages.billing_loading_accounts()} />
+            </div>
           ) : accounts.length === 0 ? (
             <p className="text-sm text-kumo-subtle">{messages.billing_no_accounts()}</p>
           ) : (
