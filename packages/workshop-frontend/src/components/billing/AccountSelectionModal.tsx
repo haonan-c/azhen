@@ -4,6 +4,7 @@ import { Dialog, Button, Loader, Radio, useKumoToastManager } from '@cloudflare/
 import { Warning } from '@phosphor-icons/react'
 import { useOptionalAuthenticatedApi } from '../../AuthContext'
 import { useCloudflareLimitsEnabled } from '../../ServerConfigContext'
+import { m as messages } from '../../paraglide/messages.js'
 
 // Global, mandatory modal that forces the user to pick which Cloudflare account to bill whenever
 // they're connected but have access to more than one account. Auto-opens (and re-opens) as long as
@@ -53,12 +54,15 @@ export default function AccountSelectionModal() {
     setSaving(true)
     try {
       await auth.authenticatedApi.selectCloudflareAccount(chosen)
-      toasts.add({ title: 'Cloudflare account selected', variant: 'success' })
+      toasts.add({ title: messages.billing_account_selected(), variant: 'success' })
       setNeedsSelection(false)
       setAccounts(null)
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to select account'
-      toasts.add({ title: msg, variant: 'error' })
+      toasts.add({
+        title: messages.billing_select_account_error(),
+        description: err instanceof Error ? err.message : undefined,
+        variant: 'error',
+      })
     } finally {
       setSaving(false)
     }
@@ -71,19 +75,18 @@ export default function AccountSelectionModal() {
       <Dialog className="p-6 sm:w-[480px]" size="base">
         <Dialog.Title className="text-lg font-semibold mb-2 flex items-center gap-2">
           <Warning size={22} weight="bold" className="text-kumo-warning" />
-          Choose a Cloudflare account
+          {messages.billing_select_account_title()}
         </Dialog.Title>
 
         <div className="space-y-4">
           <p className="text-sm text-kumo-subtle">
-            Your Cloudflare connection has access to multiple accounts. Select the one whose credits
-            should be billed for usage beyond the free tier.
+            {messages.billing_select_account_description()}
           </p>
 
           {accounts === null ? (
             <div className="flex justify-center py-6"><Loader size="base" /></div>
           ) : accounts.length === 0 ? (
-            <p className="text-sm text-kumo-subtle">No accounts available on this connection.</p>
+            <p className="text-sm text-kumo-subtle">{messages.billing_no_accounts()}</p>
           ) : (
             <Radio.Group
               appearance="card"
@@ -91,7 +94,7 @@ export default function AccountSelectionModal() {
               onValueChange={setChosen}
               disabled={saving}
             >
-              <Radio.Legend className="sr-only">Cloudflare account</Radio.Legend>
+              <Radio.Legend className="sr-only">{messages.billing_account_label()}</Radio.Legend>
               {accounts.map((a) => (
                 <Radio.Item key={a.accountId} value={a.accountId} label={a.accountName} />
               ))}
@@ -105,10 +108,10 @@ export default function AccountSelectionModal() {
               // un-actionable modal — let them retry or dismiss (it re-checks on focus).
               <>
                 <Button variant="ghost" onClick={() => setNeedsSelection(false)}>
-                  Dismiss
+                  {messages.common_dismiss()}
                 </Button>
                 <Button variant="secondary" onClick={() => setAccounts(null)}>
-                  Try again
+                  {messages.common_retry()}
                 </Button>
               </>
             ) : (
@@ -118,7 +121,7 @@ export default function AccountSelectionModal() {
                 loading={saving}
                 disabled={!chosen || saving}
               >
-                Save
+                {messages.common_save()}
               </Button>
             )}
           </div>

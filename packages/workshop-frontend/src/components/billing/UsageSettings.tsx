@@ -7,6 +7,9 @@ import { useAuthenticatedApi } from '../../AuthContext'
 import { useCloudflareLimitsEnabled } from '../../ServerConfigContext'
 import { buildAddCreditsUrl } from './creditsUrl'
 import ResetCountdown from './ResetCountdown'
+import { formatResetTime, formatUsdBalance } from './formatBilling'
+import { m as messages } from '../../paraglide/messages.js'
+import { formatLocaleNumber } from '../../utils/formatNumber'
 
 // Shows the user's free-tier usage and Cloudflare connection / credit status on the profile page.
 // Renders nothing unless the Cloudflare limits flow is enabled server-side.
@@ -60,8 +63,12 @@ export default function UsageSettings() {
       // OAuth popup; the connected-accounts subscription + focus refresh pick up the result.
       const { url } = await authenticatedApi.connectAccount('cloudflare')
       window.open(url, '_blank', 'noopener,noreferrer')
-    } catch {
-      toasts.add({ title: 'Failed to start Cloudflare connection', variant: 'error' })
+    } catch (err) {
+      toasts.add({
+        title: messages.billing_connection_start_error(),
+        description: err instanceof Error ? err.message : undefined,
+        variant: 'error',
+      })
     } finally {
       setBusy(false)
     }
@@ -71,12 +78,15 @@ export default function UsageSettings() {
     setSelecting(accountId)
     try {
       await authenticatedApi.selectCloudflareAccount(accountId)
-      toasts.add({ title: 'Cloudflare account selected', variant: 'success' })
+      toasts.add({ title: messages.billing_account_selected(), variant: 'success' })
       setAccounts(null)
       refresh()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to select account'
-      toasts.add({ title: msg, variant: 'error' })
+      toasts.add({
+        title: messages.billing_select_account_error(),
+        description: err instanceof Error ? err.message : undefined,
+        variant: 'error',
+      })
     } finally {
       setSelecting(null)
     }
@@ -85,23 +95,34 @@ export default function UsageSettings() {
   return (
     <section className="flex flex-col gap-3">
       <h2 className="px-1 text-[12px] font-medium uppercase tracking-[0.08em] text-kumo-inactive">
-        Usage &amp; billing
+        {messages.billing_usage_heading()}
       </h2>
       <div className="rounded-xl border border-kumo-line bg-kumo-base p-5">
       {loading || !usage ? (
-        <p className="text-sm text-kumo-subtle">Loading usage…</p>
+        <p role="status" className="text-sm text-kumo-subtle">
+          {messages.billing_loading_usage()}
+        </p>
       ) : (
         <div className="space-y-6">
           {/* Free daily allowance */}
           <div>
-            <p className="text-xs font-medium text-kumo-subtle mb-1">Free daily allowance</p>
+            <p className="text-xs font-medium text-kumo-subtle mb-1">
+              {messages.billing_free_allowance()}
+            </p>
             <p className="text-sm text-kumo-default">
-              {usage.remaining} of {usage.dailyLimit}{' '}
-              {usage.dailyLimit === 1 ? 'request' : 'requests'} remaining today
+              {usage.dailyLimit === 1
+                ? messages.billing_requests_remaining_one({
+                    remaining: formatLocaleNumber(usage.remaining),
+                    limit: formatLocaleNumber(usage.dailyLimit),
+                  })
+                : messages.billing_requests_remaining_many({
+                    remaining: formatLocaleNumber(usage.remaining),
+                    limit: formatLocaleNumber(usage.dailyLimit),
+                  })}
             </p>
             {usage.resetAt && (
               <p className="text-xs text-kumo-subtle mt-1">
-                Resets at 00:00 UTC, in{' '}
+                {messages.billing_resets_in({ time: formatResetTime(usage.resetAt) })}{' '}
                 <ResetCountdown resetAt={usage.resetAt} onElapsed={refresh} />.
               </p>
             )}
@@ -109,22 +130,22 @@ export default function UsageSettings() {
 
           {/* Cloudflare connection / credits */}
           <div>
-            <p className="text-xs font-medium text-kumo-subtle mb-1">Cloudflare account</p>
+            <p className="text-xs font-medium text-kumo-subtle mb-1">
+              {messages.billing_account_label()}
+            </p>
             {!usage.connected ? (
               <div className="space-y-3">
                 <div className="flex items-center gap-2 text-sm text-kumo-subtle">
                   <CloudflareLogo size={16} />
-                  <span>Not connected</span>
+                  <span>{messages.billing_not_connected()}</span>
                 </div>
                 <p className="text-sm text-kumo-subtle">
-                  Connect your Cloudflare account to keep building once your free allowance runs
-                  out. Usage beyond the free tier is billed to your own Cloudflare AI Gateway
-                  credits.
+                  {messages.billing_connect_description()}
                 </p>
                 <div className="pt-1">
                   <Button variant="primary" size="sm" onClick={connect} loading={busy}>
                     <Lightning size={14} weight="bold" className="mr-1" />
-                    Connect Cloudflare
+                    {messages.billing_connect_cloudflare()}
                   </Button>
                 </div>
               </div>
@@ -133,17 +154,18 @@ export default function UsageSettings() {
               <div className="space-y-3">
                 <div className="flex items-center gap-2 text-sm text-kumo-default">
                   <Warning size={18} weight="bold" className="text-kumo-warning" />
-                  <span>Choose which Cloudflare account to bill</span>
+                  <span>{messages.billing_choose_account()}</span>
                 </div>
                 <p className="text-sm text-kumo-subtle">
-                  Your connection has access to multiple Cloudflare accounts. Select the one whose
-                  AI Gateway credits should be used.
+                  {messages.billing_choose_account_description()}
                 </p>
                 {accounts === null ? (
-                  <p className="text-sm text-kumo-subtle">Loading accounts…</p>
+                  <p role="status" className="text-sm text-kumo-subtle">
+                    {messages.billing_loading_accounts()}
+                  </p>
                 ) : accounts.length === 0 ? (
                   <p className="text-sm text-kumo-subtle">
-                    No accounts available on this connection.
+                    {messages.billing_no_accounts()}
                   </p>
                 ) : (
                   <div className="flex flex-col gap-2">
@@ -168,17 +190,16 @@ export default function UsageSettings() {
                 <div className="flex items-center gap-2 text-sm text-kumo-default">
                   <CloudCheck size={18} weight="bold" className="text-kumo-success" />
                   <span>
-                    Connected
+                    {messages.billing_connected()}
                     {usage.accountName && <> — {usage.accountName}</>}
                   </span>
                 </div>
                 <p className="text-sm text-kumo-default">
-                  Account balance:{' '}
-                  {usage.balance !== null ? (
-                    <strong>${usage.balance.toFixed(2)}</strong>
-                  ) : (
-                    <span className="text-kumo-subtle">unknown</span>
-                  )}
+                  {messages.billing_account_balance({
+                    balance: usage.balance !== null
+                      ? formatUsdBalance(usage.balance)
+                      : messages.billing_balance_unknown(),
+                  })}
                 </p>
 
                 <div className="flex items-center gap-2 pt-1">
@@ -188,7 +209,7 @@ export default function UsageSettings() {
                     onClick={() => window.open(buildAddCreditsUrl(usage.accountId), '_blank')}
                   >
                     <Lightning size={14} weight="bold" className="mr-1" />
-                    Add credits
+                    {messages.billing_add_credits()}
                   </Button>
                 </div>
               </div>
@@ -196,14 +217,14 @@ export default function UsageSettings() {
           </div>
 
           <p className="text-xs text-kumo-subtle border-t border-kumo-line pt-3">
-            Learn more about{' '}
+            {messages.billing_learn_more()}{' '}
             <a
               href="https://developers.cloudflare.com/ai-gateway/features/unified-billing/"
               target="_blank"
               rel="noreferrer"
               className="underline"
             >
-              AI Gateway unified billing
+              {messages.billing_unified_billing()}
             </a>
             .
           </p>

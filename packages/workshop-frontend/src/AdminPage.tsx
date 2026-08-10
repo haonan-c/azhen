@@ -3,21 +3,23 @@ import { RpcStub } from 'capnweb'
 import { Switch, Textarea, Input, Button, Tabs, useKumoToastManager } from '@cloudflare/kumo'
 import { Hexagon, ShieldWarning, UserPlus } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
-import { AdminApi, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, DEFAULT_SITE_NAME, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
+import { AdminApi, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
 import { applyAccentColor, DEFAULT_ACCENT_COLOR } from './theme'
 import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
+import { m as messages } from './paraglide/messages.js'
+import { formatLocaleNumber } from './utils/formatNumber'
 
 // Preset accent colors offered in the Theme section ('' = default brand).
-const ACCENT_PRESETS: { label: string; value: string }[] = [
-  { label: 'Default', value: '' },
-  { label: 'Blue', value: '#3b82f6' },
-  { label: 'Green', value: '#16a34a' },
-  { label: 'Purple', value: '#7c3aed' },
-  { label: 'Pink', value: '#db2777' },
-  { label: 'Teal', value: '#0d9488' },
+const ACCENT_PRESETS: { label: () => string; value: string }[] = [
+  { label: messages.admin_accent_default, value: '' },
+  { label: messages.admin_accent_blue, value: '#3b82f6' },
+  { label: messages.admin_accent_green, value: '#16a34a' },
+  { label: messages.admin_accent_purple, value: '#7c3aed' },
+  { label: messages.admin_accent_pink, value: '#db2777' },
+  { label: messages.admin_accent_teal, value: '#0d9488' },
 ]
 
 // Swatch background per banner color, matching AnnouncementBanner's accent styles.
@@ -30,16 +32,33 @@ const BANNER_SWATCH: Record<BannerColor, string> = {
   brand: 'var(--color-accent-100)',
 }
 
+const BANNER_LABELS: Record<BannerColor, () => string> = {
+  neutral: messages.admin_banner_neutral,
+  info: messages.admin_banner_info,
+  success: messages.admin_banner_success,
+  warning: messages.admin_banner_warning,
+  danger: messages.admin_banner_danger,
+  brand: messages.admin_banner_brand,
+}
+
 export default function AdminPage() {
   const { authenticatedApi, isAdmin } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
-  useDocumentTitle('Admin')
+  useDocumentTitle(messages.admin_document_title())
 
   // The admin capability (minted once via getAdminApi; null until loaded / for non-admins). Wrapped
   // in an object so useState doesn't treat the (callable) RPC stub as a state updater function.
   const [admin, setAdmin] = useState<{ api: RpcStub<AdminApi> } | null>(null)
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+
+  const showError = (title: string, error: unknown) => {
+    toasts.add({
+      title,
+      description: error instanceof Error ? error.message : undefined,
+      variant: 'error',
+    })
+  }
 
   // System-prompt instructions: last-saved value + current editor draft.
   const [savedInstructions, setSavedInstructions] = useState('')
@@ -122,7 +141,7 @@ export default function AdminPage() {
           return
         }
         if (!api) {
-          setLoadError(true)
+          setLoadError('')
           return
         }
         stub = api
@@ -131,7 +150,7 @@ export default function AdminPage() {
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to load admin settings:', err)
-          setLoadError(true)
+          setLoadError(err instanceof Error ? err.message : '')
         }
       } finally {
         if (!cancelled) setLoading(false)
@@ -173,8 +192,7 @@ export default function AdminPage() {
     try {
       await admin.api.setResourceEnabled(vendorId, urlPattern, enabled)
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Update failed'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_update_error(), err)
       await reloadResources().catch(() => {})
     } finally {
       setResourceBusy((prev) => {
@@ -195,8 +213,7 @@ export default function AdminPage() {
     try {
       await admin.api.setGatekeeperMode(vendorId, enabled ? 'enabled' : 'disabled')
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Update failed'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_update_error(), err)
       await reloadResources().catch(() => {})
     } finally {
       setResourceBusy((prev) => {
@@ -217,8 +234,7 @@ export default function AdminPage() {
     try {
       await admin.api.setGatekeeperMode(vendorId, mode)
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Update failed'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_update_error(), err)
       await reloadResources().catch(() => {})
     } finally {
       setResourceBusy((prev) => {
@@ -235,10 +251,9 @@ export default function AdminPage() {
     try {
       await admin.api.setAnnouncement(announcementDraft)
       setSavedAnnouncement(announcementDraft)
-      toasts.add({ title: 'Announcement saved', variant: 'success' })
+      toasts.add({ title: messages.admin_announcement_saved(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save announcement'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_announcement_save_error(), err)
     } finally {
       setSavingAnnouncement(false)
     }
@@ -253,10 +268,9 @@ export default function AdminPage() {
     try {
       await admin.api.setBanner(bannerTextDraft, bannerColorDraft)
       setSavedBanner({ text: bannerTextDraft, color: bannerColorDraft })
-      toasts.add({ title: 'Banner saved', variant: 'success' })
+      toasts.add({ title: messages.admin_banner_saved(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save banner'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_banner_save_error(), err)
     } finally {
       setSavingBanner(false)
     }
@@ -270,10 +284,9 @@ export default function AdminPage() {
     try {
       await admin.api.setAccentColor(accentDraft)
       setSavedAccent(accentDraft)
-      toasts.add({ title: 'Accent color saved', variant: 'success' })
+      toasts.add({ title: messages.admin_accent_saved(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save accent color'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_accent_save_error(), err)
     } finally {
       setSavingAccent(false)
     }
@@ -287,8 +300,7 @@ export default function AdminPage() {
       await admin.api.setSignupsEnabled(enabled)
     } catch (err) {
       setSignupsEnabled(!enabled) // revert
-      const message = err instanceof Error ? err.message : 'Update failed'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_update_error(), err)
     } finally {
       setSavingSignups(false)
     }
@@ -300,10 +312,9 @@ export default function AdminPage() {
     try {
       await admin.api.setSiteName(siteNameDraft)
       setSavedSiteName(siteNameDraft)
-      toasts.add({ title: 'Site name saved', variant: 'success' })
+      toasts.add({ title: messages.admin_site_name_saved(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save site name'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_site_name_save_error(), err)
     } finally {
       setSavingSiteName(false)
     }
@@ -319,10 +330,9 @@ export default function AdminPage() {
       const data = await prepareSiteLogo(file)
       const logo = await admin.api.setSiteLogo(data)
       setSiteLogoUrl(logo ? cacheBustSiteLogoUrl(logo.url) : null)
-      toasts.add({ title: 'Logo saved', variant: 'success' })
+      toasts.add({ title: messages.admin_logo_saved(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save logo'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_logo_save_error(), err)
     } finally {
       setSavingSiteLogo(false)
     }
@@ -334,10 +344,9 @@ export default function AdminPage() {
     try {
       await admin.api.setSiteLogo(null)
       setSiteLogoUrl(null)
-      toasts.add({ title: 'Default logo restored', variant: 'success' })
+      toasts.add({ title: messages.admin_logo_restored(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to remove logo'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_logo_remove_error(), err)
     } finally {
       setSavingSiteLogo(false)
     }
@@ -349,10 +358,9 @@ export default function AdminPage() {
     try {
       await admin.api.setInstanceInstructions(instructionsDraft)
       setSavedInstructions(instructionsDraft)
-      toasts.add({ title: 'System prompt instructions saved', variant: 'success' })
+      toasts.add({ title: messages.admin_agent_instructions_saved(), variant: 'success' })
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to save instructions'
-      toasts.add({ title: message, variant: 'error' })
+      showError(messages.admin_agent_instructions_save_error(), err)
     } finally {
       setSavingInstructions(false)
     }
@@ -362,7 +370,7 @@ export default function AdminPage() {
     return (
       <div className="max-w-2xl mx-auto px-4 sm:px-6 py-16 text-center">
         <ShieldWarning size={32} className="mx-auto text-kumo-subtle mb-3" />
-        <p className="text-sm text-kumo-default">You don't have access to this page.</p>
+        <p className="text-sm text-kumo-default">{messages.admin_access_denied()}</p>
       </div>
     )
   }
@@ -370,17 +378,18 @@ export default function AdminPage() {
   if (loading) {
     return (
       <div className="flex-1 flex items-center justify-center min-h-[60vh]">
-        <p className="text-kumo-subtle">Loading admin settings...</p>
+        <p role="status" className="text-kumo-subtle">{messages.admin_loading()}</p>
       </div>
     )
   }
 
-  if (loadError || !admin) {
+  if (loadError !== null || !admin) {
     return (
       <div className="mx-auto w-full max-w-[1040px] px-4 sm:px-8 py-16 text-center">
-        <p className="text-sm text-kumo-danger">Something went wrong loading admin settings.</p>
+        <p className="text-sm text-kumo-danger">{messages.admin_load_error()}</p>
+        {loadError && <p className="mt-2 text-xs text-kumo-subtle">{loadError}</p>}
         <button onClick={() => window.location.reload()} className="text-kumo-brand mt-2 text-sm underline">
-          Try again
+          {messages.common_retry()}
         </button>
       </div>
     )
@@ -389,9 +398,9 @@ export default function AdminPage() {
   return (
     <div className="mx-auto w-full max-w-[1040px] px-4 sm:px-8 py-8 space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold text-kumo-default">Admin</h1>
+        <h1 className="text-2xl font-semibold text-kumo-default">{messages.admin_heading()}</h1>
         <p className="text-sm text-kumo-subtle mt-1">
-          Deployment-wide settings. Changes apply to all users on their next connection.
+          {messages.admin_description()}
         </p>
       </div>
 
@@ -400,10 +409,10 @@ export default function AdminPage() {
         value={activeTab}
         onValueChange={setActiveTab}
         tabs={[
-          { value: 'general', label: 'General' },
-          { value: 'gatekeepers', label: 'Gatekeepers' },
-          { value: 'formats', label: 'Formats' },
-          { value: 'access', label: 'Access' },
+          { value: 'general', label: messages.admin_tab_general() },
+          { value: 'gatekeepers', label: messages.admin_tab_gatekeepers() },
+          { value: 'formats', label: messages.admin_tab_formats() },
+          { value: 'access', label: messages.admin_tab_access() },
         ]}
       />
 
@@ -424,15 +433,18 @@ export default function AdminPage() {
               <UserPlus size={18} className="text-kumo-subtle" />
             </div>
             <div className="flex-1 min-w-0">
-              <h2 className="text-lg font-semibold text-kumo-strong">Allow new sign-ups</h2>
+              <h2 className="text-lg font-semibold text-kumo-strong">
+                {messages.admin_signups_title()}
+              </h2>
               <p className="text-sm text-kumo-subtle mt-0.5">
-                When off, existing users can still log in but no new accounts can be created.
+                {messages.admin_signups_description()}
               </p>
             </div>
             <Switch
               checked={signupsEnabled}
               disabled={savingSignups}
               onCheckedChange={handleSignupsToggle}
+              aria-label={messages.admin_signups_title()}
             />
           </div>
         </div>
@@ -441,16 +453,18 @@ export default function AdminPage() {
       {/* Site name */}
       {activeTab === 'general' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Site name</h2>
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+            {messages.admin_site_name_title()}
+          </h2>
           <p className="text-sm text-kumo-subtle mb-5">
-            Shown next to the logo in the top bar. Leave empty to use the default
-            (&ldquo;{DEFAULT_SITE_NAME}&rdquo;). Applies on each user&rsquo;s next connection.
+            {messages.admin_site_name_description({ brand: messages.brand_name() })}
           </p>
 
           <Input
             value={siteNameDraft}
             onChange={(e) => setSiteNameDraft(e.target.value)}
-            placeholder={DEFAULT_SITE_NAME}
+            placeholder={messages.brand_name()}
+            aria-label={messages.admin_site_name_title()}
             maxLength={MAX_SITE_NAME_LENGTH}
           />
 
@@ -462,7 +476,7 @@ export default function AdminPage() {
                 onClick={() => setSiteNameDraft(savedSiteName)}
                 disabled={savingSiteName}
               >
-                Reset
+                {messages.common_reset()}
               </Button>
             )}
             <Button
@@ -472,7 +486,7 @@ export default function AdminPage() {
               loading={savingSiteName}
               disabled={siteNameDraft === savedSiteName}
             >
-              Save
+              {messages.common_save()}
             </Button>
           </div>
         </div>
@@ -481,11 +495,11 @@ export default function AdminPage() {
       {/* Site logo */}
       {activeTab === 'general' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Logo</h2>
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+            {messages.admin_logo_title()}
+          </h2>
           <p className="text-sm text-kumo-subtle mb-5">
-            Shown in the app chrome, sign-in screens, and browser tab. Images are scaled without
-            cropping and converted to a static PNG. Square images work best. Applies on each
-            user&rsquo;s next connection.
+            {messages.admin_logo_description()}
           </p>
 
           <div className="flex flex-wrap items-center gap-4">
@@ -510,7 +524,7 @@ export default function AdminPage() {
                 loading={savingSiteLogo}
                 disabled={savingSiteLogo}
               >
-                {siteLogoUrl ? 'Change logo' : 'Upload logo'}
+                {siteLogoUrl ? messages.admin_logo_change() : messages.admin_logo_upload()}
               </Button>
               {siteLogoUrl && (
                 <Button
@@ -519,7 +533,7 @@ export default function AdminPage() {
                   onClick={handleRemoveSiteLogo}
                   disabled={savingSiteLogo}
                 >
-                  Restore default
+                  {messages.admin_logo_restore()}
                 </Button>
               )}
             </div>
@@ -530,11 +544,11 @@ export default function AdminPage() {
       {/* Theme / accent color */}
       {activeTab === 'general' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Theme</h2>
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+            {messages.admin_theme_title()}
+          </h2>
           <p className="text-sm text-kumo-subtle mb-5">
-            Accent color used for buttons, links, and highlights. Changes preview live here; click
-            Save to apply for everyone (on their next connection). Backgrounds keep the default
-            warm theme.
+            {messages.admin_theme_description()}
           </p>
 
           <div className="flex flex-wrap items-center gap-2 mb-4">
@@ -543,7 +557,7 @@ export default function AdminPage() {
               const swatch = preset.value || DEFAULT_ACCENT_COLOR
               return (
                 <button
-                  key={preset.label}
+                  key={preset.value}
                   type="button"
                   onClick={() => setAccentDraft(preset.value)}
                   className={`flex items-center gap-2 pl-1.5 pr-3 py-1.5 rounded-full border text-xs font-medium transition-colors ${
@@ -556,7 +570,7 @@ export default function AdminPage() {
                     className="w-4 h-4 rounded-full border border-kumo-line"
                     style={{ background: swatch }}
                   />
-                  {preset.label}
+                  {preset.label()}
                 </button>
               )
             })}
@@ -569,11 +583,12 @@ export default function AdminPage() {
                 value={accentDraft || DEFAULT_ACCENT_COLOR}
                 onChange={(e) => setAccentDraft(e.target.value)}
                 className="w-9 h-9 rounded-md border border-kumo-line bg-transparent cursor-pointer p-0.5"
+                aria-label={messages.admin_theme_custom()}
               />
-              Custom
+              {messages.admin_theme_custom()}
             </label>
             <span className="text-xs font-mono text-kumo-subtle">
-              {accentDraft || `${DEFAULT_ACCENT_COLOR} (default)`}
+              {accentDraft || messages.admin_theme_default_value({ color: DEFAULT_ACCENT_COLOR })}
             </span>
             <div className="flex-1" />
             {accentDirty && (
@@ -583,7 +598,7 @@ export default function AdminPage() {
                 onClick={() => setAccentDraft(savedAccent)}
                 disabled={savingAccent}
               >
-                Reset
+                {messages.common_reset()}
               </Button>
             )}
             <Button
@@ -593,7 +608,7 @@ export default function AdminPage() {
               loading={savingAccent}
               disabled={!accentDirty}
             >
-              Save
+              {messages.common_save()}
             </Button>
           </div>
         </div>
@@ -602,11 +617,11 @@ export default function AdminPage() {
       {/* Full-width banner */}
       {activeTab === 'general' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Banner</h2>
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+            {messages.admin_banner_title()}
+          </h2>
           <p className="text-sm text-kumo-subtle mb-5">
-            A dismissible bar across the very top of the app (logged in or not). Markdown is
-            supported, so you can include links. Leave empty to hide it. Applies on each
-            user&rsquo;s next connection.
+            {messages.admin_banner_description()}
           </p>
 
           <Textarea
@@ -614,18 +629,23 @@ export default function AdminPage() {
             value={bannerTextDraft}
             onValueChange={setBannerTextDraft}
             rows={1}
-            placeholder={'e.g. \uD83C\uDF89 New: blueprints now support imports \u2014 [learn more](https://example.com).'}
+            placeholder={messages.admin_banner_placeholder()}
+            aria-label={messages.admin_banner_title()}
             maxLength={MAX_ANNOUNCEMENT_LENGTH}
             error={
               bannerTextDraft.length > MAX_ANNOUNCEMENT_LENGTH
-                ? `Too long by ${bannerTextDraft.length - MAX_ANNOUNCEMENT_LENGTH} characters`
+                ? messages.admin_too_long({
+                    count: formatLocaleNumber(bannerTextDraft.length - MAX_ANNOUNCEMENT_LENGTH),
+                  })
                 : undefined
             }
           />
 
           <div className="mt-4 flex items-end justify-between gap-4">
             <div className="min-w-0">
-              <p className="text-xs font-medium text-kumo-subtle mb-2">Type</p>
+              <p className="text-xs font-medium text-kumo-subtle mb-2">
+                {messages.admin_banner_type()}
+              </p>
               <div className="flex flex-wrap items-center gap-2">
                 {BANNER_COLORS.map((c) => {
                   const selected = bannerColorDraft === c
@@ -644,7 +664,7 @@ export default function AdminPage() {
                         className="w-4 h-4 rounded-full border border-kumo-line"
                         style={{ background: BANNER_SWATCH[c] }}
                       />
-                      {c.charAt(0).toUpperCase() + c.slice(1)}
+                      {BANNER_LABELS[c]()}
                     </button>
                   )
                 })}
@@ -662,7 +682,7 @@ export default function AdminPage() {
                   }}
                   disabled={savingBanner}
                 >
-                  Reset
+                  {messages.common_reset()}
                 </Button>
               )}
               <Button
@@ -672,7 +692,7 @@ export default function AdminPage() {
                 loading={savingBanner}
                 disabled={!bannerDirty || bannerTextDraft.length > MAX_ANNOUNCEMENT_LENGTH}
               >
-                Save
+                {messages.common_save()}
               </Button>
             </div>
           </div>
@@ -682,11 +702,11 @@ export default function AdminPage() {
       {/* Top-bar notice */}
       {activeTab === 'general' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Top-bar notice</h2>
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+            {messages.admin_announcement_title()}
+          </h2>
           <p className="text-sm text-kumo-subtle mb-5">
-            Shown centered in the top navigation bar. Markdown is supported, so you can include
-            links. Keep it short — it renders on a single line. Leave empty to show nothing. Applies
-            on each user&rsquo;s next connection.
+            {messages.admin_announcement_description()}
           </p>
 
           <Textarea
@@ -694,18 +714,24 @@ export default function AdminPage() {
             value={announcementDraft}
             onValueChange={setAnnouncementDraft}
             rows={1}
-            placeholder={'e.g. Heads up: scheduled maintenance Saturday \u2014 see [status](https://status.example.com).'}
+            placeholder={messages.admin_announcement_placeholder()}
+            aria-label={messages.admin_announcement_title()}
             maxLength={MAX_ANNOUNCEMENT_LENGTH}
             error={
               announcementDraft.length > MAX_ANNOUNCEMENT_LENGTH
-                ? `Too long by ${announcementDraft.length - MAX_ANNOUNCEMENT_LENGTH} characters`
+                ? messages.admin_too_long({
+                    count: formatLocaleNumber(announcementDraft.length - MAX_ANNOUNCEMENT_LENGTH),
+                  })
                 : undefined
             }
           />
 
           <div className="flex items-center justify-between mt-3">
             <span className="text-xs text-kumo-subtle">
-              {announcementDraft.length.toLocaleString()} / {MAX_ANNOUNCEMENT_LENGTH.toLocaleString()} characters
+              {messages.admin_character_count({
+                count: formatLocaleNumber(announcementDraft.length),
+                limit: formatLocaleNumber(MAX_ANNOUNCEMENT_LENGTH),
+              })}
             </span>
             <div className="flex items-center gap-2">
               {announcementDraft !== savedAnnouncement && (
@@ -715,7 +741,7 @@ export default function AdminPage() {
                   onClick={() => setAnnouncementDraft(savedAnnouncement)}
                   disabled={savingAnnouncement}
                 >
-                  Reset
+                  {messages.common_reset()}
                 </Button>
               )}
               <Button
@@ -728,7 +754,7 @@ export default function AdminPage() {
                   announcementDraft.length > MAX_ANNOUNCEMENT_LENGTH
                 }
               >
-                Save
+                {messages.common_save()}
               </Button>
             </div>
           </div>
@@ -738,10 +764,11 @@ export default function AdminPage() {
       {/* Agent system prompt additions */}
       {activeTab === 'general' && (
       <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-        <h2 className="text-lg font-semibold text-kumo-strong mb-1">Agent instructions</h2>
+        <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+          {messages.admin_agent_instructions_title()}
+        </h2>
         <p className="text-sm text-kumo-subtle mb-5">
-          Extra instructions added to every agent&rsquo;s system prompt on this deployment. Use this
-          for instance-specific context, conventions, or guardrails.
+          {messages.admin_agent_instructions_description()}
         </p>
 
         <Textarea
@@ -749,18 +776,26 @@ export default function AdminPage() {
           value={instructionsDraft}
           onValueChange={setInstructionsDraft}
           rows={6}
-          placeholder={'e.g. ACME Corp is a logistics company that helps small businesses ship\ninternationally. Our team builds internal tools and dashboards to track shipments.'}
+          placeholder={messages.admin_agent_instructions_placeholder()}
+          aria-label={messages.admin_instructions_label()}
           maxLength={MAX_INSTANCE_INSTRUCTIONS_LENGTH}
           error={
             instructionsDraft.length > MAX_INSTANCE_INSTRUCTIONS_LENGTH
-              ? `Too long by ${instructionsDraft.length - MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters`
+              ? messages.admin_too_long({
+                  count: formatLocaleNumber(
+                    instructionsDraft.length - MAX_INSTANCE_INSTRUCTIONS_LENGTH,
+                  ),
+                })
               : undefined
           }
         />
 
         <div className="flex items-center justify-between mt-3">
           <span className="text-xs text-kumo-subtle">
-            {instructionsDraft.length.toLocaleString()} / {MAX_INSTANCE_INSTRUCTIONS_LENGTH.toLocaleString()} characters
+            {messages.admin_character_count({
+              count: formatLocaleNumber(instructionsDraft.length),
+              limit: formatLocaleNumber(MAX_INSTANCE_INSTRUCTIONS_LENGTH),
+            })}
           </span>
           <div className="flex items-center gap-2">
             {instructionsDraft !== savedInstructions && (
@@ -770,7 +805,7 @@ export default function AdminPage() {
                 onClick={() => setInstructionsDraft(savedInstructions)}
                 disabled={savingInstructions}
               >
-                Reset
+                {messages.common_reset()}
               </Button>
             )}
             <Button
@@ -783,7 +818,7 @@ export default function AdminPage() {
                 instructionsDraft.length > MAX_INSTANCE_INSTRUCTIONS_LENGTH
               }
             >
-              Save
+              {messages.common_save()}
             </Button>
           </div>
         </div>
@@ -793,17 +828,16 @@ export default function AdminPage() {
       {/* Gatekeeper resources */}
       {activeTab === 'gatekeepers' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
-          <h2 className="text-lg font-semibold text-kumo-strong mb-1">Gatekeepers</h2>
+          <h2 className="text-lg font-semibold text-kumo-strong mb-1">
+            {messages.admin_gatekeepers_title()}
+          </h2>
           <p className="text-sm text-kumo-subtle mb-5">
-            Turn connectors and resource types on or off for each service. Auto-provisioned
-            gatekeepers (like the Context Library) have three modes &mdash; disabled, optional, or
-            enabled for everyone. Changes are soft: they don&rsquo;t revoke access a gadget already
-            holds.
+            {messages.admin_gatekeepers_description()}
           </p>
 
           {resourceVendors.length === 0 && (
             <p className="text-sm text-kumo-subtle">
-              No configurable gatekeepers are installed on this deployment.
+              {messages.admin_gatekeepers_empty()}
             </p>
           )}
 
@@ -815,9 +849,21 @@ export default function AdminPage() {
               if (vendor.autoProvisions) {
                 const mode = vendor.ambientMode ?? 'optional'
                 const options: { value: AmbientGatekeeperMode; label: string; hint: string }[] = [
-                  { value: 'disabled', label: 'Disabled', hint: 'Off for everyone' },
-                  { value: 'optional', label: 'Optional', hint: 'Users can add it themselves' },
-                  { value: 'enabled', label: 'Enabled', hint: 'On for everyone automatically' },
+                  {
+                    value: 'disabled',
+                    label: messages.admin_mode_disabled(),
+                    hint: messages.admin_mode_disabled_hint(),
+                  },
+                  {
+                    value: 'optional',
+                    label: messages.admin_mode_optional(),
+                    hint: messages.admin_mode_optional_hint(),
+                  },
+                  {
+                    value: 'enabled',
+                    label: messages.admin_mode_enabled(),
+                    hint: messages.admin_mode_enabled_hint(),
+                  },
                 ]
                 return (
                   <div key={vendor.vendorId}>
@@ -833,7 +879,7 @@ export default function AdminPage() {
                         {vendor.displayName}
                       </h3>
                       <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-kumo-tint text-kumo-subtle border border-kumo-line">
-                        auto-provisioned
+                        {messages.admin_auto_provisioned()}
                       </span>
                     </div>
                     <div className="flex gap-2 px-3 py-1">
@@ -886,18 +932,19 @@ export default function AdminPage() {
                     {vendor.displayName}
                     {!vendor.enabled && (
                       <span className="ml-2 text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-kumo-tint text-kumo-subtle border border-kumo-line">
-                        disabled
+                        {messages.admin_disabled()}
                       </span>
                     )}
                   </h3>
                   <span className="text-xs text-kumo-subtle">
-                    {vendor.enabled ? 'Enabled' : 'Off'}
+                    {vendor.enabled ? messages.admin_status_enabled() : messages.admin_status_off()}
                   </span>
                   <span onClick={(e) => e.stopPropagation()}>
                     <Switch
                       checked={vendor.enabled}
                       disabled={resourceBusy.has(gkKey)}
                       onCheckedChange={(enabled) => handleGatekeeperToggle(vendor.vendorId, enabled)}
+                      aria-label={`${messages.admin_tab_gatekeepers()}: ${vendor.displayName}`}
                     />
                   </span>
                 </div>
@@ -935,6 +982,7 @@ export default function AdminPage() {
                               onCheckedChange={(enabled) =>
                                 handleResourceToggle(vendor.vendorId, resource.urlPattern, enabled)
                               }
+                              aria-label={`${vendor.displayName}: ${resource.title}`}
                             />
                           </span>
                         </div>
@@ -943,7 +991,13 @@ export default function AdminPage() {
                   </div>
                 ) : (
                   <p className="text-xs text-kumo-subtle px-3 py-1">
-                    {vendor.resources.length} resource{vendor.resources.length === 1 ? '' : 's'} hidden while disabled.
+                    {vendor.resources.length === 1
+                      ? messages.admin_resources_hidden_one({
+                          count: formatLocaleNumber(vendor.resources.length),
+                        })
+                      : messages.admin_resources_hidden_many({
+                          count: formatLocaleNumber(vendor.resources.length),
+                        })}
                   </p>
                 )}
               </div>

@@ -1,5 +1,6 @@
 import { Component, type ReactNode } from 'react'
 import { reportIssue } from './errorReporting'
+import { m as messages } from './paraglide/messages.js'
 
 type Props = { children: ReactNode }
 type State = { crashed: boolean }
@@ -24,10 +25,10 @@ export default class FrontendErrorBoundary extends Component<Props, State> {
     if (!this.state.crashed) return this.props.children
     return (
       <main className="mx-auto flex min-h-screen max-w-lg flex-col items-center justify-center gap-4 px-6 text-center">
-        <h1 className="text-xl font-semibold">Something went wrong</h1>
-        <p className="text-sm text-kumo-subtle">Reload the Workshop to start again.</p>
+        <h1 className="text-xl font-semibold">{messages.error_boundary_title()}</h1>
+        <p className="text-sm text-kumo-subtle">{messages.error_boundary_description()}</p>
         <button className="rounded-md bg-kumo-brand px-4 py-2 text-sm" onClick={() => location.reload()}>
-          Reload
+          {messages.error_boundary_reload()}
         </button>
       </main>
     )

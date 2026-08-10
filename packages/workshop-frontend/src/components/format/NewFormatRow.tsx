@@ -3,8 +3,10 @@
 
 import { FormatGlyph } from './FormatVisuals'
 import { useOutputFormats } from './useOutputFormats'
+import { formatOfferNoun } from './formats'
+import { m as messages } from '../../paraglide/messages.js'
 
-export default function NewFormatRow({ label = 'Start with' }: { label?: string }) {
+export default function NewFormatRow({ label = messages.output_format_start_with() }: { label?: string }) {
   const { formats, creating, create } = useOutputFormats()
 
   if (formats.length === 0) return null
@@ -29,7 +31,9 @@ export default function NewFormatRow({ label = 'Start with' }: { label?: string 
               size="md"
               className={creating === format.blueprintId ? 'animate-pulse' : 'text-kumo-subtle'}
             />
-            {creating === format.blueprintId ? `Creating…` : `New ${format.output.noun}`}
+            {creating === format.blueprintId
+              ? messages.output_format_creating({ format: formatOfferNoun(format) })
+              : messages.command_palette_new_format({ format: formatOfferNoun(format) })}
           </button>
         ))}
       </div>

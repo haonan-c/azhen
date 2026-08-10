@@ -15,8 +15,16 @@ describe('FrontendErrorBoundary', () => {
   let root: Root | undefined
   afterEach(() => { act(() => root?.unmount()); vi.restoreAllMocks() })
 
-  it('reports a React crash and offers a reload action', async () => {
+  it.each([
+    { path: '/', title: 'Something went wrong', reload: 'Reload' },
+    { path: '/zh', title: '出现问题', reload: '重新加载' },
+  ])('reports a React crash and offers a localized reload action at $path', async ({
+    path,
+    title,
+    reload,
+  }) => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
+    window.history.replaceState({}, '', path)
     const container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -25,8 +33,8 @@ describe('FrontendErrorBoundary', () => {
         <Broken />
       </FrontendErrorBoundary>,
     ))
-    expect(container.textContent).toContain('Something went wrong')
-    expect(container.querySelector('button')?.textContent).toContain('Reload')
+    expect(container.textContent).toContain(title)
+    expect(container.querySelector('button')?.textContent).toContain(reload)
     expect(reportIssue).toHaveBeenCalledWith('workshop.react-render', expect.any(Error),
       expect.objectContaining({ captureMechanism: 'react', handled: false }))
     container.remove()

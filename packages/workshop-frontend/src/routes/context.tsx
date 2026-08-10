@@ -3,6 +3,8 @@ import { BookOpen, Sparkle, type Icon as PhosphorIcon } from '@phosphor-icons/re
 import { useDocumentTitle } from '../useDocumentTitle'
 import ComingSoonPreview from '../components/ComingSoonPreview'
 import { useSiteName } from '../ServerConfigContext'
+import { m as messages } from '../paraglide/messages.js'
+import { formatLocaleNumber } from '../utils/formatNumber'
 
 // Context & Skills. The knowledge/skills surface isn't built into the rail yet — agents read
 // curated collections of documents (context) and reusable skills. Until then this page shows a
@@ -21,19 +23,33 @@ interface ContextItem {
   updated: string
 }
 
-const TYPE_META: Record<Kind, { label: string; Icon: PhosphorIcon }> = {
-  collection: { label: 'Collection', Icon: BookOpen },
-  skill: { label: 'Skill', Icon: Sparkle },
+const TYPE_META: Record<Kind, { label: () => string; Icon: PhosphorIcon }> = {
+  collection: { label: messages.context_collection, Icon: BookOpen },
+  skill: { label: messages.context_skill, Icon: Sparkle },
 }
 
-const MOCK_ITEMS: ContextItem[] = [
-  { id: '1', name: 'Company Handbook', kind: 'collection', detail: '12 documents', updated: '2d ago' },
-  { id: '2', name: 'Brand Voice & Style', kind: 'collection', detail: '5 documents', updated: '1w ago' },
-  { id: '3', name: 'API Reference', kind: 'collection', detail: '28 documents', updated: '1w ago' },
-  { id: '4', name: 'Summarize meeting notes', kind: 'skill', detail: 'Reusable skill', updated: '3d ago' },
-  { id: '5', name: 'Sales Playbook', kind: 'collection', detail: '9 documents', updated: '2w ago' },
-  { id: '6', name: 'Draft a customer email', kind: 'skill', detail: 'Reusable skill', updated: '2w ago' },
-]
+const documents = (count: number) => messages.context_documents({
+  count: formatLocaleNumber(count),
+})
+
+const days = (count: number) => messages.context_updated_days({
+  count: formatLocaleNumber(count),
+})
+
+const weeks = (count: number) => messages.context_updated_weeks({
+  count: formatLocaleNumber(count),
+})
+
+function mockItems(): ContextItem[] {
+  return [
+    { id: '1', name: messages.context_item_company_handbook(), kind: 'collection', detail: documents(12), updated: days(2) },
+    { id: '2', name: messages.context_item_brand_voice(), kind: 'collection', detail: documents(5), updated: weeks(1) },
+    { id: '3', name: messages.context_item_api_reference(), kind: 'collection', detail: documents(28), updated: weeks(1) },
+    { id: '4', name: messages.context_item_summarize_meeting(), kind: 'skill', detail: messages.context_reusable_skill(), updated: days(3) },
+    { id: '5', name: messages.context_item_sales_playbook(), kind: 'collection', detail: documents(9), updated: weeks(2) },
+    { id: '6', name: messages.context_item_customer_email(), kind: 'skill', detail: messages.context_reusable_skill(), updated: weeks(2) },
+  ]
+}
 
 function ContextRow({ item }: { item: ContextItem }) {
   const { label, Icon } = TYPE_META[item.kind]
@@ -45,7 +61,7 @@ function ContextRow({ item }: { item: ContextItem }) {
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium tracking-[-0.25px] text-kumo-default">{item.name}</p>
         <p className="mt-0.5 truncate text-[12px] leading-4 tracking-[-0.2px] text-kumo-subtle">
-          {label} · {item.detail}
+          {label()} · {item.detail}
         </p>
       </div>
       <span className="hidden shrink-0 text-xs tracking-[-0.1px] text-kumo-inactive lg:block">
@@ -56,25 +72,27 @@ function ContextRow({ item }: { item: ContextItem }) {
 }
 
 function ContextPage() {
-  useDocumentTitle('Context & Skills')
+  useDocumentTitle(messages.context_document_title())
   const siteName = useSiteName()
   return (
     <div className="mx-auto flex h-full w-full max-w-4xl flex-col px-6 sm:px-10">
       <header className="px-3 pb-4 pt-10">
-        <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">Context &amp; Skills</h1>
+        <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
+          {messages.context_heading()}
+        </h1>
         <p className="mt-1 text-[13px] leading-[18px] tracking-[-0.25px] text-kumo-subtle">
-          Curated collections of knowledge your agents read, plus reusable skills they can apply.
+          {messages.context_description()}
         </p>
       </header>
 
       <ComingSoonPreview
         icon={BookOpen}
-        title={`Context & Skills are coming soon to ${siteName}`}
-        description="A preview of how you'll author knowledge collections and skills for your agents to draw on."
+        title={messages.context_coming_soon_title({ siteName })}
+        description={messages.context_coming_soon_description()}
       >
         <div className="chat-panel min-h-0 flex-1 overflow-y-auto pb-8 pt-1">
           <div className="flex flex-col gap-0.5">
-            {MOCK_ITEMS.map((item) => (
+            {mockItems().map((item) => (
               <ContextRow key={item.id} item={item} />
             ))}
           </div>

@@ -1,16 +1,22 @@
 import { useEffect, useRef, useState } from 'react'
+import { m as messages } from '../../paraglide/messages.js'
+import { formatLocaleNumber } from '../../utils/formatNumber'
 
 // Format the milliseconds remaining until `resetAt` as a compact "Hh Mm Ss" string.
 function formatRemaining(ms: number): string {
-  if (ms <= 0) return '0s'
+  if (ms <= 0) return messages.billing_countdown_zero()
   const totalSeconds = Math.floor(ms / 1000)
   const hours = Math.floor(totalSeconds / 3600)
   const minutes = Math.floor((totalSeconds % 3600) / 60)
   const seconds = totalSeconds % 60
   const parts: string[] = []
-  if (hours > 0) parts.push(`${hours}h`)
-  if (hours > 0 || minutes > 0) parts.push(`${minutes}m`)
-  parts.push(`${seconds}s`)
+  if (hours > 0) {
+    parts.push(messages.billing_countdown_hours({ count: formatLocaleNumber(hours) }))
+  }
+  if (hours > 0 || minutes > 0) {
+    parts.push(messages.billing_countdown_minutes({ count: formatLocaleNumber(minutes) }))
+  }
+  parts.push(messages.billing_countdown_seconds({ count: formatLocaleNumber(seconds) }))
   return parts.join(' ')
 }
 
