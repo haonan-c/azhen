@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { RpcStub } from 'capnweb'
 import { PublicApi, AuthVendorInfo } from '@gadgets/workshop-shared/api'
 import { Button, Banner } from '@cloudflare/kumo'
+import { m as messages } from '../../paraglide/messages.js'
+
+class KnownOAuthError extends Error {}
 
 interface OAuthButtonsProps {
   rpcStub: RpcStub<PublicApi>
@@ -13,7 +16,7 @@ interface OAuthButtonsProps {
 // OAuth popup (which self-closes) and waits for the result over RPC; on success the session token is
 // stored and the app re-authenticates.
 export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButtonsProps) {
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<{ title: string; detail?: string } | null>(null)
   const [pending, setPending] = useState<string | null>(null)
 
   // Track the pop-up-poll interval, the in-flight login RPC, and mounted state so we can stop a
@@ -58,7 +61,7 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
       if (!popup) {
         try { (attempt as unknown as Disposable)[Symbol.dispose]() } catch { /* already disposed */ }
         loginRpcRef.current = null
-        throw new Error('Pop-up blocked. Please allow pop-ups and try again.')
+        throw new KnownOAuthError(messages.auth_popup_blocked())
       }
       // Resolve when the gatekeeper finishes, or reject if the user closes the pop-up first.
       const token = await new Promise<string>((resolve, reject) => {
@@ -74,11 +77,13 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
           fn()
         }
         pollRef.current = window.setInterval(() => {
-          if (popup.closed) finish(() => reject(new Error('Sign-in was cancelled.')))
+          if (popup.closed) finish(() => reject(new KnownOAuthError(messages.auth_cancelled())))
         }, 500)
         attempt.wait()
           .then(t => finish(() => resolve(t)))
-          .catch(e => finish(() => reject(e instanceof Error ? e : new Error('Could not sign in'))))
+          .catch(e => finish(() => reject(
+            e instanceof Error ? e : new Error(messages.auth_unknown_error_detail()),
+          )))
       })
       if (!mountedRef.current) return  // user navigated away mid-flow; drop the result
       localStorage.setItem('authToken', token)
@@ -86,14 +91,21 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
       else window.location.reload()
     } catch (err) {
       if (!mountedRef.current) return
-      setError(err instanceof Error ? err.message : 'Could not sign in')
+      setError(err instanceof KnownOAuthError
+        ? { title: err.message }
+        : {
+            title: messages.auth_sign_in_error_title(),
+            detail: err instanceof Error ? err.message : messages.auth_unknown_error_detail(),
+          })
       setPending(null)
     }
   }
 
   return (
     <div className="space-y-3">
-      {error && <Banner variant="error" title={error} />}
+      {error && (
+        <Banner variant="error" title={error.title} description={error.detail} />
+      )}
       {vendors.map((vendor) => (
         <Button
           key={vendor.vendorId}
@@ -111,7 +123,7 @@ export default function OAuthButtons({ rpcStub, vendors, onSuccess }: OAuthButto
               style={{ height: 18, width: 'auto' }}
             />
           )}
-          Continue with {vendor.displayName}
+          {messages.auth_continue_with_provider({ provider: vendor.displayName })}
         </Button>
       ))}
     </div>

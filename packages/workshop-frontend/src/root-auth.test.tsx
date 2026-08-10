@@ -158,6 +158,7 @@ describe('root session validation', () => {
     const router = await render('/', api)
 
     expect(container?.textContent).toContain(failure)
+    expect(container?.textContent).toContain('transport failure')
     expect(container?.textContent).toContain(retry)
     expect(localStorage.getItem('authToken')).toBe('stored-token')
 
@@ -171,7 +172,11 @@ describe('root session validation', () => {
     expect(router.state.location.hash).toBe('')
   })
 
-  it('keeps a protected deep link after sign-in succeeds', async () => {
+  it.each([
+    '/workspace/intended?tab=files#code',
+    '/zh/workspace/intended?tab=files#code',
+  ])('keeps the protected deep link after sign-in succeeds at %s', async (href) => {
+    window.history.replaceState({}, '', href)
     const authenticated = createAuthenticatedApi(async () => AUTH_TEST_USER)
     const api = createPublicApi(() => authenticated.stub)
     const router = await render('/workspace/intended?tab=files#code', api)
@@ -184,6 +189,7 @@ describe('root session validation', () => {
     expect(router.state.location.pathname).toBe('/workspace/intended')
     expect(router.state.location.search).toEqual({ tab: 'files' })
     expect(router.state.location.hash).toBe('code')
+    expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(href)
   })
 
   it('keeps the existing signed-out Blueprint Landing Page behavior', async () => {

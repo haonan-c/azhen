@@ -3,6 +3,9 @@ import { DropdownMenu } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
 import { useAvatar } from '../useAvatar'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './menuStyles'
+import { changeLocale } from '../locale'
+import { getLocale, type Locale } from '../paraglide/runtime.js'
+import { m as messages } from '../paraglide/messages.js'
 
 export default function UserMenu() {
   const { authenticatedApi, logout, currentUser, isAdmin } = useAuthenticatedApi()
@@ -20,8 +23,8 @@ export default function UserMenu() {
         render={
           <button
             className="w-7 h-7 cursor-pointer rounded-full flex items-center justify-center bg-kumo-tint hover:bg-kumo-fill transition-colors overflow-hidden"
-            title="Open profile menu"
-            aria-label="Open profile menu"
+            title={messages.user_menu_open()}
+            aria-label={messages.user_menu_open()}
           >
             {avatarUrl ? (
               <img src={avatarUrl} alt="" className="w-full h-full object-cover" />
@@ -36,29 +39,46 @@ export default function UserMenu() {
           onClick={() => navigate({ to: '/profile' })}
           className={MENU_ITEM}
         >
-          Profile
+          {messages.user_menu_profile()}
         </DropdownMenu.Item>
         <DropdownMenu.Item
           onClick={() => navigate({ to: '/providers' })}
           className={MENU_ITEM}
         >
-          Providers
+          {messages.user_menu_providers()}
         </DropdownMenu.Item>
         {isAdmin && (
           <DropdownMenu.Item
             onClick={() => navigate({ to: '/admin' })}
             className={MENU_ITEM}
           >
-            Admin
+            {messages.user_menu_admin()}
           </DropdownMenu.Item>
         )}
+        <DropdownMenu.Separator />
+        <DropdownMenu.Group>
+          <DropdownMenu.Label>{messages.user_menu_language()}</DropdownMenu.Label>
+          <DropdownMenu.RadioGroup
+            value={getLocale()}
+            onValueChange={locale => changeLocale(locale as Locale)}
+          >
+            <DropdownMenu.RadioItem value="en" className={MENU_ITEM}>
+              {messages.language_english()}
+              <DropdownMenu.RadioItemIndicator />
+            </DropdownMenu.RadioItem>
+            <DropdownMenu.RadioItem value="zh" className={MENU_ITEM}>
+              {messages.language_chinese()}
+              <DropdownMenu.RadioItemIndicator />
+            </DropdownMenu.RadioItem>
+          </DropdownMenu.RadioGroup>
+        </DropdownMenu.Group>
         <DropdownMenu.Separator />
         <DropdownMenu.Item
           variant="danger"
           onClick={logout}
           className={MENU_ITEM_DANGER}
         >
-          Sign out
+          {messages.user_menu_sign_out()}
         </DropdownMenu.Item>
       </DropdownMenu.Content>
     </DropdownMenu>

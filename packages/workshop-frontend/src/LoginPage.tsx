@@ -10,6 +10,8 @@ import { useDocumentTitle } from './useDocumentTitle'
 import { useConnectionLost } from './RpcContext'
 import OAuthButtons from './components/auth/OAuthButtons'
 import SiteLogo from './components/SiteLogo'
+import LanguageSelector from './components/LanguageSelector'
+import { m as messages } from './paraglide/messages.js'
 
 
 interface LoginPageProps {
@@ -21,12 +23,12 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<{ title: string; detail?: string } | null>(null)
   const serverConfig = useServerConfig()
   const serverConfigError = useServerConfigError()
   const siteName = useSiteName()
   const connectionLost = useConnectionLost()
-  useDocumentTitle('Sign in')
+  useDocumentTitle(messages.auth_sign_in_document_title())
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
@@ -45,10 +47,13 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
           window.location.reload()
         }
       } else {
-        setError('Invalid username or password')
+        setError({ title: messages.auth_invalid_credentials() })
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed')
+      setError({
+        title: messages.auth_sign_in_error_title(),
+        detail: err instanceof Error ? err.message : messages.auth_unknown_error_detail(),
+      })
     } finally {
       setLoading(false)
     }
@@ -63,20 +68,24 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
       return (
         <div
           role="alert"
-          className="min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4"
+          className="relative min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4"
         >
+          <LanguageSelector className="absolute right-4 top-4" />
           <p className="text-sm text-kumo-danger text-center">
-            Couldn&apos;t load deployment settings.
+            {messages.auth_deployment_settings_error()}
           </p>
-          <Button variant="secondary" onClick={() => window.location.reload()}>Reload</Button>
+          <Button variant="secondary" onClick={() => window.location.reload()}>
+            {messages.auth_reload()}
+          </Button>
         </div>
       )
     }
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4">
+      <div className="relative min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4">
+        <LanguageSelector className="absolute right-4 top-4" />
         <Loader size="lg" />
         <p className="text-sm text-kumo-subtle text-center">
-          {connectionLost ? "Can't reach the server. Retrying…" : 'Loading…'}
+          {connectionLost ? messages.auth_server_retrying() : messages.auth_loading()}
         </p>
       </div>
     )
@@ -87,6 +96,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-kumo-base px-4 relative overflow-hidden">
+      <LanguageSelector className="absolute right-4 top-4 z-10" />
       {/* Dot grid — fades from top to bottom */}
       <div
         className="absolute inset-0 pointer-events-none"
@@ -107,7 +117,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
             </div>
           </SiteLogo>
           <h1 className="text-xl font-semibold text-kumo-default">{siteName}</h1>
-          <p className="text-sm text-kumo-subtle mt-1">Sign in to your account</p>
+          <p className="text-sm text-kumo-subtle mt-1">{messages.auth_sign_in_heading()}</p>
         </div>
 
         {passwordAuthEnabled && (
@@ -115,27 +125,27 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
             {/* Username / password form */}
             <form onSubmit={handleSubmit} className="space-y-4">
               <Input
-                label="Username"
+                label={messages.auth_username_label()}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 autoFocus
                 autoComplete="username"
                 disabled={loading}
-                placeholder="your-username"
+                placeholder={messages.auth_username_placeholder()}
               />
 
               <Input
                 type="password"
-                label="Password"
+                label={messages.auth_password_label()}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 autoComplete="current-password"
                 disabled={loading}
-                placeholder="••••••••"
+                placeholder={messages.auth_password_placeholder()}
               />
 
               {error && (
-                <Banner variant="error" title={error} />
+                <Banner variant="error" title={error.title} description={error.detail} />
               )}
 
               <Button
@@ -145,14 +155,14 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
                 loading={loading}
                 className="w-full justify-center"
               >
-                Sign in
+                {messages.auth_sign_in_submit()}
               </Button>
             </form>
 
             <p className="text-center text-sm text-kumo-subtle mt-6">
-              Don't have an account?{' '}
+              {messages.auth_no_account()}{' '}
               <Link to="/signup" className="text-kumo-brand hover:underline font-medium">
-                Create one
+                {messages.auth_create_account()}
               </Link>
             </p>
           </>
@@ -164,12 +174,17 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
             {passwordAuthEnabled && (
               <div className="flex items-center gap-3 mb-4">
                 <div className="h-px flex-1 bg-kumo-line" />
-                <span className="text-xs text-kumo-subtle">or</span>
+                <span className="text-xs text-kumo-subtle">{messages.auth_or()}</span>
                 <div className="h-px flex-1 bg-kumo-line" />
               </div>
             )}
             {!passwordAuthEnabled && error && (
-              <Banner variant="error" title={error} className="mb-4" />
+              <Banner
+                variant="error"
+                title={error.title}
+                description={error.detail}
+                className="mb-4"
+              />
             )}
             <OAuthButtons rpcStub={rpcStub} vendors={authVendors} onSuccess={onLoginSuccess} />
           </div>

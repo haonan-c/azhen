@@ -10,9 +10,16 @@ import { useDocumentTitle } from "./useDocumentTitle";
 import OAuthButtons from "./components/auth/OAuthButtons";
 import SiteLogo from "./components/SiteLogo";
 import { useConnectionLost } from "./RpcContext";
+import LanguageSelector from "./components/LanguageSelector";
+import { m as messages } from "./paraglide/messages.js";
+import { getWorkshopHomeHref } from "./locale";
 
 interface SignupPageProps {
   rpcStub: RpcStub<PublicApi>;
+}
+
+function continueToWorkshop() {
+  window.location.href = getWorkshopHomeHref();
 }
 
 export default function SignupPage({ rpcStub }: SignupPageProps) {
@@ -20,26 +27,26 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
   const serverConfigError = useServerConfigError();
   const siteName = useSiteName();
   const connectionLost = useConnectionLost();
-  useDocumentTitle("Create account");
+  useDocumentTitle(messages.auth_create_account_document_title());
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ title: string; detail?: string } | null>(null);
 
   const usernameError =
-    username && !/^[a-z0-9_-]+$/i.test(username)
-      ? "Letters, numbers, underscores, and hyphens only"
+    username && !/^[a-z][a-z0-9_]*$/i.test(username)
+      ? messages.auth_username_rules()
       : undefined;
 
   const passwordError =
     password && password.length < 8
-      ? "Must be at least 8 characters"
+      ? messages.auth_password_minimum()
       : undefined;
 
   const confirmError =
     confirmPassword && confirmPassword !== password
-      ? "Passwords do not match"
+      ? messages.auth_password_mismatch()
       : undefined;
 
   const canSubmit =
@@ -66,12 +73,15 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
       );
       if (token) {
         localStorage.setItem("authToken", token);
-        window.location.href = "/";
+        continueToWorkshop();
       } else {
-        setError("Username already exists");
+        setError({ title: messages.auth_username_taken() });
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Account creation failed");
+      setError({
+        title: messages.auth_account_creation_error_title(),
+        detail: err instanceof Error ? err.message : messages.auth_unknown_error_detail(),
+      });
     } finally {
       setLoading(false);
     }
@@ -82,20 +92,24 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
       return (
         <div
           role="alert"
-          className="min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4"
+          className="relative min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4"
         >
+          <LanguageSelector className="absolute right-4 top-4" />
           <p className="text-sm text-kumo-danger text-center">
-            Couldn&apos;t load deployment settings.
+            {messages.auth_deployment_settings_error()}
           </p>
-          <Button variant="secondary" onClick={() => window.location.reload()}>Reload</Button>
+          <Button variant="secondary" onClick={() => window.location.reload()}>
+            {messages.auth_reload()}
+          </Button>
         </div>
       );
     }
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4">
+      <div className="relative min-h-screen flex flex-col items-center justify-center gap-4 bg-kumo-base px-4">
+        <LanguageSelector className="absolute right-4 top-4" />
         <Loader size="lg" />
         <p className="text-sm text-kumo-subtle text-center">
-          {connectionLost ? "Can't reach the server. Retrying…" : "Loading…"}
+          {connectionLost ? messages.auth_server_retrying() : messages.auth_loading()}
         </p>
       </div>
     );
@@ -108,6 +122,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-kumo-base px-4 relative overflow-hidden">
+      <LanguageSelector className="absolute right-4 top-4 z-10" />
       {/* Dot grid — fades from top to bottom */}
       <div
         className="absolute inset-0 pointer-events-none"
@@ -133,17 +148,18 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
           <h1 className="text-xl font-semibold text-kumo-default">
             {siteName}
           </h1>
-          <p className="text-sm text-kumo-subtle mt-1">Create your account</p>
+          <p className="text-sm text-kumo-subtle mt-1">
+            {messages.auth_create_account_heading()}
+          </p>
         </div>
 
         {!signupsEnabled && (
           <Banner
             variant="default"
-            title="Signups are closed"
+            title={messages.auth_signups_closed_title()}
+            description={messages.auth_signups_closed_body()}
             className="mb-4"
-          >
-            New account registration is currently disabled on this deployment.
-          </Banner>
+          />
         )}
 
         {passwordAuthEnabled && (
@@ -151,39 +167,41 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
             {/* Form */}
             <form onSubmit={handleSubmit} className="space-y-4">
               <Input
-                label="Username"
+                label={messages.auth_username_label()}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 autoFocus
                 autoComplete="username"
                 disabled={loading}
-                placeholder="your-username"
+                placeholder={messages.auth_username_placeholder()}
                 error={usernameError}
               />
 
               <Input
                 type="password"
-                label="Password"
+                label={messages.auth_password_label()}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 autoComplete="new-password"
                 disabled={loading}
-                placeholder="••••••••"
+                placeholder={messages.auth_password_placeholder()}
                 error={passwordError}
               />
 
               <Input
                 type="password"
-                label="Confirm Password"
+                label={messages.auth_confirm_password_label()}
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
                 autoComplete="new-password"
                 disabled={loading}
-                placeholder="••••••••"
+                placeholder={messages.auth_confirm_password_placeholder()}
                 error={confirmError}
               />
 
-              {error && <Banner variant="error" title={error} />}
+              {error && (
+                <Banner variant="error" title={error.title} description={error.detail} />
+              )}
 
               <Button
                 type="submit"
@@ -192,7 +210,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
                 loading={loading}
                 className="w-full justify-center"
               >
-                Create account
+                {messages.auth_create_account_submit()}
               </Button>
             </form>
           </>
@@ -204,19 +222,23 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
             {passwordAuthEnabled && (
               <div className="flex items-center gap-3 mb-4">
                 <div className="h-px flex-1 bg-kumo-line" />
-                <span className="text-xs text-kumo-subtle">or</span>
+                <span className="text-xs text-kumo-subtle">{messages.auth_or()}</span>
                 <div className="h-px flex-1 bg-kumo-line" />
               </div>
             )}
-            <OAuthButtons rpcStub={rpcStub} vendors={authVendors} />
+            <OAuthButtons
+              rpcStub={rpcStub}
+              vendors={authVendors}
+              onSuccess={continueToWorkshop}
+            />
           </div>
         )}
 
         {passwordAuthEnabled && (
           <p className="text-center text-sm text-kumo-subtle mt-6">
-            Already have an account?{" "}
+            {messages.auth_existing_account()}{" "}
             <Link to="/" className="text-kumo-brand hover:underline font-medium">
-              Sign in
+              {messages.auth_sign_in()}
             </Link>
           </p>
         )}

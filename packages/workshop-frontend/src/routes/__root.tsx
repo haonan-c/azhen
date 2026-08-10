@@ -73,9 +73,10 @@ export function RootComponent() {
   if (error && !standalone) {
     return (
       <div className="min-h-screen flex items-center justify-center flex-col gap-4 bg-kumo-base p-6">
-        <p role="alert" className="text-sm text-kumo-danger text-center">
-          {messages.auth_session_retry()}
-        </p>
+        <div role="alert" className="text-center">
+          <p className="text-sm text-kumo-danger">{messages.auth_session_retry()}</p>
+          <p className="mt-2 text-xs text-kumo-subtle">{error}</p>
+        </div>
         <button
           onClick={retry}
           className="px-4 py-2 text-sm font-medium text-kumo-inverse bg-kumo-brand rounded-lg hover:bg-kumo-brand-hover transition-colors"

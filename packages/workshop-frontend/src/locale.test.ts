@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   changeLocale,
+  getWorkshopHomeHref,
   initializeLocale,
   resolveInitialLocale,
 } from './locale'
@@ -101,6 +102,11 @@ describe('resolveInitialLocale', () => {
 })
 
 describe('locale browser integration', () => {
+  it('keeps the URL locale when sign-up continues to the Workshop', () => {
+    expect(getWorkshopHomeHref('https://example.com/signup')).toBe('/')
+    expect(getWorkshopHomeHref('https://example.com/zh/signup')).toBe('/zh')
+  })
+
   it('does not overwrite an explicit preference when the URL selects another locale', () => {
     window.history.replaceState({}, '', '/workspaces')
     localStorage.setItem('PARAGLIDE_LOCALE', 'zh')
