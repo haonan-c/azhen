@@ -13,6 +13,7 @@ import AppShell from '../components/AppShell/AppShell'
 import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
 import AccountSelectionModal from '../components/billing/AccountSelectionModal'
+import { m as messages } from '../paraglide/messages.js'
 
 export const Route = createRootRoute({
   component: RootComponent,
@@ -21,15 +22,15 @@ export const Route = createRootRoute({
 function ConnectionLostBanner() {
   return (
     <div className="sticky top-0 z-[100] bg-kumo-warning-tint border-b border-kumo-warning/30 px-4 py-2 text-center text-sm text-kumo-warning">
-      Connection lost — reconnecting…
+      {messages.connection_lost()}
     </div>
   )
 }
 
-function RootComponent() {
+export function RootComponent() {
   const rpcStub = useRpcStub()
   const connectionLost = useConnectionLost()
-  const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
+  const { isAuthenticated, authenticatedApi, isLoading, error, logout, login, retry } = useAuth(rpcStub)
   const pathname = useRouterState({ select: (s) => s.location.pathname })
 
   // When authenticatedApi becomes available, the connection is proven alive.
@@ -44,7 +45,7 @@ function RootComponent() {
   // A standalone (no app shell) render is used only for signed-out visitors of public routes.
   // Signed-in users get the full app chrome so public pages (esp. the blueprint detail) feel
   // native — sidebar and all — instead of floating on a bare page.
-  const standalone = isSignup || (isBlueprint && !isAuthenticated)
+  const standalone = isSignup || (isBlueprint && !isLoading && !error && !isAuthenticated)
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
@@ -63,7 +64,7 @@ function RootComponent() {
       <div className="min-h-screen flex items-center justify-center flex-col gap-4 bg-kumo-base">
         {connectionLost && <ConnectionLostBanner />}
         <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
-        <p className="text-sm text-kumo-subtle">{connectionLost ? 'Waiting for server…' : 'Loading...'}</p>
+        <p role="status" className="text-sm text-kumo-subtle">{messages.auth_session_checking()}</p>
       </div>
     )
   }
@@ -72,12 +73,14 @@ function RootComponent() {
   if (error && !standalone) {
     return (
       <div className="min-h-screen flex items-center justify-center flex-col gap-4 bg-kumo-base p-6">
-        <p className="text-sm text-kumo-danger">Authentication error: {error}</p>
+        <p role="alert" className="text-sm text-kumo-danger text-center">
+          {messages.auth_session_retry()}
+        </p>
         <button
-          onClick={() => window.location.reload()}
+          onClick={retry}
           className="px-4 py-2 text-sm font-medium text-kumo-inverse bg-kumo-brand rounded-lg hover:bg-kumo-brand-hover transition-colors"
         >
-          Retry
+          {messages.auth_retry()}
         </button>
       </div>
     )
@@ -88,7 +91,7 @@ function RootComponent() {
     return (
       <div className="min-h-screen flex items-center justify-center flex-col gap-4 bg-kumo-base">
         <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
-        <p className="text-sm text-kumo-subtle">Authenticating...</p>
+        <p role="status" className="text-sm text-kumo-subtle">{messages.auth_session_checking()}</p>
       </div>
     )
   }

@@ -1,4 +1,8 @@
 {
   "$schema": "https://inlang.com/schema/inlang-message-format",
-  "brand_name": "阿珍"
+  "brand_name": "阿珍",
+  "auth_session_checking": "正在验证会话…",
+  "auth_session_retry": "无法验证会话。请检查网络连接后重试。",
+  "auth_retry": "重试",
+  "connection_lost": "连接已断开，正在重新连接…"
 }

@@ -1,4 +1,8 @@
 {
   "$schema": "https://inlang.com/schema/inlang-message-format",
-  "brand_name": "azhen"
+  "brand_name": "azhen",
+  "auth_session_checking": "Checking your session…",
+  "auth_session_retry": "We couldn't verify your session. Check your connection and try again.",
+  "auth_retry": "Retry",
+  "connection_lost": "Connection lost — reconnecting…"
 }

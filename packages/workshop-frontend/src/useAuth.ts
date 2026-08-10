@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { RpcStub } from 'capnweb'
 import { PublicApi, AuthenticatedApi } from '@gadgets/workshop-shared/api'
 
@@ -11,7 +11,22 @@ interface AuthState {
   error: string | null
 }
 
+const SIGNED_OUT_STATE: AuthState = {
+  token: null,
+  authenticatedApi: null,
+  isLoading: false,
+  error: null,
+}
+
 export { CF_ACCESS_MODE }
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function isInvalidSession(error: unknown): boolean {
+  return /^invalid session token\.?$/i.test(errorMessage(error))
+}
 
 export function useAuth(publicApi: RpcStub<PublicApi>) {
   const [authState, setAuthState] = useState<AuthState>({
@@ -21,10 +36,81 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
     error: null
   })
 
-  // Track current authenticated API stub for cleanup on unmount.
-  // State closures go stale in cleanup functions, so we use a ref.
+  const requestIdRef = useRef(0)
+  const validatingApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
   const authenticatedApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
-  authenticatedApiRef.current = authState.authenticatedApi
+
+  const disposeApis = useCallback(() => {
+    validatingApiRef.current?.[Symbol.dispose]()
+    authenticatedApiRef.current?.[Symbol.dispose]()
+    validatingApiRef.current = null
+    authenticatedApiRef.current = null
+  }, [])
+
+  const resetToSignedOut = useCallback(() => {
+    requestIdRef.current++
+    disposeApis()
+    setAuthState(SIGNED_OUT_STATE)
+  }, [disposeApis])
+
+  const validate = useCallback((
+    token: string | null,
+    authenticate: () => RpcStub<AuthenticatedApi>,
+  ) => {
+    const requestId = ++requestIdRef.current
+    disposeApis()
+    setAuthState({ token, authenticatedApi: null, isLoading: true, error: null })
+
+    let authenticatedApi: RpcStub<AuthenticatedApi> | null = null
+    const fail = (error: unknown) => {
+      if (validatingApiRef.current === authenticatedApi) {
+        validatingApiRef.current = null
+        authenticatedApi?.[Symbol.dispose]()
+      }
+      if (requestId !== requestIdRef.current) return
+
+      if (token !== null && isInvalidSession(error)) {
+        if (localStorage.getItem('authToken') === token) localStorage.removeItem('authToken')
+        setAuthState(SIGNED_OUT_STATE)
+      } else {
+        setAuthState({
+          token,
+          authenticatedApi: null,
+          isLoading: false,
+          error: errorMessage(error),
+        })
+      }
+    }
+
+    try {
+      // Keep promise pipelining: start the identity check without waiting for authenticate() to
+      // resolve, but do not expose the capability until the check succeeds.
+      authenticatedApi = authenticate()
+      validatingApiRef.current = authenticatedApi
+      authenticatedApi.whoami().then(() => {
+        if (requestId !== requestIdRef.current) {
+          if (validatingApiRef.current === authenticatedApi) {
+            validatingApiRef.current = null
+            authenticatedApi?.[Symbol.dispose]()
+          }
+          return
+        }
+        validatingApiRef.current = null
+        authenticatedApiRef.current = authenticatedApi
+        setAuthState({ token, authenticatedApi, isLoading: false, error: null })
+      }).catch(fail)
+    } catch (error) {
+      fail(error)
+    }
+  }, [disposeApis])
+
+  const authenticateWithCfAccess = useCallback(() => {
+    validate(null, () => publicApi.authenticateFromCfAccess())
+  }, [publicApi, validate])
+
+  const authenticateWithToken = useCallback((token: string) => {
+    validate(token, () => publicApi.authenticate(token))
+  }, [publicApi, validate])
 
   useEffect(() => {
     if (CF_ACCESS_MODE) {
@@ -34,91 +120,49 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       if (storedToken) {
         authenticateWithToken(storedToken)
       } else {
-        setAuthState(prev => ({ ...prev, isLoading: false }))
+        setAuthState(SIGNED_OUT_STATE)
       }
     }
     return () => {
-      // The authenticateWithXxx functions also dispose the old stub via their setAuthState
-      // updater, so this may double-dispose on reconnect. That's fine — dispose is idempotent.
-      authenticatedApiRef.current?.[Symbol.dispose]()
+      requestIdRef.current++
+      disposeApis()
     }
-  }, [publicApi])
+  }, [authenticateWithCfAccess, authenticateWithToken, disposeApis])
 
-  const authenticateWithCfAccess = () => {
-    setAuthState(prev => {
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
-      return { ...prev, authenticatedApi: null, isLoading: true, error: null }
-    })
-
-    // Use promise pipelining - no need to await. The CF Access JWT is already attached
-    // to the request by the browser (injected by the Access service worker/cookie), so
-    // the server validates it and returns an authenticated stub immediately.
-    const authenticatedApi = publicApi.authenticateFromCfAccess()
-    setAuthState({
-      token: null,
-      authenticatedApi,
-      isLoading: false,
-      error: null
-    })
-  }
-
-  const authenticateWithToken = (token: string) => {
-    setAuthState(prev => {
-      // Dispose the previous authenticated API stub if it exists
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
-      return {
-        ...prev,
-        authenticatedApi: null, // Clear the disposed stub
-        isLoading: true,
-        error: null
-      }
-    })
-
-    // Use promise pipelining - we can use the returned promise as a stub immediately
-    // without awaiting. Authentication errors will be handled when the stub is actually used.
-    const authenticatedApi = publicApi.authenticate(token)
-    setAuthState({
-      token,
-      authenticatedApi,
-      isLoading: false,
-      error: null
-    })
-  }
-
-  const login = (token: string) => {
+  const login = useCallback((token: string) => {
     authenticateWithToken(token)
-  }
+  }, [authenticateWithToken])
 
-  const logout = () => {
+  const logout = useCallback(() => {
     if (CF_ACCESS_MODE) {
+      resetToSignedOut()
       window.location.assign('/cdn-cgi/access/logout')
       return
     }
 
-    // Use functional updater to read current state (avoids stale closure).
-    setAuthState(prev => {
-      if (prev.authenticatedApi) {
-        prev.authenticatedApi[Symbol.dispose]()
-      }
-      return {
-        token: null,
-        authenticatedApi: null,
-        isLoading: false,
-        error: null
-      }
-    })
-
+    resetToSignedOut()
     localStorage.removeItem('authToken')
-  }
+  }, [resetToSignedOut])
+
+  const retry = useCallback(() => {
+    if (CF_ACCESS_MODE) {
+      authenticateWithCfAccess()
+      return
+    }
+
+    const storedToken = localStorage.getItem('authToken')
+    if (storedToken) {
+      authenticateWithToken(storedToken)
+    } else {
+      resetToSignedOut()
+    }
+  }, [authenticateWithCfAccess, authenticateWithToken, resetToSignedOut])
 
   return {
     ...authState,
     login,
     logout,
+    retry,
     isAuthenticated: !!authState.authenticatedApi
   }
 }
