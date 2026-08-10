@@ -3,12 +3,12 @@ import { Popover } from '@cloudflare/kumo'
 import { ArrowRight, Pulse } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
 import type { ActionLogEntry, Overseer } from '@gadgets/workshop-shared/api'
-import { getLocale } from './paraglide/runtime'
 import { m as messages } from './paraglide/messages'
 import { CountBadge } from './components/CountBadge'
 import { ResolveButton } from './components/ResolveButton'
 import { formatRelativeTime, type ActivityView } from './Activity'
 import { useResolveAction } from './useResolveAction'
+import { formatLocaleNumber } from './utils/formatNumber'
 
 interface ActivityNotificationsProps {
   overseer: RpcStub<Overseer>
@@ -17,10 +17,6 @@ interface ActivityNotificationsProps {
 }
 
 const PREVIEW_LIMIT = 3
-
-function formatCount(count: number): string {
-  return new Intl.NumberFormat(getLocale()).format(count)
-}
 
 export default function ActivityNotifications({
   overseer,
@@ -48,8 +44,8 @@ export default function ActivityNotifications({
             type="button"
             aria-label={pending.length > 0
               ? (pending.length === 1
-                  ? messages.activity_label_pending_one({ count: formatCount(pending.length) })
-                  : messages.activity_label_pending_many({ count: formatCount(pending.length) }))
+                  ? messages.activity_label_pending_one({ count: formatLocaleNumber(pending.length) })
+                  : messages.activity_label_pending_many({ count: formatLocaleNumber(pending.length) }))
               : messages.activity_label()}
             className={`relative flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors duration-150 hover:bg-kumo-tint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring ${
               pending.length > 0 ? 'text-kumo-strong' : 'text-kumo-subtle hover:text-kumo-default'
@@ -133,7 +129,7 @@ export default function ActivityNotifications({
           >
             <span>
               {pending.length > PREVIEW_LIMIT
-                ? messages.activity_view_all_requests({ count: formatCount(pending.length) })
+                ? messages.activity_view_all_requests({ count: formatLocaleNumber(pending.length) })
                 : messages.activity_view_all()}
             </span>
             <ArrowRight size={13} className="text-kumo-inactive" />

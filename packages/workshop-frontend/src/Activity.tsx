@@ -16,6 +16,7 @@ import { useAvatar } from './useAvatar'
 import { useVendorBranding } from './useVendorBranding'
 import { useResolveAction } from './useResolveAction'
 import { safeExternalUrl } from './utils/safeExternalUrl'
+import { formatLocaleNumber } from './utils/formatNumber'
 import AutoApproveConfirmDialog from './components/AutoApproveConfirmDialog'
 import { m as messages } from './paraglide/messages.js'
 import { getLocale } from './paraglide/runtime.js'
@@ -68,14 +69,14 @@ export function formatRelativeTime(date: Date): string {
   const minutes = Math.floor(Math.max(0, Date.now() - new Date(date).getTime()) / 60_000)
   if (minutes < 1) return messages.activity_time_just_now()
   if (minutes < 60) {
-    return messages.activity_time_minutes_ago({ count: new Intl.NumberFormat(getLocale()).format(minutes) })
+    return messages.activity_time_minutes_ago({ count: formatLocaleNumber(minutes) })
   }
   const hours = Math.floor(minutes / 60)
   if (hours < 24) {
-    return messages.activity_time_hours_ago({ count: new Intl.NumberFormat(getLocale()).format(hours) })
+    return messages.activity_time_hours_ago({ count: formatLocaleNumber(hours) })
   }
   return messages.activity_time_days_ago({
-    count: new Intl.NumberFormat(getLocale()).format(Math.floor(hours / 24)),
+    count: formatLocaleNumber(Math.floor(hours / 24)),
   })
 }
 
@@ -228,8 +229,8 @@ export default function Activity({
             <div className={`${PANE_BAR} gap-2 px-5`}>
               <span className="text-[12.5px] font-medium leading-[17px] tracking-[-0.15px] text-kumo-default">
                 {pendingActions.length === 1
-                  ? messages.activity_request_waiting_one({ count: new Intl.NumberFormat(getLocale()).format(pendingActions.length) })
-                  : messages.activity_request_waiting_many({ count: new Intl.NumberFormat(getLocale()).format(pendingActions.length) })}
+                  ? messages.activity_request_waiting_one({ count: formatLocaleNumber(pendingActions.length) })
+                  : messages.activity_request_waiting_many({ count: formatLocaleNumber(pendingActions.length) })}
               </span>
               <span className="ml-auto text-[11.5px] leading-[17px] text-kumo-inactive">{messages.activity_oldest_first()}</span>
             </div>
@@ -287,8 +288,8 @@ export default function Activity({
             ))}
             <span className="ml-auto pr-2 text-[11.5px] leading-[17px] tabular-nums text-kumo-inactive">
               {historyShown === 1
-                ? messages.activity_events_one({ count: new Intl.NumberFormat(getLocale()).format(historyShown) })
-                : messages.activity_events_many({ count: new Intl.NumberFormat(getLocale()).format(historyShown) })}
+                ? messages.activity_events_one({ count: formatLocaleNumber(historyShown) })
+                : messages.activity_events_many({ count: formatLocaleNumber(historyShown) })}
             </span>
 
           </div>

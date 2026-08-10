@@ -17,7 +17,7 @@ import {
 } from "./slash-command-catalog";
 import { useSiteName } from "../../ServerConfigContext";
 import { m as messages } from "../../paraglide/messages.js";
-import { getLocale } from "../../paraglide/runtime.js";
+import { formatLocaleNumber } from "../../utils/formatNumber";
 
 type SlashCommandPopupLayout = {
   left: number;
@@ -323,7 +323,7 @@ export function useSlashCommandPicker({
           : choices.length === 1
             ? messages.slash_commands_status_found_one()
             : messages.slash_commands_status_found_many({
-                count: new Intl.NumberFormat(getLocale()).format(choices.length),
+                count: formatLocaleNumber(choices.length),
               })
       : "",
   };

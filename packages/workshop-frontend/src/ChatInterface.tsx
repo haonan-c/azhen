@@ -120,6 +120,7 @@ import { useVendorBranding } from "./useVendorBranding";
 import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { useSlashCommandPicker } from "./components/chat/SlashCommandPicker";
 import { formatFullTimestamp } from "./utils/formatTimestamp";
+import { formatLocaleNumber } from "./utils/formatNumber";
 import { copyToClipboard } from "./clipboard";
 import { m as uiMessages } from "./paraglide/messages.js";
 import { getLocale } from "./paraglide/runtime.js";
@@ -1296,10 +1297,6 @@ function formatAttachmentSize(size: number | undefined): string | null {
   if (size < 1024) return `${formatLocaleNumber(size, options)} B`;
   if (size < 1024 * 1024) return `${formatLocaleNumber(size / 1024, options)} KB`;
   return `${formatLocaleNumber(size / (1024 * 1024), options)} MB`;
-}
-
-function formatLocaleNumber(value: number, options?: Intl.NumberFormatOptions): string {
-  return new Intl.NumberFormat(getLocale(), options).format(value);
 }
 
 function formatUsdCost(value: number): string {

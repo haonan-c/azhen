@@ -196,6 +196,7 @@ describe('localized conversation history', () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const approveAction = vi.fn<(actionId: number) => Promise<void>>(async () => {})
     const denyConnectionRequest = vi.fn<(requestId: string) => Promise<void>>(async () => {})
+    const revertChanges = vi.fn<(chatId: number, revertFrom: number) => Promise<void>>(async () => {})
     const onOpenGadget = vi.fn<(gadgetId: number) => void>()
     const outputOfWorkpiece = (gadgetId: number) => {
       if (gadgetId === 11) return DOCUMENT_OUTPUT
@@ -223,6 +224,7 @@ describe('localized conversation history', () => {
       approveAction,
       rejectAction: async () => {},
       denyConnectionRequest,
+      revertChanges,
     } as unknown as RpcStub<Overseer>
 
     container = document.createElement('div')
@@ -308,6 +310,10 @@ describe('localized conversation history', () => {
     expect(document.body.textContent).toContain('放弃所有待处理的更改？')
     expect(document.body.textContent).toContain('待处理的更改无法恢复。')
     expect(document.body.textContent).toContain('取消')
+    const confirmDiscard = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === '放弃更改')
+    await act(async () => confirmDiscard!.click())
+    expect(revertChanges).toHaveBeenCalledWith(7, 0)
     expect(container.textContent).toContain('RESULT TITLE VERBATIM')
     const result = [...container.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.includes('RESULT TITLE VERBATIM'))

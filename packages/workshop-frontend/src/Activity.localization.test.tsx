@@ -54,6 +54,7 @@ describe('localized activity', () => {
   it('localizes Chinese approval feedback without changing connector content', async () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const approveAction = vi.fn<(actionId: number) => Promise<void>>(async () => {})
+    const rejectAction = vi.fn<(actionId: number) => Promise<void>>(async () => {})
     const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
     const overseer = {
       subscribeToActions: async (subscriber: ActionsSubscriber) => {
@@ -74,7 +75,7 @@ describe('localized activity', () => {
         return disposable
       },
       approveAction,
-      rejectAction: async () => {},
+      rejectAction,
     } as unknown as RpcStub<Overseer>
 
     container = document.createElement('div')
@@ -91,6 +92,11 @@ describe('localized activity', () => {
     expect(container.textContent).toContain('CONNECTOR ACTION TITLE VERBATIM')
     expect(container.textContent).toContain('CONNECTOR ACTION BODY VERBATIM')
     expect(container.textContent).toContain('RESOURCE TITLE VERBATIM')
+
+    const reject = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === '拒绝')
+    await act(async () => reject!.click())
+    expect(rejectAction).toHaveBeenCalledWith(42)
 
     const approve = [...container.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent === '批准')
@@ -174,6 +180,7 @@ describe('localized activity', () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
     const setAutoApprovedActionKind = vi.fn<() => Promise<void>>(async () => {})
+    const removeAutoApprovedActionKind = vi.fn<() => Promise<void>>(async () => {})
     const overseer = {
       subscribeToActions: async (subscriber: ActionsSubscriber) => {
         subscriber.ready()
@@ -185,10 +192,16 @@ describe('localized activity', () => {
         vendorId: 'vendor-original',
         actionKind: { tag: 'publish', label: 'AUTO KIND VERBATIM' },
         alreadyEnabled: false,
+      }, {
+        gatekeeperId: 9,
+        resourceTitle: 'AUTO RESOURCE VERBATIM',
+        vendorId: 'vendor-original',
+        actionKind: { tag: 'archive', label: 'AUTO ENABLED KIND VERBATIM' },
+        alreadyEnabled: true,
       }],
       listAutoApprovedActionKinds: async () => [],
       setAutoApprovedActionKind,
-      removeAutoApprovedActionKind: async () => {},
+      removeAutoApprovedActionKind,
     } as unknown as RpcStub<Overseer>
 
     container = document.createElement('div')
@@ -213,6 +226,13 @@ describe('localized activity', () => {
       9,
       { tag: 'publish', label: 'AUTO KIND VERBATIM' },
     )
+
+    const disableToggle = container.querySelector<HTMLButtonElement>(
+      '[aria-label="为 AUTO ENABLED KIND VERBATIM 停用自动批准"]',
+    )
+    await act(async () => disableToggle!.click())
+    await waitFor(() => removeAutoApprovedActionKind.mock.calls.length === 1)
+    expect(removeAutoApprovedActionKind).toHaveBeenCalledWith(9, 'archive')
   })
 
   it('localizes Chinese activity notifications and preserves preview content', async () => {
