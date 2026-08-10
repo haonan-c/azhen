@@ -132,8 +132,32 @@ describe('ConnectConnectorModal localization', () => {
     expect(onConfirm).toHaveBeenCalledWith(undefined)
   })
 
-  it('localizes account management and disconnect confirmation', async () => {
-    window.history.replaceState({}, '', '/zh/gatekeepers')
+  it.each([
+    {
+      path: '/gatekeepers',
+      resources: 'Resources',
+      manageDescription: 'This account can be used by Gadgets you connect it to.',
+      disconnect: 'Disconnect',
+      confirmation: 'Disconnect GitHub Vendor Original?',
+      confirmAction: 'Yes, disconnect',
+    },
+    {
+      path: '/zh/gatekeepers',
+      resources: '资源',
+      manageDescription: '此账号可供与其连接的应用使用。',
+      disconnect: '断开连接',
+      confirmation: '断开 GitHub Vendor Original 的连接？',
+      confirmAction: '确认断开',
+    },
+  ])('localizes account management and disconnect confirmation at $path', async ({
+    path,
+    resources,
+    manageDescription,
+    disconnect,
+    confirmation,
+    confirmAction,
+  }) => {
+    window.history.replaceState({}, '', path)
     const onDisconnect = vi.fn<() => void>()
     container = document.createElement('div')
     document.body.append(container)
@@ -157,17 +181,17 @@ describe('ConnectConnectorModal localization', () => {
 
     expect(container.querySelector('h1')?.textContent).toBe('GitHub Vendor Original')
     expect(container.textContent).toContain('Seller Account Original / seller@example.com')
-    expect(container.textContent).toContain('资源')
+    expect(container.textContent).toContain(resources)
     expect(container.textContent).toContain('Vendor-owned connector description')
-    expect(container.textContent).toContain('此账号可供与其连接的应用使用。')
+    expect(container.textContent).toContain(manageDescription)
 
-    const disconnect = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent === '断开连接')!
-    await act(async () => disconnect.click())
+    const disconnectButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === disconnect)!
+    await act(async () => disconnectButton.click())
 
-    expect(container.textContent).toContain('断开 GitHub Vendor Original 的连接？')
+    expect(container.textContent).toContain(confirmation)
     const confirm = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent === '确认断开')!
+      .find(button => button.textContent === confirmAction)!
     await act(async () => confirm.click())
     expect(onDisconnect).toHaveBeenCalledOnce()
   })

@@ -99,8 +99,50 @@ describe('GatekeeperModal localization', () => {
     container = undefined
   })
 
-  it('localizes connection discovery and AI model configuration', async () => {
-    window.history.replaceState({}, '', '/zh/workspace/campaign')
+  it.each([
+    {
+      path: '/workspace/campaign',
+      initialTitle: 'Create New Connection',
+      chooseDescription: 'Choose what this Gadget should be able to use.',
+      search: 'Search services, apps, data sources…',
+      aiModel: 'AI Model',
+      aiDescription: 'Expose a selected model through this connection.',
+      allTypes: 'All connection types',
+      modelDescription: 'Choose the model this connection can use.',
+      selectLabel: 'Select an AI model',
+      back: 'Back',
+      create: 'Create connection',
+      otherLocaleText: '创建新连接',
+    },
+    {
+      path: '/zh/workspace/campaign',
+      initialTitle: '创建新连接',
+      chooseDescription: '选择此应用可以使用的内容。',
+      search: '搜索服务、应用和数据源…',
+      aiModel: 'AI 模型',
+      aiDescription: '通过此连接使用所选模型。',
+      allTypes: '所有连接类型',
+      modelDescription: '选择此连接可以使用的模型。',
+      selectLabel: '选择 AI 模型',
+      back: '返回',
+      create: '创建连接',
+      otherLocaleText: 'Create New Connection',
+    },
+  ])('localizes connection discovery and AI model configuration at $path', async ({
+    path,
+    initialTitle,
+    chooseDescription,
+    search,
+    aiModel,
+    aiDescription,
+    allTypes,
+    modelDescription,
+    selectLabel,
+    back,
+    create,
+    otherLocaleText,
+  }) => {
+    window.history.replaceState({}, '', path)
     type CreatedGatekeeper = Parameters<GatekeeperModalProps['onCreated']>[0]
     const gatekeeper = {} as CreatedGatekeeper
     const newAiModelGatekeeper = vi.fn<(modelId: string) => Promise<CreatedGatekeeper>>(
@@ -121,40 +163,39 @@ describe('GatekeeperModal localization', () => {
     ))
 
     await vi.waitFor(() => expect(container?.textContent).toContain('GitHub Vendor Original'))
-    expect(container.querySelector('h1')?.textContent).toBe('创建新连接')
-    expect(container.textContent).toContain('选择此应用可以使用的内容。')
+    expect(container.querySelector('h1')?.textContent).toBe(initialTitle)
+    expect(container.textContent).toContain(chooseDescription)
     expect(container.querySelector<HTMLInputElement>('input')?.placeholder)
-      .toBe('搜索服务、应用和数据源…')
-    expect(container.textContent).toContain('AI 模型')
+      .toBe(search)
+    expect(container.textContent).toContain(aiModel)
     expect(container.textContent).toContain('Agent')
     expect(container.textContent).toContain('GitHub Vendor Original')
     expect(container.textContent).toContain('Vendor-owned resource description')
 
     const aiModelGroup = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.includes('AI 模型'))!
+      .find(button => button.textContent?.includes(aiModel))!
     await act(async () => aiModelGroup.click())
     const aiModelRows = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .filter(button => button.textContent?.includes('AI 模型'))
+      .filter(button => button.textContent?.includes(aiModel))
     await act(async () => aiModelRows.at(-1)!.click())
 
-    expect(container.querySelector('h1')?.textContent).toBe('AI 模型')
-    expect(container.textContent).toContain('通过此连接使用所选模型。')
-    expect(container.textContent).toContain('所有连接类型')
-    expect(container.textContent).toContain('选择此连接可以使用的模型。')
-    expect(container.querySelector('[aria-label="选择 AI 模型"]')).not.toBeNull()
+    expect(container.querySelector('h1')?.textContent).toBe(aiModel)
+    expect(container.textContent).toContain(aiDescription)
+    expect(container.textContent).toContain(allTypes)
+    expect(container.textContent).toContain(modelDescription)
+    expect(container.querySelector(`[aria-label="${selectLabel}"]`)).not.toBeNull()
     expect(container.textContent).toContain('Model Original')
-    expect(container.textContent).toContain('返回')
-    expect(container.textContent).toContain('创建连接')
-    expect(container.textContent).not.toContain('Create New Connection')
-    expect(container.textContent).not.toContain('Choose the model this connection can use.')
+    expect(container.textContent).toContain(back)
+    expect(container.textContent).toContain(create)
+    expect(container.textContent).not.toContain(otherLocaleText)
 
     await act(async () => {
       container!.querySelector<HTMLButtonElement>('[data-testid="select-test-model"]')!.click()
     })
-    const create = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent === '创建连接')!
+    const createButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent === create)!
     await act(async () => {
-      create.click()
+      createButton.click()
       await Promise.resolve()
     })
     expect(newAiModelGatekeeper).toHaveBeenCalledWith('model-original')

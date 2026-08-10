@@ -736,11 +736,23 @@ export default function GatekeeperModal({
     let gatekeeper: RpcStub<GatekeeperClient<any>> | null = null
     let transferred = false
     try {
-      if (!configuratorFrameState?.frame || configuratorFrameState.accountId !== selectedAccountId || configuratorFrameState.resourceUrlPattern !== resourceUrlPattern) {
-        throw new Error(messages.resource_configurator_not_ready())
+      let resourceUrl: string
+      try {
+        if (!configuratorFrameState?.frame || configuratorFrameState.accountId !== selectedAccountId || configuratorFrameState.resourceUrlPattern !== resourceUrlPattern) {
+          throw new Error(messages.resource_configurator_not_ready())
+        }
+        resourceUrl = await configuratorCollectResourceUrlRef.current?.() ?? ''
+        if (!resourceUrl) throw new Error(messages.resource_configurator_no_url())
+      } catch (err) {
+        console.error('Failed to collect resource configuration:', err)
+        toasts.add({
+          title: err instanceof Error && err.message
+            ? err.message
+            : messages.gatekeeper_modal_connection_create_failed(),
+          variant: 'error',
+        })
+        return
       }
-      const resourceUrl = await configuratorCollectResourceUrlRef.current?.()
-      if (!resourceUrl) throw new Error(messages.resource_configurator_no_url())
       const overseer = await getOverseer()
       gatekeeper = await overseer.newGatekeeper(selectedAccountId, resourceUrl)
       if (gatekeeper) {
@@ -752,12 +764,7 @@ export default function GatekeeperModal({
       }
     } catch (err) {
       console.error('Failed to create resource gatekeeper:', err)
-      toasts.add({
-        title: err instanceof Error && err.message
-          ? err.message
-          : messages.gatekeeper_modal_connection_create_failed(),
-        variant: 'error',
-      })
+      toasts.add({ title: messages.gatekeeper_modal_connection_create_failed(), variant: 'error' })
     } finally {
       if (gatekeeper && !transferred) gatekeeper[Symbol.dispose]()
       setCreating(false)
