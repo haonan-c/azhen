@@ -192,6 +192,11 @@ describe('localized conversation history', () => {
     vi.clearAllMocks()
   })
 
+  // Reproduce under full-suite load with `pnpm test & suite_pid=$!; for run_index in 1 2 3;
+  // do pnpm --filter @gadgets/workshop-frontend exec vitest run
+  // src/conversation-history.localization.test.tsx -t "lets a Chinese user"; done; wait "$suite_pid"`.
+  // Five isolated runs took 0.90-1.19s. A loaded run took 5.41s. The test has no unawaited
+  // updates or leaked subscriptions, so this local margin covers measured CPU contention.
   it('lets a Chinese user view a response, inspect a tool, approve an action, and open a result', async () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const approveAction = vi.fn<(actionId: number) => Promise<void>>(async () => {})
@@ -319,7 +324,7 @@ describe('localized conversation history', () => {
       .find(button => button.textContent?.includes('RESULT TITLE VERBATIM'))
     await act(async () => result!.click())
     expect(onOpenGadget).toHaveBeenCalledWith(11)
-  })
+  }, 15_000)
 
   it('localizes the Chinese conversation list and formats its time and cost', async () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
