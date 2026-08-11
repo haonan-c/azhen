@@ -7562,9 +7562,9 @@ function ChatInterface({
                               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-kumo-inactive" aria-hidden="true">
                                 <Code size={16} />
                               </span>
-                              <span className="min-w-0 truncate font-mono text-[13px]">
+                              <code className="min-w-0 truncate font-mono text-[13px]">
                                 self.{msg.methodName}()
-                              </span>
+                              </code>
                             </div>
                             {msg.argsSummary && (
                               <div className="ml-8 mt-1">

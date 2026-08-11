@@ -1047,7 +1047,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
                 onClick={() => setError(null)}
                 className="cursor-pointer text-kumo-danger hover:text-kumo-default"
               >
-                &times;
+                ×
               </button>
             </div>
           )}

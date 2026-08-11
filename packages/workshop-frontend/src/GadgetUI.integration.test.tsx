@@ -192,6 +192,20 @@ describe('GadgetUI RPC recovery', () => {
     expect(container.textContent).not.toContain('No gadget UI yet')
   })
 
+  it('keeps Gadget content unchanged in the Chinese Workshop', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+    const gadgetCode = 'document.body.textContent = "GADGET CONTENT 原样保留"'
+    const gadget = fakeGadget('original', gadgetCode)
+
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    expect(container.querySelector('iframe')?.getAttribute('srcdoc'))
+      .toContain(encodeURIComponent(gadgetCode))
+  })
+
   it('keeps the iframe while redirecting calls to the replacement gadget client', async () => {
     const first = fakeGadget('first', 'document.body.textContent = "first"')
     await act(async () => {
