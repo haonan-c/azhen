@@ -48,6 +48,7 @@ function buildTestManifest() {
     wranglerVersion: "0.0.0-fixture",
     workers,
     assetVariants: {
+      public: collectAssets(join(TESTDATA, "fixture-assets", "public")),
       access: collectAssets(join(TESTDATA, "fixture-assets", "access")),
     },
   });
@@ -116,7 +117,8 @@ test("worker entries carry the deploy contract", () => {
   assert.equal(backend.migrations[0].tag, "v0");
   assert.ok(backend.migrations[0].new_sqlite_classes.includes("UserDurableObject"));
 
-  // Router: serves the access asset variant, binds the backend by templated worker name.
+  // Router: offers stable public and Access asset choices and binds the backend by templated
+  // worker name.
   const router = workers["router"];
   assert.deepEqual(
       router.bindings.find((b) => b.name === "WORKSHOP_BACKEND"),
@@ -127,13 +129,24 @@ test("worker entries carry the deploy contract", () => {
       ["/*", "!/assets/*", "!/favicon.svg", "!/marketing/*"]);
   assert.equal(router.assetsConfig.html_handling, "drop-trailing-slash");
   assert.equal(router.assetsConfig.not_found_handling, "single-page-application");
-  assert.deepEqual(Object.keys(router.assetsConfig.variants), ["access"]);
+  assert.deepEqual(Object.keys(router.assetsConfig.variants), ["public", "access"]);
   for (const variant of Object.values(router.assetsConfig.variants)) {
+    assert.ok(variant.manifest["/index.html"], "English Marketing Landing Page document missing");
+    assert.ok(variant.manifest["/zh/index.html"],
+        "Chinese Marketing Landing Page document missing");
     for (const { hash } of Object.values(variant.manifest)) {
       assert.ok(manifest.assets[hash], `asset blob ${hash} missing from release index`);
       assert.equal(manifest.assets[hash].r2Key, `blobs/assets/${hash}`);
     }
   }
+  assert.equal(
+      router.assetsConfig.variants.public.manifest["/assets/shared.css"].hash,
+      router.assetsConfig.variants.access.manifest["/assets/shared.css"].hash,
+      "byte-identical assets should share one content hash across variants");
+  const referencedAssetHashes = new Set(Object.values(router.assetsConfig.variants)
+      .flatMap((variant) => Object.values(variant.manifest).map(({ hash }) => hash)));
+  assert.equal(Object.keys(manifest.assets).length, referencedAssetHashes.size,
+      "release asset index should contain one entry per content hash");
 
   // Gatekeepers: BASE_URL under the shared origin, shortName matches the router's path scan.
   const google = workers["gatekeeper-google"];

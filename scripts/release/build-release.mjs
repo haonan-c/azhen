@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 // Builds an immutable release: every deployable worker bundled exactly as `wrangler deploy`
-// would upload it (dry-run + outdir, with the repo's pinned wrangler), plus the Access-mode
-// workshop-frontend asset build, plus the release manifest that describes it all.
+// would upload it (dry-run + outdir, with the repo's pinned wrangler), plus the public and
+// Cloudflare Access workshop-frontend asset builds, plus the release manifest that describes it
+// all.
 //
 // Output layout (mirrored to R2 by upload-release.mjs):
 //   <out>/manifest.json                    the release manifest (upload LAST — its presence
@@ -70,13 +71,10 @@ function pinnedWranglerVersion() {
   return pkg.version;
 }
 
-// Builds the Access-mode frontend (VITE_CF_ACCESS_MODE is a build-time flag,
-// workshop-frontend/src/useAuth.ts) — the one asset variant every release carries.
-function buildFrontend() {
-  const env = { ...process.env, VITE_CF_ACCESS_MODE: "true" };
-  run("pnpm", ["run", "build"], { cwd: FRONTEND_DIR, env });
-  return collectAssets(join(FRONTEND_DIR, "dist"));
-}
+export const FRONTEND_VARIANTS = [
+  { name: "public", env: { VITE_CF_ACCESS_MODE: "false" } },
+  { name: "access", env: { VITE_CF_ACCESS_MODE: "true" } },
+];
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -91,9 +89,15 @@ function main() {
 
   // 1. Frontend first: the router's wrangler.jsonc points its assets directory at
   //    workshop-frontend/dist, so it must exist before the router's dry-run.
-  const assetVariants = {
-    access: buildFrontend(),
-  };
+  const assetVariants = {};
+  for (const { name, env } of FRONTEND_VARIANTS) {
+    console.log(`building frontend variant: ${name}`);
+    run("pnpm", ["run", "build"], {
+      cwd: FRONTEND_DIR,
+      env: { ...process.env, ...env },
+    });
+    assetVariants[name] = collectAssets(join(FRONTEND_DIR, "dist"));
+  }
   for (const { blobs } of Object.values(assetVariants)) {
     for (const [hash, blob] of blobs) {
       writeFileSync(join(args.out, "assets", hash), blob.bytes);
@@ -139,4 +143,4 @@ function main() {
       `${Object.keys(manifest.assets).length} unique asset blobs -> ${args.out}`);
 }
 
-main();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

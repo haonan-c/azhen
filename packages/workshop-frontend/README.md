@@ -40,3 +40,20 @@ VITE_CF_ACCESS_MODE=true
 ```
 
 The backend also needs to be configured with the `CF_ACCESS_ISS` and `CF_ACCESS_AUD` environment variables (see the workshop-backend package) for the JWT verification to work.
+
+## Release frontend variants
+
+Each release manifest offers two stable frontend asset choices:
+
+- `public` uses application sign-in. A signed-out visitor can read the Marketing Landing Page.
+- `access` uses Cloudflare Access authentication. Select it only when an external Cloudflare
+  Access policy protects the full Production Site origin before a request reaches the Router.
+
+Both variants contain the localized English and Chinese static Marketing Landing Page documents.
+The `access` variant hides the prerendered Marketing Landing Page while the application starts its
+Access authentication, but the external Access policy is the security boundary that prevents a
+signed-out request from retrieving those documents.
+
+Selecting a frontend variant does not create, remove, or bypass a Cloudflare Access policy. A
+`public` variant behind an existing Access policy stays protected. An `access` variant without that
+policy is a deployment error; the variant selection alone does not protect the origin.

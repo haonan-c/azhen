@@ -71,7 +71,8 @@ test("collectAssets builds an upload-session-shaped manifest with deduped blobs"
   const access = collectAssets(join(TESTDATA, "fixture-assets", "access"));
 
   assert.deepEqual(Object.keys(access.manifest).toSorted(),
-      ["/assets/app.js", "/assets/print.css", "/assets/shared.css", "/index.html"]);
+      ["/assets/app.js", "/assets/print.css", "/assets/shared.css", "/index.html",
+        "/zh/index.html"]);
   for (const entry of Object.values(access.manifest)) {
     assert.equal(entry.hash.length, 32);
     assert.ok(entry.size > 0);
@@ -82,8 +83,9 @@ test("collectAssets builds an upload-session-shaped manifest with deduped blobs"
       access.manifest["/assets/print.css"].hash);
   assert.notEqual(access.manifest["/assets/app.js"].hash,
       access.manifest["/assets/shared.css"].hash);
-  assert.equal(access.blobs.size, 3);
+  assert.equal(access.blobs.size, 4);
   assert.ok(access.blobs.has(access.manifest["/index.html"].hash));
+  assert.ok(access.blobs.has(access.manifest["/zh/index.html"].hash));
 });
 
 test("stableStringify sorts object keys but preserves array order", () => {
