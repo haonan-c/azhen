@@ -10,7 +10,7 @@
     "pretypes:check": "pnpm paraglide:compile",
     "types:check": "tsc --noEmit",
     "pretest": "pnpm paraglide:compile",
-    "test": "vitest run",
+    "test": "vitest run --exclude '**/build-artifacts.test.mjs' && vitest run build-artifacts.test.mjs",
     "preview": "vite preview",
     "clean": "rm -rf dist"
   },

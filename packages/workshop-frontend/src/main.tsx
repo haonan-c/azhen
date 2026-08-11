@@ -1,5 +1,5 @@
-import { StrictMode, useState, useEffect } from 'react'
-import { createRoot } from 'react-dom/client'
+import { StrictMode, useState, useEffect, useLayoutEffect } from 'react'
+import { createRoot, hydrateRoot } from 'react-dom/client'
 import { RouterProvider } from '@tanstack/react-router'
 import { RpcStub, newWebSocketRpcSession } from 'capnweb'
 import { PublicApi, ServerConfig } from '@gadgets/workshop-shared/api'
@@ -12,8 +12,9 @@ import { applyAccentColor, applyStoredThemeMode } from './theme'
 import './styles.css'
 import FrontendErrorBoundary from './FrontendErrorBoundary'
 import { installWorkshopErrorReporting, reportIssue } from './errorReporting'
-import { initializeLocale } from './locale'
+import { initializeLocale, localizedHomePath } from './locale'
 import { applySiteFavicon, cacheBustSiteLogoUrl } from './siteLogoUtils'
+import { CF_ACCESS_MODE } from './useAuth'
 
 // ---------------------------------------------------------------------------
 // Dev auto-login: if VITE_DEV_AUTO_LOGIN=true, automatically create/login
@@ -131,6 +132,10 @@ function AppWithConnection() {
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [serverConfigError, setServerConfigError] = useState(false);
 
+  useLayoutEffect(() => {
+    document.getElementById('root')?.removeAttribute('hidden')
+  }, [])
+
   useEffect(() => {
     let cb = () => setRpcState({ stub: currentStub, connectionLost: isConnectionLost });
     notifyCurrentStubUpdated.add(cb);
@@ -178,11 +183,12 @@ function AppWithConnection() {
   );
 }
 
-const root = createRoot(document.getElementById('root')!, {
-  onUncaughtError: (error) => reportIssue('workshop.react-root', error, {
+const rootElement = document.getElementById('root')!
+const rootOptions = {
+  onUncaughtError: (error: unknown) => reportIssue('workshop.react-root', error, {
     handled: false, severity: 'fatal', captureMechanism: 'react',
   }),
-})
+}
 
 // Kick off dev auto-login in the background. If it completes before
 // useAuth checks the token, the user skips the login page. If the backend
@@ -190,10 +196,32 @@ const root = createRoot(document.getElementById('root')!, {
 // banner or login page) instead of hanging on a blank screen.
 devAutoLogin(currentStub).catch(() => {})
 
-root.render(
+const app = (
   <StrictMode>
     <FrontendErrorBoundary>
       <AppWithConnection />
     </FrontendErrorBoundary>
   </StrictMode>
 )
+
+let hasStoredSession = CF_ACCESS_MODE
+try {
+  hasStoredSession ||= Boolean(localStorage.getItem('authToken'))
+} catch {
+  hasStoredSession = true
+}
+
+const prerenderedLocale = rootElement.dataset.prerenderedLocale
+const prerenderedHome = prerenderedLocale === 'en' || prerenderedLocale === 'zh'
+  ? localizedHomePath(prerenderedLocale)
+  : null
+const canHydrate = !hasStoredSession
+  && prerenderedLocale === document.documentElement.lang
+  && window.location.pathname === prerenderedHome
+
+if (canHydrate) {
+  hydrateRoot(rootElement, app, rootOptions)
+} else {
+  rootElement.replaceChildren()
+  createRoot(rootElement, rootOptions).render(app)
+}

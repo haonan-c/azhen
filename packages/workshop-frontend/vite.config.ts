@@ -5,6 +5,7 @@ import tsconfigPaths from 'vite-tsconfig-paths'
 import { TanStackRouterVite } from '@tanstack/router-plugin/vite'
 import { paraglideVitePlugin } from '@inlang/paraglide-js'
 import { paraglideOptions } from './paraglide.config.mjs'
+import { prerenderMarketingPages } from './prerender-marketing.mjs'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd())
@@ -17,6 +18,7 @@ export default defineConfig(({ mode }) => {
       react(),
       tailwindcss(),
       tsconfigPaths(),
+      prerenderMarketingPages(),
     ],
     server: {
       port: 3000,
