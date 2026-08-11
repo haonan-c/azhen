@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { createRootRoute, Outlet, useRouterState } from '@tanstack/react-router'
+import { createRootRoute, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
 import { TooltipProvider, Toasty } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
@@ -29,10 +29,10 @@ function ConnectionLostBanner() {
 }
 
 export function RootComponent() {
-  const [showSignIn, setShowSignIn] = useState(false)
   const rpcStub = useRpcStub()
   const connectionLost = useConnectionLost()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login, retry } = useAuth(rpcStub)
+  const navigate = useNavigate()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
 
   // When authenticatedApi becomes available, the connection is proven alive.
@@ -49,7 +49,7 @@ export function RootComponent() {
   // Signed-in users get the full app chrome so public pages (esp. the blueprint detail) feel
   // native — sidebar and all — instead of floating on a bare page.
   const standalone = isSignup
-    || (((isHome && !showSignIn) || isBlueprint) && !isLoading && !error && !isAuthenticated)
+    || ((isHome || isBlueprint) && !isLoading && !error && !isAuthenticated)
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
@@ -58,7 +58,6 @@ export function RootComponent() {
   const handleLoginSuccess = () => {
     const token = localStorage.getItem('authToken')
     if (token) {
-      setShowSignIn(false)
       login(token)
     }
   }
@@ -109,7 +108,13 @@ export function RootComponent() {
 
   // Signed-out visitors of public routes render without the auth wrapper / app shell.
   if (standalone) {
-    if (isHome) return <MarketingLandingPage onSignIn={() => setShowSignIn(true)} />
+    if (isHome) {
+      return <MarketingLandingPage onSignIn={() => navigate({
+        to: '/login',
+        search: true,
+        hash: true,
+      })} />
+    }
     const showHeader = !isSignup
     return (
       <TooltipProvider>
