@@ -103,14 +103,31 @@ describe('root session validation', () => {
     return router
   }
 
-  it.each(['/', '/zh'])('shows the signed-out root surface with no stored token at %s', async (href) => {
+  it.each([
+    { href: '/', heading: 'From brief to usable result.' },
+    { href: '/zh', heading: '从任务到可用成果。' },
+  ])('shows the localized Marketing Landing Page with no stored token at $href', async ({ href, heading }) => {
     window.history.replaceState({}, '', href)
     const api = createPublicApi(() => { throw new Error('unexpected authentication') })
 
     await render('/', api)
 
-    expect(container?.textContent).toBe('signed-out')
+    expect(container?.textContent).toContain(heading)
+    expect(container?.textContent).not.toContain('signed-out')
     expect(api.authenticate).not.toHaveBeenCalled()
+  })
+
+  it('opens the existing sign-in surface from the Marketing Landing Page', async () => {
+    const api = createPublicApi(() => { throw new Error('unexpected authentication') })
+
+    await render('/', api)
+    const signIn = [...container!.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent?.trim() === 'Sign in')
+    expect(signIn).toBeDefined()
+
+    await act(async () => signIn!.click())
+
+    expect(container?.textContent).toBe('signed-out')
   })
 
   it.each([
@@ -133,14 +150,17 @@ describe('root session validation', () => {
     expect(container?.querySelector('[data-destination="home"]')).not.toBeNull()
   })
 
-  it.each(['/', '/zh'])('clears an invalid session and shows the signed-out root surface at %s', async (href) => {
+  it.each([
+    { href: '/', heading: 'From brief to usable result.' },
+    { href: '/zh', heading: '从任务到可用成果。' },
+  ])('clears an invalid session and shows the Marketing Landing Page at $href', async ({ href, heading }) => {
     window.history.replaceState({}, '', href)
     localStorage.setItem('authToken', 'invalid-token')
     const invalid = createAuthenticatedApi(async () => { throw new Error('Invalid session token.') })
 
     await render('/', createPublicApi(() => invalid.stub))
 
-    expect(container?.textContent).toBe('signed-out')
+    expect(container?.textContent).toContain(heading)
     expect(localStorage.getItem('authToken')).toBeNull()
   })
 

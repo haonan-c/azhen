@@ -51,6 +51,59 @@ const requiredAuthMessages = [
   'user_menu_sign_out',
 ] as const
 
+const requiredMarketingMessages = [
+  'marketing_capabilities_description',
+  'marketing_capabilities_heading',
+  'marketing_capability_apps_description',
+  'marketing_capability_apps_title',
+  'marketing_capability_content_description',
+  'marketing_capability_content_title',
+  'marketing_capability_documents_description',
+  'marketing_capability_documents_title',
+  'marketing_capability_insight_description',
+  'marketing_capability_insight_title',
+  'marketing_capability_rendering_description',
+  'marketing_capability_rendering_title',
+  'marketing_category',
+  'marketing_collaboration_description',
+  'marketing_collaboration_title',
+  'marketing_document_title',
+  'marketing_final_description',
+  'marketing_final_heading',
+  'marketing_footer_description',
+  'marketing_header_navigation',
+  'marketing_hero_description',
+  'marketing_hero_heading',
+  'marketing_menu_close',
+  'marketing_menu_open',
+  'marketing_nav_capabilities',
+  'marketing_nav_security',
+  'marketing_nav_templates',
+  'marketing_nav_workflow',
+  'marketing_product_evidence_alt',
+  'marketing_product_evidence_caption',
+  'marketing_security_actions_description',
+  'marketing_security_actions_title',
+  'marketing_security_connectors_description',
+  'marketing_security_connectors_title',
+  'marketing_security_description',
+  'marketing_security_heading',
+  'marketing_security_sandbox_description',
+  'marketing_security_sandbox_title',
+  'marketing_templates_description',
+  'marketing_templates_heading',
+  'marketing_templates_reuse_description',
+  'marketing_templates_reuse_title',
+  'marketing_workflow_brief_description',
+  'marketing_workflow_brief_title',
+  'marketing_workflow_description',
+  'marketing_workflow_evidence_description',
+  'marketing_workflow_evidence_title',
+  'marketing_workflow_heading',
+  'marketing_workflow_result_description',
+  'marketing_workflow_result_title',
+] as const
+
 const requiredWorkspaceCreationMessages = [
   'composer_add_resource',
   'composer_attached_file',
@@ -385,6 +438,10 @@ describe('message catalogs', () => {
 
   it('includes every authentication and global language-control message', () => {
     expect(messageKeys(english)).toEqual(expect.arrayContaining([...requiredAuthMessages]))
+  })
+
+  it('includes every Marketing Landing Page message', () => {
+    expect(messageKeys(english)).toEqual(expect.arrayContaining([...requiredMarketingMessages]))
   })
 
   it('includes every Prompt Composer and Workspace creation message', () => {
