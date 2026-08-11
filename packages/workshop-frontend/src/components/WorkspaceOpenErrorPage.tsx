@@ -2,12 +2,12 @@ import { Lock, MagnifyingGlass, WarningCircle } from '@phosphor-icons/react'
 import { useEffect, useId, useRef } from 'react'
 import {
   getOpenGadgetErrorCode,
-  OBSERVER_BINDING_FAILURE_CODES,
   OPEN_GADGET_ERROR_CODES,
   type OpenGadgetObserverFailure,
 } from '@gadgets/workshop-shared/api'
 import { WorkshopButton } from './WorkshopControls'
 import { m as messages } from '../paraglide/messages.js'
+import { presentObserverFailureReason } from '../observer-failure-presentation'
 
 export type WorkspaceOpenFailureKind =
   | 'access-denied'
@@ -71,12 +71,6 @@ type Props = {
   onGoToWorkspaces: () => void
 }
 
-function observerFailureReason(failure: OpenGadgetObserverFailure): string | undefined {
-  return failure.reasonCode === OBSERVER_BINDING_FAILURE_CODES.accountDisconnected
-    ? messages.observer_account_disconnected_reason()
-    : failure.reason
-}
-
 export default function WorkspaceOpenErrorPage({ kind, details, onRetry, onGoToWorkspaces }: Props) {
   const { title: titleMessage, message: messageText, Icon, retryable } = CONTENT[kind]
   const title = titleMessage()
@@ -122,7 +116,7 @@ export default function WorkspaceOpenErrorPage({ kind, details, onRetry, onGoToW
             className="mt-4 max-h-40 list-disc space-y-2 overflow-auto rounded-lg border border-kumo-line bg-kumo-elevated py-3 pl-8 pr-3 text-left text-[12px] leading-[18px] text-kumo-subtle"
           >
             {details.map((failure, index) => {
-              const reason = observerFailureReason(failure)
+              const reason = presentObserverFailureReason(failure)
               return (
                 <li key={index}>
                   {failure.resourceTitle || messages.observer_service()}

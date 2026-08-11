@@ -4,7 +4,11 @@
 import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
-import { createOpenGadgetError, OPEN_GADGET_ERROR_CODES } from '@gadgets/workshop-shared/api'
+import {
+  createOpenGadgetError,
+  OBSERVER_BINDING_FAILURE_CODES,
+  OPEN_GADGET_ERROR_CODES,
+} from '@gadgets/workshop-shared/api'
 import type { OpenGadgetObserverFailure } from '@gadgets/workshop-shared/api'
 import WorkspaceOpenErrorPage, { classifyWorkspaceOpenFailure } from './WorkspaceOpenErrorPage'
 
@@ -117,6 +121,22 @@ describe('WorkspaceOpenErrorPage', () => {
     expect(renderedContainer.textContent).toContain('RESOURCE TITLE VERBATIM')
     expect(renderedContainer.textContent).toContain('ACCOUNT LABEL VERBATIM')
     expect(renderedContainer.textContent).toContain('VENDOR DETAIL VERBATIM')
+  })
+
+  it('localizes a known observer reason without blank optional details', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/shared-campaign')
+
+    const { container: renderedContainer } = await render(
+      'observer-verification-failed',
+      [{
+        resourceTitle: '',
+        reasonCode: OBSERVER_BINDING_FAILURE_CODES.accountDisconnected,
+      }],
+    )
+
+    expect(renderedContainer.querySelector('li')?.textContent).toBe('服务 — 此账户已断开连接。')
+    expect(renderedContainer.textContent).not.toContain('This account is no longer connected.')
+    expect(renderedContainer.textContent).not.toContain('()')
   })
 
   it('classifies stable open error codes without treating unexpected errors as expected', () => {

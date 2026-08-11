@@ -5,7 +5,6 @@ import { RpcStub, RpcTarget } from 'capnweb'
 import {
   AuthenticatedApi,
   ConnectedAccountsSubscriber,
-  OBSERVER_BINDING_FAILURE_CODES,
   ObserverBindingNeed,
   ObserverAccountChoice,
 } from '@gadgets/workshop-shared/api'
@@ -13,6 +12,7 @@ import { AccountDescription, VendorDescription, SupportedResource } from '@gadge
 import { WorkshopButton } from './components/WorkshopControls'
 import Avatar from './components/Avatar'
 import { m as messages } from './paraglide/messages.js'
+import { presentObserverFailureReason } from './observer-failure-presentation'
 
 // Shown when a non-owner opens a shared Gadget that reads data through one or more gatekeeper
 // bindings, and they haven't yet chosen which of their own connected accounts to use for each one.
@@ -38,12 +38,6 @@ function accountLabel(account: AccountInfo | undefined, accountId: number): stri
   return account?.description.uniqueName
     || account?.description.displayName
     || messages.observer_account_fallback({ id: accountId })
-}
-
-function observerFailureReason(failure: NonNullable<ObserverBindingNeed['failure']>): string {
-  return failure.reasonCode === OBSERVER_BINDING_FAILURE_CODES.accountDisconnected
-    ? messages.observer_account_disconnected_reason()
-    : failure.reason
 }
 
 interface ObserverConfigModalProps {
@@ -302,7 +296,7 @@ export default function ObserverConfigModal({
                           {accountLabel(accounts.get(need.failure.accountId), need.failure.accountId)}
                         </span>
                         {' — '}
-                        {observerFailureReason(need.failure)}
+                        {presentObserverFailureReason(need.failure)}
                       </div>
                     </div>
                   )}
