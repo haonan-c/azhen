@@ -240,5 +240,6 @@ describe('Marketing Landing Page', () => {
     await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })))
     expect(menuButton?.getAttribute('aria-expanded')).toBe('false')
     expect(container?.querySelector('#marketing-mobile-navigation')).toBeNull()
+    expect(document.activeElement).toBe(menuButton)
   })
 })

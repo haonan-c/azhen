@@ -23,12 +23,23 @@ import { getLocale } from './paraglide/runtime.js'
 import { m as messages } from './paraglide/messages.js'
 
 interface MarketingLandingPageProps {
-  onSignIn?: () => void
+  onSignIn: () => void
 }
 
 const focusClassName = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring focus-visible:ring-offset-2 focus-visible:ring-offset-kumo-base'
-const primaryActionClassName = `inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-kumo-contrast px-5 text-sm font-semibold text-kumo-inverse transition-[background-color,transform] hover:bg-kumo-strong active:scale-[0.98] ${focusClassName}`
-const secondaryActionClassName = `inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-5 text-sm font-semibold text-kumo-default transition-[background-color,transform] hover:bg-kumo-elevated active:scale-[0.98] ${focusClassName}`
+const primaryActionClassName = `inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-kumo-contrast px-5 text-sm font-semibold text-kumo-inverse transition-[background-color,transform] hover:bg-kumo-strong active:scale-[0.98] motion-reduce:transition-none motion-reduce:active:scale-100 ${focusClassName}`
+const secondaryActionClassName = `inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-5 text-sm font-semibold text-kumo-default transition-[background-color,transform] hover:bg-kumo-elevated active:scale-[0.98] motion-reduce:transition-none motion-reduce:active:scale-100 ${focusClassName}`
+
+const productEvidence = {
+  en: {
+    screenshot: '/marketing/product-evidence-en.jpg',
+    mobileScreenshot: '/marketing/product-evidence-en-mobile.jpg',
+  },
+  zh: {
+    screenshot: '/marketing/product-evidence-zh.jpg',
+    mobileScreenshot: '/marketing/product-evidence-zh-mobile.jpg',
+  },
+} as const
 
 function MarketingActions({
   signupAvailable,
@@ -59,7 +70,7 @@ function MarketingActions({
   )
 }
 
-export default function MarketingLandingPage({ onSignIn = () => {} }: MarketingLandingPageProps) {
+export default function MarketingLandingPage({ onSignIn }: MarketingLandingPageProps) {
   const locale = getLocale()
   const siteName = useSiteName()
   const serverConfig = useServerConfig()
@@ -154,12 +165,13 @@ export default function MarketingLandingPage({ onSignIn = () => {} }: MarketingL
     },
   ]
 
-  const screenshot = locale === 'zh'
-    ? '/marketing/product-evidence-zh.jpg'
-    : '/marketing/product-evidence-en.jpg'
-  const mobileScreenshot = locale === 'zh'
-    ? '/marketing/product-evidence-zh-mobile.jpg'
-    : '/marketing/product-evidence-en-mobile.jpg'
+  const navigation = [
+    { href: '#workflow', label: messages.marketing_nav_workflow() },
+    { href: '#capabilities', label: messages.marketing_nav_capabilities() },
+    { href: '#security', label: messages.marketing_nav_security() },
+    { href: '#templates', label: messages.marketing_nav_templates() },
+  ] as const
+  const { screenshot, mobileScreenshot } = productEvidence[locale]
 
   return (
     <div className="min-h-[100dvh] bg-kumo-base text-kumo-default">
@@ -181,18 +193,15 @@ export default function MarketingLandingPage({ onSignIn = () => {} }: MarketingL
             aria-label={messages.marketing_header_navigation()}
             className="hidden items-center gap-1 lg:flex"
           >
-            <a className={`rounded-md px-3 py-2 text-sm text-kumo-subtle hover:text-kumo-default ${focusClassName}`} href="#workflow">
-              {messages.marketing_nav_workflow()}
-            </a>
-            <a className={`rounded-md px-3 py-2 text-sm text-kumo-subtle hover:text-kumo-default ${focusClassName}`} href="#capabilities">
-              {messages.marketing_nav_capabilities()}
-            </a>
-            <a className={`rounded-md px-3 py-2 text-sm text-kumo-subtle hover:text-kumo-default ${focusClassName}`} href="#security">
-              {messages.marketing_nav_security()}
-            </a>
-            <a className={`rounded-md px-3 py-2 text-sm text-kumo-subtle hover:text-kumo-default ${focusClassName}`} href="#templates">
-              {messages.marketing_nav_templates()}
-            </a>
+            {navigation.map(item => (
+              <a
+                key={item.href}
+                className={`rounded-md px-3 py-2 text-sm text-kumo-subtle hover:text-kumo-default ${focusClassName}`}
+                href={item.href}
+              >
+                {item.label}
+              </a>
+            ))}
           </nav>
 
           <div className="flex items-center gap-2">
@@ -217,18 +226,16 @@ export default function MarketingLandingPage({ onSignIn = () => {} }: MarketingL
         {mobileMenuOpen && (
           <div id="marketing-mobile-navigation" className="border-t border-kumo-line bg-kumo-base px-4 py-4 lg:hidden">
             <nav aria-label={messages.marketing_header_navigation()} className="mx-auto flex max-w-7xl flex-col">
-              <a onClick={() => setMobileMenuOpen(false)} className={`rounded-md px-3 py-2.5 text-sm text-kumo-default ${focusClassName}`} href="#workflow">
-                {messages.marketing_nav_workflow()}
-              </a>
-              <a onClick={() => setMobileMenuOpen(false)} className={`rounded-md px-3 py-2.5 text-sm text-kumo-default ${focusClassName}`} href="#capabilities">
-                {messages.marketing_nav_capabilities()}
-              </a>
-              <a onClick={() => setMobileMenuOpen(false)} className={`rounded-md px-3 py-2.5 text-sm text-kumo-default ${focusClassName}`} href="#security">
-                {messages.marketing_nav_security()}
-              </a>
-              <a onClick={() => setMobileMenuOpen(false)} className={`rounded-md px-3 py-2.5 text-sm text-kumo-default ${focusClassName}`} href="#templates">
-                {messages.marketing_nav_templates()}
-              </a>
+              {navigation.map(item => (
+                <a
+                  key={item.href}
+                  onClick={() => setMobileMenuOpen(false)}
+                  className={`rounded-md px-3 py-2.5 text-sm text-kumo-default ${focusClassName}`}
+                  href={item.href}
+                >
+                  {item.label}
+                </a>
+              ))}
               <div className="mt-3 border-t border-kumo-line px-3 pt-4 sm:hidden">
                 <LanguageSelector />
               </div>
