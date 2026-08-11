@@ -274,18 +274,25 @@ export const OPEN_GADGET_ERROR_CODES = {
 export type OpenGadgetErrorCode =
     typeof OPEN_GADGET_ERROR_CODES[keyof typeof OPEN_GADGET_ERROR_CODES];
 
-/** One structured observer failure attached to an expected `openGadget()` error. */
+/**
+ * One structured observer failure attached to an expected `openGadget()` error, with exactly one
+ * Gatekeeper/Vendor reason or Workshop-authored reason code.
+ */
 export type OpenGadgetObserverFailure = {
   // User- or connector-provided resource title. Clients preserve a non-empty value unchanged and
   // supply a localized generic fallback when it is empty.
   resourceTitle: string;
   // User- or connector-provided account label. Absent after the account is disconnected.
   accountLabel?: string;
-  // Gatekeeper/Vendor free text. Absent for a Workshop-authored `reasonCode`.
-  reason?: string;
+} & ({
+  // Non-blank Gatekeeper/Vendor free text, preserved unchanged.
+  reason: string;
+  reasonCode?: never;
+} | {
+  reason?: never;
   // Stable code for a Workshop-authored reason that the client must localize.
-  reasonCode?: ObserverBindingFailureCode;
-};
+  reasonCode: ObserverBindingFailureCode;
+});
 
 const OPEN_GADGET_ERROR_MESSAGES: Record<OpenGadgetErrorCode, string> = {
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
@@ -336,14 +343,15 @@ function isOpenGadgetObserverFailure(value: unknown): value is OpenGadgetObserve
       typeof value.accountLabel !== "string") {
     return false;
   }
-  if ("reason" in value && value.reason !== undefined && typeof value.reason !== "string") {
-    return false;
+  const hasReason = "reason" in value;
+  const hasReasonCode = "reasonCode" in value;
+  if (hasReason === hasReasonCode) return false;
+
+  if (hasReason) {
+    return typeof value.reason === "string" && value.reason.trim().length > 0;
   }
-  if ("reasonCode" in value && value.reasonCode !== undefined &&
-      value.reasonCode !== OBSERVER_BINDING_FAILURE_CODES.accountDisconnected) {
-    return false;
-  }
-  return true;
+  return "reasonCode" in value &&
+      value.reasonCode === OBSERVER_BINDING_FAILURE_CODES.accountDisconnected;
 }
 
 function isOpenGadgetErrorCode(value: unknown): value is OpenGadgetErrorCode {

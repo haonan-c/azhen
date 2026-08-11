@@ -17,6 +17,7 @@ import type { RpcStub } from "capnweb";
 import {
   getOpenGadgetErrorCode,
   getOpenGadgetObserverFailures,
+  OBSERVER_BINDING_FAILURE_CODES,
   OPEN_GADGET_ERROR_CODES,
   type AuthenticatedApi,
   type OpenGadgetObserverFailure,
@@ -303,6 +304,56 @@ describe("observer re-verification", () => {
         accountLabel: shared.bobLabel,
         reason: EXPIRED_REASON,
       }]);
+    });
+  });
+
+  it.concurrent("preserves the Gatekeeper reason across observer RPC boundaries", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareGadgetWithBob(publicApi, ["unchanged"]);
+      await bobOpensAndCloses(shared);
+      const reason = "Vendor outage:\n  reconnect later.";
+      await shared.failBob(reason);
+
+      const retryRecorder =
+          new ObserverConfigRecorder().alwaysChoose(shared.bobAccount.id, MAX_OBSERVER_PROMPTS);
+      const error = await rejectedOpen(bobOpens(shared, retryRecorder));
+
+      expect(observerFailures(error)).toEqual([{
+        resourceTitle: "Test Thing unchanged",
+        accountLabel: shared.bobLabel,
+        reason,
+      }]);
+    });
+  });
+
+  it.concurrent("keeps the re-prompt fallback when the terminal failure uses a code", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareGadgetWithBob(publicApi, ["disconnected"]);
+      await bobOpensAndCloses(shared);
+      await shared.bobApi.disconnectAccount(shared.bobAccount.id);
+
+      const retryRecorder =
+          new ObserverConfigRecorder().alwaysChoose(shared.bobAccount.id, MAX_OBSERVER_PROMPTS);
+      const error = await rejectedOpen(bobOpens(shared, retryRecorder));
+
+      expect(retryRecorder.calls[0]).toHaveLength(2);
+      for (const need of retryRecorder.calls[0]) {
+        expect(need.failure).toEqual({
+          accountId: shared.bobAccount.id,
+          reason: "This account is no longer connected.",
+          reasonCode: OBSERVER_BINDING_FAILURE_CODES.accountDisconnected,
+        });
+      }
+      expect(observerFailures(error)).toEqual([
+        {
+          resourceTitle: "Test Ambient",
+          reasonCode: OBSERVER_BINDING_FAILURE_CODES.accountDisconnected,
+        },
+        {
+          resourceTitle: "Test Thing disconnected",
+          reasonCode: OBSERVER_BINDING_FAILURE_CODES.accountDisconnected,
+        },
+      ]);
     });
   });
 

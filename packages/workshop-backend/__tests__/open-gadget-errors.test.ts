@@ -53,4 +53,34 @@ describe("open gadget errors", () => {
     expect(getOpenGadgetObserverFailures(new Error("failure"))).toBeUndefined();
   });
 
+  it.each([
+    ["no reason", { resourceTitle: "Quarterly plan" }],
+    ["both reason forms", {
+      resourceTitle: "Quarterly plan",
+      reason: "Vendor denied access.",
+      reasonCode: OBSERVER_BINDING_FAILURE_CODES.accountDisconnected,
+    }],
+    ["an unknown reason code", {
+      resourceTitle: "Quarterly plan",
+      reasonCode: "UNKNOWN_REASON",
+    }],
+    ["an empty reason", { resourceTitle: "Quarterly plan", reason: "" }],
+    ["a blank reason", { resourceTitle: "Quarterly plan", reason: " \n " }],
+    ["an invalid resource title", { resourceTitle: 42, reason: "Vendor denied access." }],
+    ["an invalid account label", {
+      resourceTitle: "Quarterly plan",
+      accountLabel: 42,
+      reason: "Vendor denied access.",
+    }],
+    ["an invalid reason", { resourceTitle: "Quarterly plan", reason: 42 }],
+    ["an invalid reason code", { resourceTitle: "Quarterly plan", reasonCode: 42 }],
+  ])("rejects a structured observer failure with %s", (_description, failure) => {
+    let error = Object.assign(new Error("Observer verification failed."), {
+      code: OPEN_GADGET_ERROR_CODES.observerVerificationFailed,
+      observerFailures: [failure],
+    });
+
+    expect(getOpenGadgetObserverFailures(error)).toBeUndefined();
+  });
+
 });
