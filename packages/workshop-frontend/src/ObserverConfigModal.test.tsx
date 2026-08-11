@@ -10,6 +10,7 @@ import type {
   ConnectedAccountsSubscriber,
   ObserverBindingNeed,
 } from '@gadgets/workshop-shared/api'
+import { OBSERVER_BINDING_FAILURE_CODES } from '@gadgets/workshop-shared/api'
 import type { AccountDescription, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -92,14 +93,17 @@ describe('ObserverConfigModal account selection', () => {
     container = undefined
   })
 
-  async function render(accountEntries: ReturnType<typeof account>[]) {
+  async function render(
+    accountEntries: ReturnType<typeof account>[],
+    need: ObserverBindingNeed = NEED,
+  ) {
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
     await act(async () => {
       root!.render(
         <ObserverConfigModal
-          needs={[NEED]}
+          needs={[need]}
           authenticatedApi={fakeApi(accountEntries)}
           onConfirm={() => {}}
           onCancel={() => {}}
@@ -143,5 +147,23 @@ describe('ObserverConfigModal account selection', () => {
     expect(rendered.textContent).toContain('验证并打开')
     expect(rendered.textContent).not.toContain('Verify your access')
     expect(rendered.textContent).not.toContain('Choose a Google account')
+  })
+
+  it('localizes a known disconnected-account failure', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+    const rendered = await render([], {
+      ...NEED,
+      resourceTitle: '',
+      failure: {
+        accountId: 7,
+        reason: 'This account is no longer connected.',
+        reasonCode: OBSERVER_BINDING_FAILURE_CODES.accountDisconnected,
+      },
+    })
+
+    expect(rendered.textContent).toContain('账户 7')
+    expect(rendered.textContent).toContain('服务')
+    expect(rendered.textContent).toContain('此账户已断开连接。')
+    expect(rendered.textContent).not.toContain('This account is no longer connected.')
   })
 })

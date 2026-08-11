@@ -5,6 +5,7 @@ import { RpcStub, RpcTarget } from 'capnweb'
 import {
   AuthenticatedApi,
   ConnectedAccountsSubscriber,
+  OBSERVER_BINDING_FAILURE_CODES,
   ObserverBindingNeed,
   ObserverAccountChoice,
 } from '@gadgets/workshop-shared/api'
@@ -37,6 +38,12 @@ function accountLabel(account: AccountInfo | undefined, accountId: number): stri
   return account?.description.uniqueName
     || account?.description.displayName
     || messages.observer_account_fallback({ id: accountId })
+}
+
+function observerFailureReason(failure: NonNullable<ObserverBindingNeed['failure']>): string {
+  return failure.reasonCode === OBSERVER_BINDING_FAILURE_CODES.accountDisconnected
+    ? messages.observer_account_disconnected_reason()
+    : failure.reason
 }
 
 interface ObserverConfigModalProps {
@@ -264,7 +271,7 @@ export default function ObserverConfigModal({
                     />
                     <div className="min-w-0 flex-1">
                       <div className="text-[14px] font-medium text-kumo-default truncate">
-                        {need.resourceTitle}
+                        {need.resourceTitle || messages.observer_service()}
                       </div>
                       {need.resourceUrl && (
                         <div className="text-xs font-mono text-kumo-subtle truncate">
@@ -285,8 +292,8 @@ export default function ObserverConfigModal({
                     )}
                   </div>
 
-                  {/* Name the account that was refused and why. The reason is free text, either from
-                      the gatekeeper or authored by the overseer, and must not be parsed. */}
+                  {/* Name the account that was refused and why. Workshop-authored reasons use stable
+                      codes; Gatekeeper/Vendor free text stays unchanged. */}
                   {need.failure && (
                     <div className={`flex items-start gap-2 px-3 py-2 rounded-md text-xs text-kumo-warning bg-kumo-warning-tint border border-kumo-warning/20${matching.length === 0 ? '' : ' mb-3'}`}>
                       <Warning size={14} className="mt-0.5 shrink-0" />
@@ -295,7 +302,7 @@ export default function ObserverConfigModal({
                           {accountLabel(accounts.get(need.failure.accountId), need.failure.accountId)}
                         </span>
                         {' — '}
-                        {need.failure.reason}
+                        {observerFailureReason(need.failure)}
                       </div>
                     </div>
                   )}

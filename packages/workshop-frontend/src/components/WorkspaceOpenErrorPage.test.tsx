@@ -5,6 +5,7 @@ import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { createOpenGadgetError, OPEN_GADGET_ERROR_CODES } from '@gadgets/workshop-shared/api'
+import type { OpenGadgetObserverFailure } from '@gadgets/workshop-shared/api'
 import WorkspaceOpenErrorPage, { classifyWorkspaceOpenFailure } from './WorkspaceOpenErrorPage'
 
 const testGlobal = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -33,7 +34,11 @@ describe('WorkspaceOpenErrorPage', () => {
     container = undefined
   })
 
-  async function render(kind: 'access-denied' | 'not-found' | 'unexpected') {
+  async function render(
+    kind: 'access-denied' | 'not-found' | 'observer-accounts-required'
+      | 'observer-verification-failed' | 'unexpected',
+    details?: OpenGadgetObserverFailure[],
+  ) {
     const onRetry = vi.fn<() => void>()
     const onGoToWorkspaces = vi.fn<() => void>()
     container = document.createElement('div')
@@ -42,6 +47,7 @@ describe('WorkspaceOpenErrorPage', () => {
     await act(async () => root!.render(
       <WorkspaceOpenErrorPage
         kind={kind}
+        details={details}
         onRetry={onRetry}
         onGoToWorkspaces={onGoToWorkspaces}
       />,
@@ -94,6 +100,25 @@ describe('WorkspaceOpenErrorPage', () => {
       .toEqual(['Go to workspaces', 'Try again'])
   })
 
+  it('localizes observer verification failures while preserving vendor details', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/shared-campaign')
+
+    const { container: renderedContainer } = await render(
+      'observer-verification-failed',
+      [{
+        resourceTitle: 'RESOURCE TITLE VERBATIM',
+        accountLabel: 'ACCOUNT LABEL VERBATIM',
+        reason: 'VENDOR DETAIL VERBATIM',
+      }],
+    )
+
+    expect(renderedContainer.querySelector('h1')?.textContent).toBe('无法验证工作空间连接')
+    expect(renderedContainer.textContent).toContain('请修复以下连接问题，然后重试。')
+    expect(renderedContainer.textContent).toContain('RESOURCE TITLE VERBATIM')
+    expect(renderedContainer.textContent).toContain('ACCOUNT LABEL VERBATIM')
+    expect(renderedContainer.textContent).toContain('VENDOR DETAIL VERBATIM')
+  })
+
   it('classifies stable open error codes without treating unexpected errors as expected', () => {
     expect(classifyWorkspaceOpenFailure(
       createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceAccessDenied),
@@ -101,6 +126,12 @@ describe('WorkspaceOpenErrorPage', () => {
     expect(classifyWorkspaceOpenFailure(
       createOpenGadgetError(OPEN_GADGET_ERROR_CODES.workspaceNotFound),
     )).toBe('not-found')
+    expect(classifyWorkspaceOpenFailure(
+      createOpenGadgetError(OPEN_GADGET_ERROR_CODES.observerAccountsRequired),
+    )).toBe('observer-accounts-required')
+    expect(classifyWorkspaceOpenFailure(
+      createOpenGadgetError(OPEN_GADGET_ERROR_CODES.observerVerificationFailed),
+    )).toBe('observer-verification-failed')
     expect(classifyWorkspaceOpenFailure(
       new Error(OPEN_GADGET_ERROR_CODES.workspaceAccessDenied),
     )).toBe('unexpected')

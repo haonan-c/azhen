@@ -3,11 +3,13 @@ import { RpcStub, RpcTarget } from 'capnweb'
 import type {
   AuthenticatedApi,
   GadgetMetadata,
+  OpenGadgetObserverFailure,
   ObserverAccountChoice,
   ObserverBindingNeed,
   ObserverConfigCallback,
   Overseer,
 } from '@gadgets/workshop-shared/api'
+import { getOpenGadgetObserverFailures } from '@gadgets/workshop-shared/api'
 import { reportIssue } from './errorReporting'
 import { useDocumentTitle } from './useDocumentTitle'
 import {
@@ -18,8 +20,7 @@ import {
 const OBSERVER_CANCELLED = 'OBSERVER_CONFIG_CANCELLED'
 
 export type WorkspaceLoadError =
-  | { kind: 'open'; failure: WorkspaceOpenFailureKind }
-  | { kind: 'message'; message: string }
+  | { kind: 'open'; failure: WorkspaceOpenFailureKind; details?: OpenGadgetObserverFailure[] }
 
 type ObserverConfigState = {
   needs: ObserverBindingNeed[]
@@ -144,17 +145,19 @@ export function useWorkspaceOpen({
         }
         if (message.includes(OBSERVER_CANCELLED)) {
           showTerminalError({
-            kind: 'message',
-            message: 'To open this workspace, you must choose connected accounts for the services it uses.',
+            kind: 'open',
+            failure: 'observer-accounts-required',
           })
-        } else if (message.includes('permitted to observe') ||
-                   message.includes('no longer connected') ||
-                   message.includes('connect an account for every service')) {
-          showTerminalError({ kind: 'message', message })
         } else {
           const failure = classifyWorkspaceOpenFailure(caught)
           if (failure !== 'unexpected') {
-            showTerminalError({ kind: 'open', failure })
+            showTerminalError({
+              kind: 'open',
+              failure,
+              details: failure === 'observer-verification-failed'
+                ? getOpenGadgetObserverFailures(caught)
+                : undefined,
+            })
           } else if (!hadOpenWorkspace) {
             reportIssue('gadget.load', caught, { gadgetId: id })
             showTerminalError({ kind: 'open', failure })

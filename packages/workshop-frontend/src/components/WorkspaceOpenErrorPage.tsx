@@ -2,12 +2,19 @@ import { Lock, MagnifyingGlass, WarningCircle } from '@phosphor-icons/react'
 import { useEffect, useId, useRef } from 'react'
 import {
   getOpenGadgetErrorCode,
+  OBSERVER_BINDING_FAILURE_CODES,
   OPEN_GADGET_ERROR_CODES,
+  type OpenGadgetObserverFailure,
 } from '@gadgets/workshop-shared/api'
 import { WorkshopButton } from './WorkshopControls'
 import { m as messages } from '../paraglide/messages.js'
 
-export type WorkspaceOpenFailureKind = 'access-denied' | 'not-found' | 'unexpected'
+export type WorkspaceOpenFailureKind =
+  | 'access-denied'
+  | 'not-found'
+  | 'observer-accounts-required'
+  | 'observer-verification-failed'
+  | 'unexpected'
 
 const CONTENT = {
   'access-denied': {
@@ -21,6 +28,18 @@ const CONTENT = {
     message: messages.workspace_open_not_found_message,
     Icon: MagnifyingGlass,
     retryable: false,
+  },
+  'observer-accounts-required': {
+    title: messages.workspace_open_observer_accounts_required_title,
+    message: messages.workspace_open_observer_accounts_required,
+    Icon: WarningCircle,
+    retryable: true,
+  },
+  'observer-verification-failed': {
+    title: messages.workspace_open_observer_verification_failed_title,
+    message: messages.workspace_open_observer_verification_failed_message,
+    Icon: WarningCircle,
+    retryable: true,
   },
   unexpected: {
     title: messages.workspace_open_unexpected_title,
@@ -36,6 +55,10 @@ export function classifyWorkspaceOpenFailure(error: unknown): WorkspaceOpenFailu
       return 'access-denied'
     case OPEN_GADGET_ERROR_CODES.workspaceNotFound:
       return 'not-found'
+    case OPEN_GADGET_ERROR_CODES.observerAccountsRequired:
+      return 'observer-accounts-required'
+    case OPEN_GADGET_ERROR_CODES.observerVerificationFailed:
+      return 'observer-verification-failed'
     default:
       return 'unexpected'
   }
@@ -43,16 +66,24 @@ export function classifyWorkspaceOpenFailure(error: unknown): WorkspaceOpenFailu
 
 type Props = {
   kind: WorkspaceOpenFailureKind
+  details?: OpenGadgetObserverFailure[]
   onRetry: () => void
   onGoToWorkspaces: () => void
 }
 
-export default function WorkspaceOpenErrorPage({ kind, onRetry, onGoToWorkspaces }: Props) {
+function observerFailureReason(failure: OpenGadgetObserverFailure): string | undefined {
+  return failure.reasonCode === OBSERVER_BINDING_FAILURE_CODES.accountDisconnected
+    ? messages.observer_account_disconnected_reason()
+    : failure.reason
+}
+
+export default function WorkspaceOpenErrorPage({ kind, details, onRetry, onGoToWorkspaces }: Props) {
   const { title: titleMessage, message: messageText, Icon, retryable } = CONTENT[kind]
   const title = titleMessage()
   const message = messageText()
   const titleId = useId()
   const descriptionId = useId()
+  const detailId = useId()
   const titleRef = useRef<HTMLHeadingElement>(null)
 
   useEffect(() => {
@@ -63,7 +94,7 @@ export default function WorkspaceOpenErrorPage({ kind, onRetry, onGoToWorkspaces
     <div className="flex min-h-screen items-center justify-center bg-kumo-base px-6 py-12">
       <section
         aria-atomic="true"
-        aria-describedby={descriptionId}
+        aria-describedby={details?.length ? `${descriptionId} ${detailId}` : descriptionId}
         aria-labelledby={titleId}
         aria-live="polite"
         className="themed-compact-shadow w-full max-w-md rounded-2xl border border-kumo-line bg-kumo-base px-6 py-8 text-center"
@@ -85,6 +116,23 @@ export default function WorkspaceOpenErrorPage({ kind, onRetry, onGoToWorkspaces
         >
           {message}
         </p>
+        {details && details.length > 0 && (
+          <ul
+            id={detailId}
+            className="mt-4 max-h-40 list-disc space-y-2 overflow-auto rounded-lg border border-kumo-line bg-kumo-elevated py-3 pl-8 pr-3 text-left text-[12px] leading-[18px] text-kumo-subtle"
+          >
+            {details.map((failure, index) => {
+              const reason = observerFailureReason(failure)
+              return (
+                <li key={index}>
+                  {failure.resourceTitle || messages.observer_service()}
+                  {failure.accountLabel ? ` (${failure.accountLabel})` : ''}
+                  {reason ? ` — ${reason}` : ''}
+                </li>
+              )
+            })}
+          </ul>
+        )}
         <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
           <WorkshopButton
             tone={retryable ? 'secondary' : 'primary'}

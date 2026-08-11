@@ -48,7 +48,7 @@ import ShareModal from './ShareModal'
 import { GadgetPresence } from './components/GadgetPresence'
 import BlueprintModal from './BlueprintModal'
 import TopBarNotice from './TopBarNotice'
-import { WorkshopButton, WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
+import { WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
 import { useActions } from './useActions'
 import DeleteConfirmationDialog from './components/DeleteConfirmationDialog'
 import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
@@ -1266,28 +1266,10 @@ export default function GadgetEditor() {
     return (
       <WorkspaceOpenErrorPage
         kind={error.failure}
+        details={error.details}
         onGoToWorkspaces={handleGoToWorkspaces}
         onRetry={retryOpen}
       />
-    )
-  }
-
-  if (error?.kind === 'message') {
-    return (
-      <div className="min-h-screen flex items-center justify-center flex-col gap-4 bg-kumo-base">
-        {/* Observer-verification denials list one line per failed connection, so preserve newlines. */}
-        <p className="text-sm text-kumo-danger whitespace-pre-line text-center max-w-lg">
-          {error.message}
-        </p>
-        <div className="flex items-center gap-2">
-          <WorkshopButton tone="secondary" onClick={handleGoToWorkspaces}>
-            {messages.workspace_open_go_to_workspaces()}
-          </WorkshopButton>
-          <WorkshopButton tone="primary" onClick={retryOpen}>
-            {messages.workspace_open_retry()}
-          </WorkshopButton>
-        </div>
-      </div>
     )
   }
 
