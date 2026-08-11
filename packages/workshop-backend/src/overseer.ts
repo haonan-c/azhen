@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, ObserverBindingFailureCode, OpenGadgetObserverFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OBSERVER_BINDING_FAILURE_CODES, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
@@ -291,10 +291,10 @@ function observerVendorId(record: GatekeeperRecord): string | null {
   return "vendorId" in record.creationSpec ? record.creationSpec.vendorId : null;
 }
 
-// Human-readable title for an observer binding -- what the user sees both in the config modal and in
-// a verification-failure message, so both must derive it the same way.
+// Preserve a connector-provided title for observer UI. An empty value lets each client localize its
+// own generic fallback.
 function observerBindingTitle(record: GatekeeperRecord): string {
-  return record.resourceTitle || "Connection";
+  return record.resourceTitle || "";
 }
 
 function observerBindingNeed(record: GatekeeperRecord): ObserverBindingNeed {
@@ -6097,9 +6097,7 @@ class OverseerImpl implements AgentHooks {
         if (uncovered.length > 0) {
           if (!configureCb) {
             // Non-interactive open (e.g. no UI). We can't configure, so deny.
-            throw new Error(
-                "To open this workspace, you must choose connected accounts for the services it " +
-                "uses, but no configuration channel was provided.");
+            throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.observerAccountsRequired);
           }
 
           let needs: ObserverBindingNeed[] = uncovered.map(gk => ({
@@ -6124,9 +6122,7 @@ class OverseerImpl implements AgentHooks {
           // The client must have supplied a choice for every uncovered binding.
           let stillUncovered = uncovered.filter(gk => !(gk.id in accountChoices));
           if (stillUncovered.length > 0) {
-            throw new Error(
-                "You must connect an account for every service this workspace uses in order to open " +
-                "it.");
+            throw createOpenGadgetError(OPEN_GADGET_ERROR_CODES.observerAccountsRequired);
           }
         }
 
@@ -6142,8 +6138,11 @@ class OverseerImpl implements AgentHooks {
             throw new Error("An observer account was requested for a non-gatekeeper binding.");
           }
 
-          let fail = (reason: string, err?: unknown) => {
-            failures.set(gk.id, {accountId, reason});
+          let fail = (
+              reason: string,
+              err?: unknown,
+              reasonCode?: ObserverBindingFailureCode) => {
+            failures.set(gk.id, {accountId, reason, reasonCode});
             this.logger.warn("observer verification failed", {
               event: "gatekeeper.observer.verify.failed",
               gatekeeperId: gk.id, vendorId, accountId, observerId, error: err,
@@ -6153,7 +6152,10 @@ class OverseerImpl implements AgentHooks {
           let verifier = await clientUser.getVerifier(accountId, vendorId);
           if (!verifier) {
             // Account gone -> the overseer authors the reason. (Wrong vendor throws above.)
-            fail("This account is no longer connected.");
+            fail(
+                "This account is no longer connected.",
+                undefined,
+                OBSERVER_BINDING_FAILURE_CODES.accountDisconnected);
             return;
           }
 
@@ -6187,10 +6189,9 @@ class OverseerImpl implements AgentHooks {
 
           // Terminal. Name each failed connection and account so the user knows what to fix, rather
           // than reporting an anonymous refusal.
-          throw new Error(
-              "This workspace could not confirm that you are permitted to observe all of the data it " +
-              "has accessed:\n" +
-              await this.#describeObserverFailures(clientUser, inScope, failures));
+          throw createOpenGadgetError(
+              OPEN_GADGET_ERROR_CODES.observerVerificationFailed,
+              await this.#observerFailureDetails(clientUser, inScope, failures));
         }
 
         // All in-scope bindings verified successfully.
@@ -6208,15 +6209,13 @@ class OverseerImpl implements AgentHooks {
     this.storage.observers.put({profileId, observerId, accountChoices});
   }
 
-  // Render the observer verification failures as one line per binding, naming the connection and the
-  // account that was refused: `<resourceTitle> (<account label>) — <reason>`. Cold path only (we're
-  // about to deny the open), so the extra User DO round trip per failure is fine. Discloses nothing
-  // new: the reason was either already thrown to this same user or authored by us, and the account is
-  // their own.
-  async #describeObserverFailures(
+  // Structure observer verification failures for client localization. Cold path only (we're about
+  // to deny the open), so the extra User DO round trip per failure is fine. Resource titles, account
+  // labels, and Gatekeeper/Vendor reasons remain unchanged; Workshop-authored reasons use codes.
+  async #observerFailureDetails(
       clientUser: DurableObjectStub<UserDurableObject>,
       inScope: GatekeeperRecord[],
-      failures: Map<number, ObserverBindingFailure>): Promise<string> {
+      failures: Map<number, ObserverBindingFailure>): Promise<OpenGadgetObserverFailure[]> {
     // Iterate inScope rather than `failures`: the map is filled from concurrent verification
     // callbacks, so its insertion order varies run to run and the message would reorder on retry.
     let failed = inScope.flatMap(gk => {
@@ -6224,26 +6223,27 @@ class OverseerImpl implements AgentHooks {
       return failure ? [{gk, failure}] : [];
     });
 
-    let lines = await Promise.all(failed.map(async ({gk, failure}) => {
-      // A disconnected account has no description left, so name it by what became of it.
-      let label = "an account you have since disconnected";
+    return await Promise.all(failed.map(async ({gk, failure}) => {
+      let accountLabel: string | undefined;
       try {
         let description = await clientUser.describeConnectedAccount(failure.accountId);
         if (description) {
-          label = description.uniqueName || description.displayName || `account ${failure.accountId}`;
+          accountLabel = description.uniqueName || description.displayName || undefined;
         }
       } catch (err) {
-        label = `account ${failure.accountId}`;
         this.logger.warn("failed to describe account for observer failure", {
           event: "gatekeeper.observer.verify.describe.failed",
           gatekeeperId: gk.id, accountId: failure.accountId, error: err,
         });
       }
 
-      return `${observerBindingTitle(gk)} (${label}) — ${oneLineReason(failure.reason)}`;
+      return {
+        resourceTitle: observerBindingTitle(gk),
+        accountLabel,
+        reason: failure.reasonCode ? undefined : oneLineReason(failure.reason),
+        reasonCode: failure.reasonCode,
+      };
     }));
-
-    return lines.join("\n");
   }
 
   // Get the owner's profile ID, using the in-memory cache when available. The owner's

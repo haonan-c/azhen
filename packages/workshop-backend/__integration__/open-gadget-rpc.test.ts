@@ -16,6 +16,8 @@ const PASSWORD_HASH = new Uint8Array([1, 2, 3]);
 const EXPECTED_MESSAGES: Record<OpenGadgetErrorCode, string> = {
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
   [OPEN_GADGET_ERROR_CODES.workspaceAccessDenied]: "You don't have access to this workspace.",
+  [OPEN_GADGET_ERROR_CODES.observerAccountsRequired]: "Observer accounts are required.",
+  [OPEN_GADGET_ERROR_CODES.observerVerificationFailed]: "Observer verification failed.",
 };
 
 function username(prefix: string): string {

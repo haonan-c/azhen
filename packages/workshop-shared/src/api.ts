@@ -189,9 +189,16 @@ export function validateBindingName(name: string): void {
   }
 }
 
-// Why a previously-configured observer binding failed verification on this open attempt. Attached to
-// the ObserverBindingNeed the overseer re-prompts with, so the client can explain what went wrong
-// instead of dead-ending the open.
+/** Stable codes for Workshop-authored observer binding failures. */
+export const OBSERVER_BINDING_FAILURE_CODES = {
+  accountDisconnected: "ACCOUNT_DISCONNECTED",
+} as const;
+
+/** A stable Workshop-authored observer binding failure code. */
+export type ObserverBindingFailureCode =
+    typeof OBSERVER_BINDING_FAILURE_CODES[keyof typeof OBSERVER_BINDING_FAILURE_CODES];
+
+/** Why a previously-configured observer binding failed verification on this open attempt. */
 export type ObserverBindingFailure = {
   // The account that was tried and rejected (a ConnectedAccountRecord id in the opening user's own
   // User DO). Re-authenticating it in place is usually the fix, so the client should pre-select it
@@ -201,6 +208,9 @@ export type ObserverBindingFailure = {
   // the account, or a message the overseer authored itself for a cause it can see directly (e.g.
   // the chosen account is no longer connected). Free text: MUST NOT be parsed or matched on.
   reason: string;
+  // Present when the Workshop authored `reason`; clients localize this code and treat `reason` as a
+  // backwards-compatible fallback. Absent for Gatekeeper/Vendor free text, which stays unchanged.
+  reasonCode?: ObserverBindingFailureCode;
 };
 
 /**
@@ -214,7 +224,8 @@ export type ObserverBindingNeed = {
   // The vendor the user must have a connected account for (e.g. "google"). The frontend filters
   // the user's connected accounts by this to find candidates.
   vendorId: string;
-  // Human-readable resource title, for display in the configuration modal.
+  // Human-readable resource title, for display in the configuration modal. May be empty when the
+  // connector has no title; clients must then supply a localized generic fallback.
   resourceTitle: string;
   // Canonical resource URL, if known, for display.
   resourceUrl?: string;
@@ -255,21 +266,43 @@ export interface ObserverConfigCallback extends RpcTarget {
 export const OPEN_GADGET_ERROR_CODES = {
   workspaceNotFound: "WORKSPACE_NOT_FOUND",
   workspaceAccessDenied: "WORKSPACE_ACCESS_DENIED",
+  observerAccountsRequired: "OBSERVER_ACCOUNTS_REQUIRED",
+  observerVerificationFailed: "OBSERVER_VERIFICATION_FAILED",
 } as const;
 
 /** An expected failure code from `AuthenticatedApi.openGadget()`. */
 export type OpenGadgetErrorCode =
     typeof OPEN_GADGET_ERROR_CODES[keyof typeof OPEN_GADGET_ERROR_CODES];
 
+/** One structured observer failure attached to an expected `openGadget()` error. */
+export type OpenGadgetObserverFailure = {
+  // User- or connector-provided resource title. Clients preserve a non-empty value unchanged and
+  // supply a localized generic fallback when it is empty.
+  resourceTitle: string;
+  // User- or connector-provided account label. Absent after the account is disconnected.
+  accountLabel?: string;
+  // Gatekeeper/Vendor free text. Absent for a Workshop-authored `reasonCode`.
+  reason?: string;
+  // Stable code for a Workshop-authored reason that the client must localize.
+  reasonCode?: ObserverBindingFailureCode;
+};
+
 const OPEN_GADGET_ERROR_MESSAGES: Record<OpenGadgetErrorCode, string> = {
   [OPEN_GADGET_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
   [OPEN_GADGET_ERROR_CODES.workspaceAccessDenied]: "You don't have access to this workspace.",
+  [OPEN_GADGET_ERROR_CODES.observerAccountsRequired]: "Observer accounts are required.",
+  [OPEN_GADGET_ERROR_CODES.observerVerificationFailed]: "Observer verification failed.",
 };
 
-/** Creates an expected `openGadget()` error with a machine-readable code. */
+/** Creates an expected `openGadget()` error with a code and optional structured observer failures. */
 export function createOpenGadgetError(
-    code: OpenGadgetErrorCode): Error & { code: OpenGadgetErrorCode } {
-  return Object.assign(new Error(OPEN_GADGET_ERROR_MESSAGES[code]), { code });
+    code: OpenGadgetErrorCode,
+    observerFailures?: OpenGadgetObserverFailure[]):
+    Error & { code: OpenGadgetErrorCode; observerFailures?: OpenGadgetObserverFailure[] } {
+  return Object.assign(
+      new Error(OPEN_GADGET_ERROR_MESSAGES[code]),
+      {code},
+      observerFailures ? {observerFailures} : undefined);
 }
 
 /** Reads the machine-readable code from an expected `openGadget()` error. */
@@ -280,9 +313,44 @@ export function getOpenGadgetErrorCode(error: unknown): OpenGadgetErrorCode | un
   return isOpenGadgetErrorCode(candidate) ? candidate : undefined;
 }
 
+/** Reads validated structured observer failures from an expected `openGadget()` error. */
+export function getOpenGadgetObserverFailures(
+    error: unknown): OpenGadgetObserverFailure[] | undefined {
+  if (getOpenGadgetErrorCode(error) !== OPEN_GADGET_ERROR_CODES.observerVerificationFailed ||
+      typeof error !== "object" || error === null || !("observerFailures" in error) ||
+      !Array.isArray(error.observerFailures)) {
+    return undefined;
+  }
+
+  return error.observerFailures.every(isOpenGadgetObserverFailure)
+    ? error.observerFailures
+    : undefined;
+}
+
+function isOpenGadgetObserverFailure(value: unknown): value is OpenGadgetObserverFailure {
+  if (typeof value !== "object" || value === null ||
+      !("resourceTitle" in value) || typeof value.resourceTitle !== "string") {
+    return false;
+  }
+  if ("accountLabel" in value && value.accountLabel !== undefined &&
+      typeof value.accountLabel !== "string") {
+    return false;
+  }
+  if ("reason" in value && value.reason !== undefined && typeof value.reason !== "string") {
+    return false;
+  }
+  if ("reasonCode" in value && value.reasonCode !== undefined &&
+      value.reasonCode !== OBSERVER_BINDING_FAILURE_CODES.accountDisconnected) {
+    return false;
+  }
+  return true;
+}
+
 function isOpenGadgetErrorCode(value: unknown): value is OpenGadgetErrorCode {
   return value === OPEN_GADGET_ERROR_CODES.workspaceNotFound ||
-      value === OPEN_GADGET_ERROR_CODES.workspaceAccessDenied;
+      value === OPEN_GADGET_ERROR_CODES.workspaceAccessDenied ||
+      value === OPEN_GADGET_ERROR_CODES.observerAccountsRequired ||
+      value === OPEN_GADGET_ERROR_CODES.observerVerificationFailed;
 }
 
 // Top-level API exposed to the user after they have authenticated.
@@ -372,7 +440,10 @@ export interface AuthenticatedApi extends RpcTarget {
   // can be pipelined on the returned Overseer.
   //
   // To allow for pipelining, this throws an exception if the gadget doesn't exist. Expected
-  // missing and authorization failures carry a code from `OPEN_GADGET_ERROR_CODES`.
+  // missing, authorization, and observer-verification failures carry a code from
+  // `OPEN_GADGET_ERROR_CODES`. Observer verification failures can also carry structured
+  // `OpenGadgetObserverFailure` entries so clients can localize Workshop-authored reasons while
+  // preserving Gatekeeper/Vendor free text.
   //
   // `configureObservers` is invoked only when the opening user is a non-owner who must choose
   // connected accounts for one or more gatekeeper bindings before they can observe the gadget (see

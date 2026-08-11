@@ -4,8 +4,8 @@
 // later open ensureObserver() re-verifies without prompting. When that verification fails -- routinely,
 // because credentials lapse -- the open used to dead-end with "You are not permitted to observe all of
 // the data this Gadget has accessed" and no way forward. It should instead re-prompt through
-// ObserverConfigCallback with the failure attached, and if the re-prompt doesn't fix it, say which
-// connection and which account failed.
+// ObserverConfigCallback with the failure attached, and if the re-prompt doesn't fix it, return
+// structured details that identify the connection and account.
 //
 // Nothing is stubbed but the network. The real workshop-backend runs under wrangler, tests speak Cap'n
 // Web over a WebSocket to /api exactly as the browser does, and the gatekeeper is a real Worker
@@ -14,7 +14,15 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RpcStub } from "capnweb";
-import type { AuthenticatedApi, Overseer, PublicApi } from "@gadgets/workshop-shared/api";
+import {
+  getOpenGadgetErrorCode,
+  getOpenGadgetObserverFailures,
+  OPEN_GADGET_ERROR_CODES,
+  type AuthenticatedApi,
+  type OpenGadgetObserverFailure,
+  type Overseer,
+  type PublicApi,
+} from "@gadgets/workshop-shared/api";
 import {
   startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
 } from "../src/harness.js";
@@ -25,7 +33,7 @@ import {
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 
 // Reason text shaped like the two failures a gatekeeper actually reports. The overseer cannot tell
-// them apart -- both arrive as a thrown error -- so what the user reads is the reason itself.
+// them apart -- both arrive as a thrown error -- so it preserves the Vendor text in structured data.
 const EXPIRED_REASON = "credentials expired — please reconnect";
 const DENIED_REASON = "You do not have access to this thing.";
 
@@ -101,7 +109,7 @@ type SharedGadget = {
   gadgetId: string;
   bobApi: RpcStub<AuthenticatedApi>;
   bobAccount: ConnectedAccount;
-  /** Bob's account label: what the gatekeeper keys outcomes on and the Workshop names in a message. */
+  /** Bob's account label: what the gatekeeper keys outcomes on and the Workshop reports. */
   bobLabel: string;
   /** Make the gatekeeper refuse Bob from now on, as if his credential lapsed between opens. */
   failBob(reason: string): Promise<void>;
@@ -111,8 +119,8 @@ type SharedGadget = {
 // account. Call failBob() to put the gadget into the state the bug lives in.
 //
 // `thingNames` names the fixture gatekeeper's "Test Thing" resources to bind, one gatekeeper each --
-// thingUrl() turns each name into a resource URL. They also end up in the failure message the last
-// two cases assert on ("Test Thing multi-a"), so pass something recognisable per test.
+// thingUrl() turns each name into a resource URL. They also end up in the structured failure details,
+// so pass something recognisable per test.
 async function shareGadgetWithBob(
     publicApi: RpcStub<PublicApi>, thingNames: string[]): Promise<SharedGadget> {
   const [alice, bob] = nextUsernames("alice", "bob");
@@ -161,6 +169,24 @@ async function bobOpensAndCloses(shared: SharedGadget): Promise<ObserverConfigRe
       new ObserverConfigRecorder().alwaysChoose(shared.bobAccount.id, MAX_OBSERVER_PROMPTS);
   (await bobOpens(shared, recorder))[Symbol.dispose]();
   return recorder;
+}
+
+async function rejectedOpen(value: PromiseLike<RpcStub<Overseer>>): Promise<unknown> {
+  try {
+    using _overseer = await value;
+  } catch (error) {
+    return error;
+  }
+  throw new Error("Expected openGadget() to reject.");
+}
+
+function observerFailures(error: unknown): OpenGadgetObserverFailure[] {
+  expect(getOpenGadgetErrorCode(error)).toBe(
+      OPEN_GADGET_ERROR_CODES.observerVerificationFailed);
+  const failures = getOpenGadgetObserverFailures(error);
+  expect(failures).toBeDefined();
+  if (!failures) throw new Error("Expected structured observer failures.");
+  return failures;
 }
 
 describe("observer re-verification", () => {
@@ -248,7 +274,9 @@ describe("observer re-verification", () => {
       // the same still-failing account spends the re-prompt budget, so the open then rejects.
       const second =
           new ObserverConfigRecorder().alwaysChoose(shared.bobAccount.id, MAX_OBSERVER_PROMPTS);
-      await expect(bobOpens(shared, second)).rejects.toThrow(/could not confirm/i);
+      const error = await rejectedOpen(bobOpens(shared, second));
+
+      expect(observerFailures(error)).toHaveLength(1);
 
       expect(second.callCount).toBe(1);
       const need = second.needAt(0);
@@ -266,18 +294,15 @@ describe("observer re-verification", () => {
 
       const second =
           new ObserverConfigRecorder().alwaysChoose(shared.bobAccount.id, MAX_OBSERVER_PROMPTS);
-      const error = await bobOpens(shared, second).then(
-        overseer => { overseer[Symbol.dispose](); return null; },
-        (err: unknown) => err as Error);
+      const error = await rejectedOpen(bobOpens(shared, second));
 
-      expect(error).not.toBeNull();
       // The whole point of the change: the failure is attributable. It names the binding, Bob's own
-      // account label, and the gatekeeper's own reason -- not an anonymous refusal.
-      expect(error!.message).toContain("Test Thing named");
-      expect(error!.message).toContain(shared.bobLabel);
-      expect(error!.message).toContain(EXPIRED_REASON);
-      // One line per failed binding, so a single failure must not introduce stray newlines.
-      expect(error!.message.split("\n").filter(l => l.includes(shared.bobLabel))).toHaveLength(1);
+      // account label, and the gatekeeper's own reason without forcing clients to parse prose.
+      expect(observerFailures(error)).toEqual([{
+        resourceTitle: "Test Thing named",
+        accountLabel: shared.bobLabel,
+        reason: EXPIRED_REASON,
+      }]);
     });
   });
 
@@ -295,9 +320,7 @@ describe("observer re-verification", () => {
       // and dropped the rest, so a second failing connection was invisible.
       const second =
           new ObserverConfigRecorder().alwaysChoose(shared.bobAccount.id, MAX_OBSERVER_PROMPTS);
-      const error = await bobOpens(shared, second).then(
-        overseer => { overseer[Symbol.dispose](); return null; },
-        (err: unknown) => err as Error);
+      const error = await rejectedOpen(bobOpens(shared, second));
 
       expect(second.callCount).toBe(1);
       const needs = second.calls[0];
@@ -305,17 +328,26 @@ describe("observer re-verification", () => {
       for (const need of needs) {
         expect(need.failure?.accountId).toBe(shared.bobAccount.id);
       }
-      // And the terminal message accounts for both, one line each.
-      expect(error!.message).toContain("Test Thing multi-a");
-      expect(error!.message).toContain("Test Thing multi-b");
-      expect(error!.message.split("\n").filter(l => l.includes(shared.bobLabel))).toHaveLength(2);
+      // And the terminal error accounts for both in deterministic connection order.
+      expect(observerFailures(error)).toEqual([
+        {
+          resourceTitle: "Test Thing multi-a",
+          accountLabel: shared.bobLabel,
+          reason: EXPIRED_REASON,
+        },
+        {
+          resourceTitle: "Test Thing multi-b",
+          accountLabel: shared.bobLabel,
+          reason: EXPIRED_REASON,
+        },
+      ]);
     });
   });
 
   it.concurrent("denies terminally with no prompt when the client offers no config channel",
       async () => {
     // The path a collaborator hits by favouriting or sharing a workspace from the sidebar, where
-    // openGadget() is called without a callback. This message is the only thing they ever see.
+    // openGadget() is called without a callback. This error is the only input the client receives.
     //
     // Uses a settled denial rather than an expiry, since there is nothing to repair here anyway.
     await withSession(async publicApi => {
@@ -323,12 +355,13 @@ describe("observer re-verification", () => {
       await bobOpensAndCloses(shared);
       await shared.failBob(DENIED_REASON);
 
-      const error = await shared.bobApi.openGadget(shared.gadgetId).then(
-        () => null, (err: unknown) => err as Error);
+      const error = await rejectedOpen(shared.bobApi.openGadget(shared.gadgetId));
 
-      expect(error).not.toBeNull();
-      expect(error!.message).toMatch(/could not confirm/i);
-      expect(error!.message).toContain(DENIED_REASON);
+      expect(observerFailures(error)).toEqual([{
+        resourceTitle: "Test Thing nocb",
+        accountLabel: shared.bobLabel,
+        reason: DENIED_REASON,
+      }]);
     });
   });
 });
