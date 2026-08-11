@@ -13,6 +13,7 @@ import DeleteConfirmationDialog from './DeleteConfirmationDialog'
 import { m as messages } from '../paraglide/messages.js'
 import { formatFullTimestamp } from '../utils/formatTimestamp'
 import { formatLocaleNumber } from '../utils/formatNumber'
+import { useSessionStorageSearch } from '../useSessionStorageSearch'
 
 // Neutral monogram for a workspace — matches the sidebar treatment (no per-item color noise).
 function initials(title: string | undefined): string {
@@ -180,10 +181,7 @@ export default function GadgetList({ showHeader = true }: { showHeader?: boolean
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const [gadgets, setGadgets] = useState<GadgetMetadataWithTimestamps[]>([])
-  const [search, setSearch] = useState(() => {
-    if (typeof window === 'undefined') return ''
-    return sessionStorage.getItem('workspaces-search') ?? ''
-  })
+  const [search, setSearch] = useSessionStorageSearch('workspaces-search')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
 
@@ -224,10 +222,6 @@ export default function GadgetList({ showHeader = true }: { showHeader?: boolean
   }
 
   useEffect(() => loadGadgets(), [authenticatedApi])
-
-  useEffect(() => {
-    sessionStorage.setItem('workspaces-search', search)
-  }, [search])
 
   // Clean up share overseer when modal closes
   useEffect(() => {

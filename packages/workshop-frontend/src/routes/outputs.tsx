@@ -29,6 +29,7 @@ import DeleteConfirmationDialog from '../components/DeleteConfirmationDialog'
 import { WorkshopButton, WorkshopIconButton } from '../components/WorkshopControls'
 import { m as messages } from '../paraglide/messages.js'
 import { formatLocaleNumber } from '../utils/formatNumber'
+import { useSessionStorageSearch } from '../useSessionStorageSearch'
 
 // The Outputs page: everything the user's workspaces have produced, in one place, so they don't
 // have to remember which workspace they made a thing in. Backed by an index in the user's own
@@ -427,10 +428,7 @@ function OutputsPage() {
     const stored = sessionStorage.getItem('outputs-owner-filter')
     return stored === 'mine' || stored === 'shared' ? stored : 'all'
   })
-  const [search, setSearch] = useState(() => {
-    if (typeof window === 'undefined') return ''
-    return sessionStorage.getItem('outputs-search') ?? ''
-  })
+  const [search, setSearch] = useSessionStorageSearch('outputs-search')
   const [outputs, setOutputs] = useState<OutputSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
@@ -448,8 +446,7 @@ function OutputsPage() {
   useEffect(() => {
     sessionStorage.setItem('outputs-type-filter', typeFilter)
     sessionStorage.setItem('outputs-owner-filter', ownerFilter)
-    sessionStorage.setItem('outputs-search', search)
-  }, [typeFilter, ownerFilter, search])
+  }, [typeFilter, ownerFilter])
 
   useEffect(() => {
     let cancelled = false

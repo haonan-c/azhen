@@ -13,6 +13,7 @@ import { BindingBadge, uniqueBindingBadges } from "./components/BlueprintCard";
 import { BlueprintPreviewPlaceholder } from "./components/BlueprintPreviewImage";
 import ViewToggle from "./components/ViewToggle";
 import { m as messages } from "./paraglide/messages.js";
+import { useSessionStorageSearch } from "./useSessionStorageSearch";
 
 type VendorMap = Map<string, VendorDescription>;
 
@@ -30,18 +31,11 @@ export default function BlueprintsPage() {
     if (typeof window === "undefined") return "grid";
     return localStorage.getItem("explore-view") === "list" ? "list" : "grid";
   });
-  const [search, setSearch] = useState(() => {
-    if (typeof window === "undefined") return "";
-    return sessionStorage.getItem("explore-search") ?? "";
-  });
+  const [search, setSearch] = useSessionStorageSearch("explore-search");
 
   useEffect(() => {
     localStorage.setItem("explore-view", view);
   }, [view]);
-
-  useEffect(() => {
-    sessionStorage.setItem("explore-search", search);
-  }, [search]);
 
   useEffect(() => {
     let cancelled = false;

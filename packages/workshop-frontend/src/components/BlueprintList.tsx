@@ -15,6 +15,7 @@ import { useAuthenticatedApi } from '../AuthContext'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './menuStyles'
 import { m as messages } from '../paraglide/messages.js'
 import { formatLocaleNumber } from '../utils/formatNumber'
+import { useSessionStorageSearch } from '../useSessionStorageSearch'
 
 // A unified row item, merged from the user's published blueprints (`listOwnBlueprints`) and their
 // library (`listLibraryBlueprints`). Mirrors the sidebar's SidebarBlueprintItem but adds the bits
@@ -129,10 +130,7 @@ export default function BlueprintList() {
   const toasts = useKumoToastManager()
 
   const [items, setItems] = useState<BlueprintItem[]>([])
-  const [search, setSearch] = useState(() => {
-    if (typeof window === 'undefined') return ''
-    return sessionStorage.getItem('blueprints-search') ?? ''
-  })
+  const [search, setSearch] = useSessionStorageSearch('blueprints-search')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
   const [uploading, setUploading] = useState(false)
@@ -190,10 +188,6 @@ export default function BlueprintList() {
     // Bump the generation on unmount so a late resolve doesn't set state on an unmounted component.
     return () => { loadGenRef.current++ }
   }, [load])
-
-  useEffect(() => {
-    sessionStorage.setItem('blueprints-search', search)
-  }, [search])
 
   // Import a `.gadget` archive exported from another Workshop instance, then refresh the list.
   const handleBlueprintSelected = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
