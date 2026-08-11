@@ -192,9 +192,10 @@ describe('localized conversation history', () => {
     vi.clearAllMocks()
   })
 
-  // Reproduce under full-suite load with `pnpm test & suite_pid=$!; for run_index in 1 2 3;
-  // do pnpm --filter @gadgets/workshop-frontend exec vitest run
-  // src/conversation-history.localization.test.tsx -t "lets a Chinese user"; done; wait "$suite_pid"`.
+  // Reproduce under full-suite load with `pnpm test & suite_pid=$!; target_status=0;
+  // for run_index in 1 2 3; do pnpm --filter @gadgets/workshop-frontend exec vitest run
+  // src/conversation-history.localization.test.tsx -t "lets a Chinese user" || target_status=$?;
+  // done; wait "$suite_pid"; exit "$target_status"`.
   // Five isolated runs took 0.90-1.19s. A loaded run took 5.41s. The test has no unawaited
   // updates or leaked subscriptions, so this local margin covers measured CPU contention.
   it('lets a Chinese user view a response, inspect a tool, approve an action, and open a result', async () => {
