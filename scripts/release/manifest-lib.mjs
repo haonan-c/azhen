@@ -152,6 +152,7 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
   if (config.assets) {
     bindings.push({ type: "assets", name: config.assets.binding ?? "ASSETS" });
     assetsConfig = {
+      html_handling: config.assets.html_handling,
       not_found_handling: config.assets.not_found_handling,
       run_worker_first: config.assets.run_worker_first,
       // Filled by the caller (build-release) with
@@ -163,7 +164,7 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
   Object.assign(vars, config.vars ?? {});
 
   // Per-kind template vars, mirroring what generate-wrangler-prod.js hand-codes internally
-  // (PUBLIC_BASE_URL on the backend; per-gatekeeper BASE_URL under the shared origin).
+  // (PUBLIC_BASE_URL on the backend and router; per-gatekeeper BASE_URL under the shared origin).
   let inputs;
   let installable = true;
   let gatekeeperBindingExpansion;
@@ -188,6 +189,7 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
       },
     };
   } else if (kind === "router") {
+    vars.PUBLIC_BASE_URL = "$PUBLIC_BASE_URL";
     // The router routes /gatekeeper/<short>/* by scanning its own GATEKEEPER_* bindings
     // (default entrypoint — it forwards whole HTTP requests, not vendor RPC).
     gatekeeperBindingExpansion = { propsByPackage: {} };

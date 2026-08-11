@@ -13,6 +13,8 @@ type EmailEntrypoint = CloudflareWorkersModule.WorkerEntrypoint &
     Required<Pick<CloudflareWorkersModule.WorkerEntrypoint, "email">>;
 
 export interface Env {
+  // Present in release deployments; may be absent in local development.
+  PUBLIC_BASE_URL?: string;
   WORKSHOP_BACKEND: Fetcher;
   // Present in production (wrangler.jsonc assets stanza); absent in dev.
   ASSETS?: Fetcher;
@@ -21,9 +23,103 @@ export interface Env {
   [key: string]: unknown;
 }
 
+const MARKETING_LANDING_PAGES = [
+  { path: "/", hreflang: "en", isDefault: true },
+  { path: "/zh", hreflang: "zh-Hans", isDefault: false },
+] as const;
+
+function absoluteMarketingLandingPages(publicOrigin: string) {
+  return MARKETING_LANDING_PAGES.map((page) => ({
+    ...page,
+    url: `${publicOrigin}${page.path}`,
+  }));
+}
+
+function normalizePublicOrigin(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== "https:" && url.protocol !== "http:") ||
+        url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function crawlerDocument(pathname: string, publicBaseUrl: string | undefined): Response | null {
+  if (pathname !== "/robots.txt" && pathname !== "/sitemap.xml") return null;
+
+  const publicOrigin = normalizePublicOrigin(publicBaseUrl);
+  if (pathname === "/robots.txt") {
+    const sitemap = publicOrigin ? `\nSitemap: ${publicOrigin}/sitemap.xml` : "";
+    return new Response(`User-agent: *\nAllow: /${sitemap}\n`, {
+      headers: { "content-type": "text/plain; charset=UTF-8" },
+    });
+  }
+
+  if (!publicOrigin) {
+    return new Response("Public Base URL is not configured.", {
+      headers: { "content-type": "text/plain; charset=UTF-8" },
+      status: 503,
+    });
+  }
+
+  const marketingLandingPages = absoluteMarketingLandingPages(publicOrigin);
+  return new Response(
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
+      marketingLandingPages.map(({ url }) => `<url><loc>${url}</loc></url>`).join("") +
+      `</urlset>\n`,
+      { headers: { "content-type": "application/xml; charset=UTF-8" } },
+  );
+}
+
+function applyPageSeo(
+    response: Response, requestUrl: URL, publicBaseUrl: string | undefined): Response {
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("text/html")) {
+    return response;
+  }
+
+  const publicOrigin = normalizePublicOrigin(publicBaseUrl);
+  const marketingLandingPage = MARKETING_LANDING_PAGES.find(
+      ({ path }) => path === requestUrl.pathname);
+  const headers = new Headers(response.headers);
+  if (publicOrigin && requestUrl.origin === publicOrigin && marketingLandingPage) {
+    headers.delete("x-robots-tag");
+  } else {
+    headers.set("x-robots-tag", "noindex");
+  }
+  const pageResponse = new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+
+  if (!publicOrigin || !marketingLandingPage) return pageResponse;
+
+  const marketingLandingPages = absoluteMarketingLandingPages(publicOrigin);
+  const defaultPage = marketingLandingPages.find(({ isDefault }) => isDefault)!;
+  const links = [
+    `<link rel="canonical" href="${publicOrigin}${marketingLandingPage.path}">`,
+    ...marketingLandingPages.map(({ hreflang, url }) => (
+      `<link rel="alternate" hreflang="${hreflang}" href="${url}">`
+    )),
+    `<link rel="alternate" hreflang="x-default" href="${defaultPage.url}">`,
+  ].join("");
+
+  return new HTMLRewriter()
+      .on("head", { element: (element) => { element.append(links, { html: true }); } })
+      .transform(pageResponse);
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
+    const crawlerResponse = crawlerDocument(url.pathname, env.PUBLIC_BASE_URL);
+    if (crawlerResponse) return crawlerResponse;
 
     for (const key of Object.keys(env)) {
       if (!key.startsWith("GATEKEEPER_")) continue;
@@ -45,7 +141,8 @@ export default {
     // callbacks.
 
     if (env.ASSETS) {
-      return env.ASSETS.fetch(req);
+      const response = await env.ASSETS.fetch(req);
+      return applyPageSeo(response, url, env.PUBLIC_BASE_URL);
     }
 
     // Dev only: with no assets binding here, everything else goes to the backend.
@@ -56,7 +153,8 @@ export default {
     // expected here -- run the Vite dev server with `pnpm dev-client` and open localhost:3000
     // directly instead. (We don't try to forward to localhost:3000 becaues it doesn't work well:
     // Vite's HMR socket gets disconnected every time wrangler restarts workerd.)
-    return env.WORKSHOP_BACKEND.fetch(req);
+    const response = await env.WORKSHOP_BACKEND.fetch(req);
+    return applyPageSeo(response, url, env.PUBLIC_BASE_URL);
   },
 
   async email(message, env) {

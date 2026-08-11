@@ -122,7 +122,10 @@ test("worker entries carry the deploy contract", () => {
       router.bindings.find((b) => b.name === "WORKSHOP_BACKEND"),
       { type: "service", name: "WORKSHOP_BACKEND", service: "$WORKER_NAME(workshop-backend)" });
   assert.ok(router.bindings.some((b) => b.type === "assets" && b.name === "ASSETS"));
-  assert.ok(router.assetsConfig.run_worker_first.includes("/gatekeeper/*"));
+  assert.equal(router.vars.PUBLIC_BASE_URL, "$PUBLIC_BASE_URL");
+  assert.deepEqual(router.assetsConfig.run_worker_first,
+      ["/*", "!/assets/*", "!/favicon.svg", "!/marketing/*"]);
+  assert.equal(router.assetsConfig.html_handling, "drop-trailing-slash");
   assert.equal(router.assetsConfig.not_found_handling, "single-page-application");
   assert.deepEqual(Object.keys(router.assetsConfig.variants), ["access"]);
   for (const variant of Object.values(router.assetsConfig.variants)) {

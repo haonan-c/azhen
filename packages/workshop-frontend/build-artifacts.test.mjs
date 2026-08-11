@@ -1,17 +1,24 @@
-import { readFile, rm } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JSDOM } from 'jsdom'
 import { build } from 'vite'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { unstable_readConfig, unstable_startWorker } from 'wrangler'
 
 const packageRoot = fileURLToPath(new URL('.', import.meta.url))
 const outputDirectory = join(tmpdir(), `azhen-frontend-build-${process.pid}`)
+const routerConfigPath = fileURLToPath(new URL('../router/wrangler.jsonc', import.meta.url))
+const routerEntryPath = fileURLToPath(new URL('../router/src/index.ts', import.meta.url))
+const integrationConfigPath = join(tmpdir(), `azhen-router-integration-${process.pid}.json`)
+const integrationOrigin = 'http://localhost:8788'
 
 describe('production Marketing Landing Page documents', () => {
   /** @type {Map<string, string>} */
   const documents = new Map()
+  /** @type {Awaited<ReturnType<typeof unstable_startWorker>> | undefined} */
+  let routerWorker
 
   beforeAll(async () => {
     await build({
@@ -29,10 +36,30 @@ describe('production Marketing Landing Page documents', () => {
     ].map(async ([locale, path]) => {
       documents.set(locale, await readFile(join(outputDirectory, path), 'utf8'))
     }))
+
+    const routerConfig = unstable_readConfig(
+      { config: routerConfigPath },
+      { hideWarnings: true },
+    )
+    await writeFile(integrationConfigPath, JSON.stringify({
+      assets: {
+        ...routerConfig.assets,
+        directory: outputDirectory,
+      },
+      compatibility_date: routerConfig.compatibility_date,
+      main: routerEntryPath,
+      name: 'router-seo-integration',
+      vars: { PUBLIC_BASE_URL: integrationOrigin },
+    }))
+    routerWorker = await unstable_startWorker({ config: integrationConfigPath })
   }, 180_000)
 
   afterAll(async () => {
-    await rm(outputDirectory, { force: true, recursive: true })
+    await routerWorker?.dispose()
+    await Promise.all([
+      rm(outputDirectory, { force: true, recursive: true }),
+      rm(integrationConfigPath, { force: true }),
+    ])
   })
 
   it.each([
@@ -92,5 +119,24 @@ describe('production Marketing Landing Page documents', () => {
     expect(parsedDocuments.map(document => document.querySelectorAll('#root').length)).toEqual([1, 1])
     expect(entrySources[0]).toMatch(/^\/assets\/[^/]+\.js$/)
     expect(entrySources[1]).toBe(entrySources[0])
+  })
+
+  it.each([
+    ['/', 'en'],
+    ['/zh', 'zh'],
+  ])('passes the real %s Marketing Landing Page through the Production Site Router', async (
+    path,
+    locale,
+  ) => {
+    const response = await routerWorker.fetch(`${integrationOrigin}${path}`, {
+      redirect: 'manual',
+    })
+    const html = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('location')).toBeNull()
+    expect(response.headers.get('x-robots-tag')).toBeNull()
+    expect(html).toContain(`data-prerendered-locale="${locale}"`)
+    expect(html).toContain(`<link rel="canonical" href="${integrationOrigin}${path}">`)
   })
 })
