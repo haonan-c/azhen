@@ -146,6 +146,10 @@ describe('localized sign-in to Workshop Home journey', () => {
       </ServerConfigErrorContext.Provider>,
     ))
 
+    const landingSignIn = [...container!.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent?.trim() === expected.signIn)!
+    await act(async () => landingSignIn.click())
+
     const username = container!.querySelector<HTMLInputElement>('input[autocomplete="username"]')!
     const password = container!.querySelector<HTMLInputElement>('input[autocomplete="current-password"]')!
     await act(async () => {
