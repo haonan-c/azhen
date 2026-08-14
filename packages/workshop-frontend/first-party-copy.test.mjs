@@ -1,7 +1,9 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import ts from 'typescript'
+// TypeScript 7 uses the native compiler and does not expose the JavaScript compiler API used by
+// this source scanner. The root keeps TypeScript 6 under this alias for build-time tooling.
+import ts from 'typescript6'
 import { describe, expect, it } from 'vitest'
 
 const sourceRoot = fileURLToPath(new URL('./src/', import.meta.url))

@@ -1,16 +1,13 @@
+import { logRpcFailure } from './rpcErrors'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
-import { RpcTarget } from 'capnweb'
 import { useAuthenticatedApi } from './AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
-  ConnectedAccountsSubscriber,
 } from '@gadgets/workshop-shared/api'
 import {
   VendorDescription,
-  AccountDescription,
-  SupportedResource,
 } from '@gadgets/workshop-shared/gatekeeper'
 import {
   Camera,
@@ -35,6 +32,7 @@ import { useSiteName } from './ServerConfigContext'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import { m as messages } from './paraglide/messages.js'
+import { AccountsSubscriberAdapter } from './accountsSubscriber'
 
 // ─── constants ──────────────────────────────────────────────────────────────────
 
@@ -187,15 +185,8 @@ export default function OnboardingWizard({
         if (!cancelled) setVendorsLoading(false)
       })
 
-    class AccountsSubscriber extends RpcTarget implements ConnectedAccountsSubscriber {
-      add(
-        id: number,
-        _description: AccountDescription,
-        vendor: VendorDescription,
-        _supportedResources: SupportedResource[] = [],
-        _credentialsValid: boolean = true,
-        _vendorId: string = '',
-      ) {
+    const subscriber = new AccountsSubscriberAdapter({
+      add({ id, vendor }) {
         if (cancelled) return
         const url = vendor.url
         accountIdToUrl.set(id, url)
@@ -205,8 +196,8 @@ export default function OnboardingWizard({
         } else {
           pendingUrls.push(url)
         }
-      }
-      remove(id: number) {
+      },
+      remove(id) {
         const url = accountIdToUrl.get(id)
         if (url) {
           accountIdToUrl.delete(id)
@@ -214,29 +205,18 @@ export default function OnboardingWizard({
           if (!stillHas) connectedUrls.delete(url)
           refreshConnectedIds()
         }
-      }
-      ready() {}
-    }
+      },
+    })
 
-    const subscriber = new AccountsSubscriber()
-    let subscriptionStub: { [Symbol.dispose](): void } | null = null
-
-    authenticatedApi
-      .subscribeConnectedAccounts(subscriber)
-      .then((stub) => {
-        if (cancelled) {
-          stub[Symbol.dispose]()
-        } else {
-          subscriptionStub = stub
-        }
-      })
-      .catch((err) => {
-        console.error('Failed to subscribe to connected accounts:', err)
-      })
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    subscription.catch((err) => {
+      if (cancelled) return
+      logRpcFailure('Failed to subscribe to connected accounts:', err)
+    })
 
     return () => {
       cancelled = true
-      subscriptionStub?.[Symbol.dispose]()
+      subscription[Symbol.dispose]()
     }
   }, [authenticatedApi])
 

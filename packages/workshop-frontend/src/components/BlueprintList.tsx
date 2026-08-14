@@ -208,7 +208,12 @@ export default function BlueprintList() {
     }
   }, [authenticatedApi, load, toasts])
 
+  // Overlapping setBlueprintPinned calls have no ordering guarantee, so ignore clicks while
+  // one is in flight.
+  const pinsInFlight = useRef(new Set<string>())
   const handleTogglePin = async (item: BlueprintItem) => {
+    if (pinsInFlight.current.has(item.id)) return
+    pinsInFlight.current.add(item.id)
     const nextPinned = !item.pinned
     setItems((prev) => sortItems(prev.map((b) => (b.id === item.id ? { ...b, pinned: nextPinned } : b))))
     try {
@@ -217,6 +222,8 @@ export default function BlueprintList() {
       console.error('Failed to update blueprint pin:', err)
       setItems((prev) => sortItems(prev.map((b) => (b.id === item.id ? { ...b, pinned: item.pinned } : b))))
       toasts.add({ title: messages.blueprints_update_favorite_failed(), variant: 'error' })
+    } finally {
+      pinsInFlight.current.delete(item.id)
     }
   }
 

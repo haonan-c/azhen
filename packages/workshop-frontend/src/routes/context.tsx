@@ -6,9 +6,11 @@ import { useSiteName } from '../ServerConfigContext'
 import { m as messages } from '../paraglide/messages.js'
 import { formatLocaleNumber } from '../utils/formatNumber'
 
-// Context & Skills. The knowledge/skills surface isn't built into the rail yet — agents read
-// curated collections of documents (context) and reusable skills. Until then this page shows a
-// frosted design mock so the nav entry has a stable, on-language target.
+/**
+ * Context & Skills. The knowledge/skills surface isn't built into the rail yet — agents read
+ * curated collections of documents (context) and reusable skills. Until then this page shows a
+ * frosted design mock so the nav entry has a stable, on-language target.
+ */
 export const Route = createFileRoute('/context')({
   component: ContextPage,
 })

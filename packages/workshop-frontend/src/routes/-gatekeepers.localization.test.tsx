@@ -32,7 +32,7 @@ testState.authenticatedApi = {
       urlPattern: 'https://github.com/:owner/:repo',
     }],
   }],
-  subscribeConnectedAccounts: async (subscriber) => {
+  subscribeConnectedAccounts: (subscriber) => {
     subscriber.add(
       7,
       { displayName: 'Seller Account Original', uniqueName: 'seller@example.com' },
@@ -45,7 +45,9 @@ testState.authenticatedApi = {
       'google',
     )
     subscriber.ready()
-    return { [Symbol.dispose]() {} }
+    return Object.assign(Promise.resolve({ [Symbol.dispose]() {} }), {
+      [Symbol.dispose]() {},
+    })
   },
 }
 

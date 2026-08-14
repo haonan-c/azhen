@@ -12,13 +12,15 @@
 type EmailEntrypoint = CloudflareWorkersModule.WorkerEntrypoint &
     Required<Pick<CloudflareWorkersModule.WorkerEntrypoint, "email">>;
 
+/** Bindings used by the public origin router. */
 export interface Env {
-  // Present in release deployments; may be absent in local development.
+  /** Present in release deployments; may be absent in local development. */
   PUBLIC_BASE_URL?: string;
+  /** The Workshop backend service binding. */
   WORKSHOP_BACKEND: Fetcher;
-  // Present in production (wrangler.jsonc assets stanza); absent in dev.
+  /** Present in production (wrangler.jsonc assets stanza); absent in dev. */
   ASSETS?: Fetcher;
-  // Dormant until custom domains + Email Routing exist; the handler ships anyway.
+  /** Dormant until custom domains + Email Routing exist; the handler ships anyway. */
   GATEKEEPER_EMAIL?: Service<EmailEntrypoint>;
   [key: string]: unknown;
 }

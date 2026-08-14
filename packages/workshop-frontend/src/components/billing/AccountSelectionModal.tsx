@@ -6,9 +6,11 @@ import { useOptionalAuthenticatedApi } from '../../AuthContext'
 import { useCloudflareLimitsEnabled } from '../../ServerConfigContext'
 import { m as messages } from '../../paraglide/messages.js'
 
-// Global, mandatory modal that forces the user to pick which Cloudflare account to bill whenever
-// they're connected but have access to more than one account. Auto-opens (and re-opens) as long as
-// the selection is pending, so it can't be missed after connecting. Mounted once in the app shell.
+/**
+ * Global, mandatory modal that forces the user to pick which Cloudflare account to bill whenever
+ * they're connected but have access to more than one account. Auto-opens (and re-opens) as long as
+ * the selection is pending, so it can't be missed after connecting. Mounted once in the app shell.
+ */
 export default function AccountSelectionModal() {
   const limitsEnabled = useCloudflareLimitsEnabled()
   const auth = useOptionalAuthenticatedApi()

@@ -246,7 +246,10 @@ describe('localized sign-in to Workshop Home journey', () => {
       listGatekeeperVendors: async () => [],
       listModels: async () => [{ type: 'agent', id: 'model-1', name: 'Model 原名' } as const],
       setPreferredModel: async () => {},
-      subscribeConnectedAccounts: async () => ({ [Symbol.dispose]: vi.fn<() => void>() }),
+      subscribeConnectedAccounts: () => Object.assign(
+        Promise.resolve({ [Symbol.dispose]: vi.fn<() => void>() }),
+        { [Symbol.dispose]: vi.fn<() => void>() },
+      ),
       whoami: async () => ({ type: 'user', id: 'user-1', name: '用户 原名' } as const),
       [Symbol.dispose]: vi.fn<() => void>(),
     } as unknown as RpcStub<AuthenticatedApi>

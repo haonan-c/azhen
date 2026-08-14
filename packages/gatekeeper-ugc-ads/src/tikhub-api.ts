@@ -121,9 +121,7 @@ type TikHubUserNotesResult = TikHubResult & {
   data?: { notes?: RawTikHubNote[]; cursor?: string; has_more?: boolean };
 };
 
-// A Xiaohongshu note as returned by search or detail lookups. `url`/`user.url` are derived;
-// `extra` carries a bounded set of documented content and engagement fields. TikHub also returns
-// large playback/widget payloads that are not useful for topic research, so they are not exposed.
+/** A bounded Xiaohongshu note summary returned by search or detail lookups. */
 export type XiaohongshuNoteSummary = {
   id?: string;
   xsecToken?: string;

@@ -17,6 +17,7 @@ const testState = vi.hoisted(() => {
   return {
     addToast: vi.fn<(toast: unknown) => void>(),
     authenticatedApi: { listModels, newGadget },
+    currentUser: { id: "user-a", name: "User A" },
     listModels,
     navigate: vi.fn<(options: unknown) => void>(),
     newChat,
@@ -25,6 +26,7 @@ const testState = vi.hoisted(() => {
     dispose,
     send: undefined as TestSend | undefined,
     seeds: [] as Array<{ text?: string; nonce?: number }>,
+    draftStorageKeys: [] as Array<string | undefined>,
   };
 });
 
@@ -40,17 +42,20 @@ vi.mock("@cloudflare/kumo", () => ({
 vi.mock("./AuthContext", () => ({
   useAuthenticatedApi: () => ({
     authenticatedApi: testState.authenticatedApi,
+    currentUser: testState.currentUser,
   }),
 }));
 
 vi.mock("./ChatInterface", () => ({
-  ChatInput: ({ seedText, seedNonce, onSend }: {
+  ChatInput: ({ seedText, seedNonce, draftStorageKey, onSend }: {
     seedText?: string;
     seedNonce?: number;
+    draftStorageKey?: string;
     onSend: TestSend;
   }) => {
     testState.seeds.push({ text: seedText, nonce: seedNonce });
     testState.send = onSend;
+    testState.draftStorageKeys.push(draftStorageKey);
     return <textarea aria-label="Prompt" readOnly value={seedText ?? ""} />;
   },
 }));
@@ -74,6 +79,7 @@ describe("Home prompt route flow", () => {
     window.history.replaceState({}, "", "/");
     testState.seeds.length = 0;
     testState.send = undefined;
+    testState.draftStorageKeys.length = 0;
     vi.clearAllMocks();
   });
 
@@ -89,6 +95,7 @@ describe("Home prompt route flow", () => {
     expect(Math.max(...testState.seeds.map(({ nonce }) => nonce ?? 0))).toBe(1);
     expect(testState.navigate).toHaveBeenCalledWith({ to: "/", search: {}, replace: true });
     expect(testState.newGadget).not.toHaveBeenCalled();
+    expect(testState.draftStorageKeys).toContain("gadgets:composer-draft:v1:user-a:home");
   });
 
   it("keeps a Chinese user prompt unchanged", async () => {

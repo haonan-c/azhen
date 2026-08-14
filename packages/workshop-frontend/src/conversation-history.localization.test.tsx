@@ -239,6 +239,7 @@ describe('localized conversation history', () => {
     root = createRoot(container)
     await act(async () => root!.render(
       <ChatInterface
+        workspaceId="workspace-7"
         overseer={overseer}
         selectedChatId={7}
         onNavigateToChat={() => {}}
@@ -356,6 +357,7 @@ describe('localized conversation history', () => {
     root = createRoot(container)
     await act(async () => root!.render(
       <ChatInterface
+        workspaceId="workspace-8"
         overseer={overseer}
         selectedChatId={null}
         onNavigateToChat={() => {}}
@@ -415,6 +417,7 @@ describe('localized conversation history', () => {
     root = createRoot(container)
     await act(async () => root!.render(
       <ChatInterface
+        workspaceId="workspace-7"
         overseer={overseer}
         selectedChatId={7}
         onNavigateToChat={stableNavigateToChat}
@@ -459,6 +462,7 @@ describe('localized conversation history', () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     await act(async () => root!.render(
       <ChatInterface
+        workspaceId="workspace-7"
         overseer={overseer}
         selectedChatId={7}
         onNavigateToChat={stableNavigateToChat}
