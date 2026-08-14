@@ -18,7 +18,7 @@ export type SkillIndexEntry = {
   description: string;
 };
 
-// Skills grouped by collection.
+/** Skills grouped by collection. */
 export type CollectionSkills = {
   collection: EnabledCollectionInfo;
   skills: SkillIndexEntry[];
@@ -26,7 +26,7 @@ export type CollectionSkills = {
 
 type AgentSkillCatalogEntry = AgentCatalogEntry & {kind: "agent-skill"};
 
-// Build slash command entries for the picker.
+/** Build slash command entries for the picker. */
 export function buildAgentSkillCommands(
     loaded: CollectionSkills[]): SlashCommandDescriptor[] {
   let commands: SlashCommandDescriptor[] = [];
@@ -44,7 +44,7 @@ export function buildAgentSkillCommands(
   return commands;
 }
 
-// Build Agent Catalog entries. Their IDs can be passed to ContextLibrary.read().
+/** Build Agent Catalog entries. Their IDs can be passed to ContextLibrary.read(). */
 export function buildAgentSkillCatalogEntries(
     loaded: CollectionSkills[]): AgentSkillCatalogEntry[] {
   let entries: AgentSkillCatalogEntry[] = [];

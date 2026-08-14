@@ -25,9 +25,11 @@ testState.authenticatedApi = {
       urlPattern: 'https://github.com/:owner/:repo',
     }],
   }],
-  subscribeConnectedAccounts: async (subscriber: ConnectedAccountsSubscriber) => {
+  subscribeConnectedAccounts: (subscriber: ConnectedAccountsSubscriber) => {
     subscriber.ready()
-    return { [Symbol.dispose]() {} }
+    return Object.assign(Promise.resolve({ [Symbol.dispose]() {} }), {
+      [Symbol.dispose]() {},
+    })
   },
 } as unknown as RpcStub<AuthenticatedApi>
 

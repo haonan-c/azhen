@@ -27,7 +27,7 @@ testState.authenticatedApi = {
       grantable: true,
     }],
   }],
-  subscribeConnectedAccounts: async (subscriber: ConnectedAccountsSubscriber) => {
+  subscribeConnectedAccounts: (subscriber: ConnectedAccountsSubscriber) => {
     const vendor = {
       displayName: 'GitHub Vendor Original',
       url: 'https://vendor.example',
@@ -55,7 +55,9 @@ testState.authenticatedApi = {
       grantedResourceUrlPatterns: [],
     }, vendor, resources, true, 'github')
     subscriber.ready()
-    return { [Symbol.dispose]() {} }
+    return Object.assign(Promise.resolve({ [Symbol.dispose]() {} }), {
+      [Symbol.dispose]() {},
+    })
   },
 } as unknown as RpcStub<AuthenticatedApi>
 

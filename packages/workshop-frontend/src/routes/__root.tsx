@@ -1,9 +1,10 @@
+import { logRpcFailure } from '../rpcErrors'
 import { useState, useEffect } from 'react'
 import { createRootRoute, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
 import { TooltipProvider, Toasty } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
-import { useRpcStub, useConnectionLost } from '../RpcContext'
+import { useRpcStub } from '../RpcContext'
 import { markConnectionRestored } from '../main'
 import { useAuth, CF_ACCESS_MODE } from '../useAuth'
 import { AuthProvider } from '../AuthContext'
@@ -20,17 +21,8 @@ export const Route = createRootRoute({
   component: RootComponent,
 })
 
-function ConnectionLostBanner() {
-  return (
-    <div className="sticky top-0 z-[100] bg-kumo-warning-tint border-b border-kumo-warning/30 px-4 py-2 text-center text-sm text-kumo-warning">
-      {messages.connection_lost()}
-    </div>
-  )
-}
-
 export function RootComponent() {
   const rpcStub = useRpcStub()
-  const connectionLost = useConnectionLost()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login, retry } = useAuth(rpcStub)
   const navigate = useNavigate()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
@@ -66,7 +58,6 @@ export function RootComponent() {
   if (isLoading && !standalone) {
     return (
       <div className="min-h-screen flex items-center justify-center flex-col gap-4 bg-kumo-base">
-        {connectionLost && <ConnectionLostBanner />}
         <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
         <p role="status" className="text-sm text-kumo-subtle">{messages.auth_session_checking()}</p>
       </div>
@@ -137,7 +128,6 @@ export function RootComponent() {
           <Toasty>
             <AuthenticatedShell
               authenticatedApi={authenticatedApi}
-              connectionLost={connectionLost}
               isWorkspaceEditor={isWorkspaceEditor}
             />
           </Toasty>
@@ -154,11 +144,9 @@ export function RootComponent() {
  */
 function AuthenticatedShell({
   authenticatedApi,
-  connectionLost,
   isWorkspaceEditor,
 }: {
   authenticatedApi: RpcStub<AuthenticatedApi>
-  connectionLost: boolean
   isWorkspaceEditor: boolean
 }) {
   // null = still checking, true = needs onboarding, false = onboarding done
@@ -169,7 +157,7 @@ function AuthenticatedShell({
     authenticatedApi.isOnboardingCompleted().then((completed) => {
       if (!cancelled) setOnboardingNeeded(!completed)
     }).catch((err) => {
-      console.error('Failed to check onboarding status:', err)
+      logRpcFailure('Failed to check onboarding status:', err)
       // If the check fails, skip onboarding to avoid blocking the user
       if (!cancelled) setOnboardingNeeded(false)
     })
@@ -194,11 +182,11 @@ function AuthenticatedShell({
   }
 
   // Normal app shell. The workspace editor is rendered fullscreen (no chrome); everything else
-  // gets the persistent left-rail AppShell.
+  // gets the persistent left-rail AppShell. Connection loss is surfaced by a chip in whichever of
+  // those two top bars is showing, never by a banner that reflows the page (see ReconnectingChip).
   const fullscreen = isWorkspaceEditor
   return (
     <>
-      {connectionLost && <ConnectionLostBanner />}
       <AccountSelectionModal />
       {fullscreen ? (
         <main>

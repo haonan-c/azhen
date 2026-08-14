@@ -20,7 +20,7 @@ import {
 import type { BlueprintOutput, OutputFormatOffer, OutputIcon } from '@gadgets/workshop-shared/api'
 import { m as messages } from '../../paraglide/messages.js'
 
-// The glyph for each key in the shared `OUTPUT_ICONS` vocabulary.
+/** The glyph for each key in the shared `OUTPUT_ICONS` vocabulary. */
 export const FORMAT_ICONS = {
   fileText: FileText,
   gridNine: GridNine,
@@ -34,8 +34,10 @@ export const FORMAT_ICONS = {
   listChecks: ListChecks,
 } satisfies Record<OutputIcon, PhosphorIcon>
 
-// Which wireframe illustrates a format. Derived from the icon rather than picked separately, so
-// the two can't disagree; icons depicting the same artefact (a page vs. a notebook) share one.
+/**
+ * Which wireframe illustrates a format. Derived from the icon rather than picked separately, so
+ * the two can't disagree; icons depicting the same artefact (a page vs. a notebook) share one.
+ */
 export type FormatWireframe = 'page' | 'grid' | 'slide' | 'window' | 'list' | 'board' | 'chart'
 
 const WIREFRAME_FOR_ICON: Record<OutputIcon, FormatWireframe> = {
@@ -51,8 +53,10 @@ const WIREFRAME_FOR_ICON: Record<OutputIcon, FormatWireframe> = {
   listChecks: 'list',
 }
 
-// How a gadget with no declared format is shown. Also the fallback for an icon this build doesn't
-// know, which is normal: a deployment can serve a format newer than the browser's cached bundle.
+/**
+ * How a gadget with no declared format is shown. Also the fallback for an icon this build doesn't
+ * know, which is normal: a deployment can serve a format newer than the browser's cached bundle.
+ */
 export const GENERIC_OUTPUT: BlueprintOutput = {
   id: 'app',
   noun: 'App',
@@ -105,14 +109,13 @@ function bundledFormat(output: BlueprintOutput) {
     && bundled.icon === output.icon)
 }
 
-// Resolve what to draw for a (possibly absent, possibly unrecognized) declared format.
+/** Resolve what to draw for a (possibly absent, possibly unrecognized) declared format. */
 export function formatOf(output?: BlueprintOutput): BlueprintOutput {
   if (!output || !Object.hasOwn(FORMAT_ICONS, output.icon)) return GENERIC_OUTPUT
   return output
 }
 
-// The bundled declarations are first-party copy. Match their full presentation signature so a
-// custom format that merely shares a grouping id keeps its author-provided name unchanged.
+/** The localized noun for a declared format, preserving custom author-provided names. */
 export function formatNoun(output?: BlueprintOutput): string {
   if (!output) return messages.workspace_generic_app()
   const bundled = bundledFormat(output)
@@ -121,6 +124,7 @@ export function formatNoun(output?: BlueprintOutput): string {
   return format === GENERIC_OUTPUT ? messages.workspace_generic_app() : format.noun
 }
 
+/** The localized plural noun for a declared format, preserving custom author-provided names. */
 export function formatPlural(output?: BlueprintOutput): string {
   if (!output) return messages.output_format_app_plural()
   const bundled = bundledFormat(output)
@@ -129,12 +133,12 @@ export function formatPlural(output?: BlueprintOutput): string {
   return format === GENERIC_OUTPUT ? messages.output_format_app_plural() : format.plural
 }
 
+/** Resolve the visual wireframe associated with a declared format. */
 export function wireframeOf(output?: BlueprintOutput): FormatWireframe {
   return WIREFRAME_FOR_ICON[formatOf(output).icon]
 }
 
-// The bundled formats have localized first-party names. Deployment overrides and custom formats
-// keep the exact name supplied by their author.
+/** Resolve the localized noun shown for a format offer. */
 export function formatOfferNoun(format: OutputFormatOffer): string {
   const bundled = BUNDLED_FORMATS.find((candidate) =>
     candidate.blueprintId === format.blueprintId && candidate.noun === format.output.noun)

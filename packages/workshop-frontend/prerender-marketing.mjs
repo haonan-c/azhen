@@ -87,6 +87,14 @@ export function prerenderMarketingPages() {
         logLevel: config.logLevel,
         mode: config.mode,
         plugins: [react(), tsconfigPaths()],
+        resolve: {
+          // Keep the SSR/prerender Vite server in sync with the production build. y-monaco still
+          // imports this legacy Monaco path while Monaco 0.56 exposes the editor entrypoint via
+          // the package export below.
+          alias: {
+            'monaco-editor/esm/vs/editor/editor.api.js': 'monaco-editor/editor',
+          },
+        },
         root: config.root,
         server: { middlewareMode: true },
       })

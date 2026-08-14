@@ -22,7 +22,10 @@ const testState = vi.hoisted(() => {
   const authenticatedApi = {
     listModels: async () => [],
     listGatekeeperVendors: async () => [],
-    subscribeConnectedAccounts: async () => ({ [Symbol.dispose]: () => {} }),
+    subscribeConnectedAccounts: () => Object.assign(
+      Promise.resolve({ [Symbol.dispose]: () => {} }),
+      { [Symbol.dispose]: () => {} },
+    ),
     getAdminApi: async () => null,
     isBlueprintInLibrary: async () => null,
     isBlueprintPinned: async () => false,

@@ -3,8 +3,10 @@ import type { RpcStub } from "capnweb";
 import type { Overseer, SlashCommandChoice, SlashCommandId } from "@gadgets/workshop-shared/api";
 import { m as messages } from "../../paraglide/messages.js";
 
-// How a consumer reaches the Overseer. Identity matters: it keys the cache below, and callers
-// already hold it steady for as long as the chat they belong to.
+/**
+ * How a consumer reaches the Overseer. Identity matters: it keys the cache below, and callers
+ * already hold it steady for as long as the chat they belong to.
+ */
 export type OverseerSource = () => Promise<RpcStub<Overseer>> | RpcStub<Overseer>;
 
 // The catalog is the same for every consumer in a chat, and both the composer's picker and the
@@ -12,7 +14,7 @@ export type OverseerSource = () => Promise<RpcStub<Overseer>> | RpcStub<Overseer
 // the next caller retries.
 const catalogs = new WeakMap<OverseerSource, Promise<SlashCommandChoice[]>>();
 
-// Built-in command copy belongs to the Workshop. Gatekeeper-provided copy is returned unchanged.
+/** Localize Workshop-owned built-in command copy while preserving provider-owned copy. */
 export function presentSlashCommandChoice(
   choice: SlashCommandChoice,
   siteName: string,
@@ -38,15 +40,19 @@ export function loadSlashCommandCatalog(source: OverseerSource): Promise<SlashCo
   return load;
 }
 
-// Identifies a command across providers. A built-in has no Gatekeeper, so it gets its own namespace
-// rather than colliding on an undefined one.
+/**
+ * Identifies a command across providers. A built-in has no Gatekeeper, so it gets its own namespace
+ * rather than colliding on an undefined one.
+ */
 export function slashCommandKey(id: SlashCommandId): string {
   return `${id.builtin === true ? "builtin" : id.gatekeeperId}:${id.commandId}`;
 }
 
-// Looks up a command a message was sent with. Names aren't unique across providers, so this matches
-// on the full id. Resolves to undefined for a command whose provider is gone, which is why callers
-// treat the description as an enhancement rather than something to reserve space for.
+/**
+ * Looks up a command a message was sent with. Names aren't unique across providers, so this matches
+ * on the full id. Resolves to undefined for a command whose provider is gone, which is why callers
+ * treat the description as an enhancement rather than something to reserve space for.
+ */
 export function useSlashCommandChoice(
   source: OverseerSource,
   id: SlashCommandId | undefined,

@@ -79,9 +79,10 @@ describe('localized first-run onboarding', () => {
       { type: 'agent', id: 'model-1', name: 'Model 原名' },
     ])
     testState.api.setPreferredModel.mockResolvedValue(undefined)
-    testState.api.subscribeConnectedAccounts.mockResolvedValue({
-      [Symbol.dispose]: vi.fn<() => void>(),
-    })
+    testState.api.subscribeConnectedAccounts.mockReturnValue(Object.assign(
+      Promise.resolve({ [Symbol.dispose]: vi.fn<() => void>() }),
+      { [Symbol.dispose]: vi.fn<() => void>() },
+    ))
   }
 
   async function render(path: string) {
@@ -174,9 +175,10 @@ describe('localized first-run onboarding', () => {
     testState.api.getAiConfig.mockResolvedValue({ enabled: false, enabledProviders: [] })
     testState.api.listGatekeeperVendors.mockResolvedValue([])
     testState.api.listModels.mockReturnValue(new Promise(() => {}))
-    testState.api.subscribeConnectedAccounts.mockResolvedValue({
-      [Symbol.dispose]: vi.fn<() => void>(),
-    })
+    testState.api.subscribeConnectedAccounts.mockReturnValue(Object.assign(
+      Promise.resolve({ [Symbol.dispose]: vi.fn<() => void>() }),
+      { [Symbol.dispose]: vi.fn<() => void>() },
+    ))
     window.history.replaceState({}, '', '/zh')
     container = document.createElement('div')
     document.body.append(container)

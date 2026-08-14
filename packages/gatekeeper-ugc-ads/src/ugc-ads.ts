@@ -120,15 +120,13 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
         "UGC Ads bundles a suite of content-creation Agent Skills -- positioning, " +
         "titles, copywriting, and cover/diagram rendering -- for WeChat Official Account, " +
         "Xiaohongshu, and video creators, plus a small Xiaohongshu content-search capability. " +
-        "Always available -- no connection needed.",
+        "Available without a per-user OAuth connection after the deployment installs it.",
       autoProvisionsAccount: true,
       providesAuth: false,
     };
   }
 
-  // Mint a fresh account capability with no user identity and no per-account state: every account
-  // sees the same vendored skills and the same deployment-wide TikHub key, so there is nothing
-  // to key by account.
+  /** Mint a fresh account capability backed by the deployment-wide UGC Ads service. */
   @skipRpcValidation()
   async createAccount(): Promise<Fetcher<GatekeeperUser>> {
     return this.ctx.exports.UgcAdsAccount({ props: {} }) as unknown as Fetcher<GatekeeperUser>;
@@ -170,6 +168,7 @@ export class UgcAdsAccount
   }
 
   // --- GatekeeperUser resource surface (no URL-addressed resources) ---
+  /** This singleton exposes no URL-addressed resources. */
   async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
   }
@@ -182,7 +181,7 @@ export class UgcAdsAccount
   async ensureResources(_resourceUrlPatterns: string[]): Promise<{ url?: string }> {
     return {};
   }
-  // No per-account state to delete.
+  /** Delete the account; the singleton keeps no per-account state. */
   async revoke(): Promise<void> {}
   reconnect(): never {
     throw new Error("UGC Ads is a singleton gatekeeper; it has no connect flow.");
@@ -252,7 +251,7 @@ export class UgcAdsGatekeeper
     return catalog;
   }
 
-  // Read-only gatekeeper: no side-effecting actions, so nothing is ever auto-approvable.
+  /** Read-only gatekeeper: no side-effecting actions are auto-approvable. */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
     return [];
   }
@@ -260,16 +259,20 @@ export class UgcAdsGatekeeper
   // Strategy D (low-stakes, see .agents/skills/write-gatekeeper/SKELETON.md): every user with
   // access to their own UGC Ads singleton sees identical vendored skills and the same
   // deployment-wide TikHub key, so there is nothing observer-specific to verify.
+  /** Register an observer; all users see the same deployment-wide read-only data. */
   async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
+  /** Remove an observer from the read-only singleton. */
   async removeObserver(_id: string): Promise<void> {}
 
-  // Read-only gatekeeper: no actions are submitted, so these callbacks should never run.
+  /** Reject an action; this read-only gatekeeper has no actions. */
   applyAction(_action: number): Promise<void> {
     throw new Error("UGC Ads is read-only and implements no actions.");
   }
+  /** Reject an action; this read-only gatekeeper has no actions. */
   rejectAction(_action: number): Promise<void | { restart?: boolean }> {
     throw new Error("UGC Ads is read-only and implements no actions.");
   }
+  /** Reject a revert; this read-only gatekeeper has no actions. */
   revertAction(_action: number):
       Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
     throw new Error("UGC Ads is read-only and implements no actions.");
