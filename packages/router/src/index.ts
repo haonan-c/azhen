@@ -8,6 +8,16 @@
 // The same worker doubles as the dev router (`pnpm dev-server` at the repo root): dev has no
 // `ASSETS` binding, so frontend requests fall through to the backend instead.
 
+import {
+  alternatesOf,
+  canonicalUrl,
+  enabledPages,
+  localizedPath,
+  SITE_PAGES,
+  type SiteLocale,
+  type SitePage,
+} from "@gadgets/site-config";
+
 // gatekeeper-email's entrypoint: a WorkerEntrypoint whose optional email() handler is present.
 type EmailEntrypoint = CloudflareWorkersModule.WorkerEntrypoint &
     Required<Pick<CloudflareWorkersModule.WorkerEntrypoint, "email">>;
@@ -25,16 +35,19 @@ export interface Env {
   [key: string]: unknown;
 }
 
-const MARKETING_LANDING_PAGES = [
-  { path: "/", hreflang: "en", isDefault: true },
-  { path: "/zh", hreflang: "zh-Hans", isDefault: false },
-] as const;
+interface LocalizedSitePage {
+  page: SitePage;
+  locale: SiteLocale;
+}
 
-function absoluteMarketingLandingPages(publicOrigin: string) {
-  return MARKETING_LANDING_PAGES.map((page) => ({
-    ...page,
-    url: `${publicOrigin}${page.path}`,
-  }));
+function indexablePageForPath(pathname: string): LocalizedSitePage | null {
+  for (const page of SITE_PAGES) {
+    if (!page.enabled || !page.indexable) continue;
+    for (const locale of page.locales) {
+      if (localizedPath(page.path, locale) === pathname) return { page, locale };
+    }
+  }
+  return null;
 }
 
 function normalizePublicOrigin(value: string | undefined): string | null {
@@ -69,11 +82,14 @@ function crawlerDocument(pathname: string, publicBaseUrl: string | undefined): R
     });
   }
 
-  const marketingLandingPages = absoluteMarketingLandingPages(publicOrigin);
+  const sitemapUrls = enabledPages()
+      .filter(({ indexable }) => indexable)
+      .flatMap((page) => page.locales.map(
+          (locale) => canonicalUrl(publicOrigin, page.path, locale)));
   return new Response(
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
       `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
-      marketingLandingPages.map(({ url }) => `<url><loc>${url}</loc></url>`).join("") +
+      sitemapUrls.map((url) => `<url><loc>${url}</loc></url>`).join("") +
       `</urlset>\n`,
       { headers: { "content-type": "application/xml; charset=UTF-8" } },
   );
@@ -86,10 +102,9 @@ function applyPageSeo(
   }
 
   const publicOrigin = normalizePublicOrigin(publicBaseUrl);
-  const marketingLandingPage = MARKETING_LANDING_PAGES.find(
-      ({ path }) => path === requestUrl.pathname);
+  const localizedPage = indexablePageForPath(requestUrl.pathname);
   const headers = new Headers(response.headers);
-  if (publicOrigin && requestUrl.origin === publicOrigin && marketingLandingPage) {
+  if (publicOrigin && requestUrl.origin === publicOrigin && localizedPage) {
     headers.delete("x-robots-tag");
   } else {
     headers.set("x-robots-tag", "noindex");
@@ -100,16 +115,14 @@ function applyPageSeo(
     statusText: response.statusText,
   });
 
-  if (!publicOrigin || !marketingLandingPage) return pageResponse;
+  if (!publicOrigin || !localizedPage) return pageResponse;
 
-  const marketingLandingPages = absoluteMarketingLandingPages(publicOrigin);
-  const defaultPage = marketingLandingPages.find(({ isDefault }) => isDefault)!;
   const links = [
-    `<link rel="canonical" href="${publicOrigin}${marketingLandingPage.path}">`,
-    ...marketingLandingPages.map(({ hreflang, url }) => (
+    `<link rel="canonical" href="${canonicalUrl(
+        publicOrigin, localizedPage.page.path, localizedPage.locale)}">`,
+    ...alternatesOf(publicOrigin, localizedPage.page).map(({ hreflang, url }) => (
       `<link rel="alternate" hreflang="${hreflang}" href="${url}">`
     )),
-    `<link rel="alternate" hreflang="x-default" href="${defaultPage.url}">`,
   ].join("");
 
   return new HTMLRewriter()
