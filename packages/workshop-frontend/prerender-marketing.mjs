@@ -1,8 +1,9 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
 import { createServer } from 'vite'
 import tsconfigPaths from 'vite-tsconfig-paths'
+import { localizedPath, SITE_PAGES } from '../site-config/src/index.ts'
 
 function escapeHtml(value) {
   return value
@@ -12,9 +13,13 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;')
 }
 
+function serializeStructuredData(value) {
+  return JSON.stringify(value).replaceAll('<', '\\u003c')
+}
+
 function startupVisibilityScript(page, accessMode, localeKeys) {
   return `<script>(() => {
-    const expectedPath = ${JSON.stringify(page.homePath)};
+    const expectedPath = ${JSON.stringify(page.documentPath)};
     let hide = ${JSON.stringify(accessMode)} || window.location.pathname !== expectedPath;
     try {
       hide ||= Boolean(window.localStorage.getItem('authToken'));
@@ -41,18 +46,29 @@ function startupVisibilityScript(page, accessMode, localeKeys) {
   })();</script>`
 }
 
-function createDocument(template, page, accessMode, localeKeys) {
+function outputFilePath(outputDirectory, publicPath) {
+  const relativeDirectory = publicPath === '/' ? '' : publicPath.slice(1)
+  return join(outputDirectory, relativeDirectory, 'index.html')
+}
+
+export function createDocument(template, page, accessMode, localeKeys) {
   const title = escapeHtml(page.title)
   const description = escapeHtml(page.description)
+  const openGraphTitle = escapeHtml(page.openGraphTitle)
+  const openGraphDescription = escapeHtml(page.openGraphDescription)
+  const structuredData = page.structuredData
+    .map(value => `<script type="application/ld+json">${serializeStructuredData(value)}</script>`)
+    .join('\n    ')
   const metadata = `<title>${title}</title>
     <meta name="description" content="${description}" />
     <meta property="og:type" content="website" />
     <meta property="og:locale" content="${page.locale === 'zh' ? 'zh_CN' : 'en_US'}" />
-    <meta property="og:title" content="${title}" />
-    <meta property="og:description" content="${description}" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="${title}" />
-    <meta name="twitter:description" content="${description}" />`
+    <meta property="og:title" content="${openGraphTitle}" />
+    <meta property="og:description" content="${openGraphDescription}" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="${openGraphTitle}" />
+    <meta name="twitter:description" content="${openGraphDescription}" />
+    ${structuredData}`
   const root = `<div id="root" data-prerendered-locale="${page.locale}">${page.body}</div>
     ${startupVisibilityScript(page, accessMode, localeKeys)}`
 
@@ -61,9 +77,9 @@ function createDocument(template, page, accessMode, localeKeys) {
   }
 
   return template
-    .replace(/<html lang="[^"]*">/, `<html lang="${page.locale}">`)
-    .replace(/<title>[\s\S]*?<\/title>/, metadata)
-    .replace('<div id="root"></div>', root)
+    .replace(/<html lang="[^"]*">/, () => `<html lang="${page.locale}">`)
+    .replace(/<title>[\s\S]*?<\/title>/, () => metadata)
+    .replace('<div id="root"></div>', () => root)
 }
 
 export function prerenderMarketingPages() {
@@ -88,9 +104,8 @@ export function prerenderMarketingPages() {
         mode: config.mode,
         plugins: [react(), tsconfigPaths()],
         resolve: {
-          // Keep the SSR/prerender Vite server in sync with the production build. y-monaco still
-          // imports this legacy Monaco path while Monaco 0.56 exposes the editor entrypoint via
-          // the package export below.
+          // Keep the prerender Vite server equal to the production build. y-monaco still imports
+          // this old Monaco path while Monaco 0.56 exports the editor from the path below.
           alias: {
             'monaco-editor/esm/vs/editor/editor.api.js': 'monaco-editor/editor',
           },
@@ -110,14 +125,32 @@ export function prerenderMarketingPages() {
           bareRootResolved: BARE_ROOT_RESOLVED_KEY,
           preference: LOCALE_PREFERENCE_KEY,
         }
-        const english = await renderMarketingPage('en')
-        const chinese = await renderMarketingPage('zh')
+        const targets = SITE_PAGES
+          .filter(page => page.enabled && page.prerendered)
+          .flatMap(page => page.locales.map(locale => ({
+            locale,
+            pagePath: page.path,
+            publicPath: localizedPath(page.path, locale),
+          })))
+        const documents = []
+        // The renderer changes the shared Paraglide locale. Render one target at a time.
+        for (const target of targets) {
+          documents.push({
+            ...target,
+            content: createDocument(
+              template,
+              await renderMarketingPage(target.pagePath, target.locale),
+              accessMode,
+              localeKeys,
+            ),
+          })
+        }
 
-        await mkdir(join(outputDirectory, 'zh'), { recursive: true })
-        await Promise.all([
-          writeFile(join(outputDirectory, 'index.html'), createDocument(template, english, accessMode, localeKeys)),
-          writeFile(join(outputDirectory, 'zh', 'index.html'), createDocument(template, chinese, accessMode, localeKeys)),
-        ])
+        await Promise.all(documents.map(async ({ content, publicPath }) => {
+          const outputPath = outputFilePath(outputDirectory, publicPath)
+          await mkdir(dirname(outputPath), { recursive: true })
+          await writeFile(outputPath, content)
+        }))
       } finally {
         await server.close()
       }

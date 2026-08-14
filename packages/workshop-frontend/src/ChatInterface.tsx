@@ -126,7 +126,7 @@ import { formatLocaleNumber } from "./utils/formatNumber";
 import { copyToClipboard } from "./clipboard";
 import { m as uiMessages } from "./paraglide/messages.js";
 import { getLocale } from "./paraglide/runtime.js";
-import { useSiteName } from "./ServerConfigContext";
+import { useAssistantName } from "./ServerConfigContext";
 import {
   composerDraftStorageKey,
   decorateComposerDraft,
@@ -1146,8 +1146,8 @@ function SlashCommandMention(
   },
 ) {
   const choice = useSlashCommandChoice(getOverseer, name ? id : undefined);
-  const siteName = useSiteName();
-  const presentation = choice && presentSlashCommandChoice(choice, siteName);
+  const assistantName = useAssistantName();
+  const presentation = choice && presentSlashCommandChoice(choice, assistantName);
   const mention = name ? <span className="text-kumo-brand">/{name}</span> : null;
   const command = presentation
     ? (
@@ -1973,7 +1973,7 @@ export const ChatInput = ({
    * pre-approval catalog and proactively offer to pre-approve its actions. */
 }) => {
   const toasts = useKumoToastManager();
-  const siteName = useSiteName();
+  const assistantName = useAssistantName();
   const [initialDraft] = useState(() => readComposerDraft(draftStorageKey));
   const [inputValue, setInputValue] = useState(() => initialDraft?.text ?? "");
   const [capsules, setCapsules] = useState<InputCapsule[]>([]);
@@ -3306,7 +3306,7 @@ export const ChatInput = ({
     ? uiMessages.composer_no_agent()
     : models.find((model) => model.id === selectedModel)?.name ?? selectedModel;
   const selectedSlashCommandPresentation = selectedSlashCommand
-    ? presentSlashCommandChoice(selectedSlashCommand.choice, siteName)
+    ? presentSlashCommandChoice(selectedSlashCommand.choice, assistantName)
     : null;
 
   const hasReadyAttachment = pendingAttachments.some(

@@ -107,7 +107,8 @@ describe('locale browser integration', () => {
 
     initializeLocale()
 
-    expect(messages.brand_name()).toBe('azhen')
+    expect(messages.brand_name()).toBe('UGC Angle')
+    expect(messages.assistant_name()).toBe('azhen')
     expect(localStorage.getItem('PARAGLIDE_LOCALE')).toBe('zh')
   })
 
@@ -119,6 +120,7 @@ describe('locale browser integration', () => {
 
     expect(window.location.pathname).toBe('/zh')
     expect(document.documentElement.lang).toBe('zh')
+    expect(messages.assistant_name()).toBe('阿珍')
     expect(localStorage.getItem('azhen.bareRootLocaleResolved')).toBe('1')
   })
 

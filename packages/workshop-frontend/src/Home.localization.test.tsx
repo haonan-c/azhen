@@ -73,7 +73,7 @@ describe('localized Workshop Home', () => {
     expect(container?.textContent).toContain('Ask a question, create an output')
     expect(container?.textContent).toContain('Get started')
     expect(container?.querySelector('[aria-label="Example tasks"]')).not.toBeNull()
-    expect(document.title).toBe('Home - azhen')
+    expect(document.title).toBe('Home - UGC Angle')
   })
 
   it('renders Chinese task suggestions and seeds the localized prompt', async () => {
@@ -86,7 +86,7 @@ describe('localized Workshop Home', () => {
     expect(container?.textContent).toContain('制作团队会议演示文稿')
     expect(container?.textContent).toContain('从数据中发现洞察')
     expect(container?.querySelector('[aria-label="任务示例"]')).not.toBeNull()
-    expect(document.title).toBe('首页 - 阿珍')
+    expect(document.title).toBe('首页 - UGC Angle')
 
     const suggestion = [...container!.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.includes('撰写一对一会前材料'))!

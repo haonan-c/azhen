@@ -104,8 +104,8 @@ describe('root session validation', () => {
   }
 
   it.each([
-    { href: '/', heading: 'From brief to usable result.' },
-    { href: '/zh', heading: '从任务到可用成果。' },
+    { href: '/', heading: 'AI UGC ads start with the angle, not the prompt' },
+    { href: '/zh', heading: 'AI UGC 广告的起点是角度，不是提示词' },
   ])('shows the localized Marketing Landing Page with no stored token at $href', async ({ href, heading }) => {
     window.history.replaceState({}, '', href)
     const api = createPublicApi(() => { throw new Error('unexpected authentication') })
@@ -151,8 +151,8 @@ describe('root session validation', () => {
   })
 
   it.each([
-    { href: '/', heading: 'From brief to usable result.' },
-    { href: '/zh', heading: '从任务到可用成果。' },
+    { href: '/', heading: 'AI UGC ads start with the angle, not the prompt' },
+    { href: '/zh', heading: 'AI UGC 广告的起点是角度，不是提示词' },
   ])('clears an invalid session and shows the Marketing Landing Page at $href', async ({ href, heading }) => {
     window.history.replaceState({}, '', href)
     localStorage.setItem('authToken', 'invalid-token')

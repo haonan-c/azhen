@@ -1,4 +1,5 @@
 import { renderToString } from 'react-dom/server'
+import { BRAND_NAME, localizedPath, type SiteLocale } from '@gadgets/site-config'
 import {
   createMemoryHistory,
   createRootRoute,
@@ -7,27 +8,46 @@ import {
   RouterProvider,
 } from '@tanstack/react-router'
 import MarketingLandingPage from './MarketingLandingPage'
+import { marketingFaq } from './marketingContent'
 import { ServerConfigContext } from './ServerConfigContext'
-import { localeUrlRewrite, localizedHomePath } from './locale'
+import { localeUrlRewrite } from './locale'
 import {
   getLocale,
   overwriteGetLocale,
-  type Locale,
 } from './paraglide/runtime.js'
 import { m as messages } from './paraglide/messages.js'
 
 export { BARE_ROOT_RESOLVED_KEY, LOCALE_PREFERENCE_KEY } from './locale'
 
+/** One localized Marketing Landing Page rendered for a production HTML document. */
 export interface PrerenderedMarketingPage {
+  /** Server-rendered markup for the document root. */
   body: string
+  /** The document meta description. */
   description: string
-  homePath: string
-  locale: Locale
+  /** The localized public path of the document. */
+  documentPath: string
+  /** The locale of the document. */
+  locale: SiteLocale
+  /** The Open Graph and Twitter description. */
+  openGraphDescription: string
+  /** The Open Graph and Twitter title. */
+  openGraphTitle: string
+  /** The document-level structured data objects. */
+  structuredData: readonly Record<string, unknown>[]
+  /** The document title. */
   title: string
 }
 
 /** Render one localized Marketing Landing Page for a production HTML document. */
-export async function renderMarketingPage(locale: Locale): Promise<PrerenderedMarketingPage> {
+export async function renderMarketingPage(
+  pagePath: string,
+  locale: SiteLocale,
+): Promise<PrerenderedMarketingPage> {
+  if (pagePath !== '/') {
+    throw new Error(`No prerender component is registered for the enabled site page "${pagePath}".`)
+  }
+
   const previousGetLocale = getLocale
   overwriteGetLocale(() => locale)
 
@@ -43,27 +63,52 @@ export async function renderMarketingPage(locale: Locale): Promise<PrerenderedMa
       path: '/signup',
       component: () => null,
     })
-    const homePath = localizedHomePath(locale)
+    const documentPath = localizedPath(pagePath, locale)
     const router = createRouter({
-      history: createMemoryHistory({ initialEntries: [homePath] }),
+      history: createMemoryHistory({ initialEntries: [documentPath] }),
       routeTree: rootRoute.addChildren([homeRoute, signupRoute]),
       rewrite: localeUrlRewrite,
     })
 
     await router.load()
 
-    const brandName = messages.brand_name({}, { locale })
-    const pageTitle = messages.marketing_document_title({}, { locale })
+    const faq = marketingFaq(locale)
     return {
       body: renderToString(
         <ServerConfigContext.Provider value={null}>
           <RouterProvider router={router} />
         </ServerConfigContext.Provider>,
       ),
-      description: messages.marketing_hero_description({}, { locale }),
-      homePath,
+      description: messages.marketing_meta_description({}, { locale }),
+      documentPath,
       locale,
-      title: `${pageTitle} - ${brandName}`,
+      openGraphDescription: messages.marketing_og_description({}, { locale }),
+      openGraphTitle: messages.marketing_og_title({}, { locale }),
+      structuredData: [
+        {
+          '@context': 'https://schema.org',
+          '@type': 'Organization',
+          name: BRAND_NAME,
+        },
+        {
+          '@context': 'https://schema.org',
+          '@type': 'WebSite',
+          name: BRAND_NAME,
+        },
+        {
+          '@context': 'https://schema.org',
+          '@type': 'FAQPage',
+          mainEntity: faq.map(({ question, answer }) => ({
+            '@type': 'Question',
+            name: question,
+            acceptedAnswer: {
+              '@type': 'Answer',
+              text: answer,
+            },
+          })),
+        },
+      ],
+      title: messages.marketing_document_title({}, { locale }),
     }
   } finally {
     overwriteGetLocale(previousGetLocale)
