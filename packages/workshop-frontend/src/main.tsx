@@ -220,7 +220,18 @@ const canHydrate = !hasStoredSession
   && window.location.pathname === prerenderedHome
 
 if (canHydrate) {
-  hydrateRoot(rootElement, app, rootOptions)
+  // The prerender waits for its memory router before rendering. Resolve the browser router too so
+  // RouterProvider's Suspense boundary has the same content when React starts hydrating.
+  void router.load().then(
+    () => {
+      hydrateRoot(rootElement, app, rootOptions)
+    },
+    () => {
+      // A failed router state cannot hydrate the successful prerender, so mount a client root.
+      rootElement.replaceChildren()
+      createRoot(rootElement, rootOptions).render(app)
+    },
+  )
 } else {
   rootElement.replaceChildren()
   createRoot(rootElement, rootOptions).render(app)
