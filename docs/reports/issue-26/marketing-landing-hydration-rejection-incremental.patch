@@ -1,0 +1,50 @@
+diff --git a/packages/workshop-frontend/src/main.test.tsx b/packages/workshop-frontend/src/main.test.tsx
+index 3909d9538e4270131b1760248ac4916051982100..3abdf3f8fa22fce664cb74b76b2616de94aeb036 100644
+--- a/packages/workshop-frontend/src/main.test.tsx
++++ b/packages/workshop-frontend/src/main.test.tsx
+@@ -108,6 +108,21 @@ describe('Workshop client entry', () => {
+     expect(rootElement.firstElementChild).toBe(serverNode)
+   })
+ 
++  it('falls back to a client root when prerender router loading fails', async () => {
++    testState.load.mockRejectedValue(new Error('route load failed'))
++    document.body.innerHTML = '<div id="root" hidden data-prerendered-locale="en"><p>server markup</p></div>'
++    const rootElement = document.getElementById('root')!
++
++    await import('./main')
++
++    await vi.waitFor(() => expect(testState.createRoot).toHaveBeenCalledOnce())
++    expect(testState.load).toHaveBeenCalledOnce()
++    expect(testState.hydrateRoot).not.toHaveBeenCalled()
++    expect(testState.createRoot.mock.calls[0][0]).toBe(rootElement)
++    expect(testState.render).toHaveBeenCalledOnce()
++    expect(rootElement.childNodes).toHaveLength(0)
++  })
++
+   it('keeps the non-prerendered createRoot path immediate', async () => {
+     window.history.replaceState({}, '', '/workspaces')
+     document.body.innerHTML = '<div id="root"><p>stale markup</p></div>'
+diff --git a/packages/workshop-frontend/src/main.tsx b/packages/workshop-frontend/src/main.tsx
+index 9c7536bced3426140f0129db4267dcd0d4d367f5..0ad177849b42880f54ef24dcb8d1156a9fa685e1 100644
+--- a/packages/workshop-frontend/src/main.tsx
++++ b/packages/workshop-frontend/src/main.tsx
+@@ -222,9 +222,16 @@ const canHydrate = !hasStoredSession
+ if (canHydrate) {
+   // The prerender waits for its memory router before rendering. Resolve the browser router too so
+   // RouterProvider's Suspense boundary has the same content when React starts hydrating.
+-  void router.load().then(() => {
+-    hydrateRoot(rootElement, app, rootOptions)
+-  })
++  void router.load().then(
++    () => {
++      hydrateRoot(rootElement, app, rootOptions)
++    },
++    () => {
++      // A failed router state cannot hydrate the successful prerender, so mount a client root.
++      rootElement.replaceChildren()
++      createRoot(rootElement, rootOptions).render(app)
++    },
++  )
+ } else {
+   rootElement.replaceChildren()
+   createRoot(rootElement, rootOptions).render(app)
