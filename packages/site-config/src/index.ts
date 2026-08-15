@@ -36,6 +36,9 @@ export const SITE_PAGES: readonly SitePage[] = [
 
 const HREFLANG: Record<SiteLocale, string> = { en: "en", zh: "zh-Hans" };
 
+/** x-default always resolves to English, by deliberate product decision (not page.locales order). */
+export const DEFAULT_LOCALE: SiteLocale = "en";
+
 /** Return the localized public path for one site page. */
 export function localizedPath(path: string, locale: SiteLocale): string {
   const prefix = LOCALE_PREFIX[locale];
@@ -55,7 +58,7 @@ export function alternatesOf(origin: string, page: SitePage) {
       hreflang: HREFLANG[locale],
       url: canonicalUrl(origin, page.path, locale),
     })),
-    { hreflang: "x-default", url: canonicalUrl(origin, page.path, "en") },
+    { hreflang: "x-default", url: canonicalUrl(origin, page.path, DEFAULT_LOCALE) },
   ];
 }
 
