@@ -176,7 +176,7 @@ export default function MarketingLandingPage({
 
   useEffect(() => {
     const stored = readStoredRun()
-    if (!stored) return
+    if (!stored || stored.locale !== locale) return
     setProduct(stored.product)
     setMarket(stored.market)
     setCompletedRun({

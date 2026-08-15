@@ -402,9 +402,8 @@ describe('Marketing Landing Page', () => {
     })
   })
 
-  it('restores one stored Anonymous Angle Run after a locale change', async () => {
+  it('restores a stored Anonymous Angle Run when the locale matches', async () => {
     const english = localeCases[0]
-    const chinese = localeCases[1]
     sessionStorage.setItem(ANONYMOUS_ANGLE_RUN_SESSION_KEY, JSON.stringify({
       version: 1,
       locale: english.locale,
@@ -414,20 +413,38 @@ describe('Marketing Landing Page', () => {
       selectedIndex: 1,
     }))
 
-    await renderPage({ href: chinese.href })
+    await renderPage({ href: english.href })
 
     expect(container!.querySelector<HTMLInputElement>('input[name="product"]')?.value)
       .toBe(english.product)
     expect(container!.querySelector<HTMLInputElement>('input[name="market"]')?.value)
       .toBe(english.market)
     const results = container!.querySelector<HTMLElement>('#anonymous-angle-results')!
-    expect(results.querySelector('h2')?.textContent).toBe(chinese.resultHeading)
+    expect(results.querySelector('h2')?.textContent).toBe(english.resultHeading)
     expect(results.querySelectorAll('[data-angle-card]')).toHaveLength(3)
     expect(results.textContent).toContain(english.angles[1].name)
-    expect(results.querySelector<HTMLAnchorElement>('a[href]')?.textContent)
-      .toContain(chinese.selectedCallToAction)
-    expect(JSON.parse(sessionStorage.getItem(ANONYMOUS_ANGLE_RUN_SESSION_KEY) ?? 'null').locale)
-      .toBe(chinese.locale)
+  })
+
+  it('does not restore a stored Anonymous Angle Run after a locale change', async () => {
+    const english = localeCases[0]
+    const chinese = localeCases[1]
+    const stored = {
+      version: 1,
+      locale: english.locale,
+      product: english.product,
+      market: english.market,
+      angles: english.angles,
+      selectedIndex: 1,
+    }
+    sessionStorage.setItem(ANONYMOUS_ANGLE_RUN_SESSION_KEY, JSON.stringify(stored))
+
+    await renderPage({ href: chinese.href })
+
+    expect(container!.querySelector<HTMLInputElement>('input[name="product"]')?.value).toBe('')
+    expect(container!.querySelector<HTMLInputElement>('input[name="market"]')?.value).toBe('')
+    expect(container!.querySelector('#anonymous-angle-results')).toBeNull()
+    expect(JSON.parse(sessionStorage.getItem(ANONYMOUS_ANGLE_RUN_SESSION_KEY) ?? 'null'))
+      .toEqual(stored)
   })
 
   it('keeps administrator site branding and the uploaded logo behavior', async () => {
