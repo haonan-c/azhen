@@ -31,7 +31,7 @@
   },
   "commit": "0000000000000000000000000000000000000000",
   "createdAt": "2026-01-01T00:00:00.000Z",
-  "manifestVersion": 1,
+  "manifestVersion": 2,
   "releaseId": "r000000-fixture",
   "workers": {
     "gatekeeper-cloudflare": {
@@ -1156,6 +1156,24 @@
         {
           "name": "BROWSER",
           "type": "browser"
+        },
+        {
+          "name": "ANONYMOUS_ANGLE_RUN_RATE_LIMITER",
+          "namespace_id": "1",
+          "simple": {
+            "limit": 1,
+            "period": 60
+          },
+          "type": "ratelimit"
+        },
+        {
+          "name": "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER",
+          "namespace_id": "2",
+          "simple": {
+            "limit": 30,
+            "period": 60
+          },
+          "type": "ratelimit"
         },
         {
           "name": "LOADER",
