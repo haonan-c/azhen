@@ -65,5 +65,11 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Browser PDF exports use the same local CJK fallback fonts available in production.
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fonts-noto-cjk
+
       - name: Test
         run: pnpm test
