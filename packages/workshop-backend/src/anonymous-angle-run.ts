@@ -1,7 +1,6 @@
 import {
-  ANONYMOUS_ANGLE_RUN_MARKET_MAX_CHARS,
-  ANONYMOUS_ANGLE_RUN_PRODUCT_MAX_CHARS,
-  type AnonymousAdAngle,
+  normalizeAnonymousAngleRunRequest,
+  normalizeAnonymousAngleRunResponse,
   type AnonymousAngleRunErrorCode,
   type AnonymousAngleRunErrorResponse,
   type AnonymousAngleRunRequest,
@@ -16,13 +15,11 @@ import {
   type CfAccessEnv,
 } from "./access.js";
 import { getAiGatewayConfig } from "./ai-gateway.js";
-import { completeText } from "./ai-invoke.js";
+import { AgentTurnError, completeText } from "./ai-invoke.js";
 import { getModel } from "./ai-models.js";
 
 // The request fields can expand when they use UTF-8 or JSON escapes.
 const MAX_BODY_BYTES = 16 * 1024;
-const MAX_ANGLE_NAME_CHARS = 80;
-const MAX_ANGLE_FIELD_CHARS = 320;
 const MAX_MODEL_TOKENS = 1_200;
 const MODEL_TIMEOUT_MS = 60_000;
 const BUDGET_RATE_LIMIT_KEY = "anonymous-angle-run";
@@ -125,47 +122,6 @@ async function readBoundedJson(
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizedString(value: unknown, maxChars: number): string | null {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim();
-  const length = [...normalized].length;
-  if (length < 1 || length > maxChars) return null;
-  return normalized;
-}
-
-function normalizeRequest(input: unknown): AnonymousAngleRunRequest | null {
-  if (!isRecord(input)) return null;
-  const product = normalizedString(input.product, ANONYMOUS_ANGLE_RUN_PRODUCT_MAX_CHARS);
-  const market = normalizedString(input.market, ANONYMOUS_ANGLE_RUN_MARKET_MAX_CHARS);
-  const locale = input.locale;
-  if (!product || !market || (locale !== "en" && locale !== "zh")) return null;
-  return { product, market, locale };
-}
-
-function normalizeAngle(input: unknown): AnonymousAdAngle | null {
-  if (!isRecord(input)) return null;
-  const name = normalizedString(input.name, MAX_ANGLE_NAME_CHARS);
-  const tension = normalizedString(input.tension, MAX_ANGLE_FIELD_CHARS);
-  const hypothesis = normalizedString(input.hypothesis, MAX_ANGLE_FIELD_CHARS);
-  const openingHook = normalizedString(input.openingHook, MAX_ANGLE_FIELD_CHARS);
-  const worthTesting = normalizedString(input.worthTesting, MAX_ANGLE_FIELD_CHARS);
-  if (!name || !tension || !hypothesis || !openingHook || !worthTesting) return null;
-  return { name, tension, hypothesis, openingHook, worthTesting };
-}
-
-function normalizeModelValue(input: unknown): AnonymousAngleRunResponse | null {
-  if (!isRecord(input) || !Array.isArray(input.angles) || input.angles.length !== 3) return null;
-  const first = normalizeAngle(input.angles[0]);
-  const second = normalizeAngle(input.angles[1]);
-  const third = normalizeAngle(input.angles[2]);
-  if (!first || !second || !third) return null;
-  return { angles: [first, second, third] };
-}
-
 function parseModelOutput(output: string): AnonymousAngleRunResponse | null {
   const trimmed = output.trim();
   const candidates = [trimmed];
@@ -179,7 +135,7 @@ function parseModelOutput(output: string): AnonymousAngleRunResponse | null {
 
   for (const candidate of candidates) {
     try {
-      const result = normalizeModelValue(JSON.parse(candidate));
+      const result = normalizeAnonymousAngleRunResponse(JSON.parse(candidate));
       if (result) return result;
     } catch {
       // Try the next bounded extraction form.
@@ -209,6 +165,22 @@ async function completeAnonymousAngleRun(
     maxTokens: MAX_MODEL_TOKENS,
     signal,
   });
+}
+
+async function runAnonymousAngleCompletion(
+  completion: Completion,
+  env: Cloudflare.Env,
+  config: AiModelConfig,
+  input: AnonymousAngleRunRequest,
+  signal: AbortSignal,
+): Promise<string> {
+  try {
+    return await completion(env, config, input, signal);
+  } catch (error) {
+    if (!(error instanceof AgentTurnError)) throw error;
+    const status = error.statusCode === undefined ? "" : ` with status ${error.statusCode}`;
+    throw new Error(`Anonymous Angle Run model request failed${status}.`, { cause: error });
+  }
 }
 
 function quickModelConfig(env: Cloudflare.Env): AiModelConfig | null {
@@ -256,7 +228,7 @@ export async function handleAnonymousAngleRunRequest(
   const body = await readBoundedJson(request);
   if (body === PAYLOAD_TOO_LARGE) return errorResponse("payload_too_large", 413);
   if (body === INVALID_JSON) return errorResponse("invalid_request", 400);
-  const input = normalizeRequest(body);
+  const input = normalizeAnonymousAngleRunRequest(body);
   if (!input) return errorResponse("invalid_request", 400);
 
   const actorLimiter = env.ANONYMOUS_ANGLE_RUN_RATE_LIMITER;
@@ -266,25 +238,33 @@ export async function handleAnonymousAngleRunRequest(
   if (!modelConfig) return errorResponse("unavailable", 503);
 
   try {
-    const actorOutcome = await actorLimiter.limit({ key: actorKey });
+    const actorOutcome = await actorLimiter.limit({ key: `${url.origin}:${actorKey}` });
     if (!actorOutcome.success) return errorResponse("rate_limited", 429);
-    const budgetOutcome = await budgetLimiter.limit({ key: BUDGET_RATE_LIMIT_KEY });
+    const budgetOutcome = await budgetLimiter.limit({
+      key: `${url.origin}:${BUDGET_RATE_LIMIT_KEY}`,
+    });
     if (!budgetOutcome.success) return errorResponse("rate_limited", 429);
-  } catch {
+  } catch (error) {
     logger.warn("anonymous angle run rate limit failed", {
       event: "anonymous_angle_run.rate_limit.failed",
-      error: new Error("The rate limit request failed."),
+      error,
     });
     return errorResponse("unavailable", 503);
   }
 
   let output: string;
   try {
-    output = await completion(env, modelConfig, input, AbortSignal.timeout(MODEL_TIMEOUT_MS));
-  } catch {
+    output = await runAnonymousAngleCompletion(
+      completion,
+      env,
+      modelConfig,
+      input,
+      AbortSignal.timeout(MODEL_TIMEOUT_MS),
+    );
+  } catch (error) {
     logger.warn("anonymous angle run model request failed", {
       event: "anonymous_angle_run.model.failed",
-      error: new Error("The model request failed."),
+      error,
     });
     return errorResponse("unavailable", 503);
   }

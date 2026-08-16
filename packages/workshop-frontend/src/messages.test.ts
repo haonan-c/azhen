@@ -5,6 +5,20 @@ import chinese from '../messages/zh.json'
 const messageKeys = (catalog: Record<string, string>) =>
   Object.keys(catalog).filter(key => key !== '$schema').sort()
 
+const anonymousAngleRunMessageKeys = [
+  'marketing_document_title',
+  'marketing_meta_description',
+  'marketing_og_description',
+  'marketing_hero_description',
+  'marketing_hero_limit',
+  'marketing_hero_unavailable',
+  'marketing_hero_rate_limited',
+  'marketing_hero_forbidden',
+  'marketing_hero_error',
+  'marketing_hero_register_prompt',
+  'marketing_faq_a8',
+] as const
+
 const requiredAuthMessages = [
   'auth_account_creation_error_title',
   'auth_cancelled',
@@ -513,6 +527,15 @@ describe('message catalogs', () => {
 
   it('includes every Marketing Landing Page message', () => {
     expect(messageKeys(english)).toEqual(expect.arrayContaining([...requiredMarketingMessages]))
+  })
+
+  it('uses Anonymous Angle Run vocabulary instead of generation vocabulary', () => {
+    for (const key of anonymousAngleRunMessageKeys) {
+      expect(english[key]).not.toMatch(/\bgenerat(?:e|ed|es|ing|ion)\b/i)
+      expect(chinese[key]).not.toContain('生成')
+    }
+    expect(chinese.anonymous_angle_handoff_angle).toContain('开场 Hook')
+    expect(chinese.anonymous_angle_handoff_angle).not.toContain('开场钩子')
   })
 
   it('includes every Prompt Composer and Workspace creation message', () => {

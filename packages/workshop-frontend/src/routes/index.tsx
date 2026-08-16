@@ -20,16 +20,22 @@ import {
   persistSelectedModel,
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
-import { homePromptFromSearch } from "../homePrompt";
+import { homePromptFromSearch, marketingPageRequestedFromSearch } from "../homePrompt";
 import { m as messages } from "../paraglide/messages.js";
 import { composerDraftStorageKey } from "../composerDraft";
+import {
+  anonymousAngleRunHandoffPrompt,
+  clearStoredAnonymousAngleRun,
+  readStoredAnonymousAngleRun,
+} from "../anonymousAngleRunSession";
 
-type HomeSearch = { prompt?: string };
+type HomeSearch = { prompt?: string; marketing?: boolean };
 
 export const Route = createFileRoute("/")({
   component: HomePage,
   validateSearch: (search: Record<string, unknown>): HomeSearch => ({
     prompt: homePromptFromSearch(search.prompt),
+    marketing: marketingPageRequestedFromSearch(search.marketing) ? true : undefined,
   }),
 });
 
@@ -49,8 +55,15 @@ export function HomePageContent({ prompt }: HomeSearch) {
 
   const [models, setModels] = useState<AiChatAuthorInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [anonymousAngleHandoff] = useState(() => {
+    const storedRun = readStoredAnonymousAngleRun();
+    const text = storedRun ? anonymousAngleRunHandoffPrompt(storedRun) : null;
+    return text ? { text } : null;
+  });
   // Bumped each time a task suggestion is picked; the composer re-seeds its text off the nonce.
-  const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(null);
+  const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(() =>
+    anonymousAngleHandoff ? { text: anonymousAngleHandoff.text, nonce: 1 } : null
+  );
 
   useEffect(() => {
     if (!prompt) return;
@@ -120,6 +133,9 @@ export function HomePageContent({ prompt }: HomeSearch) {
         ]);
         provisionalOverseerRef.current?.stub[Symbol.dispose]();
         provisionalOverseerRef.current = null;
+        if (typeof message === "string" && message === anonymousAngleHandoff?.text) {
+          clearStoredAnonymousAngleRun();
+        }
         // Open the conversation we just started.
         navigate({ to: "/workspace/$id", params: { id }, search: { chat } });
       } catch (err) {
@@ -136,7 +152,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
         throw err;
       }
     },
-    [ensureProvisionalGadget, navigate, toasts],
+    [anonymousAngleHandoff, ensureProvisionalGadget, navigate, toasts],
   );
 
   const getOverseer = useCallback((): RpcStub<Overseer> => {

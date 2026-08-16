@@ -101,17 +101,17 @@
   },
 
   // The Anonymous Angle Run endpoint (anonymous-angle-run.ts) fails closed with 503 unless both
-  // of these RateLimit bindings exist. namespace_id is a self-chosen identifier scoped to this
-  // worker, not a provisioned resource, so the same literal is safe across every deployment.
+  // RateLimit bindings exist. These stable, high-entropy namespace ids are shared intentionally
+  // across installed instances; every counter key includes the instance origin to keep them apart.
   "ratelimits": [
     {
       "name": "ANONYMOUS_ANGLE_RUN_RATE_LIMITER",
-      "namespace_id": "1",
+      "namespace_id": "1588061051727226",
       "simple": { "limit": 1, "period": 60 }
     },
     {
       "name": "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER",
-      "namespace_id": "2",
+      "namespace_id": "1937878701311225",
       "simple": { "limit": 30, "period": 60 }
     }
   ]

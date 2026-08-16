@@ -31,8 +31,8 @@ const HANDLED_CONFIG_KEYS = new Set([
   // Browser Rendering (Gadget PDF exports). Unlike artifacts it is generally available, so it
   // passes through to customer instances as a placeholder-free binding, like the AI binding.
   "browser",
-  // RateLimit bindings. namespace_id is a self-chosen identifier, not a provisioned resource
-  // (unlike kv_namespaces/r2_buckets), so it passes through placeholder-free like browser.
+  // RateLimit bindings use stable package-owned namespace ids rather than provisioned resources.
+  // Their keys must carry instance identity when releases can share one Cloudflare account.
   "ratelimits",
   // gatekeeper-context's Artifacts binding is closed-beta and cannot be provisioned in arbitrary
   // user accounts; it is dropped from customer manifests (the gatekeeper degrades gracefully).

@@ -86,10 +86,10 @@ const expectedStaticSectionOrder = [
 const localizedExpectations = [
   {
     locale: 'en',
-    title: 'AI UGC Ad Angles and Scripts in 60 Seconds | UGC Angle',
-    description: 'See what AI UGC ads are actually made of before you make one. UGC Angle turns your product and your market into 3 testable ad angles — each with the tension it targets, the hypothesis, and a ready-to-shoot script. Free, no account.',
+    title: 'AI UGC Ad Angles in 60 Seconds | UGC Angle',
+    description: 'See what AI UGC ads are actually made of before you make one. UGC Angle turns your product and your market into 3 testable ad angles — each with its tension, hypothesis, opening Hook, and reason to test. Free, no account.',
     openGraphTitle: 'AI UGC ads start with the angle, not the prompt',
-    openGraphDescription: '3 testable ad angles and a script for your product, in 60 seconds. Free, no account.',
+    openGraphDescription: '3 testable ad angles for your product and market, in about 60 seconds. Free, no account.',
     heading: 'AI UGC ads start with the angle, not the prompt',
     sections: {
       'marketing-steps': 'From a product to a script you can shoot, in three steps',
@@ -123,10 +123,10 @@ const localizedExpectations = [
   },
   {
     locale: 'zh',
-    title: 'AI UGC 广告角度与脚本，60 秒生成 | UGC Angle',
-    description: '在动手拍之前，先看清 AI UGC 广告到底由什么构成。输入产品与目标人群，60 秒拿到 3 个可测试的广告角度，每个都带人群张力、测试假设和可直接开拍的脚本。免费，无需注册。',
+    title: 'AI UGC 广告角度，约 60 秒返回 | UGC Angle',
+    description: '在动手拍之前，先看清 AI UGC 广告到底由什么构成。输入产品与目标人群，约 60 秒拿到 3 个可测试的广告角度，每个都带人群张力、测试假设、开场 Hook 和为什么值得测。免费，无需注册。',
     openGraphTitle: 'AI UGC 广告的起点是角度，不是提示词',
-    openGraphDescription: '约 60 秒拿到 3 个可测试的广告角度和一版脚本。免费，无需注册。',
+    openGraphDescription: '约 60 秒拿到 3 个可测试的广告角度。免费，无需注册。',
     heading: 'AI UGC 广告的起点是角度，不是提示词',
     sections: {
       'marketing-steps': '从产品到可开拍的脚本，三步',

@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleAnonymousAngleRunRequest } from "../src/anonymous-angle-run.js";
+import { AgentTurnError } from "../src/ai-invoke.js";
 
 const validInput = {
   product: "A compact standing desk",
@@ -73,6 +74,8 @@ async function expectError(response: Response, status: number, error: string) {
 }
 
 describe("handleAnonymousAngleRunRequest", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   it("rejects non-POST methods with the contract response", async () => {
     const { env, completion } = setup();
     const response = await handleAnonymousAngleRunRequest(
@@ -172,12 +175,18 @@ describe("handleAnonymousAngleRunRequest", () => {
 
   it("fails closed when a limiter call fails", async () => {
     const { env, actorLimit, completion } = setup();
-    actorLimit.mockRejectedValue(new Error("limiter details must stay private"));
+    const limiterError = new Error("limiter unavailable");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    actorLimit.mockRejectedValue(limiterError);
     const response = await handleAnonymousAngleRunRequest(request(), env, completion);
     const responseCopy = response.clone();
 
     await expectError(response, 503, "unavailable");
-    expect(await responseCopy.text()).not.toContain("limiter details");
+    expect(await responseCopy.text()).not.toContain("limiter unavailable");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: "anonymous_angle_run.rate_limit.failed",
+      error: "Error: limiter unavailable",
+    }));
     expect(completion).not.toHaveBeenCalled();
   });
 
@@ -205,8 +214,12 @@ describe("handleAnonymousAngleRunRequest", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.json()).toEqual(validResult);
-    expect(actorLimit).toHaveBeenCalledWith({ key: "ip:192.0.2.1" });
-    expect(budgetLimit).toHaveBeenCalledWith({ key: "anonymous-angle-run" });
+    expect(actorLimit).toHaveBeenCalledWith({
+      key: "https://workshop.example:ip:192.0.2.1",
+    });
+    expect(budgetLimit).toHaveBeenCalledWith({
+      key: "https://workshop.example:anonymous-angle-run",
+    });
     expect(completion).toHaveBeenCalledWith(
       env,
       expect.objectContaining({
@@ -251,13 +264,37 @@ describe("handleAnonymousAngleRunRequest", () => {
 
   it("returns unavailable without exposing a model failure", async () => {
     const { env, completion } = setup();
-    completion.mockRejectedValue(new Error("private provider response"));
+    const modelError = new Error("model request failed");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    completion.mockRejectedValue(modelError);
     const response = await handleAnonymousAngleRunRequest(request(), env, completion);
     const text = await response.text();
 
     expect(response.status).toBe(503);
     expect(JSON.parse(text)).toEqual({ error: "unavailable" });
-    expect(text).not.toContain("private provider response");
+    expect(text).not.toContain("model request failed");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: "anonymous_angle_run.model.failed",
+      error: "Error: model request failed",
+    }));
+  });
+
+  it("does not log a provider response body from an AgentTurnError", async () => {
+    const { env, completion } = setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    completion.mockRejectedValue(new AgentTurnError(
+      '400 {"error":"private provider response"}',
+      400,
+    ));
+
+    const response = await handleAnonymousAngleRunRequest(request(), env, completion);
+
+    expect(response.status).toBe(503);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: "anonymous_angle_run.model.failed",
+      error: "Error: Anonymous Angle Run model request failed with status 400.",
+    }));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private provider response");
   });
 
   it("uses a verified Access identity for the actor limit", async () => {
@@ -271,7 +308,9 @@ describe("handleAnonymousAngleRunRequest", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(actorLimit).toHaveBeenCalledWith({ key: "access-sub:user-1" });
+    expect(actorLimit).toHaveBeenCalledWith({
+      key: "https://workshop.example:access-sub:user-1",
+    });
     expect(verifyAccess).toHaveBeenCalledOnce();
   });
 

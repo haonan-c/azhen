@@ -1159,7 +1159,7 @@
         },
         {
           "name": "ANONYMOUS_ANGLE_RUN_RATE_LIMITER",
-          "namespace_id": "1",
+          "namespace_id": "1588061051727226",
           "simple": {
             "limit": 1,
             "period": 60
@@ -1168,7 +1168,7 @@
         },
         {
           "name": "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER",
-          "namespace_id": "2",
+          "namespace_id": "1937878701311225",
           "simple": {
             "limit": 30,
             "period": 60

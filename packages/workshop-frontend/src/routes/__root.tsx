@@ -15,6 +15,7 @@ import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
 import AccountSelectionModal from '../components/billing/AccountSelectionModal'
 import MarketingLandingPage from '../MarketingLandingPage'
+import { marketingPageRequestedFromSearch } from '../homePrompt'
 import { m as messages } from '../paraglide/messages.js'
 
 export const Route = createRootRoute({
@@ -26,6 +27,10 @@ export function RootComponent() {
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login, retry } = useAuth(rpcStub)
   const navigate = useNavigate()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
+  const marketingRequested = useRouterState({ select: (s) => {
+    const search = s.location.search as Record<string, unknown>
+    return marketingPageRequestedFromSearch(search.marketing)
+  } })
 
   // When authenticatedApi becomes available, the connection is proven alive.
   useEffect(() => {
@@ -41,6 +46,7 @@ export function RootComponent() {
   // Signed-in users get the full app chrome so public pages (esp. the blueprint detail) feel
   // native — sidebar and all — instead of floating on a bare page.
   const standalone = isSignup
+    || (isHome && marketingRequested && !isLoading && !error)
     || ((isHome || isBlueprint) && !isLoading && !error && !isAuthenticated)
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
@@ -100,11 +106,17 @@ export function RootComponent() {
   // Signed-out visitors of public routes render without the auth wrapper / app shell.
   if (standalone) {
     if (isHome) {
-      return <MarketingLandingPage onSignIn={() => navigate({
-        to: '/login',
-        search: true,
-        hash: true,
-      })} />
+      return <MarketingLandingPage
+        isAuthenticated={isAuthenticated}
+        onSignIn={() => navigate(isAuthenticated ? {
+          to: '/',
+          search: {},
+        } : {
+          to: '/login',
+          search: true,
+          hash: true,
+        })}
+      />
     }
     const showHeader = !isSignup
     return (

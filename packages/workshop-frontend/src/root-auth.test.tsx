@@ -130,6 +130,25 @@ describe('root session validation', () => {
     expect(container?.textContent).toBe('signed-out')
   })
 
+  it('lets a signed-in user open the Marketing Landing Page and return Home', async () => {
+    localStorage.setItem('authToken', 'stored-token')
+    const authenticated = createAuthenticatedApi(async () => AUTH_TEST_USER)
+    const router = await render('/?marketing=true', createPublicApi(() => authenticated.stub))
+
+    expect(container?.textContent).toContain('AI UGC ads start with the angle, not the prompt')
+    expect(container?.querySelector('[data-destination="home"]')).toBeNull()
+    expect(container?.querySelector('a[href="/signup"]')).toBeNull()
+    const back = [...container!.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent?.trim() === 'Back to Workshop')
+    expect(back).toBeDefined()
+
+    await act(async () => back!.click())
+
+    expect(router.state.location.pathname).toBe('/')
+    expect(router.state.location.search).toEqual({})
+    expect(container?.querySelector('[data-destination="home"]')).not.toBeNull()
+  })
+
   it.each([
     { href: '/', pending: 'Checking your session…' },
     { href: '/zh', pending: '正在验证会话…' },

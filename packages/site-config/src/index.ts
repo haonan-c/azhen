@@ -12,7 +12,7 @@ export const LOCALE_PREFIX: Record<SiteLocale, string> = { en: "", zh: "/zh" };
 
 /** One public page of the Production Site. */
 export interface SitePage {
-  /** Locale-free path. Always starts with "/"; only the root keeps a trailing slash. */
+  /** Locale-free canonical path. Always starts with "/" and keeps any required trailing slash. */
   path: string;
   /** Locales this page exists in. A locale absent here gets no document and no alternate. */
   locales: readonly SiteLocale[];
@@ -31,7 +31,7 @@ export const SITE_PAGES: readonly SitePage[] = [
   { path: "/about",   locales: ["en", "zh"], enabled: false, indexable: true, prerendered: true },
   { path: "/privacy", locales: ["en", "zh"], enabled: false, indexable: true, prerendered: true },
   { path: "/terms",   locales: ["en", "zh"], enabled: false, indexable: true, prerendered: true },
-  { path: "/hub",     locales: ["en"],       enabled: false, indexable: true, prerendered: true },
+  { path: "/hub/",    locales: ["en"],       enabled: false, indexable: true, prerendered: true },
 ];
 
 const HREFLANG: Record<SiteLocale, string> = { en: "en", zh: "zh-Hans" };

@@ -118,7 +118,7 @@ export function prerenderMarketingPages() {
         const {
           BARE_ROOT_RESOLVED_KEY,
           LOCALE_PREFERENCE_KEY,
-          renderMarketingPage,
+          renderSitePage,
         } = await server.ssrLoadModule('/src/marketing-prerender.tsx')
         const accessMode = config.env.VITE_CF_ACCESS_MODE === 'true'
         const localeKeys = {
@@ -139,7 +139,7 @@ export function prerenderMarketingPages() {
             ...target,
             content: createDocument(
               template,
-              await renderMarketingPage(target.pagePath, target.locale),
+              await renderSitePage(target.pagePath, target.locale),
               accessMode,
               localeKeys,
             ),

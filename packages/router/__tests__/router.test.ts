@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parse } from 'jsonc-parser';
-import { canonicalUrl, enabledPages } from '@gadgets/site-config';
+import { SITE_PAGES, canonicalUrl, enabledPages } from '@gadgets/site-config';
 import router, { type Env } from '../src/index';
 // Imported as text so the config-integrity tests run inside workerd without filesystem access.
 import wranglerConfigText from '../wrangler.jsonc?raw';
@@ -39,6 +39,14 @@ async function route(env: Env, path: string): Promise<string> {
 }
 
 describe('router fetch', () => {
+  it('reserves the Hub at its canonical directory path', () => {
+    const hub = SITE_PAGES.find(page => page.path.startsWith('/hub'));
+
+    expect(hub?.path).toBe('/hub/');
+    expect(canonicalUrl('https://production.example', hub!.path, 'en'))
+      .toBe('https://production.example/hub/');
+  });
+
   it.each([
     ['/', 'https://production.example/'],
     ['/zh', 'https://production.example/zh'],
@@ -106,7 +114,7 @@ describe('router fetch', () => {
     expect(body).not.toContain('Disallow:');
   });
 
-  it.each(['/pricing', '/hub', '/zh/pricing'])(
+  it.each(['/pricing', '/hub/', '/zh/pricing'])(
     'marks reserved site page %s as noindex and keeps it out of sitemap.xml',
     async (path) => {
       const env = makeEnv({

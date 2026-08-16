@@ -1,5 +1,6 @@
 import { renderToString } from 'react-dom/server'
-import { BRAND_NAME, localizedPath, type SiteLocale } from '@gadgets/site-config'
+import type { JSX } from 'react'
+import { localizedPath, type SiteLocale } from '@gadgets/site-config'
 import {
   createMemoryHistory,
   createRootRoute,
@@ -7,20 +8,17 @@ import {
   createRouter,
   RouterProvider,
 } from '@tanstack/react-router'
-import MarketingLandingPage from './MarketingLandingPage'
-import { marketingFaq } from './marketingContent'
 import { ServerConfigContext } from './ServerConfigContext'
 import { localeUrlRewrite } from './locale'
 import {
   getLocale,
   overwriteGetLocale,
 } from './paraglide/runtime.js'
-import { m as messages } from './paraglide/messages.js'
 
 export { BARE_ROOT_RESOLVED_KEY, LOCALE_PREFERENCE_KEY } from './locale'
 
-/** One localized Marketing Landing Page rendered for a production HTML document. */
-export interface PrerenderedMarketingPage {
+/** One localized Production Site page rendered for a production HTML document. */
+export interface PrerenderedSitePage {
   /** Server-rendered markup for the document root. */
   body: string
   /** The document meta description. */
@@ -39,12 +37,47 @@ export interface PrerenderedMarketingPage {
   title: string
 }
 
-/** Render one localized Marketing Landing Page for a production HTML document. */
-export async function renderMarketingPage(
+/** Document metadata supplied by one Production Site page module. */
+export type PrerenderedPageMetadata = Omit<
+  PrerenderedSitePage,
+  'body' | 'documentPath' | 'locale'
+>
+
+/** A Production Site page component and its localized document metadata. */
+export interface SitePagePrerenderer {
+  /** The component rendered for this page. */
+  component: () => JSX.Element
+  /** Return localized document metadata for this page. */
+  metadata: (locale: SiteLocale) => PrerenderedPageMetadata
+}
+
+const sitePageModules = import.meta.glob('./site-pages/**/*.tsx', {
+  eager: true,
+  import: 'default',
+}) as Record<string, SitePagePrerenderer>
+
+function sitePagePath(modulePath: string): string {
+  const relativePath = modulePath
+    .replace(/^\.\/site-pages\//u, '')
+    .replace(/\.tsx$/u, '')
+  if (relativePath === 'index') return '/'
+  return `/${relativePath.replace(/\/index$/u, '/')}`
+}
+
+const sitePagePrerenderers: Readonly<Record<string, SitePagePrerenderer>> = Object.fromEntries(
+  Object.entries(sitePageModules).map(([modulePath, prerenderer]) => [
+    sitePagePath(modulePath),
+    prerenderer,
+  ]),
+)
+
+/** Render one localized Production Site page for a production HTML document. */
+export async function renderSitePage(
   pagePath: string,
   locale: SiteLocale,
-): Promise<PrerenderedMarketingPage> {
-  if (pagePath !== '/') {
+): Promise<PrerenderedSitePage> {
+  const prerenderer = sitePagePrerenderers[pagePath]
+  if (!prerenderer) {
     throw new Error(`No prerender component is registered for the enabled site page "${pagePath}".`)
   }
 
@@ -53,10 +86,10 @@ export async function renderMarketingPage(
 
   try {
     const rootRoute = createRootRoute()
-    const homeRoute = createRoute({
+    const pageRoute = createRoute({
       getParentRoute: () => rootRoute,
-      path: '/',
-      component: () => <MarketingLandingPage onSignIn={() => undefined} />,
+      path: pagePath,
+      component: prerenderer.component,
     })
     const signupRoute = createRoute({
       getParentRoute: () => rootRoute,
@@ -66,49 +99,22 @@ export async function renderMarketingPage(
     const documentPath = localizedPath(pagePath, locale)
     const router = createRouter({
       history: createMemoryHistory({ initialEntries: [documentPath] }),
-      routeTree: rootRoute.addChildren([homeRoute, signupRoute]),
+      routeTree: rootRoute.addChildren([pageRoute, signupRoute]),
       rewrite: localeUrlRewrite,
     })
 
     await router.load()
 
-    const faq = marketingFaq(locale)
+    const metadata = prerenderer.metadata(locale)
     return {
       body: renderToString(
         <ServerConfigContext.Provider value={null}>
           <RouterProvider router={router} />
         </ServerConfigContext.Provider>,
       ),
-      description: messages.marketing_meta_description({}, { locale }),
       documentPath,
       locale,
-      openGraphDescription: messages.marketing_og_description({}, { locale }),
-      openGraphTitle: messages.marketing_og_title({}, { locale }),
-      structuredData: [
-        {
-          '@context': 'https://schema.org',
-          '@type': 'Organization',
-          name: BRAND_NAME,
-        },
-        {
-          '@context': 'https://schema.org',
-          '@type': 'WebSite',
-          name: BRAND_NAME,
-        },
-        {
-          '@context': 'https://schema.org',
-          '@type': 'FAQPage',
-          mainEntity: faq.map(({ question, answer }) => ({
-            '@type': 'Question',
-            name: question,
-            acceptedAnswer: {
-              '@type': 'Answer',
-              text: answer,
-            },
-          })),
-        },
-      ],
-      title: messages.marketing_document_title({}, { locale }),
+      ...metadata,
     }
   } finally {
     overwriteGetLocale(previousGetLocale)

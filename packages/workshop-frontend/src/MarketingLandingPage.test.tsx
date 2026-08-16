@@ -14,9 +14,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AnonymousAngleRunResponse } from '@gadgets/workshop-shared/anonymous-angle-run'
 import type { ServerConfig } from '@gadgets/workshop-shared/api'
 import type { AngleWallEntry } from './angleWall'
-import MarketingLandingPage, {
-  ANONYMOUS_ANGLE_RUN_SESSION_KEY,
-} from './MarketingLandingPage'
+import MarketingLandingPage from './MarketingLandingPage'
+import { ANONYMOUS_ANGLE_RUN_SESSION_KEY } from './anonymousAngleRunSession'
 import { ServerConfigContext } from './ServerConfigContext'
 import { deLocalizeUrl, localizeUrl } from './paraglide/runtime.js'
 
@@ -79,8 +78,8 @@ const localeCases = [
     market: '美国首次购买者',
     resultHeading: '你的 3 个可测试广告角度',
     selectedCallToAction: '免费注册并保存这个角度',
-    limit: '这次匿名生成已经完成。',
-    unavailable: '这个部署尚未开放匿名广告角度生成。',
+    limit: '这次匿名运行已经完成。',
+    unavailable: '这个部署尚未开放匿名广告角度运行。',
     wallHeading: 'AI UGC 广告到底由什么构成',
     faqHeading: '常见问题',
     signupHref: '/zh/signup',
@@ -170,11 +169,13 @@ describe('Marketing Landing Page', () => {
     config = baseConfig,
     onSignIn = vi.fn<() => void>(),
     angleWallEntries,
+    isAuthenticated = false,
   }: {
     href?: string
     config?: ServerConfig
     onSignIn?: () => void
     angleWallEntries?: readonly AngleWallEntry[]
+    isAuthenticated?: boolean
   } = {}) {
     window.history.replaceState({}, '', href)
     const rootRoute = createRootRoute()
@@ -185,6 +186,7 @@ describe('Marketing Landing Page', () => {
         <MarketingLandingPage
           onSignIn={onSignIn}
           angleWallEntries={angleWallEntries}
+          isAuthenticated={isAuthenticated}
         />
       ),
     })
@@ -270,6 +272,27 @@ describe('Marketing Landing Page', () => {
       expect(results.querySelectorAll('[data-angle-card]')).toHaveLength(3)
     },
   )
+
+  it('uses Workshop actions instead of signup links for an authenticated visitor', async () => {
+    const { product, market, angles } = localeCases[0]
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(successResponse(angles))
+    const onSignIn = vi.fn<() => void>()
+    vi.stubGlobal('fetch', fetchMock)
+    await renderPage({ isAuthenticated: true, onSignIn })
+
+    expect(container!.querySelector('a[href="/signup"]')).toBeNull()
+    await submitRun(product, market)
+    const results = container!.querySelector<HTMLElement>('#anonymous-angle-results')!
+    await act(async () => results.querySelectorAll<HTMLButtonElement>('[data-angle-card] button')[0].click())
+    const continueButton = [...results.querySelectorAll<HTMLButtonElement>('button')]
+      .find(button => button.textContent?.trim() === 'Continue in Workshop')
+    expect(continueButton).toBeDefined()
+    expect(results.querySelector('a[href="/signup"]')).toBeNull()
+
+    await act(async () => continueButton!.click())
+
+    expect(onSignIn).toHaveBeenCalledOnce()
+  })
 
   it('keeps stored angles bound to the normalized inputs that produced them', async () => {
     const { product, market, angles } = localeCases[0]
@@ -367,6 +390,22 @@ describe('Marketing Landing Page', () => {
 
     expect(container!.querySelector('[data-marketing-error]')?.textContent).toContain(unavailable)
     expect(container!.querySelectorAll('[data-angle-card]')).toHaveLength(0)
+    expect(container!.querySelector('#anonymous-angle-results')).toBeNull()
+  })
+
+  it('rejects an oversized successful response at the browser contract boundary', async () => {
+    const english = localeCases[0]
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(successResponse([
+      { ...english.angles[0], name: 'x'.repeat(81) },
+      english.angles[1],
+      english.angles[2],
+    ])))
+    await renderPage()
+
+    await submitRun(english.product, english.market)
+
+    expect(container!.querySelector('[data-marketing-error]')?.textContent)
+      .toContain('No Ad Angle was returned.')
     expect(container!.querySelector('#anonymous-angle-results')).toBeNull()
   })
 
