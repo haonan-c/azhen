@@ -20,7 +20,7 @@ import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "jsonc-parser";
 
-export const MANIFEST_VERSION = 1;
+export const MANIFEST_VERSION = 2;
 
 // wrangler.jsonc keys this generator understands. Anything else fails closed — a new config key
 // on a deployable worker needs an explicit decision about how customer instances get it.
@@ -31,6 +31,9 @@ const HANDLED_CONFIG_KEYS = new Set([
   // Browser Rendering (Gadget PDF exports). Unlike artifacts it is generally available, so it
   // passes through to customer instances as a placeholder-free binding, like the AI binding.
   "browser",
+  // RateLimit bindings use stable package-owned namespace ids rather than provisioned resources.
+  // Their keys must carry instance identity when releases can share one Cloudflare account.
+  "ratelimits",
   // gatekeeper-context's Artifacts binding is closed-beta and cannot be provisioned in arbitrary
   // user accounts; it is dropped from customer manifests (the gatekeeper degrades gracefully).
   "artifacts",
@@ -155,6 +158,9 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
   if (config.browser) {
     // `remote` is dev-only wrangler behavior; the deployed binding is just { type, name }.
     bindings.push({ type: "browser", name: config.browser.binding });
+  }
+  for (const rl of config.ratelimits ?? []) {
+    bindings.push({ type: "ratelimit", name: rl.name, namespace_id: rl.namespace_id, simple: rl.simple });
   }
   for (const loader of config.worker_loaders ?? []) {
     bindings.push({ type: "worker_loader", name: loader.binding });

@@ -30,6 +30,7 @@ export default defineConfig(({ mode }) => {
       port: 3000,
       host: true,
       proxy: {
+        '/api/anonymous-angle-run': `http://${backendHost}`,
         '/api/client-errors': `http://${backendHost}`,
         '/blueprint-screenshot': `http://${backendHost}`,
         '/api/site-logo': `http://${backendHost}`,

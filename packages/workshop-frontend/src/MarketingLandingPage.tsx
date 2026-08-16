@@ -1,427 +1,395 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect } from 'react'
 import { Link } from '@tanstack/react-router'
-import {
-  AppWindow,
-  ArrowRight,
-  ChartLineUp,
-  FileText,
-  ImageSquare,
-  List,
-  PencilSimple,
-  PlugsConnected,
-  ShieldCheck,
-  SquaresFour,
-  UsersThree,
-  X,
-} from '@phosphor-icons/react'
+import { enabledPages, localizedPath, type SiteLocale } from '@gadgets/site-config'
+import { ChartLineUp, FileText, PencilSimple } from '@phosphor-icons/react'
+import AnonymousAngleRunTool from './AnonymousAngleRunTool'
+import { angleWallEntries as defaultAngleWallEntries, type AngleWallEntry } from './angleWall'
 import LanguageSelector from './components/LanguageSelector'
 import SiteLogo from './components/SiteLogo'
-import { useServerConfig, useSiteName } from './ServerConfigContext'
-import { CF_ACCESS_MODE } from './useAuth'
-import { useDocumentTitle } from './useDocumentTitle'
+import { marketingFaq } from './marketingContent'
+import { useSiteName } from './ServerConfigContext'
 import { getLocale } from './paraglide/runtime.js'
 import { m as messages } from './paraglide/messages.js'
+import {
+  marketingBodyClassName,
+  marketingFocusClassName,
+  marketingPrimaryActionClassName,
+  marketingSectionClassName,
+} from './marketingStyles'
 
 interface MarketingLandingPageProps {
   onSignIn: () => void
+  angleWallEntries?: readonly AngleWallEntry[]
+  isAuthenticated?: boolean
 }
 
-const focusClassName = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring focus-visible:ring-offset-2 focus-visible:ring-offset-kumo-base'
-const primaryActionClassName = `inline-flex min-h-11 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-kumo-contrast px-5 text-sm font-semibold text-kumo-inverse transition-[background-color,transform] hover:bg-kumo-strong active:scale-[0.98] motion-reduce:transition-none motion-reduce:active:scale-100 ${focusClassName}`
-const secondaryActionClassName = `inline-flex min-h-11 items-center justify-center whitespace-nowrap rounded-lg border border-kumo-line bg-kumo-base px-5 text-sm font-semibold text-kumo-default transition-[background-color,transform] hover:bg-kumo-elevated active:scale-[0.98] motion-reduce:transition-none motion-reduce:active:scale-100 ${focusClassName}`
+const COMPARISON_COLLECTED_ON = '2026-08-13'
+const COPYRIGHT_YEAR = 2026
 
-const productEvidence = {
-  en: {
-    screenshot: '/marketing/product-evidence-en.jpg',
-    mobileScreenshot: '/marketing/product-evidence-en-mobile.jpg',
-  },
-  zh: {
-    screenshot: '/marketing/product-evidence-zh.jpg',
-    mobileScreenshot: '/marketing/product-evidence-zh-mobile.jpg',
-  },
-} as const
+function footerPageLabel(path: string, siteName: string): string {
+  if (path === '/') return siteName
+  if (path === '/pricing') return messages.marketing_footer_pricing()
+  if (path === '/about') return messages.marketing_footer_about()
+  if (path === '/privacy') return messages.marketing_footer_privacy()
+  if (path === '/terms') return messages.marketing_footer_terms()
+  if (path === '/hub/') return messages.marketing_footer_resources()
+  return messages.marketing_footer_page_label({ path })
+}
 
-function MarketingActions({
-  signupAvailable,
+export default function MarketingLandingPage({
   onSignIn,
-  className = '',
-}: {
-  signupAvailable: boolean
-  onSignIn: () => void
-  className?: string
-}) {
-  return (
-    <div className={`flex flex-col gap-3 sm:flex-row ${className}`}>
-      {signupAvailable ? (
-        <Link to="/signup" className={primaryActionClassName}>
-          {messages.auth_create_account_submit()}
-          <ArrowRight aria-hidden="true" size={16} weight="bold" />
-        </Link>
-      ) : (
-        <button type="button" onClick={onSignIn} className={primaryActionClassName}>
-          {messages.auth_sign_in()}
-          <ArrowRight aria-hidden="true" size={16} weight="bold" />
-        </button>
-      )}
-      <button type="button" onClick={onSignIn} className={secondaryActionClassName}>
-        {messages.auth_sign_in()}
-      </button>
-    </div>
-  )
-}
-
-export default function MarketingLandingPage({ onSignIn }: MarketingLandingPageProps) {
-  const locale = getLocale()
+  angleWallEntries = defaultAngleWallEntries,
+  isAuthenticated = false,
+}: MarketingLandingPageProps) {
+  const locale = getLocale() as SiteLocale
   const siteName = useSiteName()
-  const serverConfig = useServerConfig()
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null)
-  useDocumentTitle(messages.marketing_document_title())
-
-  const signupAvailable = !CF_ACCESS_MODE
-    && serverConfig?.signupsEnabled === true
-    && (serverConfig.passwordAuthEnabled || serverConfig.authVendors.length > 0)
+  const documentTitle = messages.marketing_document_title()
 
   useEffect(() => {
-    if (!mobileMenuOpen) return
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      setMobileMenuOpen(false)
-      mobileMenuButtonRef.current?.focus()
+    const previousTitle = document.title
+    document.title = documentTitle
+    return () => {
+      document.title = previousTitle
     }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [mobileMenuOpen])
+  }, [documentTitle])
 
-  const workflow = [
+  const steps = [
     {
+      number: messages.marketing_steps_one_number(),
+      title: messages.marketing_steps_one_title(),
+      body: messages.marketing_steps_one_body(),
       icon: FileText,
-      title: messages.marketing_workflow_brief_title(),
-      description: messages.marketing_workflow_brief_description(),
-      className: 'md:col-span-5',
     },
     {
+      number: messages.marketing_steps_two_number(),
+      title: messages.marketing_steps_two_title(),
+      body: messages.marketing_steps_two_body(),
       icon: ChartLineUp,
-      title: messages.marketing_workflow_evidence_title(),
-      description: messages.marketing_workflow_evidence_description(),
-      className: 'md:col-span-3',
     },
     {
+      number: messages.marketing_steps_three_number(),
+      title: messages.marketing_steps_three_title(),
+      body: messages.marketing_steps_three_body(),
       icon: PencilSimple,
-      title: messages.marketing_workflow_result_title(),
-      description: messages.marketing_workflow_result_description(),
-      className: 'md:col-span-4',
     },
   ]
-
-  const capabilities = [
-    {
-      icon: ChartLineUp,
-      title: messages.marketing_capability_insight_title(),
-      description: messages.marketing_capability_insight_description(),
-      className: 'lg:col-span-7 bg-kumo-tint',
-    },
-    {
-      icon: PencilSimple,
-      title: messages.marketing_capability_content_title(),
-      description: messages.marketing_capability_content_description(),
-      className: 'lg:col-span-5 bg-kumo-elevated',
-    },
-    {
-      icon: FileText,
-      title: messages.marketing_capability_documents_title(),
-      description: messages.marketing_capability_documents_description(),
-      className: 'lg:col-span-5 bg-kumo-elevated',
-    },
-    {
-      icon: ImageSquare,
-      title: messages.marketing_capability_rendering_title(),
-      description: messages.marketing_capability_rendering_description(),
-      className: 'lg:col-span-4 bg-kumo-tint',
-    },
-    {
-      icon: AppWindow,
-      title: messages.marketing_capability_apps_title(),
-      description: messages.marketing_capability_apps_description(),
-      className: 'lg:col-span-3 bg-kumo-elevated',
-    },
-  ]
-
-  const security = [
-    {
-      icon: ShieldCheck,
-      title: messages.marketing_security_sandbox_title(),
-      description: messages.marketing_security_sandbox_description(),
-    },
-    {
-      icon: PlugsConnected,
-      title: messages.marketing_security_connectors_title(),
-      description: messages.marketing_security_connectors_description(),
-    },
-    {
-      icon: SquaresFour,
-      title: messages.marketing_security_actions_title(),
-      description: messages.marketing_security_actions_description(),
-    },
-  ]
-
-  const navigation = [
-    { href: '#workflow', label: messages.marketing_nav_workflow() },
-    { href: '#capabilities', label: messages.marketing_nav_capabilities() },
-    { href: '#security', label: messages.marketing_nav_security() },
-    { href: '#templates', label: messages.marketing_nav_templates() },
+  const comparisonRows = [
+    [
+      messages.marketing_compare_starting_point(),
+      messages.marketing_compare_starting_point_us(),
+      messages.marketing_compare_starting_point_them(),
+    ],
+    [
+      messages.marketing_compare_output(),
+      messages.marketing_compare_output_us(),
+      messages.marketing_compare_output_them(),
+    ],
+    [
+      messages.marketing_compare_testing(),
+      messages.marketing_compare_testing_us(),
+      messages.marketing_compare_testing_them(),
+    ],
+    [
+      messages.marketing_compare_shoot(),
+      messages.marketing_compare_shoot_us(),
+      messages.marketing_compare_shoot_them(),
+    ],
+    [
+      messages.marketing_compare_time(),
+      messages.marketing_compare_time_us(),
+      messages.marketing_compare_time_them(),
+    ],
+    [
+      messages.marketing_compare_video(),
+      messages.marketing_compare_video_us(),
+      messages.marketing_compare_video_them(),
+    ],
   ] as const
-  const { screenshot, mobileScreenshot } = productEvidence[locale]
+  const faq = marketingFaq(locale)
+  const footerPages = enabledPages().filter(page => page.locales.includes(locale))
+  const hubPage = enabledPages().find(page => page.path === '/hub/' && page.locales.includes(locale))
+  const hubPlaybooksPath = hubPage
+    ? `${localizedPath(hubPage.path, locale)}playbooks/`
+    : null
 
   return (
     <div className="min-h-[100dvh] bg-kumo-base text-kumo-default">
-      <header className="sticky top-0 z-50 border-b border-kumo-line bg-kumo-base/95 backdrop-blur-md">
-        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-5 px-4 sm:px-6 lg:px-8">
-          <Link
-            to="/"
+      <header className="border-b border-kumo-line bg-kumo-base">
+        <nav
+          aria-label={messages.marketing_header_navigation()}
+          className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-5 px-4 sm:px-6 lg:px-8"
+        >
+          <a
+            href={localizedPath('/', locale)}
             aria-label={siteName}
-            className={`shrink-0 rounded-md ${focusClassName}`}
+            className={`shrink-0 rounded-md ${marketingFocusClassName}`}
           >
-            <SiteLogo size={32} className="h-8 w-auto max-w-36">
+            <SiteLogo size={32} className="h-8 w-auto max-w-40">
               <span className="text-xl font-semibold tracking-[-0.04em] text-kumo-default">
                 {siteName}
               </span>
             </SiteLogo>
-          </Link>
-
-          <nav
-            aria-label={messages.marketing_header_navigation()}
-            className="hidden items-center gap-1 lg:flex"
-          >
-            {navigation.map(item => (
-              <a
-                key={item.href}
-                className={`rounded-md px-3 py-2 text-sm text-kumo-subtle hover:text-kumo-default ${focusClassName}`}
-                href={item.href}
-              >
-                {item.label}
-              </a>
-            ))}
-          </nav>
-
-          <div className="flex items-center gap-2">
-            <LanguageSelector className="hidden sm:flex" />
-            <button
-              ref={mobileMenuButtonRef}
-              type="button"
-              aria-label={mobileMenuOpen
-                ? messages.marketing_menu_close()
-                : messages.marketing_menu_open()}
-              aria-controls="marketing-mobile-navigation"
-              aria-expanded={mobileMenuOpen}
-              onClick={() => setMobileMenuOpen(open => !open)}
-              className={`flex h-10 w-10 items-center justify-center rounded-lg border border-kumo-line text-kumo-default hover:bg-kumo-elevated lg:hidden ${focusClassName}`}
-            >
-              {mobileMenuOpen
-                ? <X aria-hidden="true" size={20} />
-                : <List aria-hidden="true" size={20} />}
-            </button>
-          </div>
-        </div>
-        {mobileMenuOpen && (
-          <div id="marketing-mobile-navigation" className="border-t border-kumo-line bg-kumo-base px-4 py-4 lg:hidden">
-            <nav aria-label={messages.marketing_header_navigation()} className="mx-auto flex max-w-7xl flex-col">
-              {navigation.map(item => (
-                <a
-                  key={item.href}
-                  onClick={() => setMobileMenuOpen(false)}
-                  className={`rounded-md px-3 py-2.5 text-sm text-kumo-default ${focusClassName}`}
-                  href={item.href}
-                >
-                  {item.label}
-                </a>
-              ))}
-              <div className="mt-3 border-t border-kumo-line px-3 pt-4 sm:hidden">
-                <LanguageSelector />
-              </div>
-            </nav>
-          </div>
-        )}
+          </a>
+          <LanguageSelector />
+        </nav>
       </header>
 
       <main>
-        <section id="marketing-hero" className="mx-auto grid max-w-7xl items-center gap-10 px-4 py-12 sm:px-6 sm:py-16 lg:grid-cols-12 lg:gap-12 lg:px-8 lg:py-20">
-          <div className="lg:col-span-5">
-            <p className="text-sm font-medium uppercase tracking-[0.14em] text-kumo-brand">
-              {messages.marketing_category()}
-            </p>
-            <h1 className="mt-5 max-w-xl text-4xl font-semibold leading-[1.03] tracking-[-0.055em] text-kumo-default sm:text-5xl lg:text-6xl">
-              {messages.marketing_hero_heading()}
-            </h1>
-            <p className="mt-6 max-w-[54ch] text-base leading-7 text-kumo-subtle sm:text-lg">
-              {messages.marketing_hero_description()}
-            </p>
-            <MarketingActions
-              signupAvailable={signupAvailable}
-              onSignIn={onSignIn}
-              className="mt-8"
-            />
-          </div>
+        <AnonymousAngleRunTool
+          locale={locale}
+          isAuthenticated={isAuthenticated}
+          onContinue={onSignIn}
+        />
 
-          <figure className="lg:col-span-7">
-            <div className="mx-auto aspect-[9/10] w-full max-w-[360px] overflow-hidden rounded-2xl border border-kumo-line bg-kumo-elevated p-1.5 shadow-[0_24px_64px_-36px_color-mix(in_srgb,var(--color-kumo-brand)_38%,transparent)] sm:aspect-[8/5] sm:max-w-none">
-              <picture>
-                <source media="(max-width: 640px)" srcSet={`${mobileScreenshot} 360w`} />
-                <img
-                  src={screenshot}
-                  alt={messages.marketing_product_evidence_alt()}
-                  width={1440}
-                  height={900}
-                  loading="eager"
-                  fetchPriority="high"
-                  decoding="async"
-                  className="h-full w-full rounded-xl object-cover object-left-top"
-                />
-              </picture>
+        <section id="marketing-steps" className="border-t border-kumo-line">
+          <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+            <h2 className={marketingSectionClassName}>{messages.marketing_steps_heading()}</h2>
+            <div className="mt-10 grid gap-6 md:grid-cols-3">
+              {steps.map((step) => {
+                const Icon = step.icon
+                return (
+                  <article key={step.number} className="rounded-md border border-kumo-line p-6">
+                    <Icon aria-hidden="true" size={24} weight="regular" className="text-kumo-brand" />
+                    <p className="mt-6 text-sm font-semibold text-kumo-brand">{step.number}</p>
+                    <h3 className="mt-2 text-xl font-semibold leading-7 text-kumo-default">{step.title}</h3>
+                    <p className="mt-3 text-[17px] leading-[1.7] text-kumo-subtle">{step.body}</p>
+                  </article>
+                )
+              })}
             </div>
-            <figcaption className="mx-auto mt-3 max-w-2xl text-center text-xs leading-5 text-kumo-subtle">
-              {messages.marketing_product_evidence_caption()}
-            </figcaption>
-          </figure>
+          </div>
         </section>
 
-        <section id="workflow" className="border-y border-kumo-line bg-kumo-elevated">
-          <div className="mx-auto max-w-7xl px-4 py-20 sm:px-6 lg:px-8 lg:py-24">
-            <div className="max-w-2xl">
-              <h2 className="text-3xl font-semibold tracking-[-0.04em] text-kumo-default sm:text-4xl">
-                {messages.marketing_workflow_heading()}
-              </h2>
-              <p className="mt-4 max-w-[60ch] text-base leading-7 text-kumo-subtle">
-                {messages.marketing_workflow_description()}
-              </p>
-            </div>
-
-            <div className="mt-12 grid gap-8 md:grid-cols-12 md:gap-0">
-              {workflow.map((item) => {
-                const Icon = item.icon
-                return (
-                  <article key={item.title} className={`${item.className} border-l border-kumo-line pl-5 pr-6`}>
-                    <Icon aria-hidden="true" size={22} weight="duotone" className="text-kumo-brand" />
-                    <h3 className="mt-5 text-lg font-semibold text-kumo-default">{item.title}</h3>
-                    <p className="mt-2 max-w-[38ch] text-sm leading-6 text-kumo-subtle">
-                      {item.description}
+        {angleWallEntries.length > 0 && (
+          <section id="marketing-wall" className="border-t border-kumo-line">
+            <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+              <h2 className={marketingSectionClassName}>{messages.marketing_wall_heading()}</h2>
+              <p className={`mt-4 ${marketingBodyClassName}`}>{messages.marketing_wall_description()}</p>
+              <div className="mt-10 grid gap-4 lg:grid-cols-3">
+                {angleWallEntries.map(entry => (
+                  <details key={entry.id} className="rounded-md border border-kumo-line p-5">
+                    <summary className={`cursor-pointer rounded-sm ${marketingFocusClassName}`}>
+                      <span className="block text-sm font-semibold text-kumo-brand">
+                        {messages.marketing_wall_summary({
+                          industry: entry.industry,
+                          angleName: entry.angleName,
+                          platform: entry.platform,
+                        })}
+                      </span>
+                      <span className="mt-3 block text-[17px] leading-[1.7] text-kumo-subtle">
+                        {entry.tension}
+                      </span>
+                      <span className="mt-4 block text-sm font-semibold text-kumo-default">
+                        {messages.marketing_wall_read_script()}
+                      </span>
+                    </summary>
+                    <dl className="mt-5 space-y-4 border-t border-kumo-line pt-5 text-sm leading-6">
+                      <div>
+                        <dt className="font-semibold text-kumo-default">{messages.marketing_wall_hypothesis_label()}</dt>
+                        <dd className="mt-1 text-kumo-subtle">{entry.hypothesis}</dd>
+                      </div>
+                      <div>
+                        <dt className="font-semibold text-kumo-default">{messages.marketing_wall_hook_label()}</dt>
+                        <dd className="mt-1 text-kumo-subtle">{entry.openingHook}</dd>
+                      </div>
+                      <div>
+                        <dt className="font-semibold text-kumo-default">{messages.marketing_wall_script_label()}</dt>
+                        <dd className="mt-1 text-kumo-subtle">{entry.scriptExcerpt}</dd>
+                      </div>
+                    </dl>
+                    <p className="mt-5 text-xs text-kumo-inactive">
+                      {messages.marketing_wall_produced_on({ date: entry.producedOn })}
                     </p>
-                  </article>
-                )
-              })}
+                  </details>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
+        <section id="marketing-difference" className="border-t border-kumo-line">
+          <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+            <div className="max-w-[68ch]">
+              <h2 className={marketingSectionClassName}>{messages.marketing_diff_heading()}</h2>
+              <div className="mt-7 space-y-5 text-[17px] leading-[1.7] text-kumo-subtle">
+                <p>{messages.marketing_diff_body_one()}</p>
+                <p>{messages.marketing_diff_body_two()}</p>
+                <p>{messages.marketing_diff_body_three()}</p>
+              </div>
+              {hubPlaybooksPath && (
+                <a
+                  href={hubPlaybooksPath}
+                  className={`mt-7 inline-flex rounded-sm text-sm font-semibold text-kumo-link hover:underline ${marketingFocusClassName}`}
+                >
+                  {messages.marketing_diff_link()}
+                </a>
+              )}
             </div>
           </div>
         </section>
 
-        <section id="capabilities" className="mx-auto max-w-7xl px-4 py-20 sm:px-6 lg:px-8 lg:py-28">
-          <div className="max-w-2xl">
-            <h2 className="text-3xl font-semibold tracking-[-0.04em] text-kumo-default sm:text-4xl">
-              {messages.marketing_capabilities_heading()}
-            </h2>
-            <p className="mt-4 max-w-[60ch] text-base leading-7 text-kumo-subtle">
-              {messages.marketing_capabilities_description()}
-            </p>
-          </div>
-
-          <div className="mt-12 grid grid-cols-1 gap-4 lg:grid-cols-12">
-            {capabilities.map((item) => {
-              const Icon = item.icon
-              return (
-                <article key={item.title} className={`${item.className} rounded-2xl border border-kumo-line p-6 sm:p-8`}>
-                  <Icon aria-hidden="true" size={24} weight="duotone" className="text-kumo-brand" />
-                  <h3 className="mt-8 text-xl font-semibold tracking-[-0.025em] text-kumo-default">
-                    {item.title}
+        <section id="marketing-whatis" className="border-t border-kumo-line">
+          <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+            <article className="max-w-[68ch]">
+              <h2 className={marketingSectionClassName}>{messages.marketing_whatis_heading()}</h2>
+              <div className="mt-10 space-y-10 text-[17px] leading-[1.7] text-kumo-subtle">
+                <section>
+                  <h3 className="text-xl font-semibold leading-7 text-kumo-default">
+                    {messages.marketing_whatis_definition_heading()}
                   </h3>
-                  <p className="mt-2 max-w-[52ch] text-sm leading-6 text-kumo-subtle">
-                    {item.description}
+                  <p className="mt-3">{messages.marketing_whatis_definition_body()}</p>
+                </section>
+                <section>
+                  <h3 className="text-xl font-semibold leading-7 text-kumo-default">
+                    {messages.marketing_whatis_fit_heading()}
+                  </h3>
+                  <div className="mt-3 space-y-4">
+                    <p>{messages.marketing_whatis_fit_body_one()}</p>
+                    <p>{messages.marketing_whatis_fit_body_two()}</p>
+                    <p>{messages.marketing_whatis_fit_body_three()}</p>
+                  </div>
+                </section>
+                <section>
+                  <h3 className="text-xl font-semibold leading-7 text-kumo-default">
+                    {messages.marketing_whatis_comparison_heading()}
+                  </h3>
+                  <div className="mt-3 space-y-4">
+                    <p>{messages.marketing_whatis_comparison_body_one()}</p>
+                    <p>{messages.marketing_whatis_comparison_body_two()}</p>
+                  </div>
+                </section>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="marketing-compare" className="border-t border-kumo-line">
+          <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+            <h2 className={marketingSectionClassName}>{messages.marketing_compare_heading()}</h2>
+            <div
+              data-marketing-compare-scroll=""
+              role="region"
+              aria-label={messages.marketing_compare_heading()}
+              tabIndex={0}
+              className={`mt-10 overflow-x-auto rounded-md border border-kumo-line ${marketingFocusClassName}`}
+            >
+              <table className="w-full min-w-[720px] border-collapse text-left text-sm leading-6">
+                <thead>
+                  <tr className="border-b border-kumo-line">
+                    <th scope="col" className="p-4 font-semibold text-kumo-subtle">
+                      <span className="sr-only">{messages.marketing_compare_dimension()}</span>
+                    </th>
+                    <th scope="col" className="p-4 font-semibold text-kumo-default">
+                      {messages.marketing_compare_ugc_angle()}
+                    </th>
+                    <th scope="col" className="p-4 font-semibold text-kumo-default">
+                      {messages.marketing_compare_prompt_tools()}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {comparisonRows.map(([dimension, ownValue, otherValue], index) => (
+                    <tr
+                      key={dimension}
+                      data-video-production-row={index === comparisonRows.length - 1 ? '' : undefined}
+                      className="border-b border-kumo-line last:border-b-0"
+                    >
+                      <th scope="row" className="p-4 font-semibold text-kumo-default">{dimension}</th>
+                      <td className="p-4 text-kumo-subtle">{ownValue}</td>
+                      <td className="p-4 text-kumo-subtle">{otherValue}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-4 max-w-[68ch] text-xs leading-5 text-kumo-inactive">
+              {messages.marketing_compare_footnote({ date: COMPARISON_COLLECTED_ON })}
+            </p>
+          </div>
+        </section>
+
+        <section id="marketing-access" className="border-t border-kumo-line">
+          <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+            <div className="max-w-[68ch]">
+              <h2 className={marketingSectionClassName}>{messages.marketing_access_heading()}</h2>
+              <p className={`mt-4 ${marketingBodyClassName}`}>{messages.marketing_access_description()}</p>
+              {isAuthenticated ? (
+                <button
+                  type="button"
+                  onClick={onSignIn}
+                  className={`mt-7 ${marketingPrimaryActionClassName}`}
+                >
+                  {messages.marketing_back_to_workshop()}
+                </button>
+              ) : (
+                <Link
+                  to="/signup"
+                  className={`mt-7 ${marketingPrimaryActionClassName}`}
+                >
+                  {messages.marketing_access_cta()}
+                </Link>
+              )}
+              <p className="mt-3 text-sm text-kumo-subtle">{messages.marketing_access_note()}</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="marketing-faq" className="border-t border-kumo-line">
+          <div className="mx-auto max-w-6xl px-4 py-24 sm:px-6 lg:px-8">
+            <h2 className={marketingSectionClassName}>{messages.marketing_faq_heading()}</h2>
+            <div className="mt-10 max-w-[68ch] divide-y divide-kumo-line border-y border-kumo-line">
+              {faq.map((item, index) => (
+                <details key={item.question} open={index === 0 ? true : undefined} className="py-5">
+                  <summary className={`cursor-pointer text-lg font-semibold leading-7 text-kumo-default ${marketingFocusClassName}`}>
+                    {item.question}
+                  </summary>
+                  <p data-faq-answer="" className="mt-3 text-[17px] leading-[1.7] text-kumo-subtle">
+                    {item.answer}
                   </p>
-                </article>
-              )
-            })}
-          </div>
-        </section>
-
-        <section id="security" className="border-y border-kumo-line bg-kumo-tint">
-          <div className="mx-auto max-w-7xl px-4 py-20 sm:px-6 lg:px-8 lg:py-28">
-            <div className="max-w-2xl">
-              <h2 className="text-3xl font-semibold tracking-[-0.04em] text-kumo-default sm:text-4xl">
-                {messages.marketing_security_heading()}
-              </h2>
-              <p className="mt-4 max-w-[60ch] text-base leading-7 text-kumo-subtle">
-                {messages.marketing_security_description()}
-              </p>
+                </details>
+              ))}
             </div>
-
-            <div className="mt-12 grid gap-8 md:grid-cols-3">
-              {security.map((item) => {
-                const Icon = item.icon
-                return (
-                  <article key={item.title}>
-                    <Icon aria-hidden="true" size={26} weight="duotone" className="text-kumo-brand" />
-                    <h3 className="mt-5 text-lg font-semibold text-kumo-default">{item.title}</h3>
-                    <p className="mt-2 text-sm leading-6 text-kumo-subtle">{item.description}</p>
-                  </article>
-                )
-              })}
-            </div>
-          </div>
-        </section>
-
-        <section id="templates" className="mx-auto grid max-w-7xl gap-12 px-4 py-20 sm:px-6 md:grid-cols-2 lg:px-8 lg:py-28">
-          <div className="max-w-xl">
-            <h2 className="text-3xl font-semibold tracking-[-0.04em] text-kumo-default sm:text-4xl">
-              {messages.marketing_templates_heading()}
-            </h2>
-            <p className="mt-4 max-w-[58ch] text-base leading-7 text-kumo-subtle">
-              {messages.marketing_templates_description()}
-            </p>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-1 xl:grid-cols-2">
-            <article className="rounded-2xl border border-kumo-line bg-kumo-elevated p-6">
-              <SquaresFour aria-hidden="true" size={24} weight="duotone" className="text-kumo-brand" />
-              <h3 className="mt-8 text-lg font-semibold text-kumo-default">
-                {messages.marketing_templates_reuse_title()}
-              </h3>
-              <p className="mt-2 text-sm leading-6 text-kumo-subtle">
-                {messages.marketing_templates_reuse_description()}
-              </p>
-            </article>
-            <article className="rounded-2xl border border-kumo-line bg-kumo-tint p-6">
-              <UsersThree aria-hidden="true" size={24} weight="duotone" className="text-kumo-brand" />
-              <h3 className="mt-8 text-lg font-semibold text-kumo-default">
-                {messages.marketing_collaboration_title()}
-              </h3>
-              <p className="mt-2 text-sm leading-6 text-kumo-subtle">
-                {messages.marketing_collaboration_description()}
-              </p>
-            </article>
-          </div>
-        </section>
-
-        <section id="get-started" className="border-t border-kumo-line bg-kumo-elevated">
-          <div className="mx-auto max-w-4xl px-4 py-20 text-center sm:px-6 lg:py-24">
-            <h2 className="text-3xl font-semibold tracking-[-0.04em] text-kumo-default sm:text-4xl">
-              {messages.marketing_final_heading()}
-            </h2>
-            <p className="mx-auto mt-4 max-w-[52ch] text-base leading-7 text-kumo-subtle">
-              {messages.marketing_final_description()}
-            </p>
-            <MarketingActions
-              signupAvailable={signupAvailable}
-              onSignIn={onSignIn}
-              className="mx-auto mt-8 justify-center"
-            />
           </div>
         </section>
       </main>
 
       <footer className="border-t border-kumo-line bg-kumo-base">
-        <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-10 sm:px-6 md:flex-row md:items-end md:justify-between lg:px-8">
+        <div className="mx-auto grid max-w-6xl gap-8 px-4 py-10 sm:px-6 md:grid-cols-[1fr_auto] md:items-end lg:px-8">
           <div>
-            <p className="text-lg font-semibold tracking-[-0.035em] text-kumo-default">{siteName}</p>
-            <p className="mt-2 max-w-xl text-sm leading-6 text-kumo-subtle">
-              {messages.marketing_footer_description()}
+            <nav
+              aria-label={messages.marketing_footer_navigation()}
+              className="flex flex-wrap items-center gap-x-5 gap-y-3"
+            >
+              {footerPages.map(page => (
+                <a
+                  key={page.path}
+                  data-site-page-link=""
+                  href={localizedPath(page.path, locale)}
+                  className={`rounded-sm text-sm font-semibold text-kumo-default hover:text-kumo-link ${marketingFocusClassName}`}
+                >
+                  {footerPageLabel(page.path, siteName)}
+                </a>
+              ))}
+              <button
+                type="button"
+                onClick={onSignIn}
+                className={`rounded-sm text-sm text-kumo-subtle hover:text-kumo-link ${marketingFocusClassName}`}
+              >
+                {isAuthenticated
+                  ? messages.marketing_back_to_workshop()
+                  : messages.marketing_sign_in()}
+              </button>
+              {!isAuthenticated && (
+                <Link
+                  to="/signup"
+                  className={`rounded-sm text-sm text-kumo-subtle hover:text-kumo-link ${marketingFocusClassName}`}
+                >
+                  {messages.marketing_create_account()}
+                </Link>
+              )}
+            </nav>
+            <p className="mt-4 text-sm text-kumo-subtle">
+              {messages.marketing_footer_copyright({ year: COPYRIGHT_YEAR, brand: siteName })}
             </p>
           </div>
           <LanguageSelector />

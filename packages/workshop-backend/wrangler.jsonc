@@ -98,6 +98,22 @@
     // Traces are free during the beta; spans bill against the Logs quota from 2026-10-01,
     // so revisit the sampling rate before then.
     "traces": { "enabled": true, "head_sampling_rate": 0.5 }
-  }
+  },
+
+  // The Anonymous Angle Run endpoint (anonymous-angle-run.ts) fails closed with 503 unless both
+  // RateLimit bindings exist. These stable, high-entropy namespace ids are shared intentionally
+  // across installed instances; every counter key includes the instance origin to keep them apart.
+  "ratelimits": [
+    {
+      "name": "ANONYMOUS_ANGLE_RUN_RATE_LIMITER",
+      "namespace_id": "1588061051727226",
+      "simple": { "limit": 1, "period": 60 }
+    },
+    {
+      "name": "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER",
+      "namespace_id": "1937878701311225",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ]
 
 }

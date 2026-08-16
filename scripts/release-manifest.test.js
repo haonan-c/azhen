@@ -105,6 +105,22 @@ test("worker entries carry the deploy contract", () => {
       backend.bindings.find((b) => b.name === "BLUEPRINT_CONTENT"),
       { type: "r2_bucket", name: "BLUEPRINT_CONTENT", bucket_name: "$R2_BLUEPRINT_CONTENT_NAME" });
   assert.deepEqual(
+      backend.bindings.find((b) => b.name === "ANONYMOUS_ANGLE_RUN_RATE_LIMITER"),
+      {
+        type: "ratelimit",
+        name: "ANONYMOUS_ANGLE_RUN_RATE_LIMITER",
+        namespace_id: "1588061051727226",
+        simple: { limit: 1, period: 60 },
+      });
+  assert.deepEqual(
+      backend.bindings.find((b) => b.name === "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER"),
+      {
+        type: "ratelimit",
+        name: "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER",
+        namespace_id: "1937878701311225",
+        simple: { limit: 30, period: 60 },
+      });
+  assert.deepEqual(
       backend.bindings.find((b) => b.name === "LOADER"),
       { type: "worker_loader", name: "LOADER" });
   // The Workers AI binding always ships (webFetch's toMarkdown conversion depends on it).

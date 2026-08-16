@@ -17,13 +17,13 @@ const catalogs = new WeakMap<OverseerSource, Promise<SlashCommandChoice[]>>();
 /** Localize Workshop-owned built-in command copy while preserving provider-owned copy. */
 export function presentSlashCommandChoice(
   choice: SlashCommandChoice,
-  siteName: string,
+  assistantName: string,
 ): SlashCommandChoice {
   if (choice.selection.builtin !== true) return choice;
   return {
     ...choice,
     description: messages.slash_builtin_compact_description(),
-    providerLabel: siteName,
+    providerLabel: assistantName,
   };
 }
 

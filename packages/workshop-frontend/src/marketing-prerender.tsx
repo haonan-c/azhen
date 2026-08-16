@@ -1,4 +1,6 @@
 import { renderToString } from 'react-dom/server'
+import type { JSX } from 'react'
+import { localizedPath, type SiteLocale } from '@gadgets/site-config'
 import {
   createMemoryHistory,
   createRootRoute,
@@ -6,64 +8,113 @@ import {
   createRouter,
   RouterProvider,
 } from '@tanstack/react-router'
-import MarketingLandingPage from './MarketingLandingPage'
 import { ServerConfigContext } from './ServerConfigContext'
-import { localeUrlRewrite, localizedHomePath } from './locale'
+import { localeUrlRewrite } from './locale'
 import {
   getLocale,
   overwriteGetLocale,
-  type Locale,
 } from './paraglide/runtime.js'
-import { m as messages } from './paraglide/messages.js'
 
 export { BARE_ROOT_RESOLVED_KEY, LOCALE_PREFERENCE_KEY } from './locale'
 
-export interface PrerenderedMarketingPage {
+/** One localized Production Site page rendered for a production HTML document. */
+export interface PrerenderedSitePage {
+  /** Server-rendered markup for the document root. */
   body: string
+  /** The document meta description. */
   description: string
-  homePath: string
-  locale: Locale
+  /** The localized public path of the document. */
+  documentPath: string
+  /** The locale of the document. */
+  locale: SiteLocale
+  /** The Open Graph and Twitter description. */
+  openGraphDescription: string
+  /** The Open Graph and Twitter title. */
+  openGraphTitle: string
+  /** The document-level structured data objects. */
+  structuredData: readonly Record<string, unknown>[]
+  /** The document title. */
   title: string
 }
 
-/** Render one localized Marketing Landing Page for a production HTML document. */
-export async function renderMarketingPage(locale: Locale): Promise<PrerenderedMarketingPage> {
+/** Document metadata supplied by one Production Site page module. */
+export type PrerenderedPageMetadata = Omit<
+  PrerenderedSitePage,
+  'body' | 'documentPath' | 'locale'
+>
+
+/** A Production Site page component and its localized document metadata. */
+export interface SitePagePrerenderer {
+  /** The component rendered for this page. */
+  component: () => JSX.Element
+  /** Return localized document metadata for this page. */
+  metadata: (locale: SiteLocale) => PrerenderedPageMetadata
+}
+
+const sitePageModules = import.meta.glob('./site-pages/**/*.tsx', {
+  eager: true,
+  import: 'default',
+}) as Record<string, SitePagePrerenderer>
+
+function sitePagePath(modulePath: string): string {
+  const relativePath = modulePath
+    .replace(/^\.\/site-pages\//u, '')
+    .replace(/\.tsx$/u, '')
+  if (relativePath === 'index') return '/'
+  return `/${relativePath.replace(/\/index$/u, '/')}`
+}
+
+const sitePagePrerenderers: Readonly<Record<string, SitePagePrerenderer>> = Object.fromEntries(
+  Object.entries(sitePageModules).map(([modulePath, prerenderer]) => [
+    sitePagePath(modulePath),
+    prerenderer,
+  ]),
+)
+
+/** Render one localized Production Site page for a production HTML document. */
+export async function renderSitePage(
+  pagePath: string,
+  locale: SiteLocale,
+): Promise<PrerenderedSitePage> {
+  const prerenderer = sitePagePrerenderers[pagePath]
+  if (!prerenderer) {
+    throw new Error(`No prerender component is registered for the enabled site page "${pagePath}".`)
+  }
+
   const previousGetLocale = getLocale
   overwriteGetLocale(() => locale)
 
   try {
     const rootRoute = createRootRoute()
-    const homeRoute = createRoute({
+    const pageRoute = createRoute({
       getParentRoute: () => rootRoute,
-      path: '/',
-      component: () => <MarketingLandingPage onSignIn={() => undefined} />,
+      path: pagePath,
+      component: prerenderer.component,
     })
     const signupRoute = createRoute({
       getParentRoute: () => rootRoute,
       path: '/signup',
       component: () => null,
     })
-    const homePath = localizedHomePath(locale)
+    const documentPath = localizedPath(pagePath, locale)
     const router = createRouter({
-      history: createMemoryHistory({ initialEntries: [homePath] }),
-      routeTree: rootRoute.addChildren([homeRoute, signupRoute]),
+      history: createMemoryHistory({ initialEntries: [documentPath] }),
+      routeTree: rootRoute.addChildren([pageRoute, signupRoute]),
       rewrite: localeUrlRewrite,
     })
 
     await router.load()
 
-    const brandName = messages.brand_name({}, { locale })
-    const pageTitle = messages.marketing_document_title({}, { locale })
+    const metadata = prerenderer.metadata(locale)
     return {
       body: renderToString(
         <ServerConfigContext.Provider value={null}>
           <RouterProvider router={router} />
         </ServerConfigContext.Provider>,
       ),
-      description: messages.marketing_hero_description({}, { locale }),
-      homePath,
+      documentPath,
       locale,
-      title: `${pageTitle} - ${brandName}`,
+      ...metadata,
     }
   } finally {
     overwriteGetLocale(previousGetLocale)

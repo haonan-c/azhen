@@ -11,6 +11,9 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "dependencies": {
+    "@gadgets/site-config": "workspace:*"
+  },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "catalog:",
     "jsonc-parser": "^3.3.1",

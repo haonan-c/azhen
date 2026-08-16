@@ -17,6 +17,7 @@
   "dependencies": {
     "@cloudflare/kumo": "^2.9.2",
     "@gadgets/error-reporting": "workspace:*",
+    "@gadgets/site-config": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
     "@monaco-editor/react": "^4.7.0",
     "@phosphor-icons/react": "^2.1.10",

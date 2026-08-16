@@ -66,7 +66,13 @@ export default function Sidebar({
           collapsed ? 'justify-center px-1.5' : 'justify-between gap-2 px-3',
         ].join(' ')}
       >
-        <Link to="/" aria-label={siteName} className="flex min-w-0 items-center gap-2">
+        <Link
+          to="/"
+          search={{ marketing: true }}
+          aria-label={messages.shell_marketing_page({ siteName })}
+          title={messages.shell_marketing_page({ siteName })}
+          className="flex min-w-0 items-center gap-2"
+        >
           <SiteLogo size={20} className="shrink-0">
             <Hexagon size={20} weight="bold" className="text-kumo-brand shrink-0" />
           </SiteLogo>
