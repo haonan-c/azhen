@@ -5036,9 +5036,6 @@ class OverseerImpl implements AgentHooks {
         bindings[bindingName] = {
           ...base,
           type: "aiModel",
-          ...(suggestValue
-            ? {suggestedModel: {provider: spec.provider, modelName: spec.modelName}}
-            : {}),
         };
       } else if (spec.type === "agentSpawner") {
         spawnerEdges.push({bindingName, spec, base, suggestValue});
@@ -5112,8 +5109,6 @@ class OverseerImpl implements AgentHooks {
       if (suggestValue) {
         if (spec.config.modelId === null) {
           binding.suggestedModel = null;
-        } else if (spec.modelProvider && spec.modelName) {
-          binding.suggestedModel = {provider: spec.modelProvider, modelName: spec.modelName};
         }
       }
       bindings[bindingName] = binding;
@@ -7680,6 +7675,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let chatMeta = await this.#clientUser.getChatContext(modelId);
     let props: LanguageModelGatekeeperProps = {
       displayName: chatMeta.aiModel!.profile.name,
+      modelId,
       config: chatMeta.aiModel!.config,
       initiator: {
         type: "gadget",
@@ -7692,8 +7688,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let creationSpec: GatekeeperCreationSpec = {
       type: "aiModel",
       modelId,
-      provider: chatMeta.aiModel!.config.provider,
-      modelName: chatMeta.aiModel!.config.model,
     };
 
     let result = await this.impl.addGatekeeper(
@@ -7727,18 +7721,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       creatorUserId: this.#clientUser.id.toString(),
     };
 
-    // Resolve model provider/name for blueprint metadata.
     let creationSpec: GatekeeperCreationSpec = {
       type: "agentSpawner",
       config,
     };
-    if (config.modelId) {
-      let chatMeta = await this.#clientUser.getChatContext(config.modelId);
-      if (chatMeta.aiModel) {
-        creationSpec.modelProvider = chatMeta.aiModel.config.provider;
-        creationSpec.modelName = chatMeta.aiModel.config.model;
-      }
-    }
 
     let result = await this.impl.addGatekeeper(
         this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec);
@@ -9657,7 +9643,10 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     if (!record.creationSpec) {
       throw new Error("This gatekeeper has no creation spec (created before blueprint support).");
     }
-    return record.creationSpec;
+    let spec = record.creationSpec;
+    if (spec.type === "aiModel") return {type: spec.type, modelId: spec.modelId};
+    if (spec.type === "agentSpawner") return {type: spec.type, config: spec.config};
+    return spec;
   }
 }
 

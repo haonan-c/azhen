@@ -1,14 +1,15 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react'
 import { RpcStub } from 'capnweb'
 import { Switch, Textarea, Input, Button, Tabs, useKumoToastManager } from '@cloudflare/kumo'
-import { Hexagon, ShieldWarning, UserPlus } from '@phosphor-icons/react'
+import { Hexagon, Plus, ShieldWarning, UserPlus } from '@phosphor-icons/react'
 import { useAuthenticatedApi } from './AuthContext'
-import { AdminApi, AdminFormat, AdminResourceVendor, AmbientGatekeeperMode, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
+import { AdminApi, AdminFormat, AdminResourceVendor, AiGatewayInfo, AiModelConfig, AmbientGatekeeperMode, DeploymentModelCatalog, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_ANNOUNCEMENT_LENGTH, MAX_SITE_NAME_LENGTH, BannerColor, BANNER_COLORS, DEFAULT_BANNER_COLOR } from '@gadgets/workshop-shared/api'
 import { applyAccentColor, DEFAULT_ACCENT_COLOR } from './theme'
 import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
+import AddModelModal from './AddModelModal'
 import { m as messages } from './paraglide/messages.js'
 import { formatLocaleNumber } from './utils/formatNumber'
 
@@ -101,6 +102,13 @@ export default function AdminPage() {
 
   const [activeTab, setActiveTab] = useState('general')
 
+  const [modelCatalog, setModelCatalog] = useState<DeploymentModelCatalog>({
+    models: [],
+    defaultModelId: null,
+  })
+  const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
+  const [modelDialogOpen, setModelDialogOpen] = useState(false)
+
   // Promoted output formats, in menu order (see AdminFormatsPanel).
   const [formats, setFormats] = useState<AdminFormat[]>([])
 
@@ -146,7 +154,14 @@ export default function AdminPage() {
         }
         stub = api
         setAdmin({ api })
-        applySettings(await api.getSettings())
+        const [settings, catalog, deploymentAiConfig] = await Promise.all([
+          api.getSettings(),
+          api.getDeploymentModelCatalog(),
+          authenticatedApi.getAiConfig(),
+        ])
+        applySettings(settings)
+        setModelCatalog(catalog)
+        setAiConfig(deploymentAiConfig)
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to load admin settings:', err)
@@ -410,11 +425,50 @@ export default function AdminPage() {
         onValueChange={setActiveTab}
         tabs={[
           { value: 'general', label: messages.admin_tab_general() },
+          { value: 'models', label: messages.admin_tab_models() },
           { value: 'gatekeepers', label: messages.admin_tab_gatekeepers() },
           { value: 'formats', label: messages.admin_tab_formats() },
           { value: 'access', label: messages.admin_tab_access() },
         ]}
       />
+
+      {activeTab === 'models' && (
+        <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-kumo-strong">
+                {messages.admin_models_title()}
+              </h2>
+              <p className="mt-1 text-sm text-kumo-subtle">
+                {messages.admin_models_description()}
+              </p>
+            </div>
+            <Button variant="primary" size="sm" onClick={() => setModelDialogOpen(true)}>
+              <Plus size={14} weight="bold" />
+              {messages.admin_models_add()}
+            </Button>
+          </div>
+
+          {modelCatalog.models.length === 0 ? (
+            <p className="mt-6 text-sm text-kumo-subtle">{messages.admin_models_empty()}</p>
+          ) : (
+            <div className="mt-6 space-y-2">
+              {modelCatalog.models.map(model => (
+                <div key={model.id} className="flex items-center gap-3 rounded-lg border border-kumo-line px-4 py-3">
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium text-kumo-default">
+                    {model.name}
+                  </span>
+                  {model.id === modelCatalog.defaultModelId && (
+                    <span className="rounded-full bg-kumo-tint px-2 py-1 text-[11px] font-medium text-kumo-subtle">
+                      {messages.admin_models_default()}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Standard output formats */}
       {activeTab === 'formats' && admin && (
@@ -1005,6 +1059,17 @@ export default function AdminPage() {
           </div>
         </div>
       )}
+
+      <AddModelModal
+        visible={modelDialogOpen}
+        onCancel={() => setModelDialogOpen(false)}
+        onSuccess={() => setModelDialogOpen(false)}
+        onAddModel={async (name: string, config: AiModelConfig) => {
+          await admin.api.addDeploymentModel(name, config)
+          setModelCatalog(await admin.api.getDeploymentModelCatalog())
+        }}
+        aiConfig={aiConfig}
+      />
     </div>
   )
 }

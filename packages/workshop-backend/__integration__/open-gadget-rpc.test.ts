@@ -9,9 +9,40 @@ import {
   type OpenGadgetErrorCode,
   type PublicApi,
 } from "@gadgets/workshop-shared/api";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 type CodedError = Error & { code?: unknown };
+
+function openAiTextResponse(text: string): Response {
+  const item = {
+    type: "message",
+    id: "msg_test",
+    role: "assistant",
+    status: "completed",
+    content: [{type: "output_text", text, annotations: []}],
+  };
+  const response = {
+    id: "resp_test",
+    status: "completed",
+    output: [item],
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      total_tokens: 2,
+      input_tokens_details: {cached_tokens: 0},
+      output_tokens_details: {reasoning_tokens: 0},
+    },
+  };
+  const events = [
+    {type: "response.created", response},
+    {type: "response.output_item.added", output_index: 0, item},
+    {type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text},
+    {type: "response.output_item.done", output_index: 0, item},
+    {type: "response.completed", response},
+  ];
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") +
+      "data: [DONE]\n\n", {headers: {"content-type": "text/event-stream"}});
+}
 
 const PASSWORD_HASH = new Uint8Array([1, 2, 3]);
 // Also whitelisted in vitest.integration.config.ts onUnhandledError: capabilities held across
@@ -220,5 +251,60 @@ describe("workspace session across a user-DO-only reset", () => {
     // GadgetClient capability that must also be born with the fresh-stub design.
     using gadget = await workspace.createGadget("post-reset gadget");
     expect(await gadget.getTitle()).toBe("post-reset gadget");
+  });
+});
+
+describe("Deployment Model RPC", () => {
+  it("lets every user select an admin-published model without exposing its configuration", async () => {
+    using publicApi = await connect();
+    const adminToken = await publicApi.createAccount(
+      "DeploymentAdmin",
+      "Deployment Admin",
+      PASSWORD_HASH,
+    );
+    if (adminToken === null) throw new Error("Failed to create deployment admin.");
+    using authenticatedAdmin = await publicApi.authenticate(adminToken);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected deployment admin capability.");
+
+    await admin.addDeploymentModel("Friendly GPT", {
+      provider: "openai",
+      model: "gpt-5.2",
+      apiToken: "deployment-secret-token",
+      apiUrl: "https://provider.example.test/v1",
+    });
+    const catalog = await admin.getDeploymentModelCatalog();
+    expect(catalog.defaultModelId).toBe(catalog.models[0]?.id);
+
+    const account = await createAccount(publicApi, "ordinary");
+    using ordinary = await publicApi.authenticate(account.token);
+    expect(await ordinary.getAdminApi()).toBeNull();
+    expect(await ordinary.listModels()).toEqual(catalog.models);
+
+    const visible = JSON.stringify(await ordinary.listModels());
+    expect(visible).not.toContain("deployment-secret-token");
+    expect(visible).not.toContain("provider.example.test");
+    expect(visible).not.toContain("gpt-5.2");
+
+    using workspace = await ordinary.newGadget();
+    const attachment = await workspace.uploadChatAttachment({
+      mimeType: "application/pdf",
+      content: new TextEncoder().encode("%PDF-test"),
+    }, catalog.models[0]!.id);
+    expect(attachment.id).toEqual(expect.any(String));
+
+    const fetchMock = vi.fn(async () => openAiTextResponse("Deployment model replied."));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const chatId = await workspace.newChat("Reply once.", catalog.models[0]!.id);
+      await vi.waitFor(async () => {
+        expect(fetchMock).toHaveBeenCalled();
+        const chat = (await workspace.listChats()).find(candidate => candidate.id === chatId);
+        expect(chat?.activeAgent).toBeUndefined();
+        expect(chat?.title).toContain("Deployment model replied.");
+      }, {timeout: 10_000});
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

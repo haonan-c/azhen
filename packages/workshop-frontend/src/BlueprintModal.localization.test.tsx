@@ -108,8 +108,6 @@ describe('BlueprintModal localization', () => {
           creationSpec: {
             type: 'aiModel',
             modelId: 'model-1',
-            provider: 'anthropic',
-            modelName: 'claude-sonnet',
           },
           annotation: { title: '', description: '', suggestValue: false },
         }}

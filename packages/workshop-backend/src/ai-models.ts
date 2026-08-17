@@ -678,6 +678,7 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
 
 export type LanguageModelGatekeeperProps = {
   displayName: string,
+  modelId: string,
   config: AiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
@@ -687,12 +688,11 @@ export class LanguageModelGatekeeper
     extends DurableObject<Cloudflare.Env, LanguageModelGatekeeperProps>
     implements Gatekeeper<LanguageModelBinding> {
   async describe(): Promise<ResourceDescription> {
-    let modelConfig = this.ctx.props.config;
     let displayName = this.ctx.props.displayName;
 
     return {
       // TODO: Decide if we need real URLs or if `url` should stop being part of the description.
-      url: `http://models.local/${modelConfig.provider}/${modelConfig.model}`,
+      url: `http://models.local/${this.ctx.props.modelId}`,
 
       title: displayName,
       snippet: "An AI large language model.",

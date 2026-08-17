@@ -19,6 +19,11 @@ export default defineConfig({
       wrangler: {
         configPath: "./wrangler.jsonc",
       },
+      miniflare: {
+        bindings: {
+          ADMINS: ["deploymentadmin"],
+        },
+      },
     }),
   ],
   test: {

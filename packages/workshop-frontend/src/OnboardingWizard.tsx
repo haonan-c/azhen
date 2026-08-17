@@ -4,7 +4,6 @@ import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
 import {
   AiChatAuthorInfo,
-  AiGatewayInfo,
 } from '@gadgets/workshop-shared/api'
 import {
   VendorDescription,
@@ -13,7 +12,6 @@ import {
   Camera,
   ArrowRight,
   Check,
-  Plus,
   PlugsConnected,
   Sparkle,
   UsersThree,
@@ -21,7 +19,6 @@ import {
   Plugs,
   Hexagon,
 } from '@phosphor-icons/react'
-import AddModelModal from './AddModelModal'
 import { persistSelectedModel } from './modelSelection'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'
@@ -85,8 +82,6 @@ export default function OnboardingWizard({
   // Model state
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
-  const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
-  const [addModelOpen, setAddModelOpen] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(true)
 
   // Connections state
@@ -115,15 +110,11 @@ export default function OnboardingWizard({
     }
   }, [currentUser])
 
-  // Load models + AI config
+  // Load the Deployment Model Catalog.
   const fetchModels = useCallback(async () => {
     try {
-      const [modelList, cfg] = await Promise.all([
-        authenticatedApi.listModels(),
-        authenticatedApi.getAiConfig(),
-      ])
+      const modelList = await authenticatedApi.listModels()
       setModels(modelList)
-      setAiConfig(cfg)
       // Default to the first model in the list
       if (modelList.length > 0) {
         setSelectedModelId((prev) => prev ?? modelList[0].id)
@@ -536,9 +527,6 @@ export default function OnboardingWizard({
                             <p className="text-sm font-medium text-kumo-default truncate">
                               {model.name}
                             </p>
-                            <p className="text-xs text-kumo-subtle truncate">
-                              {model.id}
-                            </p>
                           </div>
                           {selectedModelId === model.id && (
                             <Check
@@ -561,14 +549,6 @@ export default function OnboardingWizard({
                         </div>
                       )}
                     </div>
-
-                    <button
-                      onClick={() => setAddModelOpen(true)}
-                      className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-kumo-subtle border border-dashed border-kumo-line rounded-xl hover:border-kumo-fill hover:text-kumo-default hover:bg-kumo-tint transition-colors"
-                    >
-                      <Plus size={14} weight="bold" />
-                      {messages.onboarding_add_model()}
-                    </button>
                   </>
                 )}
               </div>
@@ -728,19 +708,6 @@ export default function OnboardingWizard({
       </div>
 
     </div>
-
-    {/* Add Model Modal — outside the wizard's inner content so it's not
-        clipped by overflow-hidden on the sliding panel */}
-    <AddModelModal
-      visible={addModelOpen}
-      onCancel={() => setAddModelOpen(false)}
-      onSuccess={() => {
-        setAddModelOpen(false)
-        fetchModels()
-      }}
-      authenticatedApi={authenticatedApi}
-      aiConfig={aiConfig}
-    />
     </>
   )
 }

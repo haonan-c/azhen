@@ -458,31 +458,8 @@ export interface AuthenticatedApi extends RpcTarget {
    */
   hasPasswordLogin(): Promise<boolean>;
 
-  /**
-   * List the user's configured AI models.
-   *
-   * Note that the list returned here could be different from a particular gadget's Overseer,
-   * especially if the gadget is owned by someone else.
-   */
+  /** List the Deployment Models that this user can select. */
   listModels(): Promise<AiChatAuthorInfo[]>;
-
-  /**
-   * Adds a new model to the user's configured set. The ID must be unique among the user's
-   * configured models.
-   */
-  addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void>;
-
-  /** Deletes a configured model. */
-  deleteModel(id: string): Promise<void>;
-
-  /**
-   * Set the model to use for simple quick tasks, like generating chat titles. Set null to
-   * disable quick model use (e.g. chats will be titled "New Chat").
-   */
-  setQuickModel(id: string | null): Promise<void>;
-
-  /** Get the quick model setting. */
-  getQuickModel(): Promise<null | string>;
 
   /**
    * Get AI configuration info, including whether AI Gateway mode is active and which providers
@@ -1002,13 +979,19 @@ export type AdminFormat = {
 /**
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers branding, agent instructions, and
- * which gatekeeper connectors/resources are offered — NOT authentication config (that's env-var
- * driven). Each setter throws on invalid input.
+ * capability is minted, so these methods don't re-check. Covers Deployment Models, branding,
+ * agent instructions, and which gatekeeper connectors/resources are offered — NOT authentication
+ * config (that's env-var driven). Each setter throws on invalid input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
+
+  /** Read the Deployment Model Catalog without exposing Model Configuration. */
+  getDeploymentModelCatalog(): Promise<DeploymentModelCatalog>;
+
+  /** Add a Deployment Model. The first model becomes the Deployment Default Model. */
+  addDeploymentModel(name: string, config: AiModelConfig): Promise<void>;
 
   /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
   setSignupsEnabled(enabled: boolean): Promise<void>;
@@ -1256,6 +1239,14 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
+};
+
+/** Public Deployment Model Catalog data. It never contains Model Configuration. */
+export type DeploymentModelCatalog = {
+  /** Deployment Models in selection order. */
+  models: AiChatAuthorInfo[];
+  /** Stable public reference for the Deployment Default Model, or null when none exists. */
+  defaultModelId: string | null;
 };
 
 /**
@@ -3143,20 +3134,11 @@ export type GatekeeperCreationSpec = {
   typeUrlPattern: string;  // URL pattern from the vendor's SupportedResource (not the specific URL)
 } | {
   type: "aiModel";
-  modelId: string;         // the user's configured model ID
-  provider: string;        // provider name (e.g. "anthropic")
-  modelName: string;       // model name on the provider's API (e.g. "claude-sonnet-4-6")
+  /** Stable public Deployment Model reference. */
+  modelId: string;
 } | {
   type: "agentSpawner";
   config: AgentSpawnerConfig;
-
-  /**
-   * Denormalized from the creating user's model config at binding creation time.
-   * Absent when config.modelId is null. Used to populate blueprint suggestedModel
-   * without requiring a live lookup.
-   */
-  modelProvider?: string;
-  modelName?: string;
 } | {
   /**
    * A singleton gatekeeper account (e.g. the Context Library) auto-provided to every gadget as an
@@ -3241,8 +3223,7 @@ export type BlueprintBinding = {
   resourceUrl?: string;
 } | {
   /**
-   * An AI model binding. The user instantiating the blueprint picks one of their own
-   * configured models.
+   * An AI model binding. The user instantiating the blueprint picks an available Deployment Model.
    */
   type: "aiModel";
 
@@ -3377,7 +3358,8 @@ export type BlueprintBindingAssignment = {
   resourceUrl: string;
 } | {
   type: "aiModel";
-  modelId: string;        // one of the user's configured models
+  /** Available Deployment Model selected for the new gadget. */
+  modelId: string;
 } | {
   type: "agentSpawner";
   modelId: string | null; // model to run, or null for no agent

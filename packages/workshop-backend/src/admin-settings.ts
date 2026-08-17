@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AiChatAuthorInfo, AiModelConfig, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -13,12 +13,24 @@ import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
+import { getAiGatewayConfig } from './ai-gateway.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
+
+/** Server-only Deployment Model data. Model Configuration never enters a public catalog view. */
+export type DeploymentModelRecord = {
+  /** Public profile returned to authenticated users. */
+  profile: AiChatAuthorInfo;
+  /** Server-only Model Configuration used to create the model. */
+  config: AiModelConfig;
+};
 
 function makeAdminSettingsStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
+      deploymentModels: collection<DeploymentModelRecord>()({
+        primaryKey: record => record.profile.id,
+      }),
       // Mirror of the currently-featured blueprint public records. The user DO owns the
       // authoritative featured bit; this DO keeps the publishable deployment-wide copy.
       featuredBlueprints: collection<BlueprintPublicInfo>()({
@@ -26,6 +38,9 @@ function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       }),
     },
     singletons: {
+      // Stable public reference for the Deployment Default Model. The first model sets it.
+      deploymentDefaultModelId: <string | null>null,
+
       // Authoritative deployment admin config. Mirrored to BLUEPRINTS KV (ADMIN_CONFIG_KEY) so the
       // connect/login/agent hot paths can read it without touching this singleton DO.
       adminConfig: DEFAULT_ADMIN_CONFIG as AdminConfig,
@@ -268,6 +283,44 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   getAdminConfig(): AdminConfig {
     return this.#config();
+  }
+
+  getDeploymentModelCatalog(): DeploymentModelCatalog {
+    let defaultModelId = this.storage.deploymentDefaultModelId.get();
+    let models = [...this.storage.deploymentModels.list()].map(model => model.profile);
+    if (defaultModelId) {
+      models.sort((a, b) => Number(b.id === defaultModelId) - Number(a.id === defaultModelId));
+    }
+    return {models, defaultModelId};
+  }
+
+  addDeploymentModel(name: string, config: AiModelConfig): void {
+    let displayName = name.trim();
+    if (!displayName) throw new Error("Model name is required.");
+    if (!config.model.trim()) throw new Error("Provider model ID is required.");
+    let gateway = getAiGatewayConfig(this.env);
+    if (gateway && !gateway.canConfigureProvider(config.provider)) {
+      throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
+    }
+
+    let profile: AiChatAuthorInfo = {
+      type: "agent",
+      id: crypto.randomUUID(),
+      name: displayName,
+    };
+    this.storage.deploymentModels.put({profile, config});
+    if (this.storage.deploymentDefaultModelId.get() === null) {
+      this.storage.deploymentDefaultModelId.put(profile.id);
+    }
+  }
+
+  resolveDeploymentModel(id: string): DeploymentModelRecord | undefined {
+    return this.storage.deploymentModels.get(id);
+  }
+
+  getDeploymentDefaultModel(): DeploymentModelRecord | undefined {
+    let id = this.storage.deploymentDefaultModelId.get();
+    return id ? this.storage.deploymentModels.get(id) : undefined;
   }
 
   async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
@@ -572,6 +625,14 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   getSettings(): Promise<AdminSettingsView> {
     return this.admin.getSettings(this.adminUserId);
+  }
+
+  getDeploymentModelCatalog(): Promise<DeploymentModelCatalog> {
+    return this.admin.getDeploymentModelCatalog();
+  }
+
+  async addDeploymentModel(name: string, config: AiModelConfig): Promise<void> {
+    await this.admin.addDeploymentModel(name, config);
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {

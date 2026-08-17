@@ -17,7 +17,10 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => ({
 }))
 vi.mock('./AuthContext', () => {
   const auth = {
-    authenticatedApi: { getAdminApi: testState.getAdminApi },
+    authenticatedApi: {
+      getAdminApi: testState.getAdminApi,
+      getAiConfig: async () => ({ enabled: false as const }),
+    },
     isAdmin: true,
   }
   return { useAuthenticatedApi: () => auth }
@@ -49,6 +52,8 @@ function adminApi() {
       accentColor: '',
       formats: [],
     }),
+    getDeploymentModelCatalog: async () => ({models: [], defaultModelId: null}),
+    addDeploymentModel: async () => {},
     [Symbol.dispose]: vi.fn<() => void>(),
   }
 }
@@ -80,6 +85,7 @@ describe('administrator localization', () => {
       heading: 'Admin',
       description: 'Deployment-wide settings. Changes apply to all users on their next connection.',
       general: 'General',
+      models: 'Models',
       siteName: 'Site name',
     },
     {
@@ -87,6 +93,7 @@ describe('administrator localization', () => {
       heading: '管理员',
       description: '部署级设置。更改会在所有用户下次连接时生效。',
       general: '常规',
+      models: '模型',
       siteName: '站点名称',
     },
   ])('localizes administrator settings at $path without changing configured values', async ({
@@ -94,6 +101,7 @@ describe('administrator localization', () => {
     heading,
     description,
     general,
+    models,
     siteName,
   }) => {
     testState.getAdminApi.mockResolvedValue(adminApi())
@@ -103,6 +111,7 @@ describe('administrator localization', () => {
     expect(container?.querySelector('h1')?.textContent).toBe(heading)
     expect(container?.textContent).toContain(description)
     expect(container?.textContent).toContain(general)
+    expect(container?.textContent).toContain(models)
     expect(container?.textContent).toContain(siteName)
     expect(container?.textContent).toContain('ADMIN INSTRUCTIONS 原样')
     expect(container?.querySelector<HTMLInputElement>(`input[aria-label="${siteName}"]`)?.value)

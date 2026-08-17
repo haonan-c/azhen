@@ -526,61 +526,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
-    let result: AiChatAuthorInfo[] = [];
+    let deploymentCatalog = await this.adminSettings.getByName("").getDeploymentModelCatalog();
+    let result = [...deploymentCatalog.models];
+    let modelIds = new Set(result.map(model => model.id));
 
     // When AI Gateway mode is active, include all suggested models for enabled providers.
     let gwConfig = getAiGatewayConfig(this.env);
-    let gwModelIds = new Set<string>();
     if (gwConfig) {
       for (let entry of gwConfig.getModelList()) {
-        result.push(entry);
-        gwModelIds.add(entry.id);
-      }
-    }
-
-    // Also include user-configured models, skipping any that duplicate a gateway model.
-    for (let model of this.storage.aiModels.list()) {
-      if (!gwModelIds.has(model.profile.id)) {
-        result.push(model.profile);
+        if (!modelIds.has(entry.id)) {
+          result.push(entry);
+          modelIds.add(entry.id);
+        }
       }
     }
     return result;
-  }
-
-  async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
-    let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig && !gwConfig.canConfigureProvider(config.provider)) {
-      throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
-    }
-
-    profile.type = "agent";
-    this.storage.aiModels.put({profile, config});
-  }
-
-  async deleteModel(id: string): Promise<void> {
-    // In AI Gateway mode, don't allow deleting built-in suggested models.
-    let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig) {
-      let builtInModel = gwConfig.resolveModel(id);
-      if (builtInModel) {
-        throw new Error(`Cannot delete built-in model "${builtInModel.profile.name}".`);
-      }
-    }
-
-    this.storage.aiModels.delete(id);
-  }
-
-  async setQuickModel(id: string | null): Promise<void> {
-    this.storage.quickModel.put(id);
-  }
-
-  async getQuickModel(): Promise<null | string> {
-    let result = this.storage.quickModel.get();
-    if (result && this.storage.aiModels.get(result)) {
-      return result;
-    } else {
-      return null;
-    }
   }
 
   async getPreferredModel(): Promise<string | null> {
@@ -589,10 +549,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async setPreferredModel(id: string | null): Promise<void> {
     if (id !== null) {
-      // Validate that the model exists in the user's configured models or as a gateway model.
-      let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
-      if (!exists) {
+      if (!(await this.listModels()).some(model => model.id === id)) {
         throw new Error(`No such model: ${id}`);
       }
     }
@@ -693,34 +650,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** DO NOT MAKE PUBLIC -- returns API keys. */
   async getChatContext(modelId: string | null): Promise<UserChatContext> {
     let gwConfig = getAiGatewayConfig(this.env);
+    let admin = this.adminSettings.getByName("");
 
     let result: UserChatContext = {
       profile: this.storage.profile.get()
     };
     if (modelId) {
-      // In AI Gateway mode, resolve gateway models first.
-      if (gwConfig) {
-        result.aiModel = gwConfig.resolveModel(modelId);
-      }
+      result.aiModel = await admin.resolveDeploymentModel(modelId);
       if (!result.aiModel) {
-        result.aiModel = this.storage.aiModels.get(modelId);
+        result.aiModel = gwConfig?.resolveModel(modelId);
       }
       if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
-    if (gwConfig) {
-      // In AI Gateway mode, always use the hardcoded quick model.
-      result.quickModel = gwConfig.getQuickModelConfig();
-    } else {
-      let quickModelId = this.storage.quickModel.get();
-      if (quickModelId) {
-        let quickModel = this.storage.aiModels.get(quickModelId);
-        if (quickModel) {
-          result.quickModel = quickModel.config;
-        }
-      }
-    }
+    result.quickModel = (await admin.getDeploymentDefaultModel())?.config
+        ?? gwConfig?.getQuickModelConfig();
     return result;
   }
 

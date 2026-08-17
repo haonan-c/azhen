@@ -4,8 +4,7 @@
 import { act, type ComponentProps, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { RpcStub } from 'capnweb'
-import type { AiGatewayInfo, AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import type { AiGatewayInfo, AiModelConfig } from '@gadgets/workshop-shared/api'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -102,8 +101,7 @@ describe('AddModelModal direct-only providers in Gateway mode', () => {
   })
 
   async function render() {
-    const addModel = vi.fn<AuthenticatedApi['addModel']>(async () => {})
-    const authenticatedApi = { addModel } as unknown as RpcStub<AuthenticatedApi>
+    const addModel = vi.fn<(name: string, config: AiModelConfig) => Promise<void>>(async () => {})
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -113,7 +111,7 @@ describe('AddModelModal direct-only providers in Gateway mode', () => {
           visible
           onCancel={() => {}}
           onSuccess={() => {}}
-          authenticatedApi={authenticatedApi}
+          onAddModel={addModel}
           aiConfig={AI_CONFIG}
         />,
       )
@@ -145,7 +143,7 @@ describe('AddModelModal direct-only providers in Gateway mode', () => {
     })
 
     expect(rendered.addModel).toHaveBeenCalledWith(
-      { type: 'agent', id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+      'DeepSeek V4 Flash',
       {
         provider: 'deepseek',
         model: 'deepseek-v4-flash',
@@ -176,7 +174,7 @@ describe('AddModelModal direct-only providers in Gateway mode', () => {
     })
 
     expect(rendered.addModel).toHaveBeenCalledWith(
-      { type: 'agent', id: 'claude-custom', name: 'Claude Custom' },
+      'Claude Custom',
       { provider: 'anthropic', model: 'claude-custom', apiToken: '' },
     )
   })

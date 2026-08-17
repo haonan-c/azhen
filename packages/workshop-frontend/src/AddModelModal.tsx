@@ -1,15 +1,13 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, DIRECT_ONLY_AI_PROVIDERS, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
-import { RpcStub } from 'capnweb'
-import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
+import { AiModelConfig, AiModelProvider, AiGatewayInfo, DIRECT_ONLY_AI_PROVIDERS, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
 import { m as messages } from './paraglide/messages.js'
 
 interface AddModelModalProps {
   visible: boolean
   onCancel: () => void
   onSuccess: () => void
-  authenticatedApi: RpcStub<AuthenticatedApi>
+  onAddModel: (name: string, config: AiModelConfig) => Promise<void>
   aiConfig: AiGatewayInfo | null
 }
 
@@ -102,7 +100,7 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
   return options
 }
 
-export default function AddModelModal({ visible, onCancel, onSuccess, authenticatedApi, aiConfig }: AddModelModalProps) {
+export default function AddModelModal({ visible, onCancel, onSuccess, onAddModel, aiConfig }: AddModelModalProps) {
   const toasts = useKumoToastManager()
 
   const [loading, setLoading] = useState(false)
@@ -205,12 +203,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       const finalModelId = isSuggested ? selection!.modelId : modelId.trim()
       const finalDisplayName = isSuggested ? selection!.displayName : displayName.trim()
 
-      const profile: AiChatAuthorInfo = {
-        type: 'agent',
-        id: finalModelId,
-        name: finalDisplayName,
-      }
-
       const config: AiModelConfig = {
         provider: selection!.provider,
         model: finalModelId,
@@ -219,7 +211,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         ...(usesDirectCredentials && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
       }
 
-      await authenticatedApi.addModel(profile, config)
+      await onAddModel(finalDisplayName, config)
       toasts.add({ title: messages.add_model_success(), variant: 'success' })
       onSuccess()
     } catch (error: any) {

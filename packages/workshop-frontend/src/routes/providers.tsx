@@ -1,6 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useState, useEffect, useRef } from 'react'
-import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
+import { useState, useEffect } from 'react'
 import { useAuthenticatedApi } from '../AuthContext'
 import {
   AiChatAuthorInfo,
@@ -8,16 +7,8 @@ import {
   AiModelProvider,
   SUGGESTED_MODELS,
 } from '@gadgets/workshop-shared/api'
-import {
-  Plus,
-  Trash,
-  Lightning,
-  MagnifyingGlass,
-  DotsThreeVertical,
-} from '@phosphor-icons/react'
-import AddModelModal from '../AddModelModal'
+import { Lightning, MagnifyingGlass } from '@phosphor-icons/react'
 import { useDocumentTitle } from '../useDocumentTitle'
-import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuStyles'
 import { m as messages } from '../paraglide/messages.js'
 
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
@@ -26,40 +17,18 @@ export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
 const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
-const PRIMARY_BTN =
-  'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
-
 // ─── model row ─────────────────────────────────────────────────────────────────
 
-// Rows mirror the Blueprints list: a clickable row (here, clicking sets/clears the quick model)
-// plus a kebab for the rest. The whole row is the primary affordance, so it shows a pointer.
+// Rows mirror the Blueprints list while keeping model configuration read-only for normal users.
 function ModelRow({
   model,
-  isQuick,
   isBuiltIn,
-  onDelete,
-  onSetQuick,
 }: {
   model: AiChatAuthorInfo
-  isQuick: boolean
   isBuiltIn: boolean
-  onDelete: () => void
-  onSetQuick: () => void
 }) {
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onSetQuick}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onSetQuick()
-        }
-      }}
-      title={isQuick ? messages.providers_quick_title_clear() : messages.providers_quick_title_set()}
-      className="group flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2.5 transition-colors duration-150 ease-out hover:bg-kumo-tint"
-    >
+    <div className="flex items-center gap-3 rounded-lg px-3 py-2.5">
       {/* Neutral monogram — matches the sidebar/workspaces treatment */}
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-kumo-fill text-[12px] font-medium text-kumo-subtle">
         {model.name[0]?.toUpperCase()}
@@ -76,44 +45,7 @@ function ModelRow({
               {messages.providers_builtin()}
             </span>
           )}
-          {isQuick && (
-            <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[rgba(255,72,1,0.10)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-brand">
-              <Lightning size={9} weight="fill" />
-              {messages.providers_quick()}
-            </span>
-          )}
         </div>
-        <span className="mt-0.5 block truncate font-mono text-[12px] tracking-[-0.1px] text-kumo-inactive">
-          {model.id}
-        </span>
-      </div>
-
-      {/* Actions */}
-      <div onClick={(e) => { e.stopPropagation() }}>
-        <DropdownMenu>
-          <DropdownMenu.Trigger
-            render={
-              <button
-                aria-label={messages.providers_actions()}
-                className="cursor-pointer rounded-md p-1.5 text-kumo-subtle transition-colors hover:bg-kumo-fill hover:text-kumo-default focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
-              >
-                <DotsThreeVertical size={16} />
-              </button>
-            }
-          />
-          <DropdownMenu.Content className={MENU_CONTENT}>
-            <DropdownMenu.Item onClick={onSetQuick} className={MENU_ITEM}>
-              <Lightning size={13} className="mr-2" weight={isQuick ? 'fill' : 'regular'} />
-              {isQuick ? messages.providers_clear_quick() : messages.providers_set_quick()}
-            </DropdownMenu.Item>
-            {!isBuiltIn && (
-              <DropdownMenu.Item variant="danger" onClick={onDelete} className={MENU_ITEM_DANGER}>
-                <Trash size={13} className="mr-2" />
-                {messages.providers_delete()}
-              </DropdownMenu.Item>
-            )}
-          </DropdownMenu.Content>
-        </DropdownMenu>
       </div>
     </div>
   )
@@ -135,26 +67,20 @@ function ProvidersPage() {
   useDocumentTitle(messages.providers_document_title())
 
   const { authenticatedApi } = useAuthenticatedApi()
-  const toasts = useKumoToastManager()
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
-  const [quickModel, setQuickModel] = useState<string | null>(null)
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState(false)
-  const [sheetOpen, setSheetOpen] = useState(false)
-  const [deletingId, setDeletingId] = useState<string | null>(null)
 
   const fetchAll = async () => {
     setLoadError(false)
     try {
-      const [modelList, qm, cfg] = await Promise.all([
+      const [modelList, cfg] = await Promise.all([
         authenticatedApi.listModels(),
-        authenticatedApi.getQuickModel(),
         authenticatedApi.getAiConfig(),
       ])
       setModels(modelList)
-      setQuickModel(qm)
       setAiConfig(cfg)
     } catch (err) {
       console.error('Failed to load providers:', err)
@@ -174,39 +100,6 @@ function ProvidersPage() {
     return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
   }
 
-  const handleDelete = async (model: AiChatAuthorInfo) => {
-    if (!confirm(messages.providers_delete_confirm({ name: model.name }))) return
-    setDeletingId(model.id)
-    try {
-      await authenticatedApi.deleteModel(model.id)
-      await fetchAll()
-    } catch (err) {
-      console.error('Failed to delete model:', err)
-      toasts.add({ title: messages.providers_delete_failed(), variant: 'error' })
-    } finally {
-      setDeletingId(null)
-    }
-  }
-
-  // Overlapping setQuickModel calls have no ordering guarantee, so ignore clicks while one is
-  // in flight.
-  const quickInFlight = useRef(false)
-  const handleSetQuick = async (modelId: string) => {
-    if (quickInFlight.current) return
-    quickInFlight.current = true
-    const next = quickModel === modelId ? null : modelId
-    setQuickModel(next)
-    try {
-      await authenticatedApi.setQuickModel(next)
-    } catch (err) {
-      console.error('Failed to set quick model:', err)
-      setQuickModel(quickModel) // revert
-      toasts.add({ title: messages.providers_update_quick_failed(), variant: 'error' })
-    } finally {
-      quickInFlight.current = false
-    }
-  }
-
   const filtered = models.filter((m) => {
     if (!search) return true
     const q = search.toLowerCase()
@@ -215,7 +108,7 @@ function ProvidersPage() {
 
   return (
     <div className="mx-auto flex h-full w-full max-w-4xl flex-col px-6 sm:px-10">
-      <header className="flex items-end justify-between gap-4 px-3 pb-3 pt-10">
+      <header className="px-3 pb-3 pt-10">
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
             {messages.providers_title()}
@@ -224,10 +117,6 @@ function ProvidersPage() {
             {messages.providers_description()}
           </p>
         </div>
-        <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
-          <Plus size={14} weight="bold" />
-          {messages.providers_add()}
-        </button>
       </header>
 
       {/* Search — hidden when the user has no models */}
@@ -248,7 +137,7 @@ function ProvidersPage() {
 
       <div className="chat-panel flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pt-1 pb-16">
         {/* Notices */}
-        {(gatewayMode || (!gatewayMode && models.length > 0)) && !loading && !loadError && (
+        {models.length > 0 && !loading && !loadError && (
           <div className="flex flex-col gap-2.5 px-3 pb-2">
             {gatewayMode && (
               <Notice>
@@ -262,20 +151,7 @@ function ProvidersPage() {
               </Notice>
             )}
 
-            {!gatewayMode && models.length > 0 && (
-              <Notice>
-                <Lightning size={15} className="mt-px shrink-0 text-kumo-brand" />
-                <span>
-                  <strong className="font-medium text-kumo-default">
-                    {messages.providers_quick_label()}
-                  </strong>{' '}
-                  {quickModel
-                    ? `${models.find((m) => m.id === quickModel)?.name ?? quickModel}.`
-                    : messages.providers_quick_none()}{' '}
-                  {messages.providers_quick_description()}
-                </span>
-              </Notice>
-            )}
+            {!gatewayMode && <Notice>{messages.providers_managed_description()}</Notice>}
           </div>
         )}
 
@@ -306,10 +182,6 @@ function ProvidersPage() {
                 {messages.providers_empty_description()}
               </p>
             </div>
-            <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
-              <Plus size={14} weight="bold" />
-              {messages.providers_add_first()}
-            </button>
           </div>
         ) : filtered.length === 0 ? (
           <div className="py-12 text-center text-sm text-kumo-inactive">
@@ -317,33 +189,10 @@ function ProvidersPage() {
           </div>
         ) : (
           filtered.map((model) => (
-            <div
-              key={model.id}
-              className={deletingId === model.id ? 'pointer-events-none opacity-50' : ''}
-            >
-              <ModelRow
-                model={model}
-                isQuick={quickModel === model.id}
-                isBuiltIn={isBuiltIn(model.id)}
-                onDelete={() => handleDelete(model)}
-                onSetQuick={() => handleSetQuick(model.id)}
-              />
-            </div>
+            <ModelRow key={model.id} model={model} isBuiltIn={isBuiltIn(model.id)} />
           ))
         )}
       </div>
-
-      {/* Add model dialog */}
-      <AddModelModal
-        visible={sheetOpen}
-        onCancel={() => setSheetOpen(false)}
-        onSuccess={() => {
-          setSheetOpen(false)
-          fetchAll()
-        }}
-        authenticatedApi={authenticatedApi}
-        aiConfig={aiConfig}
-      />
     </div>
   )
 }
