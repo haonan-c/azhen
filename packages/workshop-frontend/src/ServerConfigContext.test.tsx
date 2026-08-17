@@ -5,15 +5,15 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { ServerConfig } from '@gadgets/workshop-shared/api'
-import { ServerConfigContext, useAssistantName, useSiteName } from './ServerConfigContext'
+import { ServerConfigContext, useSiteName } from './ServerConfigContext'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
-function Names() {
-  return `${useSiteName()}|${useAssistantName()}`
+function SiteName() {
+  return useSiteName()
 }
 
-describe('site and assistant names', () => {
+describe('useSiteName', () => {
   let root: Root | undefined
   let container: HTMLDivElement | undefined
 
@@ -31,7 +31,7 @@ describe('site and assistant names', () => {
 
     act(() => root!.render(
       <ServerConfigContext.Provider value={{ siteName } as ServerConfig}>
-        <Names />
+        <SiteName />
       </ServerConfigContext.Provider>,
     ))
     return container.textContent ?? ''
@@ -39,17 +39,17 @@ describe('site and assistant names', () => {
 
   it('uses the locale brand when the administrator has not set a site name', () => {
     window.history.replaceState({}, '', '/')
-    expect(render('')).toBe('UGC Angle|azhen')
+    expect(render('')).toBe('azhen')
 
     window.history.replaceState({}, '', '/zh')
-    expect(render('')).toBe('UGC Angle|阿珍')
+    expect(render('')).toBe('阿珍')
   })
 
-  it('keeps an administrator site name separate from the built-in assistant name', () => {
+  it('uses an administrator site name unchanged in both locales', () => {
     window.history.replaceState({}, '', '/')
-    expect(render('  Northstar Shop  ')).toBe('Northstar Shop|azhen')
+    expect(render('  Northstar Shop  ')).toBe('Northstar Shop')
 
     window.history.replaceState({}, '', '/zh')
-    expect(render('  Northstar Shop  ')).toBe('Northstar Shop|阿珍')
+    expect(render('  Northstar Shop  ')).toBe('Northstar Shop')
   })
 })

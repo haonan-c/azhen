@@ -1,6 +1,6 @@
 # One site page registry for canonical links, sitemaps, and prerendering
 
-Status: accepted
+Status: superseded by [ADR 0004](./0004-remove-marketing-landing-system.md)
 
 The Production Site must keep its canonical origin, its localized alternates, its sitemap, its
 prerendered documents, and its own internal links in agreement. Today two places decide this

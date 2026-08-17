@@ -15,19 +15,18 @@
   ],
 
   // The router owns the public origin for customer instances, so it serves the frontend.
-  // `run_worker_first` sends documents and dynamic routes through the Router. Built frontend
-  // assets keep their direct Asset Worker path; unmatched application routes use SPA fallback
-  // after the Router applies the page SEO boundary.
+  // `run_worker_first` keeps API and gatekeeper prefixes on the worker; everything else falls
+  // through to static assets with SPA fallback.
   "assets": {
     "directory": "../workshop-frontend/dist",
     "binding": "ASSETS",
-    "html_handling": "drop-trailing-slash",
     "not_found_handling": "single-page-application",
     "run_worker_first": [
-      "/*",
-      "!/assets/*",
-      "!/favicon.svg",
-      "!/marketing/*"
+      "/api",
+      "/api/*",
+      "/blueprint-screenshot",
+      "/blueprint-screenshot/*",
+      "/gatekeeper/*"
     ]
   },
 

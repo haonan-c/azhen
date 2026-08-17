@@ -1,6 +1,6 @@
 import { logRpcFailure } from '../rpcErrors'
 import { useState, useEffect } from 'react'
-import { createRootRoute, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
+import { createRootRoute, Outlet, useRouterState } from '@tanstack/react-router'
 import { TooltipProvider, Toasty } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
@@ -14,8 +14,6 @@ import AppShell from '../components/AppShell/AppShell'
 import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
 import AccountSelectionModal from '../components/billing/AccountSelectionModal'
-import MarketingLandingPage from '../MarketingLandingPage'
-import { marketingPageRequestedFromSearch } from '../homePrompt'
 import { m as messages } from '../paraglide/messages.js'
 
 export const Route = createRootRoute({
@@ -25,12 +23,7 @@ export const Route = createRootRoute({
 export function RootComponent() {
   const rpcStub = useRpcStub()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login, retry } = useAuth(rpcStub)
-  const navigate = useNavigate()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
-  const marketingRequested = useRouterState({ select: (s) => {
-    const search = s.location.search as Record<string, unknown>
-    return marketingPageRequestedFromSearch(search.marketing)
-  } })
 
   // When authenticatedApi becomes available, the connection is proven alive.
   useEffect(() => {
@@ -40,14 +33,11 @@ export function RootComponent() {
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
   const isBlueprint = pathname.startsWith('/blueprint/')
-  const isHome = pathname === '/'
 
   // A standalone (no app shell) render is used only for signed-out visitors of public routes.
   // Signed-in users get the full app chrome so public pages (esp. the blueprint detail) feel
   // native — sidebar and all — instead of floating on a bare page.
-  const standalone = isSignup
-    || (isHome && marketingRequested && !isLoading && !error)
-    || ((isHome || isBlueprint) && !isLoading && !error && !isAuthenticated)
+  const standalone = isSignup || (isBlueprint && !isLoading && !error && !isAuthenticated)
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
@@ -105,19 +95,6 @@ export function RootComponent() {
 
   // Signed-out visitors of public routes render without the auth wrapper / app shell.
   if (standalone) {
-    if (isHome) {
-      return <MarketingLandingPage
-        isAuthenticated={isAuthenticated}
-        onSignIn={() => navigate(isAuthenticated ? {
-          to: '/',
-          search: {},
-        } : {
-          to: '/login',
-          search: true,
-          hash: true,
-        })}
-      />
-    }
     const showHeader = !isSignup
     return (
       <TooltipProvider>

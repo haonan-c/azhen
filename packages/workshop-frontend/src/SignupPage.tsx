@@ -215,7 +215,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
         {passwordAuthEnabled && (
           <p className="text-center text-sm text-kumo-subtle mt-6">
             {messages.auth_existing_account()}{" "}
-            <Link to="/login" className="text-kumo-brand hover:underline font-medium">
+            <Link to="/" className="text-kumo-brand hover:underline font-medium">
               {messages.auth_sign_in()}
             </Link>
           </p>

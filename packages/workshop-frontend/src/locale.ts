@@ -8,18 +8,8 @@ import {
   type Locale,
 } from './paraglide/runtime.js'
 
-export const LOCALE_PREFERENCE_KEY = 'PARAGLIDE_LOCALE'
-export const BARE_ROOT_RESOLVED_KEY = 'azhen.bareRootLocaleResolved'
-
-export const localeUrlRewrite = {
-  input: ({ url }: { url: URL }) => deLocalizeUrl(url),
-  output: ({ url }: { url: URL }) => localizeUrl(url),
-}
-
-/** Return the public home path for a supported locale. */
-export function localizedHomePath(locale: Locale): string {
-  return localizeHref('/', { locale })
-}
+const LOCALE_PREFERENCE_KEY = 'PARAGLIDE_LOCALE'
+const BARE_ROOT_RESOLVED_KEY = 'azhen.bareRootLocaleResolved'
 
 type InitialLocaleInput = {
   href: string

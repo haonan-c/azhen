@@ -43,7 +43,6 @@ vi.mock('@tanstack/react-router', async (importOriginal) => ({
   Link: ({
     to,
     params,
-    search,
     children,
     activeProps: _activeProps,
     activeOptions: _activeOptions,
@@ -51,7 +50,6 @@ vi.mock('@tanstack/react-router', async (importOriginal) => ({
   }: ComponentProps<'a'> & {
     to: string
     params?: Record<string, string | number>
-    search?: Record<string, unknown>
     activeProps?: unknown
     activeOptions?: unknown
   }) => {
@@ -62,11 +60,7 @@ vi.mock('@tanstack/react-router', async (importOriginal) => ({
     const href = window.location.pathname.startsWith('/zh') && target !== '/'
       ? `/zh${target}`
       : window.location.pathname.startsWith('/zh') ? '/zh' : target
-    const query = new URLSearchParams(Object.entries(search ?? {}).map(([key, value]) => [
-      key,
-      String(value),
-    ])).toString()
-    return <a {...props} href={`${href}${query ? `?${query}` : ''}`}>{children}</a>
+    return <a {...props} href={href}>{children}</a>
   },
   useNavigate: () => testState.navigate,
   useRouterState: ({ select }: {
@@ -174,8 +168,6 @@ describe('localized Workshop shell surfaces', () => {
     await vi.waitFor(() => expect(container?.textContent).toContain('季度复盘 原名'))
 
     expect(container?.querySelector('aside[aria-label="主导航"]')).not.toBeNull()
-    expect(container?.querySelector('a[aria-label="了解 Northstar 原名"]')?.getAttribute('href'))
-      .toBe('/zh?marketing=true')
     expect(container?.textContent).toContain('首页')
     expect(container?.textContent).toContain('工作空间')
     expect(container?.textContent).toContain('模板')

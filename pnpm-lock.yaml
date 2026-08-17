@@ -740,10 +740,6 @@ importers:
         version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@26.1.0)(@vitest/browser-preview@4.1.10)(jsdom@26.1.0(supports-color@10.2.2))(vite@7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.49.2)(yaml@2.9.0))
 
   packages/router:
-    dependencies:
-      '@gadgets/site-config':
-        specifier: workspace:*
-        version: link:../site-config
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
@@ -760,12 +756,6 @@ importers:
       wrangler:
         specifier: 'catalog:'
         version: 4.119.0(@cloudflare/workers-types@5.20260804.1)
-
-  packages/site-config:
-    devDependencies:
-      typescript:
-        specifier: 'catalog:'
-        version: 7.0.2
 
   packages/typed-storage:
     devDependencies:
@@ -851,9 +841,6 @@ importers:
       '@gadgets/error-reporting':
         specifier: workspace:*
         version: link:../error-reporting
-      '@gadgets/site-config':
-        specifier: workspace:*
-        version: link:../site-config
       '@gadgets/workshop-shared':
         specifier: workspace:*
         version: link:../workshop-shared
@@ -933,9 +920,6 @@ importers:
       vitest:
         specifier: 'catalog:'
         version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@26.1.0)(@vitest/browser-preview@4.1.10)(jsdom@26.1.0(supports-color@10.2.2))(vite@7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.49.2)(yaml@2.9.0))
-      wrangler:
-        specifier: 'catalog:'
-        version: 4.119.0(@cloudflare/workers-types@5.20260804.1)
 
   packages/workshop-shared:
     dependencies:

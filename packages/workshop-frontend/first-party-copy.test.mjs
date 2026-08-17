@@ -7,10 +7,7 @@ import ts from 'typescript6'
 import { describe, expect, it } from 'vitest'
 
 const sourceRoot = fileURLToPath(new URL('./src/', import.meta.url))
-const entrypoints = [
-  join(sourceRoot, 'main.tsx'),
-  join(sourceRoot, 'marketing-prerender.tsx'),
-]
+const entrypoints = [join(sourceRoot, 'main.tsx')]
 const visibleAttributes = new Set([
   'alt',
   'aria-description',

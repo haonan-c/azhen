@@ -47,10 +47,6 @@ declare global {
       >;
       FRONTEND_ERROR_RATE_LIMITER?: RateLimit;
 
-      // Optional Anonymous Angle Run limits. The endpoint returns 503 unless both bindings exist.
-      ANONYMOUS_ANGLE_RUN_RATE_LIMITER?: RateLimit;
-      ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER?: RateLimit;
-
       // The Browser Run binding (BROWSER) used to render Gadget exports is intentionally NOT
       // redeclared here: wrangler's generated types make it required, and TypeScript 7 rejects
       // weakening it to optional in a merged augmentation. Self-hosted deployments may omit the

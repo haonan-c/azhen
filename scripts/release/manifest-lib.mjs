@@ -20,7 +20,7 @@ import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "jsonc-parser";
 
-export const MANIFEST_VERSION = 2;
+export const MANIFEST_VERSION = 1;
 
 // wrangler.jsonc keys this generator understands. Anything else fails closed — a new config key
 // on a deployable worker needs an explicit decision about how customer instances get it.
@@ -31,9 +31,6 @@ const HANDLED_CONFIG_KEYS = new Set([
   // Browser Rendering (Gadget PDF exports). Unlike artifacts it is generally available, so it
   // passes through to customer instances as a placeholder-free binding, like the AI binding.
   "browser",
-  // RateLimit bindings use stable package-owned namespace ids rather than provisioned resources.
-  // Their keys must carry instance identity when releases can share one Cloudflare account.
-  "ratelimits",
   // gatekeeper-context's Artifacts binding is closed-beta and cannot be provisioned in arbitrary
   // user accounts; it is dropped from customer manifests (the gatekeeper degrades gracefully).
   "artifacts",
@@ -159,9 +156,6 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
     // `remote` is dev-only wrangler behavior; the deployed binding is just { type, name }.
     bindings.push({ type: "browser", name: config.browser.binding });
   }
-  for (const rl of config.ratelimits ?? []) {
-    bindings.push({ type: "ratelimit", name: rl.name, namespace_id: rl.namespace_id, simple: rl.simple });
-  }
   for (const loader of config.worker_loaders ?? []) {
     bindings.push({ type: "worker_loader", name: loader.binding });
   }
@@ -178,7 +172,6 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
   if (config.assets) {
     bindings.push({ type: "assets", name: config.assets.binding ?? "ASSETS" });
     assetsConfig = {
-      html_handling: config.assets.html_handling,
       not_found_handling: config.assets.not_found_handling,
       run_worker_first: config.assets.run_worker_first,
       // Filled by the caller (build-release) with
@@ -190,7 +183,7 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
   Object.assign(vars, config.vars ?? {});
 
   // Per-kind template vars, mirroring what generate-wrangler-prod.js hand-codes internally
-  // (PUBLIC_BASE_URL on the backend and router; per-gatekeeper BASE_URL under the shared origin).
+  // (PUBLIC_BASE_URL on the backend; per-gatekeeper BASE_URL under the shared origin).
   let inputs;
   let installable = true;
   let gatekeeperBindingExpansion;
@@ -215,7 +208,6 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
       },
     };
   } else if (kind === "router") {
-    vars.PUBLIC_BASE_URL = "$PUBLIC_BASE_URL";
     // The router routes /gatekeeper/<short>/* by scanning its own GATEKEEPER_* bindings
     // (default entrypoint — it forwards whole HTTP requests, not vendor RPC).
     gatekeeperBindingExpansion = { propsByPackage: {} };

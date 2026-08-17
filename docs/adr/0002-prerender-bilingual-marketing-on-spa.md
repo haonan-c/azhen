@@ -1,6 +1,6 @@
 # Prerender bilingual marketing pages without replacing the Workshop SPA
 
-Status: accepted
+Status: superseded by [ADR 0004](./0004-remove-marketing-landing-system.md)
 
 The Workshop frontend is a client-only SPA built around a persistent WebSocket RPC session. The
 Production Site also needs an English and Chinese Marketing Landing Page whose useful content and

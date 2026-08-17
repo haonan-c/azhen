@@ -27,11 +27,6 @@ export function useSiteName(): string {
   return useContext(ServerConfigContext)?.siteName.trim() || messages.brand_name()
 }
 
-/** Returns the localized built-in assistant name. */
-export function useAssistantName(): string {
-  return messages.assistant_name()
-}
-
 /** Convenience: the gatekeeper vendors offered as sign-in methods (empty until config loads / none). */
 export function useAuthVendors(): AuthVendorInfo[] {
   return useContext(ServerConfigContext)?.authVendors ?? []

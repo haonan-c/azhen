@@ -24,7 +24,6 @@ import { ExternalMessageGateway } from "./external-message-gateway";
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
-import { handleAnonymousAngleRunRequest } from "./anonymous-angle-run.js";
 import { verifyCfAccessJwt } from "./access.js";
 import { resolveUiFeatureFlags } from "./feature-flags";
 import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
@@ -807,10 +806,6 @@ export default {
 
     if (url.pathname === "/api/client-errors") {
       return handleClientErrorRequest(req, env, ctx);
-    }
-
-    if (url.pathname === "/api/anonymous-angle-run") {
-      return handleAnonymousAngleRunRequest(req, env);
     }
 
     if (url.pathname === "/api") {

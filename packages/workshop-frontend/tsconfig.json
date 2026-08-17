@@ -16,7 +16,6 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "paths": {
-      "@gadgets/site-config": ["../site-config/src/index.ts"],
       "@gadgets/workshop-shared/*": ["../workshop-shared/src/*"],
       "@/*": ["./src/*"]
     }
