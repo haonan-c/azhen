@@ -31,4 +31,25 @@ describe("Deployment Model Catalog", () => {
     expect(serialized).not.toContain(CONFIG.apiUrl);
     expect(serialized).not.toContain(CONFIG.model);
   });
+
+  it("gives AI Gateway models stable public references", async () => {
+    const testEnv = env as Cloudflare.Env & {
+      TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
+    };
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
+    const gatewayModels = [
+      {type: "agent" as const, id: "internal-model-id", name: "Friendly Gateway Model"},
+    ];
+
+    const first = await settings.getOrCreateAiGatewayModelProfiles(gatewayModels);
+    const second = await settings.getOrCreateAiGatewayModelProfiles(gatewayModels);
+
+    expect(first).toEqual(second);
+    expect(first).toEqual([
+      {type: "agent", id: expect.any(String), name: "Friendly Gateway Model"},
+    ]);
+    expect(first[0]!.id).not.toBe(gatewayModels[0]!.id);
+    expect((await settings.resolveAiGatewayModelAlias(first[0]!.id))?.gatewayModelId)
+        .toBe("internal-model-id");
+  });
 });

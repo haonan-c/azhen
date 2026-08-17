@@ -25,10 +25,18 @@ export type DeploymentModelRecord = {
   config: AiModelConfig;
 };
 
+type AiGatewayModelAliasRecord = {
+  profile: AiChatAuthorInfo;
+  gatewayModelId: string;
+};
+
 function makeAdminSettingsStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
       deploymentModels: collection<DeploymentModelRecord>()({
+        primaryKey: record => record.profile.id,
+      }),
+      aiGatewayModelAliases: collection<AiGatewayModelAliasRecord>()({
         primaryKey: record => record.profile.id,
       }),
       // Mirror of the currently-featured blueprint public records. The user DO owns the
@@ -321,6 +329,32 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   getDeploymentDefaultModel(): DeploymentModelRecord | undefined {
     let id = this.storage.deploymentDefaultModelId.get();
     return id ? this.storage.deploymentModels.get(id) : undefined;
+  }
+
+  getOrCreateAiGatewayModelProfiles(models: AiChatAuthorInfo[]): AiChatAuthorInfo[] {
+    let aliases = [...this.storage.aiGatewayModelAliases.list()];
+    return models.map(model => {
+      let alias = aliases.find(candidate => candidate.gatewayModelId === model.id);
+      if (!alias) {
+        alias = {
+          profile: {type: "agent", id: crypto.randomUUID(), name: model.name},
+          gatewayModelId: model.id,
+        };
+        this.storage.aiGatewayModelAliases.put(alias);
+        aliases.push(alias);
+      } else if (alias.profile.name !== model.name) {
+        alias = {...alias, profile: {...alias.profile, name: model.name}};
+        this.storage.aiGatewayModelAliases.put(alias);
+      }
+      return alias.profile;
+    });
+  }
+
+  resolveAiGatewayModelAlias(id: string): AiGatewayModelAliasRecord | undefined {
+    let alias = this.storage.aiGatewayModelAliases.get(id);
+    if (alias) return alias;
+    return [...this.storage.aiGatewayModelAliases.list()]
+        .find(candidate => candidate.gatewayModelId === id);
   }
 
   async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {

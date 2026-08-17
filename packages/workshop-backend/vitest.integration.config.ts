@@ -22,6 +22,10 @@ export default defineConfig({
       miniflare: {
         bindings: {
           ADMINS: ["deploymentadmin"],
+          CF_AI_GATEWAY: "test-gateway",
+          CF_AI_GATEWAY_ACCOUNT_ID: "test-account",
+          CF_AI_GATEWAY_API_TOKEN: "test-gateway-token",
+          CF_AI_GATEWAY_PROVIDERS: "openai",
         },
       },
     }),

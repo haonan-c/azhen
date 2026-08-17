@@ -679,7 +679,6 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
 export type LanguageModelGatekeeperProps = {
   displayName: string,
   modelId: string,
-  config: AiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
 };
@@ -713,10 +712,21 @@ export class LanguageModelGatekeeper
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<LanguageModelBinding> {
-    let model = getModel(this.env, this.ctx.props.config, this.ctx.props.initiator, {
-      metadata: this.ctx.props.metadata,
+    let admin = this.ctx.exports.AdminSettings.getByName("");
+    let props = this.ctx.props;
+    return new LanguageModelBindingImpl(async () => {
+      let config: AiModelConfig | undefined =
+          (await admin.resolveDeploymentModel(props.modelId))?.config;
+      if (!config) {
+        let gateway = getAiGatewayConfig(this.env);
+        let alias = await admin.resolveAiGatewayModelAlias(props.modelId);
+        config = gateway?.resolveModel(alias?.gatewayModelId ?? props.modelId)?.config;
+      }
+      if (!config) throw new Error(`No such model: ${props.modelId}`);
+      return getModel(this.env, config, props.initiator, {
+        metadata: props.metadata,
+      });
     });
-    return new LanguageModelBindingImpl(model);
   }
 
   applyAction(action: number): Promise<void> {
@@ -742,7 +752,7 @@ export class LanguageModelGatekeeper
 
 @validateRpc()
 class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding {
-  constructor(private model: ModelHandle) {
+  constructor(private resolveModel: () => Promise<ModelHandle>) {
     super();
   }
 
@@ -750,7 +760,7 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs?
     // TODO: Account LLM costs back to the calling gadget.
-    return await completeText(this.model, {
+    return await completeText(await this.resolveModel(), {
       prompt: options.prompt,
       systemPrompt: options.systemPrompt,
     });

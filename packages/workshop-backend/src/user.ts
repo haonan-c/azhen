@@ -526,14 +526,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
-    let deploymentCatalog = await this.adminSettings.getByName("").getDeploymentModelCatalog();
+    let admin = this.adminSettings.getByName("");
+    let deploymentCatalog = await admin.getDeploymentModelCatalog();
     let result = [...deploymentCatalog.models];
     let modelIds = new Set(result.map(model => model.id));
 
     // When AI Gateway mode is active, include all suggested models for enabled providers.
     let gwConfig = getAiGatewayConfig(this.env);
     if (gwConfig) {
-      for (let entry of gwConfig.getModelList()) {
+      let gatewayProfiles = await admin.getOrCreateAiGatewayModelProfiles(gwConfig.getModelList());
+      for (let entry of gatewayProfiles) {
         if (!modelIds.has(entry.id)) {
           result.push(entry);
           modelIds.add(entry.id);
@@ -657,8 +659,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     };
     if (modelId) {
       result.aiModel = await admin.resolveDeploymentModel(modelId);
-      if (!result.aiModel) {
-        result.aiModel = gwConfig?.resolveModel(modelId);
+      if (!result.aiModel && gwConfig) {
+        await admin.getOrCreateAiGatewayModelProfiles(gwConfig.getModelList());
+        let alias = await admin.resolveAiGatewayModelAlias(modelId);
+        let gatewayModel = gwConfig.resolveModel(alias?.gatewayModelId ?? modelId);
+        if (gatewayModel) {
+          result.aiModel = {
+            ...gatewayModel,
+            profile: alias?.profile ?? gatewayModel.profile,
+          };
+        }
       }
       if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
     }

@@ -5,6 +5,7 @@ import {
   createOpenGadgetError,
   getOpenGadgetErrorCode,
   OPEN_GADGET_ERROR_CODES,
+  SUGGESTED_MODELS,
   type AuthenticatedApi,
   type OpenGadgetErrorCode,
   type PublicApi,
@@ -279,9 +280,16 @@ describe("Deployment Model RPC", () => {
     const account = await createAccount(publicApi, "ordinary");
     using ordinary = await publicApi.authenticate(account.token);
     expect(await ordinary.getAdminApi()).toBeNull();
-    expect(await ordinary.listModels()).toEqual(catalog.models);
+    const availableModels = await ordinary.listModels();
+    expect(availableModels).toEqual(expect.arrayContaining(catalog.models));
+    expect(availableModels.map(model => model.name)).toEqual(expect.arrayContaining(
+      Object.values(SUGGESTED_MODELS.openai).map(model => model.name),
+    ));
+    expect(availableModels.map(model => model.id)).not.toEqual(expect.arrayContaining(
+      Object.keys(SUGGESTED_MODELS.openai),
+    ));
 
-    const visible = JSON.stringify(await ordinary.listModels());
+    const visible = JSON.stringify(availableModels);
     expect(visible).not.toContain("deployment-secret-token");
     expect(visible).not.toContain("provider.example.test");
     expect(visible).not.toContain("gpt-5.2");
