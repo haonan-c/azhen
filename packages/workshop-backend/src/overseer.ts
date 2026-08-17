@@ -7630,7 +7630,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.recomputeHasProposedChanges(chatId, meta);
 
     let allUpdates = [...existingUpdates, newRecord];
-    let displayAuthor = this.impl.normalizeDraftAuthor(allUpdates);
+    let displayAuthor = await this.#getChatAuthorForClient(
+        this.impl.normalizeDraftAuthor(allUpdates));
     this.impl.emitChatDraftUpdate(chatId, timestamp, displayAuthor, update);
     this.impl.compactChatDraftUpdates(chatId, allUpdates);
   }
@@ -8139,7 +8140,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async listChats(): Promise<AiChatMetadata[]> {
-    return [...this.impl.storage.chatMeta.list({reverse: true})];
+    return Promise.all([...this.impl.storage.chatMeta.list({reverse: true})]
+        .map(meta => this.#getChatMetadataForClient(meta)));
   }
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
@@ -8232,7 +8234,22 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         msg.actionLog = actionRecordToLog(record);
       }
     }
-    return this.impl.hydrateChatMessageForClient(msg);
+    return {
+      ...this.impl.hydrateChatMessageForClient(msg),
+      author: await this.#getChatAuthorForClient(msg.author),
+    };
+  }
+
+  async #getChatMetadataForClient(meta: AiChatMetadata): Promise<AiChatMetadata> {
+    if (!meta.activeAgent) return meta;
+    return {...meta, activeAgent: await this.#getChatAuthorForClient(meta.activeAgent)};
+  }
+
+  async #getChatAuthorForClient(author: AiChatAuthorInfo): Promise<AiChatAuthorInfo> {
+    if (author.type !== "agent") return author;
+    let model = await this.impl.ctx.exports.AdminSettings.getByName("")
+        .resolveAvailableModel(author.id);
+    return model?.profile ?? {...author, id: "unavailable-model"};
   }
 
   async subscribeToChat(subscriber: RpcStub<AiChatSubscriber>, startAfter?: Date)
@@ -8250,34 +8267,35 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // detect a full DO restart and discard stale provisional stream state.
     subscriber.streamGeneration(this.impl.streamGeneration).catch(unsubscribe);
 
+    let self = this;
+    let metadataDeliveryTail = Promise.resolve();
+    function deliverMetadata(record: AiChatMetadata) {
+      metadataDeliveryTail = metadataDeliveryTail.then(async () => {
+        subscriber.metadata(await self.#getChatMetadataForClient(record));
+      }).catch(unsubscribe);
+    }
+
     let metaSubscriber = {
       add(record: AiChatMetadata) {
-        subscriber.metadata(record).catch(unsubscribe);
+        deliverMetadata(record);
       },
       update(oldRecord: AiChatMetadata, newRecord: AiChatMetadata): void {
-        subscriber.metadata(newRecord).catch(unsubscribe);
+        deliverMetadata(newRecord);
       },
       remove(record: AiChatMetadata): void {
         subscriber.deleted(record.id);
       }
     }
 
-    let self = this;
+    let messageDeliveryTail = Promise.resolve();
     function deliverMessage(record: AiChatMessage) {
-      let delivered = record.type === "message" && record.attachments?.length ?
-          self.impl.hydrateChatMessageForClient(record) : record;
-      subscriber.message(delivered).catch(unsubscribe);
+      messageDeliveryTail = messageDeliveryTail.then(async () => {
+        subscriber.message(await self.#getChatMessageForClient(record));
+      }).catch(unsubscribe);
     }
 
     let msgSubscriber = {
       add(record: AiChatMessage) {
-        if (record.type == "action") {
-          let actionRecord = self.impl.storage.actions.get(record.actionId);
-          if (actionRecord) {
-            record.actionLog = actionRecordToLog(actionRecord);
-          }
-        }
-
         deliverMessage(record);
       },
       update(oldRecord: AiChatMessage, newRecord: AiChatMessage): void {
@@ -8337,7 +8355,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           continue;
         }
 
-        authorByChat.set(chatId, this.impl.normalizeDraftAuthor(drafts));
+        authorByChat.set(chatId, await this.#getChatAuthorForClient(
+            this.impl.normalizeDraftAuthor(drafts)));
       }
 
       for (let draft of draftsToSend) {
@@ -8362,7 +8381,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       }
       // Messages establish the durable state that the corresponding metadata describes.
       for (let meta of changedChatMetadata) {
-        subscriber.metadata(meta).catch(unsubscribe);
+        deliverMetadata(meta);
       }
     }
 
