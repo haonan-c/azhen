@@ -678,7 +678,12 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
 
 export type LanguageModelGatekeeperProps = {
   displayName: string,
-  modelId: string,
+  modelId?: string,
+  /**
+   * Legacy bindings stored Model Configuration here. Its credentials are never used; only its
+   * model identity may locate an enabled AI Gateway model after upgrade.
+   */
+  config?: AiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
 };
@@ -691,7 +696,7 @@ export class LanguageModelGatekeeper
 
     return {
       // TODO: Decide if we need real URLs or if `url` should stop being part of the description.
-      url: `http://models.local/${this.ctx.props.modelId}`,
+      url: `http://models.local/${this.ctx.props.modelId ?? "legacy"}`,
 
       title: displayName,
       snippet: "An AI large language model.",
@@ -715,14 +720,11 @@ export class LanguageModelGatekeeper
     let admin = this.ctx.exports.AdminSettings.getByName("");
     let props = this.ctx.props;
     return new LanguageModelBindingImpl(async () => {
-      let config: AiModelConfig | undefined =
-          (await admin.resolveDeploymentModel(props.modelId))?.config;
-      if (!config) {
-        let gateway = getAiGatewayConfig(this.env);
-        let alias = await admin.resolveAiGatewayModelAlias(props.modelId);
-        config = gateway?.resolveModel(alias?.gatewayModelId ?? props.modelId)?.config;
-      }
-      if (!config) throw new Error(`No such model: ${props.modelId}`);
+      let modelRef = props.modelId ?? props.config?.model;
+      let record = modelRef ? await admin.resolveAvailableModel(modelRef) : undefined;
+      if (!props.modelId && record?.config.provider !== props.config?.provider) record = undefined;
+      if (!record) throw new Error(`No such model: ${modelRef ?? "legacy"}`);
+      let config = record.config;
       return getModel(this.env, config, props.initiator, {
         metadata: props.metadata,
       });

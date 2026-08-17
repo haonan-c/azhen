@@ -357,6 +357,19 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
         .find(candidate => candidate.gatewayModelId === id);
   }
 
+  resolveAvailableModel(id: string): DeploymentModelRecord | undefined {
+    let deploymentModel = this.resolveDeploymentModel(id);
+    if (deploymentModel) return deploymentModel;
+
+    let gateway = getAiGatewayConfig(this.env);
+    if (!gateway) return undefined;
+    this.getOrCreateAiGatewayModelProfiles(gateway.getModelList());
+    let alias = this.resolveAiGatewayModelAlias(id);
+    let gatewayModel = gateway.resolveModel(alias?.gatewayModelId ?? id);
+    if (!gatewayModel) return undefined;
+    return {...gatewayModel, profile: alias?.profile ?? gatewayModel.profile};
+  }
+
   async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
     let previousMutation = this.adminConfigMutationTail;
     let release!: () => void;

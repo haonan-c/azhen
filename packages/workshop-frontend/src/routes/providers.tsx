@@ -4,8 +4,6 @@ import { useAuthenticatedApi } from '../AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
-  AiModelProvider,
-  SUGGESTED_MODELS,
 } from '@gadgets/workshop-shared/api'
 import { Lightning, MagnifyingGlass } from '@phosphor-icons/react'
 import { useDocumentTitle } from '../useDocumentTitle'
@@ -13,20 +11,10 @@ import { m as messages } from '../paraglide/messages.js'
 
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
-// ─── constants ────────────────────────────────────────────────────────────────
-
-const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
-
 // ─── model row ─────────────────────────────────────────────────────────────────
 
 // Rows mirror the Blueprints list while keeping model configuration read-only for normal users.
-function ModelRow({
-  model,
-  isBuiltIn,
-}: {
-  model: AiChatAuthorInfo
-  isBuiltIn: boolean
-}) {
+function ModelRow({ model }: { model: AiChatAuthorInfo }) {
   return (
     <div className="flex items-center gap-3 rounded-lg px-3 py-2.5">
       {/* Neutral monogram — matches the sidebar/workspaces treatment */}
@@ -40,11 +28,6 @@ function ModelRow({
           <span className="truncate text-sm font-medium tracking-[-0.25px] text-kumo-default">
             {model.name}
           </span>
-          {isBuiltIn && (
-            <span className="shrink-0 rounded-full bg-kumo-tint px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.4px] text-kumo-subtle">
-              {messages.providers_builtin()}
-            </span>
-          )}
         </div>
       </div>
     </div>
@@ -93,12 +76,6 @@ function ProvidersPage() {
   useEffect(() => { fetchAll() }, [authenticatedApi])
 
   const gatewayMode = aiConfig?.enabled === true
-
-  const isBuiltIn = (modelId: string): boolean => {
-    if (!aiConfig?.enabled) return false
-    const enabled = new Set((aiConfig as Extract<AiGatewayInfo, { enabled: true }>).enabledProviders)
-    return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
-  }
 
   const filtered = models.filter((m) => {
     if (!search) return true
@@ -188,9 +165,7 @@ function ProvidersPage() {
             {messages.providers_no_match()}
           </div>
         ) : (
-          filtered.map((model) => (
-            <ModelRow key={model.id} model={model} isBuiltIn={isBuiltIn(model.id)} />
-          ))
+          filtered.map((model) => <ModelRow key={model.id} model={model} />)
         )}
       </div>
     </div>

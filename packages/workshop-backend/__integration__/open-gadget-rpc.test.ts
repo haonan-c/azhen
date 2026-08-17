@@ -288,6 +288,10 @@ describe("Deployment Model RPC", () => {
     expect(availableModels.map(model => model.id)).not.toEqual(expect.arrayContaining(
       Object.keys(SUGGESTED_MODELS.openai),
     ));
+    const gatewayModel = availableModels.find(
+      model => model.name === Object.values(SUGGESTED_MODELS.openai)[0]!.name,
+    );
+    expect(gatewayModel).toBeDefined();
 
     const visible = JSON.stringify(availableModels);
     expect(visible).not.toContain("deployment-secret-token");
@@ -300,6 +304,11 @@ describe("Deployment Model RPC", () => {
       content: new TextEncoder().encode("%PDF-test"),
     }, catalog.models[0]!.id);
     expect(attachment.id).toEqual(expect.any(String));
+    const gatewayAttachment = await workspace.uploadChatAttachment({
+      mimeType: "application/pdf",
+      content: new TextEncoder().encode("%PDF-gateway-test"),
+    }, gatewayModel!.id);
+    expect(gatewayAttachment.id).toEqual(expect.any(String));
 
     const fetchMock = vi.fn(async () => openAiTextResponse("Deployment model replied."));
     vi.stubGlobal("fetch", fetchMock);

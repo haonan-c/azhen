@@ -658,18 +658,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       profile: this.storage.profile.get()
     };
     if (modelId) {
-      result.aiModel = await admin.resolveDeploymentModel(modelId);
-      if (!result.aiModel && gwConfig) {
-        await admin.getOrCreateAiGatewayModelProfiles(gwConfig.getModelList());
-        let alias = await admin.resolveAiGatewayModelAlias(modelId);
-        let gatewayModel = gwConfig.resolveModel(alias?.gatewayModelId ?? modelId);
-        if (gatewayModel) {
-          result.aiModel = {
-            ...gatewayModel,
-            profile: alias?.profile ?? gatewayModel.profile,
-          };
-        }
-      }
+      result.aiModel = await admin.resolveAvailableModel(modelId);
       if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
     }
 
