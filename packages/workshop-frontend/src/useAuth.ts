@@ -32,12 +32,6 @@ function pendingState(publicApi: RpcStub<PublicApi>, token: string | null): Auth
   }
 }
 
-function initialState(publicApi: RpcStub<PublicApi>): AuthState {
-  if (CF_ACCESS_MODE) return pendingState(publicApi, null)
-  const token = localStorage.getItem('authToken')
-  return token ? pendingState(publicApi, token) : signedOutState(publicApi)
-}
-
 export { CF_ACCESS_MODE }
 
 function errorMessage(error: unknown): string {
@@ -49,7 +43,7 @@ function isInvalidSession(error: unknown): boolean {
 }
 
 export function useAuth(publicApi: RpcStub<PublicApi>) {
-  const [authState, setAuthState] = useState<AuthState>(() => initialState(publicApi))
+  const [authState, setAuthState] = useState<AuthState>(() => pendingState(publicApi, null))
 
   const requestIdRef = useRef(0)
   const validatingApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)

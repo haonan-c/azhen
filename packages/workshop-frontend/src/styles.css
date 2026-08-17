@@ -8,7 +8,6 @@
   --font-sans: "FT Kunst Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI",
     "Roboto", "Helvetica Neue", sans-serif;
   --font-mono: "Apercu Mono Pro", "SF Mono", Menlo, Monaco, Consolas, monospace;
-  --font-display: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
 
   /* ===== TEXT SIZES (restore Tailwind defaults, overriding Kumo's 12/13/14/16px) ===== */
   --text-xs: 0.75rem;
@@ -21,12 +20,12 @@
   --text-lg--line-height: 1.75rem;
 
   /* ===== KUMO SEMANTIC COLOR OVERRIDES =====
-     Near-neutral, barely-warm greys for every surface, border, and neutral text. The brand indigo
-     marks intent in active items, links, primary actions, and focus states.
+     Near-neutral, barely-warm greys for every surface, border, and neutral text. The brand orange
+     is reserved for *intent only* (active item, links, primary action, focus) so it actually pops.
      This is the single biggest lever between a "consumer/playground" feel and an enterprise one. */
 
   /* Background tokens — near-white neutrals with a faint warm undertone */
-  --color-kumo-base: #FBFAF7;
+  --color-kumo-base: #fcfcfb;
   --color-kumo-elevated: #f8f8f7;
   --color-kumo-tint: #f3f3f1;
   --color-kumo-overlay: #fbfbfa;
@@ -37,10 +36,9 @@
   --color-kumo-fill-hover: #dededb;
   --color-kumo-interact: #cac8c3;
 
-  /* Brand — deep indigo for intent */
-  --color-kumo-brand: #2E3A8C;
-  --color-kumo-brand-hover: #232E75;
-  --color-accent-mark: #C8892A;
+  /* Brand — warm orange accent (intent only) */
+  --color-kumo-brand: #ff4801;
+  --color-kumo-brand-hover: #e03f00;
 
   /* Border / line tokens — neutral hairlines */
   --color-kumo-line: #1411100f;
@@ -70,8 +68,8 @@
   --text-color-kumo-strong: #100f0d;
   --text-color-kumo-subtle: oklch(52% 0.006 60);
   --text-color-kumo-inactive: oklch(66% 0.005 60);
-  --text-color-kumo-brand: #2E3A8C;
-  --text-color-kumo-link: #2E3A8C;
+  --text-color-kumo-brand: #ff4801;
+  --text-color-kumo-link: #ff4801;
   --text-color-kumo-success: oklch(72.3% 0.219 149.579);
   --text-color-kumo-danger: oklch(63.7% 0.237 25.331);
   --text-color-kumo-warning: oklch(47.6% 0.114 61.907);
@@ -159,9 +157,8 @@
   --color-kumo-ring: oklch(0.52 0.065 285);
   --color-kumo-bubble-user: oklch(0.225 0.025 285);
 
-  --color-kumo-brand: #8E9BF0;
-  --color-kumo-brand-hover: #A8B1F5;
-  --color-accent-mark: #D6A34E;
+  --color-kumo-brand: #b84e00;
+  --color-kumo-brand-hover: #a54200;
 
   --color-kumo-info: oklch(62.3% 0.214 259.815);
   --color-kumo-info-tint: oklch(0.25 0.065 259.815);
@@ -181,8 +178,8 @@
   --text-color-kumo-strong: oklch(0.92 0.01 285);
   --text-color-kumo-subtle: oklch(0.66 0.02 285);
   --text-color-kumo-inactive: oklch(0.58 0.025 285);
-  --text-color-kumo-brand: #8E9BF0;
-  --text-color-kumo-link: #8E9BF0;
+  --text-color-kumo-brand: #ff8a5c;
+  --text-color-kumo-link: #ff8a5c;
   --text-color-kumo-success: oklch(79.2% 0.209 151.711);
   --text-color-kumo-danger: oklch(70.4% 0.191 22.216);
   --text-color-kumo-warning: oklch(82.8% 0.189 84.429);
@@ -262,12 +259,6 @@ code {
 /* Smooth scrolling */
 html {
   scroll-behavior: smooth;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
 }
 
 /* Hide scrollbar for horizontal scroll areas */

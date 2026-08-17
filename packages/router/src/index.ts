@@ -8,24 +8,12 @@
 // The same worker doubles as the dev router (`pnpm dev-server` at the repo root): dev has no
 // `ASSETS` binding, so frontend requests fall through to the backend instead.
 
-import {
-  alternatesOf,
-  canonicalUrl,
-  enabledPages,
-  localizedPath,
-  SITE_PAGES,
-  type SiteLocale,
-  type SitePage,
-} from "@gadgets/site-config";
-
 // gatekeeper-email's entrypoint: a WorkerEntrypoint whose optional email() handler is present.
 type EmailEntrypoint = CloudflareWorkersModule.WorkerEntrypoint &
     Required<Pick<CloudflareWorkersModule.WorkerEntrypoint, "email">>;
 
 /** Bindings used by the public origin router. */
 export interface Env {
-  /** Present in release deployments; may be absent in local development. */
-  PUBLIC_BASE_URL?: string;
   /** The Workshop backend service binding. */
   WORKSHOP_BACKEND: Fetcher;
   /** Present in production (wrangler.jsonc assets stanza); absent in dev. */
@@ -35,106 +23,9 @@ export interface Env {
   [key: string]: unknown;
 }
 
-interface LocalizedSitePage {
-  page: SitePage;
-  locale: SiteLocale;
-}
-
-function indexablePageForPath(pathname: string): LocalizedSitePage | null {
-  for (const page of SITE_PAGES) {
-    if (!page.enabled || !page.indexable) continue;
-    for (const locale of page.locales) {
-      if (localizedPath(page.path, locale) === pathname) return { page, locale };
-    }
-  }
-  return null;
-}
-
-function normalizePublicOrigin(value: string | undefined): string | null {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    if ((url.protocol !== "https:" && url.protocol !== "http:") ||
-        url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
-      return null;
-    }
-    return url.origin;
-  } catch {
-    return null;
-  }
-}
-
-function crawlerDocument(pathname: string, publicBaseUrl: string | undefined): Response | null {
-  if (pathname !== "/robots.txt" && pathname !== "/sitemap.xml") return null;
-
-  const publicOrigin = normalizePublicOrigin(publicBaseUrl);
-  if (pathname === "/robots.txt") {
-    const sitemap = publicOrigin ? `\nSitemap: ${publicOrigin}/sitemap.xml` : "";
-    return new Response(`User-agent: *\nAllow: /${sitemap}\n`, {
-      headers: { "content-type": "text/plain; charset=UTF-8" },
-    });
-  }
-
-  if (!publicOrigin) {
-    return new Response("Public Base URL is not configured.", {
-      headers: { "content-type": "text/plain; charset=UTF-8" },
-      status: 503,
-    });
-  }
-
-  const sitemapUrls = enabledPages()
-      .filter(({ indexable }) => indexable)
-      .flatMap((page) => page.locales.map(
-          (locale) => canonicalUrl(publicOrigin, page.path, locale)));
-  return new Response(
-      `<?xml version="1.0" encoding="UTF-8"?>\n` +
-      `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
-      sitemapUrls.map((url) => `<url><loc>${url}</loc></url>`).join("") +
-      `</urlset>\n`,
-      { headers: { "content-type": "application/xml; charset=UTF-8" } },
-  );
-}
-
-function applyPageSeo(
-    response: Response, requestUrl: URL, publicBaseUrl: string | undefined): Response {
-  if (!response.headers.get("content-type")?.toLowerCase().startsWith("text/html")) {
-    return response;
-  }
-
-  const publicOrigin = normalizePublicOrigin(publicBaseUrl);
-  const localizedPage = indexablePageForPath(requestUrl.pathname);
-  const headers = new Headers(response.headers);
-  if (publicOrigin && requestUrl.origin === publicOrigin && localizedPage) {
-    headers.delete("x-robots-tag");
-  } else {
-    headers.set("x-robots-tag", "noindex");
-  }
-  const pageResponse = new Response(response.body, {
-    headers,
-    status: response.status,
-    statusText: response.statusText,
-  });
-
-  if (!publicOrigin || !localizedPage) return pageResponse;
-
-  const links = [
-    `<link rel="canonical" href="${canonicalUrl(
-        publicOrigin, localizedPage.page.path, localizedPage.locale)}">`,
-    ...alternatesOf(publicOrigin, localizedPage.page).map(({ hreflang, url }) => (
-      `<link rel="alternate" hreflang="${hreflang}" href="${url}">`
-    )),
-  ].join("");
-
-  return new HTMLRewriter()
-      .on("head", { element: (element) => { element.append(links, { html: true }); } })
-      .transform(pageResponse);
-}
-
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
-    const crawlerResponse = crawlerDocument(url.pathname, env.PUBLIC_BASE_URL);
-    if (crawlerResponse) return crawlerResponse;
 
     for (const key of Object.keys(env)) {
       if (!key.startsWith("GATEKEEPER_")) continue;
@@ -156,8 +47,7 @@ export default {
     // callbacks.
 
     if (env.ASSETS) {
-      const response = await env.ASSETS.fetch(req);
-      return applyPageSeo(response, url, env.PUBLIC_BASE_URL);
+      return env.ASSETS.fetch(req);
     }
 
     // Dev only: with no assets binding here, everything else goes to the backend.
@@ -168,8 +58,7 @@ export default {
     // expected here -- run the Vite dev server with `pnpm dev-client` and open localhost:3000
     // directly instead. (We don't try to forward to localhost:3000 becaues it doesn't work well:
     // Vite's HMR socket gets disconnected every time wrangler restarts workerd.)
-    const response = await env.WORKSHOP_BACKEND.fetch(req);
-    return applyPageSeo(response, url, env.PUBLIC_BASE_URL);
+    return env.WORKSHOP_BACKEND.fetch(req);
   },
 
   async email(message, env) {

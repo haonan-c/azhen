@@ -15,7 +15,7 @@ import {
 import {
   loadSlashCommandCatalog, presentSlashCommandChoice, slashCommandKey,
 } from "./slash-command-catalog";
-import { useAssistantName } from "../../ServerConfigContext";
+import { useSiteName } from "../../ServerConfigContext";
 import { m as messages } from "../../paraglide/messages.js";
 import { formatLocaleNumber } from "../../utils/formatNumber";
 
@@ -84,7 +84,7 @@ export function useSlashCommandPicker({
   const [explicitChoiceToken, setExplicitChoiceToken] = useState<string | null>(null);
   const [index, setIndex] = useState(0);
   const [layout, setLayout] = useState<SlashCommandPopupLayout | null>(null);
-  const assistantName = useAssistantName();
+  const siteName = useSiteName();
   // Catalog for this mounted Gadget editor. Loaded when the picker first opens and filtered locally.
   const catalogRef = useRef<SlashCommandChoice[] | null>(null);
   const catalogSourceRef = useRef(getOverseer);
@@ -98,9 +98,9 @@ export function useSlashCommandPicker({
     [chatExists]);
   const filterCatalog = useCallback((catalog: SlashCommandChoice[], value: string) =>
       catalog.filter(choice => filterSlashCommandCatalog(
-        [presentSlashCommandChoice(choice, assistantName)], value,
+        [presentSlashCommandChoice(choice, siteName)], value,
       ).length > 0),
-    [assistantName]);
+    [siteName]);
 
   const parsed = selectedCommand || disabled
     ? null
@@ -257,7 +257,7 @@ export function useSlashCommandPicker({
           <p className={PICKER_EMPTY}>{messages.slash_commands_loading()}</p>
         ) : choices.length > 0 ? (
           choices.map((choice, optionIndex) => {
-            const presentation = presentSlashCommandChoice(choice, assistantName);
+            const presentation = presentSlashCommandChoice(choice, siteName);
             return (
               <button
                 key={slashCommandKey(choice.selection)}

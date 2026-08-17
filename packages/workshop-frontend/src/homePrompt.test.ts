@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { homePromptFromSearch, marketingPageRequestedFromSearch } from "./homePrompt";
+import { homePromptFromSearch } from "./homePrompt";
 import { MAX_GATEKEEPER_APP_PROMPT_LENGTH } from "./gatekeeperAppNavigation";
 
 describe("homePromptFromSearch", () => {
@@ -11,15 +11,5 @@ describe("homePromptFromSearch", () => {
     expect(homePromptFromSearch(42)).toBeUndefined();
     expect(homePromptFromSearch("   ")).toBeUndefined();
     expect(homePromptFromSearch("x".repeat(MAX_GATEKEEPER_APP_PROMPT_LENGTH + 1))).toBeUndefined();
-  });
-});
-
-describe("marketingPageRequestedFromSearch", () => {
-  it("accepts only the boolean and serialized true values", () => {
-    expect(marketingPageRequestedFromSearch(true)).toBe(true);
-    expect(marketingPageRequestedFromSearch("true")).toBe(true);
-    expect(marketingPageRequestedFromSearch(false)).toBe(false);
-    expect(marketingPageRequestedFromSearch("false")).toBe(false);
-    expect(marketingPageRequestedFromSearch(undefined)).toBe(false);
   });
 });

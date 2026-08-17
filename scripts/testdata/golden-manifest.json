@@ -4,10 +4,6 @@
       "r2Key": "blobs/assets/03a936d819bd1a6df9f9d9f16f1df3a5",
       "size": 41
     },
-    "27f70bee1583010cb039519425e76f55": {
-      "r2Key": "blobs/assets/27f70bee1583010cb039519425e76f55",
-      "size": 50
-    },
     "8d2e76555a7166d0e6b7da22cabfa055": {
       "r2Key": "blobs/assets/8d2e76555a7166d0e6b7da22cabfa055",
       "size": 28
@@ -15,23 +11,11 @@
     "924064d945426fd30c24d0d24235610d": {
       "r2Key": "blobs/assets/924064d945426fd30c24d0d24235610d",
       "size": 19
-    },
-    "b3c6a4a93b93f995e2dfeacc73612f28": {
-      "r2Key": "blobs/assets/b3c6a4a93b93f995e2dfeacc73612f28",
-      "size": 49
-    },
-    "c43d170c581068d0555c271cd7400f8f": {
-      "r2Key": "blobs/assets/c43d170c581068d0555c271cd7400f8f",
-      "size": 55
-    },
-    "fd9c80539b3bf6996ab7116ef8737b0b": {
-      "r2Key": "blobs/assets/fd9c80539b3bf6996ab7116ef8737b0b",
-      "size": 28
     }
   },
   "commit": "0000000000000000000000000000000000000000",
   "createdAt": "2026-01-01T00:00:00.000Z",
-  "manifestVersion": 2,
+  "manifestVersion": 1,
   "releaseId": "r000000-fixture",
   "workers": {
     "gatekeeper-cloudflare": {
@@ -1041,13 +1025,13 @@
     },
     "router": {
       "assetsConfig": {
-        "html_handling": "drop-trailing-slash",
         "not_found_handling": "single-page-application",
         "run_worker_first": [
-          "/*",
-          "!/assets/*",
-          "!/favicon.svg",
-          "!/marketing/*"
+          "/api",
+          "/api/*",
+          "/blueprint-screenshot",
+          "/blueprint-screenshot/*",
+          "/gatekeeper/*"
         ],
         "variants": {
           "access": {
@@ -1067,30 +1051,6 @@
               "/index.html": {
                 "hash": "03a936d819bd1a6df9f9d9f16f1df3a5",
                 "size": 41
-              },
-              "/zh/index.html": {
-                "hash": "27f70bee1583010cb039519425e76f55",
-                "size": 50
-              }
-            }
-          },
-          "public": {
-            "manifest": {
-              "/assets/app.js": {
-                "hash": "fd9c80539b3bf6996ab7116ef8737b0b",
-                "size": 28
-              },
-              "/assets/shared.css": {
-                "hash": "924064d945426fd30c24d0d24235610d",
-                "size": 19
-              },
-              "/index.html": {
-                "hash": "b3c6a4a93b93f995e2dfeacc73612f28",
-                "size": 49
-              },
-              "/zh/index.html": {
-                "hash": "c43d170c581068d0555c271cd7400f8f",
-                "size": 55
               }
             }
           }
@@ -1132,9 +1092,7 @@
           "invocation_logs": false
         }
       },
-      "vars": {
-        "PUBLIC_BASE_URL": "$PUBLIC_BASE_URL"
-      }
+      "vars": {}
     },
     "workshop-backend": {
       "bindings": [
@@ -1156,24 +1114,6 @@
         {
           "name": "BROWSER",
           "type": "browser"
-        },
-        {
-          "name": "ANONYMOUS_ANGLE_RUN_RATE_LIMITER",
-          "namespace_id": "1588061051727226",
-          "simple": {
-            "limit": 1,
-            "period": 60
-          },
-          "type": "ratelimit"
-        },
-        {
-          "name": "ANONYMOUS_ANGLE_RUN_BUDGET_LIMITER",
-          "namespace_id": "1937878701311225",
-          "simple": {
-            "limit": 30,
-            "period": 60
-          },
-          "type": "ratelimit"
         },
         {
           "name": "LOADER",

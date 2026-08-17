@@ -8,16 +8,14 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
-  Navigate,
   RouterProvider,
 } from '@tanstack/react-router'
 import type { RpcStub } from 'capnweb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthenticatedApi, PublicApi, ServerConfig } from '@gadgets/workshop-shared/api'
-import { RpcContext, useRpcStub } from './RpcContext'
+import { RpcContext } from './RpcContext'
 import { ServerConfigContext, ServerConfigErrorContext } from './ServerConfigContext'
 import { deLocalizeUrl, localizeUrl } from './paraglide/runtime.js'
-import SignupPage from './SignupPage'
 
 vi.mock('hash-wasm', () => ({
   argon2id: async () => new Uint8Array([1, 2, 3]),
@@ -72,45 +70,21 @@ function setInput(input: HTMLInputElement, value: string) {
   input.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
-function selectLanguage(select: HTMLSelectElement, locale: string) {
-  const setValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!
-  setValue.call(select, locale)
-  select.dispatchEvent(new Event('change', { bubbles: true }))
-}
-
-function mockLocationAssign() {
-  const implementation = Object.getOwnPropertySymbols(window.location)
-    .map(symbol => (window.location as unknown as Record<symbol, unknown>)[symbol])
-    .find(value => typeof value === 'object' && value !== null && 'assign' in value) as {
-      assign: (href: string) => void
-    }
-  return vi.spyOn(implementation, 'assign').mockImplementation(() => {})
-}
-
-function SignupTestRoute() {
-  return <SignupPage rpcStub={useRpcStub()} />
-}
-
-function makeRouter(initialEntry = '/') {
+function makeRouter() {
   const rootRoute = createRootRoute({ component: RootComponent })
   const homeRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/',
     component: () => <div data-destination="home"><HomePageContent /></div>,
   })
-  const loginRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: '/login',
-    component: () => <Navigate to="/" replace />,
-  })
   const signupRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/signup',
-    component: SignupTestRoute,
+    component: () => null,
   })
   return createRouter({
-    history: createMemoryHistory({ initialEntries: [initialEntry] }),
-    routeTree: rootRoute.addChildren([homeRoute, loginRoute, signupRoute]),
+    history: createMemoryHistory({ initialEntries: ['/'] }),
+    routeTree: rootRoute.addChildren([homeRoute, signupRoute]),
     rewrite: {
       input: ({ url }) => deLocalizeUrl(url),
       output: ({ url }) => localizeUrl(url),
@@ -131,103 +105,6 @@ describe('localized sign-in to Workshop Home journey', () => {
     vi.clearAllMocks()
     root = undefined
     container = undefined
-  })
-
-  async function renderSignedOut(href: string) {
-    act(() => root?.unmount())
-    container?.remove()
-    window.history.replaceState({}, '', href)
-    const router = makeRouter(href)
-    const publicApi = {} as RpcStub<PublicApi>
-    container = document.createElement('div')
-    document.body.append(container)
-    root = createRoot(container)
-    await act(async () => root!.render(
-      <ServerConfigErrorContext.Provider value={false}>
-        <ServerConfigContext.Provider value={serverConfig}>
-          <RpcContext.Provider value={{ stub: publicApi, connectionLost: false }}>
-            <RouterProvider router={router} />
-          </RpcContext.Provider>
-        </ServerConfigContext.Provider>
-      </ServerConfigErrorContext.Provider>,
-    ))
-    return router
-  }
-
-  it.each([
-    {
-      href: '/?qa=issue25#login',
-      signIn: 'Sign in',
-      language: 'Language',
-      locale: 'zh',
-      destinationPath: '/zh/login',
-      heading: '登录你的账户',
-    },
-    {
-      href: '/zh?qa=issue25#login',
-      signIn: '登录',
-      language: '语言',
-      locale: 'en',
-      destinationPath: '/login',
-      heading: 'Sign in to your account',
-    },
-  ])('keeps the root sign-in surface after changing locale from $href', async ({
-    href,
-    signIn,
-    language,
-    locale,
-    destinationPath,
-    heading,
-  }) => {
-    const router = await renderSignedOut(href)
-    const signInButton = [...container!.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.trim() === signIn)!
-    await act(async () => signInButton.click())
-    window.history.replaceState({}, '', router.state.location.publicHref)
-    const assign = mockLocationAssign()
-    const languageSelector = container!.querySelector<HTMLSelectElement>(
-      `select[aria-label="${language}"]`,
-    )!
-
-    await act(async () => selectLanguage(languageSelector, locale))
-
-    const destination = new URL(assign.mock.calls[0][0], window.location.origin)
-    expect(destination.pathname).toBe(destinationPath)
-    expect(destination.search).toBe('?qa=issue25')
-    expect(destination.hash).toBe('#login')
-
-    await renderSignedOut(`${destination.pathname}${destination.search}${destination.hash}`)
-    expect(container?.textContent).toContain(heading)
-  })
-
-  it.each([
-    {
-      href: '/signup',
-      signIn: 'Sign in',
-      destinationPath: '/login',
-      heading: 'Sign in to your account',
-    },
-    {
-      href: '/zh/signup',
-      signIn: '登录',
-      destinationPath: '/zh/login',
-      heading: '登录你的账户',
-    },
-  ])('opens the matching sign-in surface from $href', async ({
-    href,
-    signIn,
-    destinationPath,
-    heading,
-  }) => {
-    const router = await renderSignedOut(href)
-    const signInLink = [...container!.querySelectorAll<HTMLAnchorElement>('a')]
-      .find(link => link.textContent?.trim() === signIn)!
-
-    expect(signInLink.getAttribute('href')).toBe(destinationPath)
-    await act(async () => signInLink.click())
-
-    expect(router.state.location.publicHref).toBe(destinationPath)
-    expect(container?.textContent).toContain(heading)
   })
 
   it.each([
@@ -271,10 +148,6 @@ describe('localized sign-in to Workshop Home journey', () => {
         </ServerConfigContext.Provider>
       </ServerConfigErrorContext.Provider>,
     ))
-
-    const landingSignIn = [...container!.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.trim() === expected.signIn)!
-    await act(async () => landingSignIn.click())
 
     const username = container!.querySelector<HTMLInputElement>('input[autocomplete="username"]')!
     const password = container!.querySelector<HTMLInputElement>('input[autocomplete="current-password"]')!
