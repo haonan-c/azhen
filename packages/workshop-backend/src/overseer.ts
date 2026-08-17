@@ -8268,11 +8268,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     subscriber.streamGeneration(this.impl.streamGeneration).catch(unsubscribe);
 
     let self = this;
-    let metadataDeliveryTail = Promise.resolve();
+    let chatDeliveryTail = Promise.resolve();
+    function queueChatDelivery(deliver: () => Promise<void>) {
+      chatDeliveryTail = chatDeliveryTail.then(deliver).catch(unsubscribe);
+    }
+
     function deliverMetadata(record: AiChatMetadata) {
-      metadataDeliveryTail = metadataDeliveryTail.then(async () => {
+      queueChatDelivery(async () => {
         subscriber.metadata(await self.#getChatMetadataForClient(record));
-      }).catch(unsubscribe);
+      });
     }
 
     let metaSubscriber = {
@@ -8283,15 +8287,26 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         deliverMetadata(newRecord);
       },
       remove(record: AiChatMetadata): void {
-        subscriber.deleted(record.id);
+        queueChatDelivery(async () => { subscriber.deleted(record.id); });
       }
     }
 
-    let messageDeliveryTail = Promise.resolve();
     function deliverMessage(record: AiChatMessage) {
-      messageDeliveryTail = messageDeliveryTail.then(async () => {
+      queueChatDelivery(async () => {
         subscriber.message(await self.#getChatMessageForClient(record));
-      }).catch(unsubscribe);
+      });
+    }
+
+    function deliverDraft(record: ChatDraftUpdateRecord, author: AiChatAuthorInfo) {
+      queueChatDelivery(async () => {
+        subscriber.draftUpdate(
+            record.chatId, record.timestamp,
+            await self.#getChatAuthorForClient(author), record.update);
+      });
+    }
+
+    function deliverDraftCleared(chatId: number) {
+      queueChatDelivery(async () => { subscriber.draftCleared(chatId); });
     }
 
     let msgSubscriber = {
@@ -8355,20 +8370,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           continue;
         }
 
-        authorByChat.set(chatId, await this.#getChatAuthorForClient(
-            this.impl.normalizeDraftAuthor(drafts)));
+        authorByChat.set(chatId, this.impl.normalizeDraftAuthor(drafts));
       }
 
       for (let draft of draftsToSend) {
-        subscriber.draftUpdate(
-            draft.chatId, draft.timestamp, authorByChat.get(draft.chatId)!,
-            draft.update).catch(unsubscribe);
+        deliverDraft(draft, authorByChat.get(draft.chatId)!);
       }
 
       if (startAfter !== undefined) {
         for (let chatId of changedChatIds) {
           if (!draftsByChat.has(chatId)) {
-            subscriber.draftCleared(chatId).catch(unsubscribe);
+            deliverDraftCleared(chatId);
           }
         }
       }
