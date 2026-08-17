@@ -9643,7 +9643,12 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
       throw new Error("This gatekeeper has no creation spec (created before blueprint support).");
     }
     let spec = record.creationSpec;
-    if (spec.type === "aiModel") return {type: spec.type, modelId: spec.modelId};
+    if (spec.type === "aiModel") {
+      let model = await this.impl.ctx.exports.AdminSettings.getByName("")
+          .resolveAvailableModel(spec.modelId);
+      if (!model) throw new Error("This model is no longer available.");
+      return {type: spec.type, modelId: model.profile.id};
+    }
     if (spec.type === "agentSpawner") return {type: spec.type, config: spec.config};
     return spec;
   }

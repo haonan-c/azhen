@@ -723,7 +723,7 @@ export class LanguageModelGatekeeper
       let modelRef = props.modelId ?? props.config?.model;
       let record = modelRef ? await admin.resolveAvailableModel(modelRef) : undefined;
       if (!props.modelId && record?.config.provider !== props.config?.provider) record = undefined;
-      if (!record) throw new Error(`No such model: ${modelRef ?? "legacy"}`);
+      if (!record) throw new Error("This model is no longer available.");
       let config = record.config;
       return getModel(this.env, config, props.initiator, {
         metadata: props.metadata,
