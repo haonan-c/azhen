@@ -87,6 +87,43 @@ An independently configured running installation of the Workshop, with its own p
 users, data, and settings. One codebase can produce more than one Workshop Deployment.
 _Avoid_: Repository, website page
 
+## AI Models
+
+**Deployment Model**:
+An AI model made available across one Workshop Deployment by an administrator. All users may
+select it, but only administrators may configure it.
+_Avoid_: User model, personal model
+
+**Deployment Model Catalog**:
+The shared set of Deployment Models jointly managed by all administrators of one Workshop
+Deployment and offered to all its users.
+_Avoid_: User model list, administrator model list
+
+**Deployment Default Model**:
+The Deployment Model selected by administrators for a user who has no prior Model Selection. A
+user may select another model from the Deployment Model Catalog.
+_Avoid_: User default model, personal model configuration
+
+**Deployment Quick Model**:
+The Deployment Model selected by administrators for lightweight AI work. When none is selected,
+the Deployment Default Model fills this role.
+_Avoid_: User quick model, personal quick model
+
+**Model Configuration**:
+The administrator-owned provider, model identity, and credentials that make a Deployment Model
+available. Non-administrator users cannot view or change it.
+_Avoid_: Model selection, user model settings
+
+**Model Selection**:
+A user's choice among the Deployment Models available for a conversation. It does not change a
+model's provider, identity, credentials, or deployment availability.
+_Avoid_: Model setup, model configuration
+
+**Deployment Model Revocation**:
+An administrator action that makes a Deployment Model unavailable for every later call, including
+calls from existing conversations and applications.
+_Avoid_: Hide model, remove from menu
+
 ## Chinese UI Language
 
 **工作台 (Workshop)**:
