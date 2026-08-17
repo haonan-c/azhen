@@ -8275,7 +8275,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     function deliverMetadata(record: AiChatMetadata) {
       queueChatDelivery(async () => {
-        subscriber.metadata(await self.#getChatMetadataForClient(record));
+        await subscriber.metadata(await self.#getChatMetadataForClient(record));
       });
     }
 
@@ -8287,26 +8287,26 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         deliverMetadata(newRecord);
       },
       remove(record: AiChatMetadata): void {
-        queueChatDelivery(async () => { subscriber.deleted(record.id); });
+        queueChatDelivery(async () => { await subscriber.deleted(record.id); });
       }
     }
 
     function deliverMessage(record: AiChatMessage) {
       queueChatDelivery(async () => {
-        subscriber.message(await self.#getChatMessageForClient(record));
+        await subscriber.message(await self.#getChatMessageForClient(record));
       });
     }
 
     function deliverDraft(record: ChatDraftUpdateRecord, author: AiChatAuthorInfo) {
       queueChatDelivery(async () => {
-        subscriber.draftUpdate(
+        await subscriber.draftUpdate(
             record.chatId, record.timestamp,
             await self.#getChatAuthorForClient(author), record.update);
       });
     }
 
     function deliverDraftCleared(chatId: number) {
-      queueChatDelivery(async () => { subscriber.draftCleared(chatId); });
+      queueChatDelivery(async () => { await subscriber.draftCleared(chatId); });
     }
 
     let msgSubscriber = {
