@@ -9649,7 +9649,13 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
       if (!model) throw new Error("This model is no longer available.");
       return {type: spec.type, modelId: model.profile.id};
     }
-    if (spec.type === "agentSpawner") return {type: spec.type, config: spec.config};
+    if (spec.type === "agentSpawner") {
+      if (spec.config.modelId === null) return {type: spec.type, config: spec.config};
+      let model = await this.impl.ctx.exports.AdminSettings.getByName("")
+          .resolveAvailableModel(spec.config.modelId);
+      if (!model) throw new Error("This model is no longer available.");
+      return {type: spec.type, config: {...spec.config, modelId: model.profile.id}};
+    }
     return spec;
   }
 }
