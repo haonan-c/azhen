@@ -63,73 +63,18 @@ back upstream.
 
 ## Workshop Surfaces
 
-**UGC Angle**:
-The product brand of the Production Site. The brand name is singular; what the product delivers is
-plural (`angles`). It replaces azhen as the product brand.
-_Avoid_: UGC Angles, azhen (as a product name), Cloudflare OS
-
 **azhen / 阿珍**:
 The user-facing AI partner persona inside the Workshop, and only that. Use `azhen` in English and
-`阿珍` in Chinese. The persona may speak in marketing, onboarding, and empty states, but it does
-not replace the explicit identity of a selected model or another Agent, and it is not the product
-brand.
+`阿珍` in Chinese. It does not replace the explicit identity of a selected model or another Agent.
 _Avoid_: Product brand, site name, Azhen
-
-**Ad Angle**:
-The argument one ad makes to one audience. It names the audience tension it targets, the
-hypothesis it tests, the opening Hook it suggests, and why it is worth spending on. One Ad Angle
-can produce many Hooks and many video variants.
-_Avoid_: Hook, concept, prompt
-
-**Hook**:
-The first seconds of an ad. It is one expression of an Ad Angle, never the Ad Angle itself.
-_Avoid_: Ad Angle
-
-**E-commerce Operations AI Workspace**:
-The product category used to position the Workshop for individual merchants, e-commerce operators,
-and small teams. Its first proof points are content insight, content creation, and user-specific
-operational tools; it is not a claim that every e-commerce workflow is already automated. The
-Marketing Landing Page does not use this category — it positions on AI UGC ad creative.
-_Avoid_: Full-process e-commerce automation, content-only tool
-
-**Angle Wall**:
-The Marketing Landing Page section that shows real Ad Angles with the scripts they produced. It is
-product evidence, not a customer case study, and every entry must be a real run.
-_Avoid_: Case study, results wall, showcase
-
-**Anonymous Angle Run**:
-One free run by a signed-out visitor that returns three Ad Angles for one product and one market.
-It is held in a temporary session and never gets a public URL.
-_Avoid_: Free trial, demo, generation
-
-**Hub**:
-The single content area of the Production Site, at `/hub/`. Its public label is "Resources". An
-article in it always has a two-level URL, whatever category indexes it.
-_Avoid_: Blog, Guides, content marketing site
-
-**Hub Article**:
-One published article in the Hub. A Hub Category is only an index of Hub Articles; it never owns
-them.
-_Avoid_: Blog post, nested article
-
-**Marketing Landing Page**:
-The public introduction to a Workshop deployment for signed-out visitors. It is distinct from the
-authenticated Workshop Home and from a Blueprint Landing Page.
-_Avoid_: Home page, login page
-
-**Marketing Demo Workspace**:
-A real Workshop workspace created for the Marketing Landing Page with a fictional e-commerce
-brand. It demonstrates Xiaohongshu benchmark-content analysis and an editable result in separate
-English and Chinese captures; it is product evidence, not a customer case study.
-_Avoid_: Mockup, customer story
 
 **Workshop Home**:
 The authenticated starting surface where a user begins a new workspace.
-_Avoid_: Marketing Landing Page
+_Avoid_: Blueprint Landing Page
 
 **Blueprint Landing Page**:
-The public presentation of one Blueprint. It is not the deployment's Marketing Landing Page.
-_Avoid_: Marketing Landing Page
+The public presentation of one Blueprint. It is not the authenticated Workshop Home.
+_Avoid_: Workshop Home
 
 **First-party Workshop UI**:
 The user interface owned by the Workshop frontend, including its public, authenticated, and admin
@@ -137,36 +82,10 @@ surfaces. It excludes Gadget content, AI output, user-authored content, embedded
 connector-provided text, and other third-party text.
 _Avoid_: All visible content
 
-**Long-tail Intent**:
-A curated search intent that represents a distinct audience, problem, and use case. Synonymous
-queries are signals for the same intent, not separate intents.
-_Avoid_: Keyword variant, search phrase
-
-**Tool Landing Page**:
-A public, indexable surface for one Long-tail Intent and its focused tool experience. It is distinct
-from the deployment's Marketing Landing Page.
-_Avoid_: Keyword page, Marketing Landing Page
-
 **Workshop Deployment**:
 An independently configured running installation of the Workshop, with its own public origin,
 users, data, and settings. One codebase can produce more than one Workshop Deployment.
 _Avoid_: Repository, website page
-
-**Production Site**:
-The single public Workshop Deployment operated as this product's website. Local development and
-staging deployments are not additional Production Sites.
-_Avoid_: Repository, local environment
-
-**Public Base URL**:
-The canonical origin of the Production Site. It is the source for canonical links, localized
-alternates, and sitemaps. Only requests on this origin are indexable; alternate development or
-preview origins are not.
-_Avoid_: Current request origin, preview URL
-
-**Indexable Public Page**:
-A curated public page with unique user value, an explicit sitemap entry, and complete English and
-Chinese versions.
-_Avoid_: Every public route, placeholder SEO page
 
 ## Chinese UI Language
 

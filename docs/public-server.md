@@ -6,30 +6,6 @@ multi-user service instead: users sign in with Google, GitHub, or Cloudflare, ev
 free daily allowance of AI usage, and once that runs out they connect their own Cloudflare account
 and top up credits in the Cloudflare dashboard (their account is then billed for further usage).
 
-## Production Site boundary
-
-Set `PUBLIC_BASE_URL` to the canonical origin of the Production Site. The Router uses this value
-for canonical links, localized alternates, `robots.txt`, and `sitemap.xml`. Only `/` and `/zh` on
-that origin are indexable. Other HTML routes and matching pages on other origins receive
-`noindex`.
-
-The release manifest offers two frontend asset variants:
-
-- `public` uses application sign-in and lets signed-out visitors reach the English and Chinese
-  Marketing Landing Pages.
-- `access` uses Cloudflare Access authentication. Use it only when an external Cloudflare Access
-  policy already protects the full origin.
-
-The asset choice does not create, remove, or bypass a Cloudflare Access policy. If Access blocks
-requests before they reach the Router, the Marketing Landing Page cannot be public. To operate a
-public Production Site, allow unauthenticated requests to the two localized Marketing Landing Page
-documents and use the `public` variant.
-
-An administrator site name changes runtime first-party Workshop UI immediately. Pre-rendered
-titles, descriptions, and social metadata do not read the administrator setting. They always use
-the built-in `azhen` and `阿珍` catalog names. Rebuilding the same source does not change them. To
-rebrand this static metadata, change the built-in frontend catalog and deploy that custom build.
-
 Sign-in is provided by **authentication gatekeepers**: each auth-capable gatekeeper (Google, GitHub,
 Cloudflare) uses its single OAuth app both to authenticate the user (by verified email) and to
 connect the account's capabilities. There's no single switch — the pieces turn on independently:
