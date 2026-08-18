@@ -9,6 +9,7 @@ const testState = vi.hoisted(() => ({
   addToast: vi.fn<(toast: unknown) => void>(),
   getAdminApi: vi.fn<() => Promise<unknown>>(),
   documentTitle: vi.fn<(title: string) => void>(),
+  isAdmin: true,
 }))
 
 vi.mock('@cloudflare/kumo', async (importOriginal) => ({
@@ -21,7 +22,7 @@ vi.mock('./AuthContext', () => {
       getAdminApi: testState.getAdminApi,
       getAiConfig: async () => ({ enabled: false as const }),
     },
-    isAdmin: true,
+    get isAdmin() { return testState.isAdmin },
   }
   return { useAuthenticatedApi: () => auth }
 })
@@ -74,6 +75,7 @@ describe('administrator localization', () => {
     container?.remove()
     window.history.replaceState({}, '', '/')
     vi.clearAllMocks()
+    testState.isAdmin = true
     root = undefined
     container = undefined
   })
@@ -133,6 +135,16 @@ describe('administrator localization', () => {
     await vi.waitFor(() => expect(container?.textContent).toContain('加载管理员设置时出现问题。'))
     expect(container?.textContent).toContain('重试')
     expect(container?.textContent).toContain('ADMIN-DIAGNOSTIC-原样')
+  })
+
+  it('does not mint the administrator capability for a normal user', async () => {
+    window.history.replaceState({}, '', '/zh/admin')
+    testState.isAdmin = false
+    await render('/zh/admin')
+
+    expect(container?.textContent).toContain('你无权访问此页面。')
+    expect(testState.getAdminApi).not.toHaveBeenCalled()
+    expect(container?.textContent).not.toContain('模型配置')
   })
 
   it('lets an administrator manage Default and Quick Models', async () => {

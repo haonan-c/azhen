@@ -9,6 +9,7 @@ import type { OutputFormatOffer, Overseer } from '@gadgets/workshop-shared/api'
 
 const testState = vi.hoisted(() => ({
   addToast: vi.fn<(toast: unknown) => void>(),
+  isAdmin: false,
   outputFormats: [] as OutputFormatOffer[],
 }))
 
@@ -18,7 +19,7 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => ({
 }))
 
 vi.mock('./AuthContext', () => ({
-  useAuthenticatedApi: () => ({ authenticatedApi: {} }),
+  useAuthenticatedApi: () => ({ authenticatedApi: {}, isAdmin: testState.isAdmin }),
 }))
 
 vi.mock('./useVendorBranding', () => ({
@@ -94,6 +95,7 @@ describe('localized Prompt Composer', () => {
     container?.remove()
     root = undefined
     window.history.replaceState({}, '', '/')
+    testState.isAdmin = false
     testState.outputFormats = []
     vi.clearAllMocks()
   })
@@ -115,6 +117,24 @@ describe('localized Prompt Composer', () => {
     expect(container.textContent).toContain('Model 原名')
     expect(container.querySelector('[aria-label="选择模型"]')).not.toBeNull()
     expect(container.querySelector('[aria-label="发送消息"]')).not.toBeNull()
+  })
+
+  it('does not expose an internal model ID when the catalog is empty', async () => {
+    window.history.replaceState({}, '', '/zh')
+    await renderComposer({ selectedModel: 'internal-model-id' })
+
+    expect(container.textContent).toContain('管理员尚未配置可用模型')
+    expect(container.textContent).not.toContain('internal-model-id')
+  })
+
+  it('guides an administrator to deployment model configuration when the catalog is empty', async () => {
+    window.history.replaceState({}, '', '/zh')
+    testState.isAdmin = true
+    await renderComposer()
+
+    const modelMenu = container.querySelector<HTMLButtonElement>('[aria-label="选择模型"]')!
+    await act(async () => modelMenu.click())
+    expect(document.body.textContent).toContain('前往“管理员 → AI 模型”配置可用模型。')
   })
 
   it('localizes active-agent and chat-option states', async () => {

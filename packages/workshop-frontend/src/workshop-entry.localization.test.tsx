@@ -172,7 +172,6 @@ describe('localized sign-in to Workshop Home journey', () => {
     const findButton = (label: string) => [...container!.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.trim() === label)!
     await act(async () => findButton(nextLabel).click())
-    await act(async () => findButton(nextLabel).click())
     await act(async () => findButton(finishLabel).click())
 
     await vi.waitFor(() => expect(container?.querySelector('[data-destination="home"]')).not.toBeNull())

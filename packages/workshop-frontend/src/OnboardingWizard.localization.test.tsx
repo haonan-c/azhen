@@ -22,6 +22,7 @@ const testState = vi.hoisted(() => {
     api,
     avatarBlobUrl: vi.fn<() => string>(() => 'blob:avatar'),
     compressAvatar: vi.fn<(file: File) => Promise<Uint8Array>>(),
+    isAdmin: false,
     onComplete: vi.fn<() => void>(),
   }
 })
@@ -34,6 +35,7 @@ vi.mock('./AuthContext', () => ({
   useAuthenticatedApi: () => ({
     authenticatedApi: testState.api,
     currentUser: { type: 'user', id: 'user-1', name: '店主 原名' },
+    isAdmin: testState.isAdmin,
   }),
 }))
 
@@ -67,6 +69,7 @@ describe('localized first-run onboarding', () => {
     document.title = ''
     window.history.replaceState({}, '', '/')
     vi.clearAllMocks()
+    testState.isAdmin = false
     root = undefined
     container = undefined
   })
@@ -75,9 +78,7 @@ describe('localized first-run onboarding', () => {
     testState.api.completeOnboarding.mockImplementation(completeOnboarding)
     testState.api.getAiConfig.mockResolvedValue({ enabled: false, enabledProviders: [] })
     testState.api.listGatekeeperVendors.mockResolvedValue([])
-    testState.api.listModels.mockResolvedValue([
-      { type: 'agent', id: 'model-1', name: 'Model 原名' },
-    ])
+    testState.api.listModels.mockResolvedValue([])
     testState.api.setPreferredModel.mockResolvedValue(undefined)
     testState.api.subscribeConnectedAccounts.mockReturnValue(Object.assign(
       Promise.resolve({ [Symbol.dispose]: vi.fn<() => void>() }),
@@ -93,7 +94,9 @@ describe('localized first-run onboarding', () => {
     await act(async () => root!.render(
       <OnboardingWizard onComplete={testState.onComplete} />,
     ))
-    await vi.waitFor(() => expect(container?.textContent).toContain('Model 原名'))
+    await vi.waitFor(() => expect(
+      container?.querySelector<HTMLInputElement>('#onboarding-display-name')?.value,
+    ).toBe('店主 原名'))
   }
 
   it.each([
@@ -103,11 +106,14 @@ describe('localized first-run onboarding', () => {
       profile: 'Create your profile',
       next: 'Next',
       model: 'Choose your model',
+      modelShowcase: 'Switch between the Deployment Models your administrator provides in each conversation.',
+      personalModelSetup: 'Plug in personal API tokens',
       showcase: "You're all set",
       finish: "Let's build",
       finishing: 'Setting up...',
       documentTitle: 'Setup - Northstar 原名',
-      currentStep: 'Step 1 of 3, current step',
+      currentStep: 'Step 1 of 2, current step',
+      isAdmin: false,
     },
     {
       path: '/zh',
@@ -115,16 +121,20 @@ describe('localized first-run onboarding', () => {
       profile: '创建个人资料',
       next: '下一步',
       model: '选择模型',
+      modelShowcase: '在每次对话中切换管理员提供的部署模型。',
+      personalModelSetup: '添加任意服务商的个人 API 令牌',
       showcase: '设置完成',
       finish: '开始使用',
       finishing: '正在完成设置…',
       documentTitle: '初始设置 - Northstar 原名',
-      currentStep: '第 1 步，共 3 步，当前步骤',
+      currentStep: '第 1 步，共 2 步，当前步骤',
+      isAdmin: true,
     },
   ])('completes the onboarding journey at $path', async (expected) => {
     let resolveCompletion!: () => void
     const completion = new Promise<void>((resolve) => { resolveCompletion = resolve })
     configureApi(() => completion)
+    testState.isAdmin = expected.isAdmin
     await render(expected.path)
 
     expect(container?.textContent).toContain(expected.title)
@@ -137,12 +147,12 @@ describe('localized first-run onboarding', () => {
     const next = () => [...container!.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.trim() === expected.next)!
     await act(async () => next().click())
-    expect(container?.textContent).toContain(expected.model)
-    expect(container?.textContent).toContain('Model 原名')
-
-    await act(async () => next().click())
     expect(container?.textContent).toContain(expected.showcase)
     expect(container?.textContent).toContain('Northstar 原名')
+    expect([...container!.querySelectorAll('h2')]
+      .some(heading => heading.textContent === expected.model)).toBe(false)
+    expect(container?.textContent).toContain(expected.modelShowcase)
+    expect(container?.textContent).not.toContain(expected.personalModelSetup)
 
     const finish = [...container!.querySelectorAll<HTMLButtonElement>('button')]
       .find(button => button.textContent?.trim() === expected.finish)!
@@ -150,7 +160,8 @@ describe('localized first-run onboarding', () => {
     expect(container?.textContent).toContain(expected.finishing)
 
     await act(async () => resolveCompletion())
-    expect(testState.api.setPreferredModel).toHaveBeenCalledWith('model-1')
+    expect(testState.api.listModels).not.toHaveBeenCalled()
+    expect(testState.api.setPreferredModel).not.toHaveBeenCalled()
     expect(testState.api.completeOnboarding).toHaveBeenCalledOnce()
     expect(testState.onComplete).toHaveBeenCalledOnce()
   })
@@ -169,26 +180,6 @@ describe('localized first-run onboarding', () => {
       variant: 'error',
     })
     expect(file.name).toBe('原始文件.txt')
-  })
-
-  it('exposes a localized model loading status', async () => {
-    testState.api.getAiConfig.mockResolvedValue({ enabled: false, enabledProviders: [] })
-    testState.api.listGatekeeperVendors.mockResolvedValue([])
-    testState.api.listModels.mockReturnValue(new Promise(() => {}))
-    testState.api.subscribeConnectedAccounts.mockReturnValue(Object.assign(
-      Promise.resolve({ [Symbol.dispose]: vi.fn<() => void>() }),
-      { [Symbol.dispose]: vi.fn<() => void>() },
-    ))
-    window.history.replaceState({}, '', '/zh')
-    container = document.createElement('div')
-    document.body.append(container)
-    root = createRoot(container)
-    await act(async () => root!.render(
-      <OnboardingWizard onComplete={testState.onComplete} />,
-    ))
-
-    expect(container?.querySelector('[role="status"]')?.getAttribute('aria-label'))
-      .toBe('正在加载 AI 模型…')
   })
 
   it('exposes a localized avatar processing status', async () => {

@@ -182,23 +182,25 @@ export default function Header() {
                 >
                   {messages.user_menu_profile()}
                 </Link>
-                <Link
-                  to="/providers"
-                  onClick={closeMobileMenu}
-                  className={navLinkClass}
-                  activeProps={{ className: navLinkActiveClass }}
-                >
-                  {messages.user_menu_providers()}
-                </Link>
                 {auth.isAdmin && (
-                  <Link
-                    to="/admin"
-                    onClick={closeMobileMenu}
-                    className={navLinkClass}
-                    activeProps={{ className: navLinkActiveClass }}
-                  >
-                    {messages.user_menu_admin()}
-                  </Link>
+                  <>
+                    <Link
+                      to="/providers"
+                      onClick={closeMobileMenu}
+                      className={navLinkClass}
+                      activeProps={{ className: navLinkActiveClass }}
+                    >
+                      {messages.user_menu_providers()}
+                    </Link>
+                    <Link
+                      to="/admin"
+                      onClick={closeMobileMenu}
+                      className={navLinkClass}
+                      activeProps={{ className: navLinkActiveClass }}
+                    >
+                      {messages.user_menu_admin()}
+                    </Link>
+                  </>
                 )}
                 <button
                   onClick={() => { closeMobileMenu(); auth.logout() }}

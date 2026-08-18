@@ -1999,7 +1999,7 @@ export const ChatInput = ({
   const pickerCaretRef = useRef<{key: string | null; text: string}>({key: null, text: ""});
   // Caret position and text the URL overlay was last resolved for, to skip repeated scans.
   const lastUrlScanRef = useRef({position: -1, text: ""});
-  const { authenticatedApi } = useAuthenticatedApi();
+  const { authenticatedApi, isAdmin } = useAuthenticatedApi();
   const vendorBranding = useVendorBranding(authenticatedApi);
   const selectedSlashCommandRef = useRef(selectedSlashCommand);
   selectedSlashCommandRef.current = selectedSlashCommand;
@@ -3305,9 +3305,12 @@ export const ChatInput = ({
       : oneCapturedLog
         ? uiMessages.composer_captured_log_one()
         : uiMessages.composer_captured_log_many();
-  const selectedModelLabel = selectedModel == null
-    ? uiMessages.composer_no_agent()
-    : models.find((model) => model.id === selectedModel)?.name ?? selectedModel;
+  const selectedModelLabel = models.length === 0
+    ? uiMessages.composer_models_empty()
+    : selectedModel == null
+      ? uiMessages.composer_no_agent()
+      : models.find((model) => model.id === selectedModel)?.name ??
+        uiMessages.composer_model_unavailable();
   const selectedSlashCommandPresentation = selectedSlashCommand
     ? presentSlashCommandChoice(selectedSlashCommand.choice, siteName)
     : null;
@@ -3710,6 +3713,13 @@ export const ChatInput = ({
                   }
                 />
                 <DropdownMenu.Content className="themed-floating-shadow-lg !z-[1100] !min-w-[190px] rounded-2xl border border-kumo-line/70 bg-kumo-base p-1">
+                  {models.length === 0 && (
+                    <p className="px-2 py-1.5 text-[12px] leading-4 text-kumo-subtle">
+                      {isAdmin
+                        ? uiMessages.composer_models_empty_admin()
+                        : uiMessages.composer_models_empty()}
+                    </p>
+                  )}
                   {models.map((model) => {
                     const active = selectedModel === model.id;
                     return (

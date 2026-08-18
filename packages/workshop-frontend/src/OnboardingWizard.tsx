@@ -1,25 +1,19 @@
 import { logRpcFailure } from './rpcErrors'
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
-import {
-  AiChatAuthorInfo,
-} from '@gadgets/workshop-shared/api'
 import {
   VendorDescription,
 } from '@gadgets/workshop-shared/gatekeeper'
 import {
   Camera,
   ArrowRight,
-  Check,
   PlugsConnected,
   Sparkle,
   UsersThree,
-  Key,
   Plugs,
   Hexagon,
 } from '@phosphor-icons/react'
-import { rememberSelectedModel } from './modelSelection'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
@@ -33,7 +27,7 @@ import { AccountsSubscriberAdapter } from './accountsSubscriber'
 
 // ─── constants ──────────────────────────────────────────────────────────────────
 
-const TOTAL_STEPS_WITH_CONNECTIONS = 4
+const TOTAL_STEPS_WITH_CONNECTIONS = 3
 
 // Maps RPC vendor IDs to logo keys in our logoComponents map
 const VENDOR_LOGO_MAP: Record<string, string> = {
@@ -67,7 +61,7 @@ export default function OnboardingWizard({
   useDocumentTitle(messages.onboarding_document_title())
 
   // Wizard state
-  const [step, setStep] = useState(0) // 0 = avatar, 1 = model, 2 = connections
+  const [step, setStep] = useState(0) // 0 = profile, 1 = connections
   const [mounted, setMounted] = useState(false)
   const [finishing, setFinishing] = useState(false)
 
@@ -78,11 +72,6 @@ export default function OnboardingWizard({
   const [avatarData, setAvatarData] = useState<Uint8Array | null>(null)
   const [avatarProcessing, setAvatarProcessing] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-
-  // Model state
-  const [models, setModels] = useState<AiChatAuthorInfo[]>([])
-  const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
-  const [modelsLoading, setModelsLoading] = useState(true)
 
   // Connections state
   const [vendors, setVendors] = useState<VendorEntry[]>([])
@@ -109,26 +98,6 @@ export default function OnboardingWizard({
       setOriginalDisplayName(currentUser.name)
     }
   }, [currentUser])
-
-  // Load the Deployment Model Catalog.
-  const fetchModels = useCallback(async () => {
-    try {
-      const modelList = await authenticatedApi.listModels()
-      setModels(modelList)
-      // Default to the first model in the list
-      if (modelList.length > 0) {
-        setSelectedModelId((prev) => prev ?? modelList[0].id)
-      }
-    } catch (err) {
-      console.error('Failed to load models:', err)
-    } finally {
-      setModelsLoading(false)
-    }
-  }, [authenticatedApi])
-
-  useEffect(() => {
-    fetchModels()
-  }, [fetchModels])
 
   // Load vendors and subscribe to connected accounts.
   // We use a url→vendorId lookup map (built from listGatekeeperVendors) so the
@@ -281,8 +250,6 @@ export default function OnboardingWizard({
         await authenticatedApi.setAvatar(avatarData)
         if (currentUser?.id) invalidateAvatarCache(currentUser.id)
       }
-      // selectedModelId is null when the user chose "No agent" or didn't pick one
-      await rememberSelectedModel(authenticatedApi, selectedModelId, currentUser?.id)
       await authenticatedApi.completeOnboarding()
       onComplete()
     } catch (err) {
@@ -476,84 +443,7 @@ export default function OnboardingWizard({
               </div>
             </div>
 
-            {/* ── Step 1: Model selection ───────────────────────────────────── */}
-            <div className="w-full flex-shrink-0 p-8 min-h-[420px]">
-              <div>
-                <h2 className="text-lg font-medium text-kumo-default mb-1">
-                  {messages.onboarding_model_heading()}
-                </h2>
-                <p className="text-sm text-kumo-subtle mb-6">
-                  {messages.onboarding_model_description()}
-                </p>
-
-                {modelsLoading ? (
-                  <div
-                    className="flex items-center justify-center py-12"
-                    role="status"
-                    aria-label={messages.onboarding_loading_models()}
-                  >
-                    <div className="w-6 h-6 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
-                  </div>
-                ) : (
-                  <>
-                    <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-                      {models.map((model) => (
-                        <button
-                          key={model.id}
-                          onClick={() => setSelectedModelId(model.id)}
-                          className={`
-                            w-full flex items-center gap-3 px-4 py-3 rounded-xl border text-left
-                            transition-all duration-150
-                            ${selectedModelId === model.id
-                              ? 'border-kumo-brand bg-kumo-brand/5 ring-1 ring-kumo-brand/20'
-                              : 'border-kumo-line hover:border-kumo-fill hover:bg-kumo-tint'
-                            }
-                          `}
-                        >
-                          <div
-                            className={`
-                              w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold
-                              transition-colors duration-150
-                              ${selectedModelId === model.id
-                                ? 'bg-kumo-brand text-kumo-inverse'
-                                : 'bg-kumo-tint text-kumo-subtle'
-                              }
-                            `}
-                          >
-                            {model.name[0]?.toUpperCase()}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium text-kumo-default truncate">
-                              {model.name}
-                            </p>
-                          </div>
-                          {selectedModelId === model.id && (
-                            <Check
-                              size={18}
-                              weight="bold"
-                              className="text-kumo-brand flex-shrink-0"
-                            />
-                          )}
-                        </button>
-                      ))}
-
-                      {models.length === 0 && (
-                        <div className="text-center py-8">
-                          <p className="text-sm text-kumo-subtle mb-1">
-                            {messages.onboarding_model_missing_heading()}
-                          </p>
-                          <p className="text-xs text-kumo-inactive">
-                            {messages.onboarding_model_missing_description()}
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* ── Step 2: Connections ───────────────────────────────────────── */}
+            {/* ── Step 1: Connections ───────────────────────────────────────── */}
             <div className={`w-full flex-shrink-0 p-8 min-h-[420px] ${showConnectionsStep ? '' : 'hidden'}`}>
               <div>
                 <h2 className="text-lg font-medium text-kumo-default mb-1">
@@ -738,7 +628,7 @@ function showcaseFeatures(): ShowcaseFeature[] {
       description: messages.onboarding_showcase_collaboration_description(),
     },
     {
-      icon: Key,
+      icon: Sparkle,
       iconColor: 'text-kumo-warning',
       iconBg: 'bg-kumo-warning-tint',
       title: messages.onboarding_showcase_models_title(),
