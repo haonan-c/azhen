@@ -279,15 +279,26 @@ describe('localized Prompt Composer', () => {
     await act(async () => textarea.dispatchEvent(new CompositionEvent('compositionstart', {
       bubbles: true,
     })))
-    await act(async () => setTextareaValue(textarea, 'hasda'))
+    await act(async () => setTextareaValue(textarea, 'nihao'))
     await act(async () => textarea.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'Enter',
       bubbles: true,
       cancelable: true,
       isComposing: true,
     })))
-
     expect(onSend).not.toHaveBeenCalled()
+
+    await act(async () => textarea.dispatchEvent(new CompositionEvent('compositionend', {
+      bubbles: true,
+      data: '你好',
+    })))
+    await act(async () => setTextareaValue(textarea, '你好'))
+    await act(async () => textarea.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    })))
+    expect(onSend).toHaveBeenCalledWith('你好', null, undefined, undefined, undefined)
   })
 
   it('sends a selected Chinese format with its localized reference', async () => {
