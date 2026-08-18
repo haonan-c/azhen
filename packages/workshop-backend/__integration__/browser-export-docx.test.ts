@@ -41,4 +41,66 @@ describe("Gadget DOCX export", () => {
     expect(documentXml).toContain("<w:tbl>");
     expect(documentXml).not.toContain("Toolbar command");
   });
+
+  it("embeds visible images in the Word file", async () => {
+    let browser = env.BROWSER;
+    if (!browser) throw new Error("Browser Run is not configured for this test.");
+
+    let html = `<p>产品图片<img
+      src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      alt="产品图片"
+      style="width: 120px; height: 80px"
+    ></p>`;
+    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
+    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
+    let stream = await renderGadgetDocx(browser, clientCode, "产品图片", gadget);
+    let archive = await JSZip.loadAsync(await readStream(stream));
+    let mediaFiles = Object.values(archive.files)
+      .filter(file => !file.dir && file.name.startsWith("word/media/"));
+    let documentXml = await archive.file("word/document.xml")?.async("string");
+    let relationshipsXml = await archive.file("word/_rels/document.xml.rels")?.async("string");
+
+    expect(mediaFiles).toHaveLength(1);
+    expect(documentXml).toContain("<w:drawing>");
+    expect(relationshipsXml).toContain(
+      "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+    );
+  });
+
+  it("uses alternative text when an image cannot be decoded", async () => {
+    let browser = env.BROWSER;
+    if (!browser) throw new Error("Browser Run is not configured for this test.");
+
+    let html = `<p><img
+      src="data:image/png;base64,invalid"
+      alt="图片无法显示"
+      style="width: 120px; height: 80px"
+    ></p>`;
+    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
+    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
+    let stream = await renderGadgetDocx(browser, clientCode, "图片替代文字", gadget);
+    let archive = await JSZip.loadAsync(await readStream(stream));
+    let documentXml = await archive.file("word/document.xml")?.async("string");
+
+    expect(documentXml).toContain("[图片无法显示]");
+  });
+
+  it("embeds an image outside a semantic text block", async () => {
+    let browser = env.BROWSER;
+    if (!browser) throw new Error("Browser Run is not configured for this test.");
+
+    let html = `<main><img
+      src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      alt="独立图片"
+      style="width: 120px; height: 80px"
+    ></main>`;
+    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
+    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
+    let stream = await renderGadgetDocx(browser, clientCode, "独立图片", gadget);
+    let archive = await JSZip.loadAsync(await readStream(stream));
+    let mediaFiles = Object.values(archive.files)
+      .filter(file => !file.dir && file.name.startsWith("word/media/"));
+
+    expect(mediaFiles).toHaveLength(1);
+  });
 });

@@ -4,6 +4,7 @@ import {
   BorderStyle,
   Document,
   HeadingLevel,
+  ImageRun,
   LevelFormat,
   Packer,
   Paragraph,
@@ -24,8 +25,13 @@ const PAGE_WIDTH = 11_906;
 const PAGE_HEIGHT = 16_838;
 const PAGE_MARGIN = 1_440;
 const CONTENT_WIDTH = PAGE_WIDTH - 2 * PAGE_MARGIN;
+const CONTENT_HEIGHT = PAGE_HEIGHT - 2 * PAGE_MARGIN;
+const TWIPS_PER_PIXEL = 15;
+const CONTENT_WIDTH_PX = Math.floor(CONTENT_WIDTH / TWIPS_PER_PIXEL);
+const CONTENT_HEIGHT_PX = Math.floor(CONTENT_HEIGHT / TWIPS_PER_PIXEL);
 
-type DocxRunData = {
+type DocxTextRunData = {
+  type: "text";
   text: string;
   break?: boolean;
   bold?: boolean;
@@ -34,6 +40,16 @@ type DocxRunData = {
   strike?: boolean;
   code?: boolean;
 };
+
+type DocxImageRunData = {
+  type: "image";
+  data: string;
+  width: number;
+  height: number;
+  altText?: string;
+};
+
+type DocxRunData = DocxTextRunData | DocxImageRunData;
 
 type DocxParagraphData = {
   type: "paragraph";
@@ -52,7 +68,12 @@ type DocxTableData = {
 type DocxBlockData = DocxParagraphData | DocxTableData;
 
 async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
-  return page.evaluate((maxBlocks: number, maxCharacters: number) => {
+  return page.evaluate(async (
+    maxBlocks: number,
+    maxCharacters: number,
+    maxImageWidth: number,
+    maxImageHeight: number,
+  ) => {
     type PageNode = {
       nodeType: number;
       textContent: string | null;
@@ -75,13 +96,29 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
       textDecorationLine: string;
       textAlign: string;
     };
+    type PageImageElement = PageElement & {
+      decode(): Promise<void>;
+      getBoundingClientRect(): { width: number; height: number };
+    };
+    type PageCanvasElement = {
+      width: number;
+      height: number;
+      getContext(contextId: "2d"): {
+        drawImage(image: PageImageElement, x: number, y: number, width: number, height: number): void;
+      } | null;
+      toDataURL(type: "image/png"): string;
+    };
     const pageWindow = globalThis as unknown as {
       document: {
         body: PageElement;
+        createElement(tagName: "canvas"): PageCanvasElement;
         querySelectorAll(selector: string): Iterable<PageElement>;
       };
       getComputedStyle(element: PageElement): PageStyle;
     };
+
+    await Promise.all(Array.from(pageWindow.document.querySelectorAll("img"))
+      .map(element => (element as PageImageElement).decode().catch(() => {})));
 
     let blocks: DocxBlockData[] = [];
     let characterCount = 0;
@@ -98,7 +135,7 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
 
     // Must stay inside the callback because Puppeteer serializes this function into the browser.
     // eslint-disable-next-line unicorn/consistent-function-scoping
-    function sameFormatting(left: DocxRunData, right: DocxRunData): boolean {
+    function sameFormatting(left: DocxTextRunData, right: DocxTextRunData): boolean {
       return left.bold === right.bold && left.italics === right.italics &&
         left.underline === right.underline && left.strike === right.strike &&
         left.code === right.code && !left.break && !right.break;
@@ -106,9 +143,9 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
 
     function extractRuns(root: PageElement): DocxRunData[] {
       let runs: DocxRunData[] = [];
-      function append(run: DocxRunData): void {
+      function append(run: DocxTextRunData): void {
         let previous = runs.at(-1);
-        if (previous && sameFormatting(previous, run)) {
+        if (previous?.type === "text" && sameFormatting(previous, run)) {
           previous.text += run.text;
         } else {
           runs.push(run);
@@ -123,6 +160,7 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
           let style = pageWindow.getComputedStyle(parent);
           let weight = Number.parseInt(style.fontWeight, 10);
           append({
+            type: "text",
             text,
             bold: style.fontWeight === "bold" || weight >= 600 || undefined,
             italics: style.fontStyle === "italic" || undefined,
@@ -136,33 +174,69 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
         let element = node as PageElement;
         let tag = element.tagName.toUpperCase();
         if (tag === "BR") {
-          runs.push({ text: "", break: true });
+          runs.push({ type: "text", text: "", break: true });
           return;
         }
         if (tag === "IMG") {
           let alt = element.getAttribute("alt")?.trim();
-          if (alt) append({ text: `[${alt}]` });
+          let image = element as PageImageElement;
+          let rect = image.getBoundingClientRect();
+          let scale = Math.min(
+            1,
+            maxImageWidth / rect.width,
+            maxImageHeight / rect.height,
+          );
+          let width = Math.max(1, Math.round(rect.width * scale));
+          let height = Math.max(1, Math.round(rect.height * scale));
+          let canvas = pageWindow.document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          let context = canvas.getContext("2d");
+          if (rect.width > 0 && rect.height > 0 && context) {
+            try {
+              context.drawImage(image, 0, 0, width, height);
+              runs.push({
+                type: "image",
+                data: canvas.toDataURL("image/png"),
+                width,
+                height,
+                altText: alt || undefined,
+              });
+              return;
+            } catch {
+              // Preserve the existing alternative-text fallback for unreadable images.
+            }
+          }
+          if (alt) append({ type: "text", text: `[${alt}]` });
           return;
         }
         if (element !== root && (tag === "UL" || tag === "OL" || tag === "TABLE")) return;
         for (let child of element.childNodes) visit(child);
       }
       visit(root);
-      let firstText = runs.find(run => !run.break && run.text.length > 0);
-      let lastText = runs.findLast(run => !run.break && run.text.length > 0);
+      let firstText = runs.find((run): run is DocxTextRunData =>
+        run.type === "text" && !run.break && run.text.length > 0);
+      let lastText = runs.findLast((run): run is DocxTextRunData =>
+        run.type === "text" && !run.break && run.text.length > 0);
       if (firstText) firstText.text = firstText.text.trimStart();
       if (lastText) lastText.text = lastText.text.trimEnd();
-      return runs.filter(run => run.break || run.text.length > 0);
+      return runs.filter(run => run.type === "image" || run.break || run.text.length > 0);
     }
 
     // Must stay inside the callback because Puppeteer serializes this function into the browser.
     // eslint-disable-next-line unicorn/consistent-function-scoping
     function countCharacters(block: DocxBlockData): number {
       if (block.type === "paragraph") {
-        return block.runs.reduce((total, run) => total + run.text.length, 0);
+        return block.runs.reduce(
+          (total, run) => total + (run.type === "text" ? run.text.length : 0),
+          0,
+        );
       }
       return block.rows.flat(2).reduce(
-        (total, cell) => total + cell.runs.reduce((sum, run) => sum + run.text.length, 0),
+        (total, cell) => total + cell.runs.reduce(
+          (sum, run) => sum + (run.type === "text" ? run.text.length : 0),
+          0,
+        ),
         0,
       );
     }
@@ -175,11 +249,13 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
       blocks.push(block);
     }
 
-    const blockSelector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,table";
+    const semanticBlockSelector = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,table";
+    const blockSelector = `${semanticBlockSelector},img`;
     for (let element of pageWindow.document.querySelectorAll(blockSelector)) {
       if (!isVisible(element)) continue;
       let tag = element.tagName.toUpperCase();
       if (tag !== "TABLE" && element.parentElement?.closest("table")) continue;
+      if (tag === "IMG" && element.parentElement?.closest(semanticBlockSelector)) continue;
       if ((tag === "P" || /^H[1-6]$/.test(tag) || tag === "PRE") &&
           element.parentElement?.closest("li,blockquote")) continue;
 
@@ -230,24 +306,37 @@ async function extractDocumentBlocks(page: Page): Promise<DocxBlockData[]> {
     if (blocks.length === 0) {
       for (let line of pageWindow.document.body.innerText.split(/\n+/)) {
         let text = line.trim();
-        if (text) addBlock({ type: "paragraph", runs: [{ text }] });
+        if (text) addBlock({ type: "paragraph", runs: [{ type: "text", text }] });
       }
     }
     return blocks;
-  }, MAX_DOCX_BLOCKS, MAX_DOCX_CHARACTERS);
+  }, MAX_DOCX_BLOCKS, MAX_DOCX_CHARACTERS, CONTENT_WIDTH_PX, CONTENT_HEIGHT_PX);
 }
 
-function textRuns(runs: DocxRunData[], forceBold = false): TextRun[] {
-  return runs.map(run => run.break
-    ? new TextRun({ break: 1 })
-    : new TextRun({
-      text: run.text,
-      bold: forceBold || run.bold,
-      italics: run.italics,
-      underline: run.underline ? { type: UnderlineType.SINGLE } : undefined,
-      strike: run.strike,
-      font: run.code ? "Courier New" : undefined,
-    }));
+function docxRuns(runs: DocxRunData[], forceBold = false): Array<TextRun | ImageRun> {
+  return runs.map(run => {
+    if (run.type === "image") {
+      return new ImageRun({
+        type: "png",
+        data: run.data,
+        transformation: { width: run.width, height: run.height },
+        altText: {
+          name: run.altText ?? "Image",
+          description: run.altText,
+        },
+      });
+    }
+    return run.break
+      ? new TextRun({ break: 1 })
+      : new TextRun({
+        text: run.text,
+        bold: forceBold || run.bold,
+        italics: run.italics,
+        underline: run.underline ? { type: UnderlineType.SINGLE } : undefined,
+        strike: run.strike,
+        font: run.code ? "Courier New" : undefined,
+      });
+  });
 }
 
 function paragraphAlignment(value: string | undefined) {
@@ -269,7 +358,7 @@ const HEADING_LEVELS = [
 
 function makeParagraph(block: DocxParagraphData): Paragraph {
   return new Paragraph({
-    children: textRuns(block.runs),
+    children: docxRuns(block.runs),
     heading: block.heading ? HEADING_LEVELS[block.heading] : undefined,
     alignment: paragraphAlignment(block.alignment),
     numbering: block.list ? {
@@ -303,7 +392,7 @@ function makeTable(block: DocxTableData): Table {
           borders,
           margins: { top: 80, bottom: 80, left: 120, right: 120 },
           shading: cell.header ? { fill: "E8EEF5", type: ShadingType.CLEAR } : undefined,
-          children: [new Paragraph({ children: textRuns(cell.runs, cell.header) })],
+          children: [new Paragraph({ children: docxRuns(cell.runs, cell.header) })],
         });
       }),
     })),
