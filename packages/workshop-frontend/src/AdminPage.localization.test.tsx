@@ -20,7 +20,6 @@ vi.mock('./AuthContext', () => {
   const auth = {
     authenticatedApi: {
       getAdminApi: testState.getAdminApi,
-      getAiConfig: async () => ({ enabled: false as const }),
     },
     get isAdmin() { return testState.isAdmin },
   }
@@ -57,6 +56,7 @@ function adminApi() {
     getDeploymentModelCatalog: async () => ({
       models: [], defaultModelId: null, quickModelId: null,
     }),
+    getAiGatewayInfo: async () => ({ enabled: false as const }),
     addDeploymentModel: async () => {},
     updateDeploymentModel: async () => {},
     setDeploymentDefaultModel: async () => {},

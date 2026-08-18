@@ -42,20 +42,12 @@ export default function UserMenu() {
           {messages.user_menu_profile()}
         </DropdownMenu.Item>
         {isAdmin && (
-          <>
-            <DropdownMenu.Item
-              onClick={() => navigate({ to: '/providers' })}
-              className={MENU_ITEM}
-            >
-              {messages.user_menu_providers()}
-            </DropdownMenu.Item>
-            <DropdownMenu.Item
-              onClick={() => navigate({ to: '/admin' })}
-              className={MENU_ITEM}
-            >
-              {messages.user_menu_admin()}
-            </DropdownMenu.Item>
-          </>
+          <DropdownMenu.Item
+            onClick={() => navigate({ to: '/admin' })}
+            className={MENU_ITEM}
+          >
+            {messages.user_menu_admin()}
+          </DropdownMenu.Item>
         )}
         <DropdownMenu.Separator />
         <DropdownMenu.Group>

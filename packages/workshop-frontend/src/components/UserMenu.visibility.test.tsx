@@ -88,12 +88,12 @@ describe('model management navigation visibility', () => {
     expect(container?.textContent).not.toContain('管理')
   })
 
-  it('offers the deployment administration area to an administrator', async () => {
+  it('offers only the deployment administration area to an administrator', async () => {
     window.history.replaceState({}, '', '/zh')
     testState.isAdmin = true
     await renderMenu()
 
-    expect(container?.textContent).toContain('模型服务商')
+    expect(container?.textContent).not.toContain('模型服务商')
     expect(container?.textContent).toContain('管理')
   })
 

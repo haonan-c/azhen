@@ -118,7 +118,6 @@ describe('localized sign-in to Workshop Home journey', () => {
     const authenticatedApi = {
       amIAdmin: async () => false,
       completeOnboarding,
-      getAiConfig: async () => ({ enabled: false, enabledProviders: [] }),
       isOnboardingCompleted: () => onboardingStatus,
       listGatekeeperVendors: async () => [],
       listModels: async () => [{ type: 'agent', id: 'model-1', name: 'Model 原名' } as const],

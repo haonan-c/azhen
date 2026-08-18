@@ -159,7 +159,7 @@ export default function AdminPage() {
         const [settings, catalog, deploymentAiConfig] = await Promise.all([
           api.getSettings(),
           api.getDeploymentModelCatalog(),
-          authenticatedApi.getAiConfig(),
+          api.getAiGatewayInfo(),
         ])
         applySettings(settings)
         setModelCatalog(catalog)

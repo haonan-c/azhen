@@ -47,7 +47,6 @@ const requiredAuthMessages = [
   'user_menu_language',
   'user_menu_open',
   'user_menu_profile',
-  'user_menu_providers',
   'user_menu_sign_out',
 ] as const
 

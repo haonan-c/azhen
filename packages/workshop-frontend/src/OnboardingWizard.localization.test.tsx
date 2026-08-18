@@ -9,7 +9,6 @@ const testState = vi.hoisted(() => {
   const api = {
     completeOnboarding: vi.fn<() => Promise<void>>(),
     connectAccount: vi.fn<(vendorId: string) => Promise<{ url: string }>>(),
-    getAiConfig: vi.fn<() => Promise<{ enabled: boolean; enabledProviders: string[] }>>(),
     listGatekeeperVendors: vi.fn<() => Promise<never[]>>(),
     listModels: vi.fn<() => Promise<Array<{ type: 'agent'; id: string; name: string }>>>(),
     setAvatar: vi.fn<(data: Uint8Array) => Promise<void>>(),
@@ -76,7 +75,6 @@ describe('localized first-run onboarding', () => {
 
   function configureApi(completeOnboarding: () => Promise<void>) {
     testState.api.completeOnboarding.mockImplementation(completeOnboarding)
-    testState.api.getAiConfig.mockResolvedValue({ enabled: false, enabledProviders: [] })
     testState.api.listGatekeeperVendors.mockResolvedValue([])
     testState.api.listModels.mockResolvedValue([])
     testState.api.setPreferredModel.mockResolvedValue(undefined)
