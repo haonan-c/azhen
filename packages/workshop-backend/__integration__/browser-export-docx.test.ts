@@ -4,6 +4,9 @@ import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 import { renderGadgetDocx } from "../src/browser-export";
 
+const PNG_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
 class EmptyGadget extends RpcTarget {
   [Symbol.dispose](): void {}
 }
@@ -12,11 +15,22 @@ async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Arra
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+async function renderDocxArchive(html: string, title: string): Promise<JSZip> {
+  let browser = env.BROWSER;
+  if (!browser) throw new Error("Browser Run is not configured for this test.");
+  let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
+  let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
+  let stream = await renderGadgetDocx(browser, clientCode, title, gadget);
+  return JSZip.loadAsync(await readStream(stream));
+}
+
+function mediaFiles(archive: JSZip) {
+  return Object.values(archive.files)
+    .filter(file => !file.dir && file.name.startsWith("word/media/"));
+}
+
 describe("Gadget DOCX export", () => {
   it("exports visible document structure as an editable Word file", async () => {
-    let browser = env.BROWSER;
-    if (!browser) throw new Error("Browser Run is not configured for this test.");
-
     let html = `
       <style>@media print { .toolbar { display: none; } }</style>
       <p class="toolbar">Toolbar command</p>
@@ -27,10 +41,7 @@ describe("Gadget DOCX export", () => {
         <table><tr><th>项目</th><th>状态</th></tr><tr><td>导出</td><td>完成</td></tr></table>
       </main>
     `;
-    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
-    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
-    let stream = await renderGadgetDocx(browser, clientCode, "产品发布说明", gadget);
-    let archive = await JSZip.loadAsync(await readStream(stream));
+    let archive = await renderDocxArchive(html, "产品发布说明");
     let documentXml = await archive.file("word/document.xml")?.async("string");
 
     expect(archive.file("[Content_Types].xml")).not.toBeNull();
@@ -43,24 +54,16 @@ describe("Gadget DOCX export", () => {
   });
 
   it("embeds visible images in the Word file", async () => {
-    let browser = env.BROWSER;
-    if (!browser) throw new Error("Browser Run is not configured for this test.");
-
     let html = `<p>产品图片<img
-      src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      src="${PNG_DATA_URL}"
       alt="产品图片"
       style="width: 120px; height: 80px"
     ></p>`;
-    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
-    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
-    let stream = await renderGadgetDocx(browser, clientCode, "产品图片", gadget);
-    let archive = await JSZip.loadAsync(await readStream(stream));
-    let mediaFiles = Object.values(archive.files)
-      .filter(file => !file.dir && file.name.startsWith("word/media/"));
+    let archive = await renderDocxArchive(html, "产品图片");
     let documentXml = await archive.file("word/document.xml")?.async("string");
     let relationshipsXml = await archive.file("word/_rels/document.xml.rels")?.async("string");
 
-    expect(mediaFiles).toHaveLength(1);
+    expect(mediaFiles(archive)).toHaveLength(1);
     expect(documentXml).toContain("<w:drawing>");
     expect(relationshipsXml).toContain(
       "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
@@ -68,39 +71,25 @@ describe("Gadget DOCX export", () => {
   });
 
   it("uses alternative text when an image cannot be decoded", async () => {
-    let browser = env.BROWSER;
-    if (!browser) throw new Error("Browser Run is not configured for this test.");
-
     let html = `<p><img
       src="data:image/png;base64,invalid"
       alt="图片无法显示"
       style="width: 120px; height: 80px"
     ></p>`;
-    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
-    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
-    let stream = await renderGadgetDocx(browser, clientCode, "图片替代文字", gadget);
-    let archive = await JSZip.loadAsync(await readStream(stream));
+    let archive = await renderDocxArchive(html, "图片替代文字");
     let documentXml = await archive.file("word/document.xml")?.async("string");
 
     expect(documentXml).toContain("[图片无法显示]");
   });
 
   it("embeds an image outside a semantic text block", async () => {
-    let browser = env.BROWSER;
-    if (!browser) throw new Error("Browser Run is not configured for this test.");
-
     let html = `<main><img
-      src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      src="${PNG_DATA_URL}"
       alt="独立图片"
       style="width: 120px; height: 80px"
     ></main>`;
-    let clientCode = `document.body.innerHTML = ${JSON.stringify(html)};`;
-    let gadget = new EmptyGadget() as unknown as RpcStub<EmptyGadget>;
-    let stream = await renderGadgetDocx(browser, clientCode, "独立图片", gadget);
-    let archive = await JSZip.loadAsync(await readStream(stream));
-    let mediaFiles = Object.values(archive.files)
-      .filter(file => !file.dir && file.name.startsWith("word/media/"));
+    let archive = await renderDocxArchive(html, "独立图片");
 
-    expect(mediaFiles).toHaveLength(1);
+    expect(mediaFiles(archive)).toHaveLength(1);
   });
 });
