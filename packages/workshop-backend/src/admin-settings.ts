@@ -49,6 +49,9 @@ function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       // Stable public reference for the Deployment Default Model. The first model sets it.
       deploymentDefaultModelId: <string | null>null,
 
+      // Optional Deployment Quick Model. Null means use the Deployment Default Model.
+      deploymentQuickModelId: <string | null>null,
+
       // Authoritative deployment admin config. Mirrored to BLUEPRINTS KV (ADMIN_CONFIG_KEY) so the
       // connect/login/agent hot paths can read it without touching this singleton DO.
       adminConfig: DEFAULT_ADMIN_CONFIG as AdminConfig,
@@ -295,11 +298,12 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   getDeploymentModelCatalog(): DeploymentModelCatalog {
     let defaultModelId = this.storage.deploymentDefaultModelId.get();
+    let quickModelId = this.storage.deploymentQuickModelId.get();
     let models = [...this.storage.deploymentModels.list()].map(model => model.profile);
     if (defaultModelId) {
       models.sort((a, b) => Number(b.id === defaultModelId) - Number(a.id === defaultModelId));
     }
-    return {models, defaultModelId};
+    return {models, defaultModelId, quickModelId};
   }
 
   addDeploymentModel(name: string, config: AiModelConfig): void {
@@ -311,8 +315,16 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       name: displayName,
     };
     this.storage.deploymentModels.put({profile, config});
+    logger.info("added deployment model", {
+      event: "deployment.model.added",
+      modelId: profile.id,
+    });
     if (this.storage.deploymentDefaultModelId.get() === null) {
       this.storage.deploymentDefaultModelId.put(profile.id);
+      logger.info("changed deployment default model", {
+        event: "deployment.model.default.changed",
+        modelId: profile.id,
+      });
     }
   }
 
@@ -324,18 +336,49 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       profile: {...existing.profile, name: displayName},
       config,
     });
+    logger.info("updated deployment model", {
+      event: "deployment.model.updated",
+      modelId: id,
+    });
+  }
+
+  setDeploymentDefaultModel(id: string): void {
+    if (!this.storage.deploymentModels.get(id)) {
+      throw new Error(`No such Deployment Model: ${id}`);
+    }
+    this.storage.deploymentDefaultModelId.put(id);
+    logger.info("changed deployment default model", {
+      event: "deployment.model.default.changed",
+      modelId: id,
+    });
+  }
+
+  setDeploymentQuickModel(id: string | null): void {
+    if (id !== null && !this.storage.deploymentModels.get(id)) {
+      throw new Error(`No such Deployment Model: ${id}`);
+    }
+    this.storage.deploymentQuickModelId.put(id);
+    logger.info("changed deployment quick model", {
+      event: "deployment.model.quick.changed",
+      ...(id === null ? {operation: "clear"} : {modelId: id, operation: "set"}),
+    });
   }
 
   revokeDeploymentModel(id: string): void {
     if (!this.storage.deploymentModels.get(id)) {
       throw new Error(`No such Deployment Model: ${id}`);
     }
-    this.storage.deploymentModels.delete(id);
     if (this.storage.deploymentDefaultModelId.get() === id) {
-      this.storage.deploymentDefaultModelId.put(
-        this.storage.deploymentModels.list()[Symbol.iterator]().next().value?.profile.id ?? null,
-      );
+      throw new Error("Select another Deployment Default Model before revoking this model.");
     }
+    this.storage.deploymentModels.delete(id);
+    if (this.storage.deploymentQuickModelId.get() === id) {
+      this.storage.deploymentQuickModelId.put(null);
+    }
+    logger.info("revoked deployment model", {
+      event: "deployment.model.revoked",
+      modelId: id,
+    });
   }
 
   #validateDeploymentModel(name: string, config: AiModelConfig): string {
@@ -356,6 +399,11 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   getDeploymentDefaultModel(): DeploymentModelRecord | undefined {
     let id = this.storage.deploymentDefaultModelId.get();
     return id ? this.storage.deploymentModels.get(id) : undefined;
+  }
+
+  getDeploymentQuickModel(): DeploymentModelRecord | undefined {
+    let id = this.storage.deploymentQuickModelId.get();
+    return id ? this.storage.deploymentModels.get(id) : this.getDeploymentDefaultModel();
   }
 
   getOrCreateAiGatewayModelProfiles(models: AiChatAuthorInfo[]): AiChatAuthorInfo[] {
@@ -387,6 +435,10 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   resolveAvailableModel(id: string): DeploymentModelRecord | undefined {
     let deploymentModel = this.resolveDeploymentModel(id);
     if (deploymentModel) return deploymentModel;
+
+    // Legacy AI Gateway aliases remain resolvable only after an administrator has published at
+    // least one Deployment Model. An empty catalog disables every AI path.
+    if (this.storage.deploymentModels.list()[Symbol.iterator]().next().done) return undefined;
 
     let gateway = getAiGatewayConfig(this.env);
     if (!gateway) return undefined;
@@ -711,6 +763,14 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async updateDeploymentModel(id: string, name: string, config: AiModelConfig): Promise<void> {
     await this.admin.updateDeploymentModel(id, name, config);
+  }
+
+  async setDeploymentDefaultModel(id: string): Promise<void> {
+    await this.admin.setDeploymentDefaultModel(id);
+  }
+
+  async setDeploymentQuickModel(id: string | null): Promise<void> {
+    await this.admin.setDeploymentQuickModel(id);
   }
 
   async revokeDeploymentModel(id: string): Promise<void> {

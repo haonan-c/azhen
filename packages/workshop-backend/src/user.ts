@@ -6,7 +6,6 @@ import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-ga
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
-import { getAiGatewayConfig } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
@@ -527,22 +526,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async listModels(): Promise<AiChatAuthorInfo[]> {
     let admin = this.adminSettings.getByName("");
-    let deploymentCatalog = await admin.getDeploymentModelCatalog();
-    let result = [...deploymentCatalog.models];
-    let modelIds = new Set(result.map(model => model.id));
-
-    // When AI Gateway mode is active, include all suggested models for enabled providers.
-    let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig) {
-      let gatewayProfiles = await admin.getOrCreateAiGatewayModelProfiles(gwConfig.getModelList());
-      for (let entry of gatewayProfiles) {
-        if (!modelIds.has(entry.id)) {
-          result.push(entry);
-          modelIds.add(entry.id);
-        }
-      }
-    }
-    return result;
+    return (await admin.getDeploymentModelCatalog()).models;
   }
 
   async getPreferredModel(): Promise<string | null> {
@@ -651,7 +635,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** DO NOT MAKE PUBLIC -- returns API keys. */
   async getChatContext(modelId: string | null): Promise<UserChatContext> {
-    let gwConfig = getAiGatewayConfig(this.env);
     let admin = this.adminSettings.getByName("");
 
     let result: UserChatContext = {
@@ -667,8 +650,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
-    result.quickModel = (await admin.getDeploymentDefaultModel())?.config
-        ?? gwConfig?.getQuickModelConfig();
+    result.quickModel = (await admin.getDeploymentQuickModel())?.config;
     return result;
   }
 

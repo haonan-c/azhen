@@ -266,6 +266,25 @@ describe("workspace session across a user-DO-only reset", () => {
 });
 
 describe("Deployment Model RPC", () => {
+  it("disables AI while the Deployment Model Catalog is empty", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "emptycatalog");
+    using ordinary = await publicApi.authenticate(account.token);
+    expect(await ordinary.listModels()).toEqual([]);
+
+    const internalGatewayModelId = Object.keys(SUGGESTED_MODELS.openai)[0]!;
+    const user = exports.UserDurableObject.get(
+      exports.UserDurableObject.idFromName(account.username),
+    );
+    await expect(rejection(runInDurableObject(
+      user,
+      instance => instance.getChatContext(internalGatewayModelId),
+    ))).resolves.toMatchObject({
+      message: `No such model: ${internalGatewayModelId}`,
+      code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+    });
+  });
+
   it("lets every user select an admin-published model without exposing its configuration", async () => {
     using publicApi = await connect();
     const adminToken = await getDeploymentAdminToken(publicApi);
@@ -286,17 +305,9 @@ describe("Deployment Model RPC", () => {
     using ordinary = await publicApi.authenticate(account.token);
     expect(await ordinary.getAdminApi()).toBeNull();
     const availableModels = await ordinary.listModels();
-    expect(availableModels).toEqual(expect.arrayContaining(catalog.models));
-    expect(availableModels.map(model => model.name)).toEqual(expect.arrayContaining(
-      Object.values(SUGGESTED_MODELS.openai).map(model => model.name),
-    ));
-    expect(availableModels.map(model => model.id)).not.toEqual(expect.arrayContaining(
-      Object.keys(SUGGESTED_MODELS.openai),
-    ));
-    const gatewayModel = availableModels.find(
-      model => model.name === Object.values(SUGGESTED_MODELS.openai)[0]!.name,
-    );
-    expect(gatewayModel).toBeDefined();
+    expect(availableModels).toEqual(catalog.models);
+    await ordinary.setPreferredModel(catalog.models[0]!.id);
+    expect(await ordinary.getPreferredModel()).toBe(catalog.models[0]!.id);
 
     const visible = JSON.stringify(availableModels);
     expect(visible).not.toContain("deployment-secret-token");
@@ -309,11 +320,6 @@ describe("Deployment Model RPC", () => {
       content: new TextEncoder().encode("%PDF-test"),
     }, catalog.models[0]!.id);
     expect(attachment.id).toEqual(expect.any(String));
-    const gatewayAttachment = await workspace.uploadChatAttachment({
-      mimeType: "application/pdf",
-      content: new TextEncoder().encode("%PDF-gateway-test"),
-    }, gatewayModel!.id);
-    expect(gatewayAttachment.id).toEqual(expect.any(String));
 
     const fetchMock = vi.fn(async () => openAiTextResponse("Deployment model replied."));
     vi.stubGlobal("fetch", fetchMock);
@@ -405,6 +411,15 @@ describe("Deployment Model RPC", () => {
         const requestModel = (entry.body as {model?: unknown}).model;
         return requestModel === "gpt-before" || requestModel === "gpt-after";
       }).length;
+      await admin.addDeploymentModel("Revocation fallback", {
+        provider: "openai",
+        model: "gpt-fallback",
+        apiToken: "token-fallback",
+        apiUrl: "https://fallback.example.test/v1",
+      });
+      const fallbackId = (await admin.getDeploymentModelCatalog()).models
+        .find(model => model.name === "Revocation fallback")!.id;
+      await admin.setDeploymentDefaultModel(fallbackId);
       await admin.revokeDeploymentModel(modelId);
       const blockedChatCall = await rejection(
         workspace.sendChatMessage(chatId, "Blocked call.", modelId),

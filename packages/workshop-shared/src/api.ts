@@ -996,7 +996,16 @@ export interface AdminApi {
   /** Rotate one Deployment Model's configuration while preserving its stable public reference. */
   updateDeploymentModel(id: string, name: string, config: AiModelConfig): Promise<void>;
 
-  /** Revoke a Deployment Model so its stable reference cannot start any later model call. */
+  /** Set the Deployment Default Model. The model must be present in the catalog. */
+  setDeploymentDefaultModel(id: string): Promise<void>;
+
+  /** Set the Deployment Quick Model, or pass null to use the Deployment Default Model. */
+  setDeploymentQuickModel(id: string | null): Promise<void>;
+
+  /**
+   * Revoke a Deployment Model so its stable reference cannot start any later model call. The
+   * Deployment Default Model must be replaced before it can be revoked.
+   */
   revokeDeploymentModel(id: string): Promise<void>;
 
   /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
@@ -1253,6 +1262,8 @@ export type DeploymentModelCatalog = {
   models: AiChatAuthorInfo[];
   /** Stable public reference for the Deployment Default Model, or null when none exists. */
   defaultModelId: string | null;
+  /** Stable public reference for the Deployment Quick Model, or null to use the default. */
+  quickModelId: string | null;
 };
 
 /**

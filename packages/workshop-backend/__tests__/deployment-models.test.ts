@@ -1,6 +1,6 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import type { AiModelConfig } from "@gadgets/workshop-shared/api";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AdminApiImpl, type AdminSettings } from "../src/admin-settings.js";
 
 const CONFIG: AiModelConfig = {
@@ -17,12 +17,14 @@ describe("Deployment Model Catalog", () => {
     };
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
     const admin = new AdminApiImpl(settings, "admin@example.com");
+    const otherAdmin = new AdminApiImpl(settings, "other-admin@example.com");
 
     await admin.addDeploymentModel("Friendly Sonnet", CONFIG);
 
-    expect(await admin.getDeploymentModelCatalog()).toEqual({
+    expect(await otherAdmin.getDeploymentModelCatalog()).toEqual({
       models: [{ type: "agent", id: expect.any(String), name: "Friendly Sonnet" }],
       defaultModelId: expect.any(String),
+      quickModelId: null,
     });
     const serialized = JSON.stringify(await admin.getDeploymentModelCatalog());
     expect(serialized).not.toContain(CONFIG.apiToken);
@@ -51,7 +53,7 @@ describe("Deployment Model Catalog", () => {
         .toBe("internal-model-id");
   });
 
-  it("keeps a stable reference through rotation and removes a revoked model", async () => {
+  it("manages Default and Quick Models before revoking a stable reference", async () => {
     const testEnv = env as Cloudflare.Env & {
       TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
     };
@@ -80,8 +82,17 @@ describe("Deployment Model Catalog", () => {
         {type: "agent", id: fallbackId, name: "Fallback"},
       ],
       defaultModelId: primaryId,
+      quickModelId: null,
     });
 
+    await admin.setDeploymentQuickModel(primaryId);
+    expect((await admin.getDeploymentModelCatalog()).quickModelId).toBe(primaryId);
+    await runInDurableObject(settings, instance => {
+      expect(() => instance.revokeDeploymentModel(primaryId)).toThrow(
+        "Select another Deployment Default Model before revoking this model.",
+      );
+    });
+    await admin.setDeploymentDefaultModel(fallbackId);
     await admin.revokeDeploymentModel(primaryId);
 
     // A call that already resolved its record keeps that immutable snapshot, while every later
@@ -92,6 +103,48 @@ describe("Deployment Model Catalog", () => {
     expect(await admin.getDeploymentModelCatalog()).toEqual({
       models: [{type: "agent", id: fallbackId, name: "Fallback"}],
       defaultModelId: fallbackId,
+      quickModelId: null,
     });
+    expect((await settings.getDeploymentQuickModel())?.profile.id).toBe(fallbackId);
+  });
+
+  it("writes secret-free structured logs for catalog changes", async () => {
+    const testEnv = env as Cloudflare.Env & {
+      TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
+    };
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
+    const admin = new AdminApiImpl(settings, "admin@example.com");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    try {
+      await admin.addDeploymentModel("Primary", CONFIG);
+      await admin.addDeploymentModel("Fallback", {...CONFIG, model: "claude-haiku-4-5"});
+      const catalog = await admin.getDeploymentModelCatalog();
+      const primaryId = catalog.models.find(model => model.name === "Primary")!.id;
+      const fallbackId = catalog.models.find(model => model.name === "Fallback")!.id;
+      await admin.updateDeploymentModel(primaryId, "Primary rotated", {
+        ...CONFIG,
+        apiToken: "rotated-secret-token",
+      });
+      await admin.setDeploymentQuickModel(primaryId);
+      await admin.setDeploymentDefaultModel(fallbackId);
+      await admin.revokeDeploymentModel(primaryId);
+
+      const entries = info.mock.calls.map(([entry]) => entry as Record<string, unknown>);
+      expect(entries.map(entry => entry.event)).toEqual(expect.arrayContaining([
+        "deployment.model.added",
+        "deployment.model.updated",
+        "deployment.model.default.changed",
+        "deployment.model.quick.changed",
+        "deployment.model.revoked",
+      ]));
+      const serialized = JSON.stringify(entries);
+      expect(serialized).not.toContain(CONFIG.apiToken);
+      expect(serialized).not.toContain(CONFIG.apiUrl);
+      expect(serialized).not.toContain(CONFIG.model);
+      expect(serialized).not.toContain("rotated-secret-token");
+    } finally {
+      info.mockRestore();
+    }
   });
 });
