@@ -24,7 +24,10 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => ({
 
 vi.mock('./AuthContext', () => ({
   useAuthenticatedApi: () => ({
-    authenticatedApi: {},
+    authenticatedApi: {
+      getPreferredModel: async () => null,
+      setPreferredModel: async () => {},
+    },
     currentUser: { id: 'user-1', username: 'owner', name: 'Owner' },
   }),
 }))

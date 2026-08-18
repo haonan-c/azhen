@@ -58,8 +58,11 @@ import remarkGfm from "remark-gfm";
 import * as Y from "yjs";
 import styles from "./ChatInterface.module.css";
 import {
+  getModelSelectionFallbackMessage,
   getStoredSelectedModel,
-  persistSelectedModel,
+  rememberSelectedModel,
+  revalidateSelectedModel,
+  resolveSelectedModel,
 } from "./modelSelection";
 import {
   Overseer,
@@ -4390,12 +4393,13 @@ function inferSelectedModelFromMessages(messages: AiChatMessage[]): string | nul
 function fallbackToStoredModelSelection(
   modelId: string | null,
   availableModels: AiChatAuthorInfo[],
+  userId?: string,
 ): string | null {
   if (modelId !== null || availableModels.length > 0) {
     return modelId;
   }
 
-  return getStoredSelectedModel(availableModels);
+  return getStoredSelectedModel(availableModels, userId);
 }
 
 interface ChatInterfaceProps {
@@ -4623,7 +4627,9 @@ function ChatInterface({
 }: ChatInterfaceProps) {
   // Persistent cache that survives reconnects
   const toasts = useKumoToastManager();
-  const { currentUser } = useAuthenticatedApi();
+  const { authenticatedApi, currentUser } = useAuthenticatedApi();
+  const authenticatedApiRef = useRef(authenticatedApi);
+  authenticatedApiRef.current = authenticatedApi;
   const getOverseer = useCallback(() => overseer, [overseer]);
   const cacheRef = useRef<ChatCache>({
     chats: new Map(),
@@ -5202,7 +5208,7 @@ function ChatInterface({
   // Update selected model when switching chats
   useEffect(() => {
     if (selectedChatId === null) {
-      setSelectedModel(getStoredSelectedModel(availableModels));
+      setSelectedModel(getStoredSelectedModel(availableModels, currentUser?.id));
     } else {
       // For existing threads:
       // 1. If an AI agent is currently active, use that agent's model
@@ -5214,6 +5220,7 @@ function ChatInterface({
           fallbackToStoredModelSelection(
             inferSelectedModelFromMessages(currentMessages),
             availableModels,
+            currentUser?.id,
           ),
         );
       }
@@ -5561,6 +5568,7 @@ function ChatInterface({
 
   // Subscribe to chat updates
   useEffect(() => {
+    if (!currentUser) return;
     let isMounted = true;
 
     const subscribe = async () => {
@@ -5583,10 +5591,12 @@ function ChatInterface({
 
           // After subscribing, load the list of chats and models
           // This is safe because subscription will catch any new activity
-          const [chats, models] = await Promise.all([
+          const [chats, models, preferredModelId] = await Promise.all([
             overseer.listChats(),
             overseer.listModels(),
+            authenticatedApiRef.current.getPreferredModel(),
           ]);
+          const selection = resolveSelectedModel(models, preferredModelId, currentUser?.id);
 
           chats.forEach((chat) => {
             cacheRef.current.chats.set(chat.id, chat);
@@ -5595,8 +5605,25 @@ function ChatInterface({
           setChatListReady(true);
 
           setAvailableModels(models);
+          setSelectedModel(selection.modelId);
 
-          setSelectedModel(getStoredSelectedModel(models));
+          if (preferredModelId !== selection.modelId && selection.modelId !== null) {
+            try {
+              await rememberSelectedModel(
+                authenticatedApiRef.current, selection.modelId, currentUser?.id,
+              );
+            } catch (err) {
+              logRpcFailure("Failed to store Model Selection:", err);
+              toastsRef.current.add({
+                title: uiMessages.home_model_selection_save_error(),
+                variant: "error",
+              });
+            }
+          }
+          const fallbackMessage = getModelSelectionFallbackMessage(models, selection);
+          if (fallbackMessage) {
+            toastsRef.current.add({title: fallbackMessage, variant: "warning"});
+          }
 
           forceUpdate();
         }
@@ -5624,7 +5651,7 @@ function ChatInterface({
       }
       // Note: subscriberRef.current stays alive for potential resubscription
     };
-  }, [overseer]);
+  }, [currentUser?.id, overseer]);
 
   // Patch cached chat messages on action upserts.
   useActionEntries(overseer, (record) => {
@@ -5735,10 +5762,24 @@ function ChatInterface({
     if (!message && (!attachments || attachments.length === 0)) return;
 
     // Use provided modelId or fall back to selectedModel
-    const model = modelId !== undefined ? modelId : selectedModel;
+    let model = modelId !== undefined ? modelId : selectedModel;
 
     try {
       if (selectedChatId === null) {
+        const {models, selection, fallbackMessage} = await revalidateSelectedModel(
+          () => overseer.listModels(),
+          authenticatedApiRef.current,
+          model,
+          currentUser?.id,
+        );
+        if (selection.modelId !== model) {
+          setAvailableModels(models);
+          setSelectedModel(selection.modelId);
+          model = selection.modelId;
+        }
+        if (fallbackMessage) {
+          toastsRef.current.add({title: fallbackMessage, variant: "warning"});
+        }
         // Create a new chat (with optional capsules).
         const newChatId = await overseer.newChat(
             message, model, capsules, attachments, formats);
@@ -5772,8 +5813,22 @@ function ChatInterface({
   ) => {
     const message = typeof messageText === "string" ? messageText.trim() : messageText ?? "";
     if (!message && (!attachments || attachments.length === 0)) return;
-    const model = modelId !== undefined ? modelId : selectedModel;
+    let model = modelId !== undefined ? modelId : selectedModel;
     try {
+      const {models, selection, fallbackMessage} = await revalidateSelectedModel(
+        () => overseer.listModels(),
+        authenticatedApiRef.current,
+        model,
+        currentUser?.id,
+      );
+      model = selection.modelId;
+      if (model !== (modelId !== undefined ? modelId : selectedModel)) {
+        setAvailableModels(models);
+        setSelectedModel(model);
+      }
+      if (fallbackMessage) {
+        toastsRef.current.add({title: fallbackMessage, variant: "warning"});
+      }
       const newChatId = await overseer.newChat(
           message, model, capsules, attachments, formats);
       onNavigateToChatRef.current(newChatId);
@@ -5788,7 +5843,15 @@ function ChatInterface({
   // Handle model change
   const handleModelChange = (modelId: string | null) => {
     setSelectedModel(modelId);
-    persistSelectedModel(modelId);
+    void rememberSelectedModel(
+      authenticatedApiRef.current, modelId, currentUser?.id,
+    ).catch((err) => {
+      logRpcFailure("Failed to store Model Selection:", err);
+      toastsRef.current.add({
+        title: uiMessages.home_model_selection_save_error(),
+        variant: "error",
+      });
+    });
   };
 
   // Handle stopping the agent

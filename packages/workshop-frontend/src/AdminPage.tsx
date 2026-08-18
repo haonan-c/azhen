@@ -105,6 +105,7 @@ export default function AdminPage() {
   const [modelCatalog, setModelCatalog] = useState<DeploymentModelCatalog>({
     models: [],
     defaultModelId: null,
+    quickModelId: null,
   })
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
@@ -206,6 +207,26 @@ export default function AdminPage() {
       toasts.add({ title: messages.admin_models_revoke_success(), variant: 'success' })
     } catch (err) {
       showError(messages.admin_models_revoke_error(), err)
+    }
+  }
+
+  const handleSetDefaultModel = async (id: string) => {
+    try {
+      await admin!.api.setDeploymentDefaultModel(id)
+      setModelCatalog(await admin!.api.getDeploymentModelCatalog())
+      toasts.add({ title: messages.admin_models_set_default_success(), variant: 'success' })
+    } catch (err) {
+      showError(messages.admin_models_set_default_error(), err)
+    }
+  }
+
+  const handleSetQuickModel = async (id: string | null) => {
+    try {
+      await admin!.api.setDeploymentQuickModel(id)
+      setModelCatalog(await admin!.api.getDeploymentModelCatalog())
+      toasts.add({ title: messages.admin_models_set_quick_success(), variant: 'success' })
+    } catch (err) {
+      showError(messages.admin_models_set_quick_error(), err)
     }
   }
 
@@ -474,7 +495,7 @@ export default function AdminPage() {
           ) : (
             <div className="mt-6 space-y-2">
               {modelCatalog.models.map(model => (
-                <div key={model.id} className="flex items-center gap-3 rounded-lg border border-kumo-line px-4 py-3">
+                <div key={model.id} className="flex flex-wrap items-center gap-3 rounded-lg border border-kumo-line px-4 py-3">
                   <span className="min-w-0 flex-1 truncate text-sm font-medium text-kumo-default">
                     {model.name}
                   </span>
@@ -483,17 +504,51 @@ export default function AdminPage() {
                       {messages.admin_models_default()}
                     </span>
                   )}
+                  {(model.id === modelCatalog.quickModelId ||
+                    (modelCatalog.quickModelId === null &&
+                      model.id === modelCatalog.defaultModelId)) && (
+                    <span className="rounded-full bg-kumo-tint px-2 py-1 text-[11px] font-medium text-kumo-subtle">
+                      {messages.admin_models_quick()}
+                    </span>
+                  )}
                   <Button variant="secondary" size="xs" onClick={() => {
                     setEditingModelId(model.id)
                     setModelDialogOpen(true)
                   }}>
                     {messages.admin_models_rotate()}
                   </Button>
+                  {model.id !== modelCatalog.defaultModelId && (
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      onClick={() => handleSetDefaultModel(model.id)}
+                    >
+                      {messages.admin_models_set_default()}
+                    </Button>
+                  )}
+                  {model.id === modelCatalog.quickModelId ? (
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      onClick={() => handleSetQuickModel(null)}
+                    >
+                      {messages.admin_models_use_default_for_quick()}
+                    </Button>
+                  ) : model.id !== modelCatalog.defaultModelId || modelCatalog.quickModelId !== null ? (
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      onClick={() => handleSetQuickModel(model.id)}
+                    >
+                      {messages.admin_models_set_quick()}
+                    </Button>
+                  ) : null}
                   <Button
                     variant="secondary"
                     size="xs"
                     className="text-kumo-danger"
                     onClick={() => handleRevokeModel(model.id, model.name)}
+                    disabled={model.id === modelCatalog.defaultModelId}
                   >
                     {messages.admin_models_revoke()}
                   </Button>

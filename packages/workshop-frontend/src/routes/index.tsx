@@ -16,8 +16,10 @@ import {
   SlashCommandRequest,
 } from "@gadgets/workshop-shared/api";
 import {
-  getStoredSelectedModel,
-  persistSelectedModel,
+  getModelSelectionFallbackMessage,
+  rememberSelectedModel,
+  revalidateSelectedModel,
+  resolveSelectedModel,
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
 import { homePromptFromSearch } from "../homePrompt";
@@ -59,12 +61,36 @@ export function HomePageContent({ prompt }: HomeSearch) {
   }, [navigate, prompt]);
 
   useEffect(() => {
+    if (!currentUser) return;
     let cancelled = false;
-    authenticatedApi.listModels()
-      .then((list) => {
+    Promise.all([
+      authenticatedApi.listModels(),
+      authenticatedApi.getPreferredModel(),
+    ])
+      .then(async ([list, preferredModelId]) => {
         if (cancelled) return;
+        const selection = resolveSelectedModel(list, preferredModelId, currentUser?.id);
         setModels(list);
-        setSelectedModel(getStoredSelectedModel(list));
+        setSelectedModel(selection.modelId);
+        if (preferredModelId !== selection.modelId && selection.modelId !== null) {
+          try {
+            await rememberSelectedModel(
+              authenticatedApi, selection.modelId, currentUser?.id,
+            );
+          } catch (err) {
+            logRpcFailure("Failed to store Model Selection:", err);
+            if (!cancelled) {
+              toasts.add({
+                title: messages.home_model_selection_save_error(),
+                variant: "error",
+              });
+            }
+          }
+        }
+        const fallbackMessage = getModelSelectionFallbackMessage(list, selection);
+        if (!cancelled && fallbackMessage) {
+          toasts.add({title: fallbackMessage, variant: "warning"});
+        }
       })
       .catch((err) => {
         logRpcFailure("Failed to fetch models:", err);
@@ -77,12 +103,18 @@ export function HomePageContent({ prompt }: HomeSearch) {
     return () => {
       cancelled = true;
     };
-  }, [authenticatedApi]);
+  }, [authenticatedApi, currentUser]);
 
   const handleModelChange = useCallback((value: string | null) => {
     setSelectedModel(value);
-    persistSelectedModel(value);
-  }, []);
+    void rememberSelectedModel(authenticatedApi, value, currentUser?.id).catch((err) => {
+      logRpcFailure("Failed to store Model Selection:", err);
+      toasts.add({
+        title: messages.home_model_selection_save_error(),
+        variant: "error",
+      });
+    });
+  }, [authenticatedApi, currentUser?.id, toasts]);
 
   // Pre-create a provisional gadget as soon as the user starts interacting, so that navigation
   // after submit is instant. Same pattern as before — disposed on unmount if never consumed.
@@ -111,11 +143,26 @@ export function HomePageContent({ prompt }: HomeSearch) {
       formats?: MessageFormatRef[],
     ) => {
       try {
+        const {models: currentModels, selection, fallbackMessage} =
+          await revalidateSelectedModel(
+            () => authenticatedApi.listModels(),
+            authenticatedApi,
+            modelId,
+            currentUser?.id,
+          );
+        const availableModelId = selection.modelId;
+        if (availableModelId !== modelId) {
+          setModels(currentModels);
+          setSelectedModel(availableModelId);
+        }
+        if (fallbackMessage) {
+          toasts.add({title: fallbackMessage, variant: "warning"});
+        }
         ensureProvisionalGadget();
         const overseer = provisionalOverseerRef.current!.stub;
         // Pipeline both independent calls in one batch, but settle both before releasing the stub.
         const [chat, {id}] = await Promise.all([
-          overseer.newChat(message, modelId, capsules, attachments, formats),
+          overseer.newChat(message, availableModelId, capsules, attachments, formats),
           overseer.getMetadata(),
         ]);
         provisionalOverseerRef.current?.stub[Symbol.dispose]();
@@ -136,7 +183,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
         throw err;
       }
     },
-    [ensureProvisionalGadget, navigate, toasts],
+    [authenticatedApi, currentUser?.id, ensureProvisionalGadget, navigate, toasts],
   );
 
   const getOverseer = useCallback((): RpcStub<Overseer> => {

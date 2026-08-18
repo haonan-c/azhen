@@ -8,7 +8,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 type TestSend = (message: string, modelId: string | null) => Promise<void> | void;
 
 const testState = vi.hoisted(() => {
-  const listModels = vi.fn<() => Promise<never[]>>(async () => []);
+  const listModels = vi.fn<() => Promise<Array<{
+    type: "agent"; id: string; name: string;
+  }>>>(async () => []);
+  const getPreferredModel = vi.fn<() => Promise<string | null>>(async () => null);
+  const setPreferredModel = vi.fn<(id: string | null) => Promise<void>>(async () => {});
   const newChat = vi.fn<(...args: unknown[]) => Promise<number>>(async () => 17);
   const getMetadata = vi.fn<() => Promise<{ id: number }>>(async () => ({ id: 42 }));
   const dispose = vi.fn<() => void>();
@@ -16,15 +20,18 @@ const testState = vi.hoisted(() => {
   const newGadget = vi.fn<() => typeof overseer>(() => overseer);
   return {
     addToast: vi.fn<(toast: unknown) => void>(),
-    authenticatedApi: { listModels, newGadget },
+    authenticatedApi: { listModels, getPreferredModel, setPreferredModel, newGadget },
     currentUser: { id: "user-a", name: "User A" },
     listModels,
+    getPreferredModel,
+    setPreferredModel,
     navigate: vi.fn<(options: unknown) => void>(),
     newChat,
     newGadget,
     getMetadata,
     dispose,
     send: undefined as TestSend | undefined,
+    changeModel: undefined as ((modelId: string | null) => void) | undefined,
     seeds: [] as Array<{ text?: string; nonce?: number }>,
     draftStorageKeys: [] as Array<string | undefined>,
   };
@@ -47,14 +54,16 @@ vi.mock("./AuthContext", () => ({
 }));
 
 vi.mock("./ChatInterface", () => ({
-  ChatInput: ({ seedText, seedNonce, draftStorageKey, onSend }: {
+  ChatInput: ({ seedText, seedNonce, draftStorageKey, onSend, onModelChange }: {
     seedText?: string;
     seedNonce?: number;
     draftStorageKey?: string;
     onSend: TestSend;
+    onModelChange: (modelId: string | null) => void;
   }) => {
     testState.seeds.push({ text: seedText, nonce: seedNonce });
     testState.send = onSend;
+    testState.changeModel = onModelChange;
     testState.draftStorageKeys.push(draftStorageKey);
     return <textarea aria-label="Prompt" readOnly value={seedText ?? ""} />;
   },
@@ -79,8 +88,12 @@ describe("Home prompt route flow", () => {
     window.history.replaceState({}, "", "/");
     testState.seeds.length = 0;
     testState.send = undefined;
+    testState.changeModel = undefined;
     testState.draftStorageKeys.length = 0;
     vi.clearAllMocks();
+    testState.listModels.mockResolvedValue([]);
+    testState.getPreferredModel.mockResolvedValue(null);
+    testState.setPreferredModel.mockResolvedValue();
   });
 
   it("seeds the composer once, clears route state, and does not create a workspace", async () => {
@@ -123,6 +136,71 @@ describe("Home prompt route flow", () => {
       title: "无法加载 AI 模型",
       variant: "error",
     })
+  });
+
+  it("prompts in Chinese when a revoked selection falls back to the default", async () => {
+    window.history.replaceState({}, "", "/zh");
+    testState.listModels.mockResolvedValueOnce([
+      {type: "agent", id: "default-model", name: "生产默认模型"},
+    ]);
+    testState.getPreferredModel.mockResolvedValueOnce("revoked-model");
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => root!.render(<HomePageContent />));
+
+    expect(testState.setPreferredModel).toHaveBeenCalledWith("default-model");
+    expect(testState.addToast).toHaveBeenCalledWith({
+      title: "之前选择的部署模型已被撤销。现已改用“生产默认模型”。",
+      variant: "warning",
+    });
+  });
+
+  it("stores a new Model Selection on the user account", async () => {
+    testState.listModels.mockResolvedValueOnce([
+      {type: "agent", id: "default-model", name: "Default"},
+      {type: "agent", id: "quick-model", name: "Quick"},
+    ]);
+    testState.getPreferredModel.mockResolvedValueOnce("default-model");
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root!.render(<HomePageContent />));
+
+    await act(async () => testState.changeModel!("quick-model"));
+
+    expect(testState.setPreferredModel).toHaveBeenCalledWith("quick-model");
+    expect(localStorage.getItem("lastSelectedModel:user-a")).toBe("quick-model");
+  });
+
+  it("revalidates a Model Selection before starting the next conversation", async () => {
+    testState.listModels
+      .mockResolvedValueOnce([
+        {type: "agent", id: "selected-model", name: "Selected"},
+      ])
+      .mockResolvedValueOnce([
+        {type: "agent", id: "default-model", name: "Default replacement"},
+      ]);
+    testState.getPreferredModel.mockResolvedValueOnce("selected-model");
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root!.render(<HomePageContent />));
+
+    await act(async () => testState.send!("Start after revocation.", "selected-model"));
+
+    expect(testState.newChat).toHaveBeenCalledWith(
+      "Start after revocation.",
+      "default-model",
+      undefined,
+      undefined,
+      undefined,
+    );
+    expect(testState.addToast).toHaveBeenCalledWith({
+      title: "Your previous Deployment Model was revoked. Using “Default replacement” instead.",
+      variant: "warning",
+    });
   });
 
   it.each([

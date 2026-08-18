@@ -122,6 +122,7 @@ describe('localized sign-in to Workshop Home journey', () => {
       isOnboardingCompleted: () => onboardingStatus,
       listGatekeeperVendors: async () => [],
       listModels: async () => [{ type: 'agent', id: 'model-1', name: 'Model 原名' } as const],
+      getPreferredModel: async () => 'model-1',
       setPreferredModel: async () => {},
       subscribeConnectedAccounts: () => Object.assign(
         Promise.resolve({ [Symbol.dispose]: vi.fn<() => void>() }),

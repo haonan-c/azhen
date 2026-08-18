@@ -53,9 +53,13 @@ function adminApi() {
       accentColor: '',
       formats: [],
     }),
-    getDeploymentModelCatalog: async () => ({models: [], defaultModelId: null}),
+    getDeploymentModelCatalog: async () => ({
+      models: [], defaultModelId: null, quickModelId: null,
+    }),
     addDeploymentModel: async () => {},
     updateDeploymentModel: async () => {},
+    setDeploymentDefaultModel: async () => {},
+    setDeploymentQuickModel: async () => {},
     revokeDeploymentModel: async () => {},
     [Symbol.dispose]: vi.fn<() => void>(),
   }
@@ -131,19 +135,36 @@ describe('administrator localization', () => {
     expect(container?.textContent).toContain('ADMIN-DIAGNOSTIC-原样')
   })
 
-  it('lets an administrator rotate or revoke a Deployment Model', async () => {
+  it('lets an administrator manage Default and Quick Models', async () => {
+    const setDeploymentDefaultModel = vi.fn<(id: string) => Promise<void>>().mockResolvedValue()
+    const setDeploymentQuickModel = vi.fn<(id: string | null) => Promise<void>>()
+      .mockResolvedValue()
     const revokeDeploymentModel = vi.fn<(id: string) => Promise<void>>().mockResolvedValue()
     const api = {
       ...adminApi(),
       getDeploymentModelCatalog: vi.fn<() => Promise<{
         models: Array<{ type: 'agent'; id: string; name: string }>
         defaultModelId: string | null
+        quickModelId: string | null
       }>>()
         .mockResolvedValueOnce({
-          models: [{ type: 'agent', id: 'model-1', name: '生产模型' }],
+          models: [
+            { type: 'agent', id: 'model-1', name: '生产模型' },
+            { type: 'agent', id: 'model-2', name: '快速模型' },
+          ],
           defaultModelId: 'model-1',
+          quickModelId: null,
         })
-        .mockResolvedValue({ models: [], defaultModelId: null }),
+        .mockResolvedValue({
+          models: [
+            { type: 'agent', id: 'model-1', name: '生产模型' },
+            { type: 'agent', id: 'model-2', name: '快速模型' },
+          ],
+          defaultModelId: 'model-1',
+          quickModelId: null,
+        }),
+      setDeploymentDefaultModel,
+      setDeploymentQuickModel,
       revokeDeploymentModel,
     }
     testState.getAdminApi.mockResolvedValue(api)
@@ -156,11 +177,23 @@ describe('administrator localization', () => {
     await act(async () => modelsTab!.click())
     await vi.waitFor(() => expect(container?.textContent).toContain('生产模型'))
     expect(container?.textContent).toContain('轮换配置')
+    expect(container?.textContent).toContain('默认')
+    expect(container?.textContent).toContain('快速')
 
-    const revoke = [...container!.querySelectorAll('button')]
-      .find(button => button.textContent === '撤销')
-    await act(async () => revoke!.click())
+    const modelRows = [...container!.querySelectorAll('div')]
+      .filter(row => row.className.includes('rounded-lg') && row.className.includes('border'))
+    const defaultRow = modelRows.find(row => row.textContent?.includes('生产模型'))!
+    const quickRow = modelRows.find(row => row.textContent?.includes('快速模型'))!
+    expect(defaultRow.querySelector<HTMLButtonElement>('button:last-child')?.disabled).toBe(true)
 
-    expect(revokeDeploymentModel).toHaveBeenCalledWith('model-1')
+    const setDefault = [...quickRow.querySelectorAll('button')]
+      .find(button => button.textContent === '设为默认')
+    await act(async () => setDefault!.click())
+    expect(setDeploymentDefaultModel).toHaveBeenCalledWith('model-2')
+
+    const setQuick = [...quickRow.querySelectorAll('button')]
+      .find(button => button.textContent === '设为快速模型')
+    await act(async () => setQuick!.click())
+    expect(setDeploymentQuickModel).toHaveBeenCalledWith('model-2')
   })
 })

@@ -19,7 +19,7 @@ import {
   Plugs,
   Hexagon,
 } from '@phosphor-icons/react'
-import { persistSelectedModel } from './modelSelection'
+import { rememberSelectedModel } from './modelSelection'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
@@ -282,8 +282,7 @@ export default function OnboardingWizard({
         if (currentUser?.id) invalidateAvatarCache(currentUser.id)
       }
       // selectedModelId is null when the user chose "No agent" or didn't pick one
-      await authenticatedApi.setPreferredModel(selectedModelId)
-      persistSelectedModel(selectedModelId)
+      await rememberSelectedModel(authenticatedApi, selectedModelId, currentUser?.id)
       await authenticatedApi.completeOnboarding()
       onComplete()
     } catch (err) {

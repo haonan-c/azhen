@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 const testState = vi.hoisted(() => ({
   authenticatedApi: {
     listModels: async () => [],
+    getPreferredModel: async () => null,
+    setPreferredModel: async () => {},
     newGadget: vi.fn<() => void>(),
   },
   navigate: vi.fn<(options: unknown) => void>(),
