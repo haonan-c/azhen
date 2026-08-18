@@ -38,6 +38,7 @@ globalThis.ResizeObserver = class ResizeObserver {
   unobserve() {}
   disconnect() {}
 }
+Element.prototype.scrollIntoView = vi.fn<() => void>()
 
 function adminApi() {
   return {
@@ -54,6 +55,8 @@ function adminApi() {
     }),
     getDeploymentModelCatalog: async () => ({models: [], defaultModelId: null}),
     addDeploymentModel: async () => {},
+    updateDeploymentModel: async () => {},
+    revokeDeploymentModel: async () => {},
     [Symbol.dispose]: vi.fn<() => void>(),
   }
 }
@@ -126,5 +129,38 @@ describe('administrator localization', () => {
     await vi.waitFor(() => expect(container?.textContent).toContain('加载管理员设置时出现问题。'))
     expect(container?.textContent).toContain('重试')
     expect(container?.textContent).toContain('ADMIN-DIAGNOSTIC-原样')
+  })
+
+  it('lets an administrator rotate or revoke a Deployment Model', async () => {
+    const revokeDeploymentModel = vi.fn<(id: string) => Promise<void>>().mockResolvedValue()
+    const api = {
+      ...adminApi(),
+      getDeploymentModelCatalog: vi.fn<() => Promise<{
+        models: Array<{ type: 'agent'; id: string; name: string }>
+        defaultModelId: string | null
+      }>>()
+        .mockResolvedValueOnce({
+          models: [{ type: 'agent', id: 'model-1', name: '生产模型' }],
+          defaultModelId: 'model-1',
+        })
+        .mockResolvedValue({ models: [], defaultModelId: null }),
+      revokeDeploymentModel,
+    }
+    testState.getAdminApi.mockResolvedValue(api)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    await render('/zh/admin')
+
+    await vi.waitFor(() => expect(container?.textContent).toContain('ADMIN INSTRUCTIONS 原样'))
+    const modelsTab = [...container!.querySelectorAll('button')]
+      .find(button => button.textContent === '模型')
+    await act(async () => modelsTab!.click())
+    await vi.waitFor(() => expect(container?.textContent).toContain('生产模型'))
+    expect(container?.textContent).toContain('轮换配置')
+
+    const revoke = [...container!.querySelectorAll('button')]
+      .find(button => button.textContent === '撤销')
+    await act(async () => revoke!.click())
+
+    expect(revokeDeploymentModel).toHaveBeenCalledWith('model-1')
   })
 })

@@ -108,6 +108,7 @@ export default function AdminPage() {
   })
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
+  const [editingModelId, setEditingModelId] = useState<string | null>(null)
 
   // Promoted output formats, in menu order (see AdminFormatsPanel).
   const [formats, setFormats] = useState<AdminFormat[]>([])
@@ -190,6 +191,22 @@ export default function AdminPage() {
     if (!admin) return
     const view = await admin.api.getSettings()
     setResourceVendors(view.resourceVendors)
+  }
+
+  const closeModelDialog = () => {
+    setModelDialogOpen(false)
+    setEditingModelId(null)
+  }
+
+  const handleRevokeModel = async (id: string, name: string) => {
+    if (!window.confirm(messages.admin_models_revoke_confirm({ name }))) return
+    try {
+      await admin!.api.revokeDeploymentModel(id)
+      setModelCatalog(await admin!.api.getDeploymentModelCatalog())
+      toasts.add({ title: messages.admin_models_revoke_success(), variant: 'success' })
+    } catch (err) {
+      showError(messages.admin_models_revoke_error(), err)
+    }
   }
 
   const handleResourceToggle = async (vendorId: string, urlPattern: string, enabled: boolean) => {
@@ -443,7 +460,10 @@ export default function AdminPage() {
                 {messages.admin_models_description()}
               </p>
             </div>
-            <Button variant="primary" size="sm" onClick={() => setModelDialogOpen(true)}>
+            <Button variant="primary" size="sm" onClick={() => {
+              setEditingModelId(null)
+              setModelDialogOpen(true)
+            }}>
               <Plus size={14} weight="bold" />
               {messages.admin_models_add()}
             </Button>
@@ -463,6 +483,20 @@ export default function AdminPage() {
                       {messages.admin_models_default()}
                     </span>
                   )}
+                  <Button variant="secondary" size="xs" onClick={() => {
+                    setEditingModelId(model.id)
+                    setModelDialogOpen(true)
+                  }}>
+                    {messages.admin_models_rotate()}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="xs"
+                    className="text-kumo-danger"
+                    onClick={() => handleRevokeModel(model.id, model.name)}
+                  >
+                    {messages.admin_models_revoke()}
+                  </Button>
                 </div>
               ))}
             </div>
@@ -1062,13 +1096,23 @@ export default function AdminPage() {
 
       <AddModelModal
         visible={modelDialogOpen}
-        onCancel={() => setModelDialogOpen(false)}
-        onSuccess={() => setModelDialogOpen(false)}
+        onCancel={closeModelDialog}
+        onSuccess={closeModelDialog}
         onAddModel={async (name: string, config: AiModelConfig) => {
-          await admin.api.addDeploymentModel(name, config)
+          if (editingModelId) {
+            await admin.api.updateDeploymentModel(editingModelId, name, config)
+          } else {
+            await admin.api.addDeploymentModel(name, config)
+          }
           setModelCatalog(await admin.api.getDeploymentModelCatalog())
         }}
         aiConfig={aiConfig}
+        {...(editingModelId ? {
+          title: messages.admin_models_rotate_title(),
+          submitLabel: messages.admin_models_rotate_submit(),
+          successMessage: messages.admin_models_rotate_success(),
+          errorMessage: messages.admin_models_rotate_error(),
+        } : {})}
       />
     </div>
   )

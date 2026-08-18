@@ -9,6 +9,10 @@ interface AddModelModalProps {
   onSuccess: () => void
   onAddModel: (name: string, config: AiModelConfig) => Promise<void>
   aiConfig: AiGatewayInfo | null
+  title?: string
+  submitLabel?: string
+  successMessage?: string
+  errorMessage?: string
 }
 
 type SelectionType =
@@ -100,7 +104,17 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
   return options
 }
 
-export default function AddModelModal({ visible, onCancel, onSuccess, onAddModel, aiConfig }: AddModelModalProps) {
+export default function AddModelModal({
+  visible,
+  onCancel,
+  onSuccess,
+  onAddModel,
+  aiConfig,
+  title = messages.add_model_title(),
+  submitLabel = messages.add_model_submit(),
+  successMessage = messages.add_model_success(),
+  errorMessage = messages.add_model_error(),
+}: AddModelModalProps) {
   const toasts = useKumoToastManager()
 
   const [loading, setLoading] = useState(false)
@@ -212,11 +226,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, onAddModel
       }
 
       await onAddModel(finalDisplayName, config)
-      toasts.add({ title: messages.add_model_success(), variant: 'success' })
+      toasts.add({ title: successMessage, variant: 'success' })
       onSuccess()
     } catch (error: any) {
-      console.error('Failed to add model:', error)
-      toasts.add({ title: messages.add_model_error(), variant: 'error' })
+      console.error('Failed to save model:', error)
+      toasts.add({ title: errorMessage, variant: 'error' })
     } finally {
       setLoading(false)
     }
@@ -244,7 +258,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, onAddModel
     <Dialog.Root open={visible} onOpenChange={(open) => { if (!open) onCancel() }}>
       <Dialog className="p-6" size="lg">
         <Dialog.Title className="text-lg font-semibold mb-4">
-          {messages.add_model_title()}
+          {title}
         </Dialog.Title>
 
         <div className="space-y-4">
@@ -387,7 +401,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, onAddModel
             loading={loading}
             disabled={!selection}
           >
-            {messages.add_model_submit()}
+            {submitLabel}
           </Button>
         </div>
       </Dialog>

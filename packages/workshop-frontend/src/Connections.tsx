@@ -8,7 +8,7 @@ import {
   X,
 } from '@phosphor-icons/react'
 import { RpcStub } from 'capnweb'
-import { Overseer, GadgetClient, GadgetBindingInfo, BoundHookInfo, AuthenticatedApi, WorkpieceId } from '@gadgets/workshop-shared/api'
+import { Overseer, GadgetClient, GadgetBindingInfo, BoundHookInfo, AuthenticatedApi, WorkpieceId, AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
 import GatekeeperModal from './GatekeeperModal'
 import { GatekeeperIcon } from './components/GatekeeperIcon'
 import { HookToggle } from './components/HookToggle'
@@ -54,6 +54,11 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
   const [deleteHookTarget, setDeleteHookTarget] = useState<{ id: number; title: string } | null>(null)
   const [togglingHooks, setTogglingHooks] = useState<Set<number>>(new Set())
   const [annotationTarget, setAnnotationTarget] = useState<GadgetBindingInfo | null>(null)
+  const [canReplaceModels, setCanReplaceModels] = useState(false)
+  const [replaceTarget, setReplaceTarget] = useState<GadgetBindingInfo | null>(null)
+  const [replacementModels, setReplacementModels] = useState<AiChatAuthorInfo[]>([])
+  const [replacementModelId, setReplacementModelId] = useState('')
+  const [replacingModel, setReplacingModel] = useState(false)
   const toasts = useKumoToastManager()
 
   const loadGatekeepers = async () => {
@@ -68,6 +73,11 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
       ])
       setGadgetInfo({ id, title: gadgetTitle })
       setBindings(bindingList)
+      if (bindingList.some(binding => binding.model?.available === false)) {
+        setCanReplaceModels((await overseer.getMetadata()).owner === undefined)
+      } else {
+        setCanReplaceModels(false)
+      }
       // This tab shows one gadget, so drop hooks that wake a different one -- otherwise its
       // toggle/delete controls would operate on another gadget's hooks.
       setHooks(hookList.filter((hook) => hook.gadgetId === id))
@@ -207,6 +217,35 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
     }
   }
 
+  const handleReplaceStart = async (binding: GadgetBindingInfo) => {
+    try {
+      const models = await overseer.listModels()
+      setReplacementModels(models)
+      setReplacementModelId(models[0]?.id ?? '')
+      setReplaceTarget(binding)
+    } catch (err) {
+      reportIssue('connections.model-list', err)
+      toasts.add({ title: messages.connections_replace_model_failed(), variant: 'error' })
+    }
+  }
+
+  const handleReplaceConfirm = async () => {
+    if (!replaceTarget || !replacementModelId) return
+    setReplacingModel(true)
+    try {
+      await gadget.replaceUnavailableModelBinding(replaceTarget.name, replacementModelId)
+      await loadGatekeepers()
+      onConnectionsChange?.()
+      setReplaceTarget(null)
+      toasts.add({ title: messages.connections_replace_model_success(), variant: 'success' })
+    } catch (err) {
+      reportIssue('connections.model-replace', err)
+      toasts.add({ title: messages.connections_replace_model_failed(), variant: 'error' })
+    } finally {
+      setReplacingModel(false)
+    }
+  }
+
   return (
     <div className="h-full overflow-auto bg-kumo-base">
       <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col px-4 py-5 sm:px-6">
@@ -322,6 +361,13 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
                                 </span>
                               </Tooltip>
                             )}
+                            {gk.model?.available === false && (
+                              <Tooltip content={messages.connections_model_unavailable_description()} asChild>
+                                <span className="flex-shrink-0 rounded-full bg-kumo-danger-tint px-1.5 py-0.5 text-[10px] leading-none font-medium text-kumo-danger">
+                                  {messages.connections_model_unavailable()}
+                                </span>
+                              </Tooltip>
+                            )}
                           </p>
                           <p className="mt-0.5 truncate text-[11px] leading-4 tracking-[-0.1px] text-kumo-inactive">
                             {messages.workspace_blueprint_binding_referenced_as()}{' '}
@@ -329,6 +375,11 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
                           </p>
                         </div>
                         <div className="ml-auto flex shrink-0 items-center gap-1">
+                          {canReplaceModels && gk.model?.available === false && !isPending && (
+                            <WorkshopButton onClick={() => handleReplaceStart(gk)}>
+                              {messages.connections_replace_model()}
+                            </WorkshopButton>
+                          )}
                           <Tooltip content={messages.connections_edit_name()} asChild>
                             <WorkshopIconButton
                               onClick={() => handleEditStart(gk.name)}
@@ -491,6 +542,51 @@ export default function Connections({ overseer, gadget, chatId, authenticatedApi
           setAnnotationTarget(null)
         }}
       />
+
+      <Dialog.Root
+        open={replaceTarget !== null}
+        onOpenChange={(open) => { if (!open) setReplaceTarget(null) }}
+      >
+        <Dialog className="!z-[1000] !w-[min(440px,calc(100vw-32px))] bg-kumo-base p-5" size="lg">
+          <Dialog.Title className="text-[15px] font-medium text-kumo-default">
+            {messages.connections_replace_model_title()}
+          </Dialog.Title>
+          <Dialog.Description className="mt-1 text-[12px] leading-4 text-kumo-subtle">
+            {messages.connections_replace_model_description({ title: replaceTarget?.resourceTitle ?? '' })}
+          </Dialog.Description>
+          {replacementModels.length === 0 ? (
+            <p className="mt-4 text-[13px] text-kumo-subtle">
+              {messages.connections_no_replacement_models()}
+            </p>
+          ) : (
+            <label className="mt-4 block text-[13px] text-kumo-default">
+              <span className="mb-1 block">{messages.connections_replacement_model()}</span>
+              <select
+                aria-label={messages.connections_replacement_model()}
+                className="w-full rounded-lg border border-kumo-line bg-kumo-base px-3 py-2"
+                value={replacementModelId}
+                onChange={(event) => setReplacementModelId(event.target.value)}
+              >
+                {replacementModels.map(model => (
+                  <option key={model.id} value={model.id}>{model.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="mt-5 flex justify-end gap-2">
+            <WorkshopButton onClick={() => setReplaceTarget(null)} disabled={replacingModel}>
+              {messages.common_cancel()}
+            </WorkshopButton>
+            <WorkshopButton
+              tone="primary"
+              onClick={handleReplaceConfirm}
+              disabled={replacingModel || !replacementModelId}
+            >
+              {messages.connections_replace()}
+            </WorkshopButton>
+          </div>
+        </Dialog>
+      </Dialog.Root>
 
     </div>
   )

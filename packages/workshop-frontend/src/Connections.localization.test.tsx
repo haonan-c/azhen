@@ -152,4 +152,56 @@ describe('Connections localization', () => {
     expect(container.textContent).toContain('此连接在模板中的显示方式。')
     expect(container.textContent).toContain('连接设置表单')
   })
+
+  it('lets the owner replace an unavailable model binding', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/campaign')
+    const replaceUnavailableModelBinding = vi.fn<(name: string, modelId: string) => Promise<void>>()
+      .mockResolvedValue()
+    const unavailable: GadgetBindingInfo = {
+      name: 'LLM',
+      target: 21,
+      resourceTitle: '旧模型',
+      model: { type: 'aiModel', modelId: 'revoked-model', available: false },
+    }
+    const gadget = {
+      getId: async () => 1,
+      getTitle: async () => 'Campaign app',
+      listBindings: async () => [unavailable],
+      replaceUnavailableModelBinding,
+    } as unknown as RpcStub<GadgetClient>
+    const overseer = {
+      getMetadata: async () => ({ id: 'workspace', title: 'Campaign', role: 'build' as const }),
+      listHooks: async () => [],
+      listModels: async () => [{ type: 'agent' as const, id: 'replacement-model', name: '新模型' }],
+    } as unknown as RpcStub<Overseer>
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(
+      <Connections
+        overseer={overseer}
+        gadget={gadget}
+        authenticatedApi={{} as RpcStub<AuthenticatedApi>}
+      />,
+    ))
+
+    await vi.waitFor(() => expect(container?.textContent).toContain('旧模型'))
+    expect(container.textContent).toContain('不可用')
+    const replaceButton = [...container.querySelectorAll('button')]
+      .find(button => button.textContent?.includes('更换模型'))
+    expect(replaceButton).toBeDefined()
+
+    await act(async () => replaceButton!.click())
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="替代模型"]')!
+    await act(async () => {
+      select.value = 'replacement-model'
+      select.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    const confirm = [...container.querySelectorAll('button')]
+      .find(button => button.textContent === '更换')
+    await act(async () => confirm!.click())
+
+    expect(replaceUnavailableModelBinding).toHaveBeenCalledWith('LLM', 'replacement-model')
+  })
 })
