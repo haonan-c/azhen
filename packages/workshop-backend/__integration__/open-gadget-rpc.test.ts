@@ -285,6 +285,98 @@ describe("Deployment Model RPC", () => {
     });
   });
 
+  it("keeps legacy personal model settings inert across every model resolution path", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "legacymodel");
+    const legacyModelId = "legacy-personal-model";
+    const legacyToken = "legacy-personal-secret";
+    const user = exports.UserDurableObject.get(
+      exports.UserDurableObject.idFromName(account.username),
+    );
+    await runInDurableObject(user, (_instance, state) => {
+      state.storage.kv.put(`aiModels:${legacyModelId}`, {
+        profile: {type: "agent", id: legacyModelId, name: "Legacy personal model"},
+        config: {
+          provider: "openai",
+          model: "legacy-provider-model",
+          apiToken: legacyToken,
+        },
+      });
+      state.storage.kv.put("quickModel", legacyModelId);
+    });
+
+    const adminToken = await getDeploymentAdminToken(publicApi);
+    using authenticatedAdmin = await publicApi.authenticate(adminToken);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected deployment admin capability.");
+    await admin.addDeploymentModel("Deployment model", {
+      provider: "openai",
+      model: "legacy-provider-model",
+      apiToken: "deployment-secret",
+    });
+    const catalog = await admin.getDeploymentModelCatalog();
+    const deploymentModelId = catalog.defaultModelId!;
+
+    using ordinary = await publicApi.authenticate(account.token);
+    expect(await ordinary.listModels()).toEqual(catalog.models);
+
+    const context = await runInDurableObject(user, instance => instance.getChatContext(null));
+    expect(context).toEqual({
+      profile: expect.objectContaining({id: account.username}),
+      quickModel: expect.objectContaining({
+        model: "legacy-provider-model",
+        apiToken: "deployment-secret",
+      }),
+    });
+    await expect(runInDurableObject(
+      user,
+      instance => instance.getChatContext(deploymentModelId),
+    )).resolves.toEqual(expect.objectContaining({
+      aiModel: expect.objectContaining({
+        profile: expect.objectContaining({id: deploymentModelId}),
+      }),
+    }));
+    await expect(rejection(runInDurableObject(
+      user,
+      instance => instance.getChatContext(legacyModelId),
+    ))).resolves.toMatchObject({
+      message: `No such model: ${legacyModelId}`,
+      code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+    });
+
+    using workspace = await ordinary.newGadget();
+    await expect(rejection(workspace.newChat("Do not run.", legacyModelId)))
+        .resolves.toMatchObject({
+          message: `No such model: ${legacyModelId}`,
+          code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+        });
+    await expect(rejection(workspace.newAiModelGatekeeper(legacyModelId)))
+        .resolves.toMatchObject({
+          message: `No such model: ${legacyModelId}`,
+          code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+        });
+    await expect(rejection(workspace.newAgentSpawnerGatekeeper({
+      displayName: "Legacy spawner",
+      modelId: legacyModelId,
+      env: {},
+    }))).resolves.toMatchObject({
+      message: `No such model: ${legacyModelId}`,
+      code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+    });
+
+    expect(JSON.stringify(await admin.getDeploymentModelCatalog())).not.toContain(legacyToken);
+
+    expect(await runInDurableObject(user, (_instance, state) => ({
+      model: state.storage.kv.get(`aiModels:${legacyModelId}`),
+      quickModel: state.storage.kv.get("quickModel"),
+    }))).toEqual({
+      model: expect.objectContaining({
+        config: expect.objectContaining({apiToken: legacyToken}),
+      }),
+      quickModel: legacyModelId,
+    });
+  });
+
   it("lets every user select an admin-published model without exposing its configuration", async () => {
     using publicApi = await connect();
     const adminToken = await getDeploymentAdminToken(publicApi);

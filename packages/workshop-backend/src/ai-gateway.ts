@@ -5,13 +5,7 @@ import {
   DIRECT_ONLY_AI_PROVIDERS,
   SUGGESTED_MODELS,
 } from "@gadgets/workshop-shared/api";
-import { UserAiModelRecord } from "./user.js";
-
-// The model used for quick tasks like title generation when AI Gateway mode is active.
-//
-// This 70B model is quite fast and cheap and produces pretty good titles. The cost is insignificant
-// compared to the actual coding model so there's not much reason to use a smaller model.
-const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+import type { DeploymentModelRecord } from "./admin-settings.js";
 
 export class AiGatewayConfig {
   readonly gateway: string;
@@ -70,10 +64,10 @@ export class AiGatewayConfig {
   }
 
   /**
-   * Look up an AI Gateway model by ID. Returns a UserAiModelRecord if the model is a
+   * Look up an AI Gateway model by ID. Returns a DeploymentModelRecord if the model is a
    * SUGGESTED_MODEL for an enabled gateway provider, or undefined otherwise.
    */
-  resolveModel(modelId: string): UserAiModelRecord | undefined {
+  resolveModel(modelId: string): DeploymentModelRecord | undefined {
     for (let provider of Object.keys(SUGGESTED_MODELS) as AiModelProvider[]) {
       let models = SUGGESTED_MODELS[provider];
       if (this.providers.has(provider) && modelId in models) {
@@ -93,17 +87,6 @@ export class AiGatewayConfig {
     return undefined;
   }
 
-  /**
-   * Get the AiModelConfig for the quick model (used for title generation).
-   */
-  getQuickModelConfig(): AiModelConfig | undefined {
-    // Always use Workers AI here.
-    return {
-      provider: "cloudflare",
-      model: QUICK_MODEL_ID,
-      apiToken: "",
-    };
-  }
 }
 
 /**

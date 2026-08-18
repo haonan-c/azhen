@@ -26,7 +26,8 @@ import { foldProposedChanges, isCompactionTurn, type ChangeBatch } from "./agent
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
 import { WebFetchEnv } from "./web-fetch";
-import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
+import { UserDurableObject, type UserChatContext, type WorkspaceOutputEntry } from "./user";
+import type { DeploymentModelRecord } from "./admin-settings";
 import { AgentSpawnerBinding } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
@@ -1352,7 +1353,7 @@ class OverseerImpl implements AgentHooks {
   // DO (we don't persist the secret API token), then runs the agent loop, which rebuilds its state
   // by replaying the persisted chat log.
   async #resumeAgent(record: ActiveAgentRecord, liveChat: LiveChatContext) {
-    let aiModel: UserAiModelRecord | undefined;
+    let aiModel: DeploymentModelRecord | undefined;
     try {
       let user = this.users.get(this.users.idFromString(record.initiatorUserId));
       let userMeta = await user.getChatContext(record.modelId);
@@ -3996,7 +3997,7 @@ class OverseerImpl implements AgentHooks {
   // the turn can be resumed after a server restart, and tracks the turn so the keep-alive alarm is
   // held while it runs. `initiatorUserId` is the hex DO ID of the user whose model/account is used,
   // needed to re-resolve the model config on resume.
-  startAgent(chatId: number, aiModel: UserAiModelRecord,
+  startAgent(chatId: number, aiModel: DeploymentModelRecord,
              initiator: AiChatAuthorInfo, initiatorUserId: string,
              callbackInitiated: boolean = false,
              keepAlive: boolean = false): void {
@@ -4016,7 +4017,7 @@ class OverseerImpl implements AgentHooks {
     if (keepAlive) this.ctx.waitUntil(turn);
   }
 
-  #runAgentTurn(chatId: number, aiModel: UserAiModelRecord,
+  #runAgentTurn(chatId: number, aiModel: DeploymentModelRecord,
                 initiator: AiChatAuthorInfo,
                 callbackInitiated: boolean,
                 liveChat: LiveChatContext): Promise<void> {
@@ -4029,7 +4030,7 @@ class OverseerImpl implements AgentHooks {
         chatId, aiModel, initiator, callbackInitiated, liveChat)));
   }
 
-  async #runAgentTurnWithContext(chatId: number, aiModel: UserAiModelRecord,
+  async #runAgentTurnWithContext(chatId: number, aiModel: DeploymentModelRecord,
                                  initiator: AiChatAuthorInfo,
                                  callbackInitiated: boolean,
                                  liveChat: LiveChatContext): Promise<void> {
@@ -7760,6 +7761,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   async newAgentSpawnerGatekeeper(config: AgentSpawnerConfig): Promise<GatekeeperClient<any>> {
+    if (config.modelId !== null) {
+      await this.#clientUser.getChatContext(config.modelId);
+    }
+
     // Validate the configured env: names must be valid binding names and targets must exist --
     // and must not be gadgets still provisional to some chat, which belong to that chat's
     // unaccepted proposal, not (yet) to the workspace. (Spawn-time snapshotting tolerates targets

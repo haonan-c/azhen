@@ -7,7 +7,7 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
-import type { AdminSettings } from "./admin-settings.js";
+import type { AdminSettings, DeploymentModelRecord } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
@@ -65,14 +65,9 @@ function areCredentialsValid(record: ConnectedAccountRecord): boolean {
  */
 export const CLOUDFLARE_VENDOR_ID = "cloudflare";
 
-export type UserAiModelRecord = {
-  profile: AiChatAuthorInfo;
-  config: AiModelConfig;
-}
-
 export type UserChatContext = {
   profile: AiChatAuthorInfo;
-  aiModel?: UserAiModelRecord;
+  aiModel?: DeploymentModelRecord;
   quickModel?: AiModelConfig;
 }
 
@@ -156,9 +151,6 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 function makeUserStorage(storage: DurableObjectStorage) {
   return createTypedStorage(storage, {
     collections: {
-      aiModels: collection<UserAiModelRecord>()({
-        primaryKey: record => record.profile.id,
-      }),
       gadgets: collection<GadgetRecord>()({
         primaryKey: "id"
       }),
@@ -196,7 +188,6 @@ function makeUserStorage(storage: DurableObjectStorage) {
         name: "User",
         id: "user@example.com",
       },
-      quickModel: <string | null>null,
       preferredModel: <string | null>null,
       onboardingCompleted: false,
 

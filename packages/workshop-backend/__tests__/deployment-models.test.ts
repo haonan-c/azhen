@@ -21,6 +21,8 @@ describe("Deployment Model Catalog", () => {
 
     await admin.addDeploymentModel("Friendly Sonnet", CONFIG);
 
+    expect(await admin.getAiGatewayInfo()).toEqual({enabled: false});
+
     expect(await otherAdmin.getDeploymentModelCatalog()).toEqual({
       models: [{ type: "agent", id: expect.any(String), name: "Friendly Sonnet" }],
       defaultModelId: expect.any(String),

@@ -678,12 +678,8 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
 
 export type LanguageModelGatekeeperProps = {
   displayName: string,
+  /** Stable reference to a Deployment Model. Absent on retired personal-model bindings. */
   modelId?: string,
-  /**
-   * Legacy bindings stored Model Configuration here. Its credentials are never used; only its
-   * model identity may locate an enabled AI Gateway model after upgrade.
-   */
-  config?: AiModelConfig,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
 };
@@ -720,9 +716,9 @@ export class LanguageModelGatekeeper
     let admin = this.ctx.exports.AdminSettings.getByName("");
     let props = this.ctx.props;
     return new LanguageModelBindingImpl(async () => {
-      let modelRef = props.modelId ?? props.config?.model;
-      let record = modelRef ? await admin.resolveAvailableModel(modelRef) : undefined;
-      if (!props.modelId && record?.config.provider !== props.config?.provider) record = undefined;
+      let record = props.modelId
+          ? await admin.resolveAvailableModel(props.modelId)
+          : undefined;
       if (!record) throw new Error("This model is no longer available.");
       let config = record.config;
       return getModel(this.env, config, props.initiator, {

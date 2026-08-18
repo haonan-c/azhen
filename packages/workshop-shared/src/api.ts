@@ -461,12 +461,6 @@ export interface AuthenticatedApi extends RpcTarget {
   /** List the Deployment Models that this user can select. */
   listModels(): Promise<AiChatAuthorInfo[]>;
 
-  /**
-   * Get AI configuration info, including whether AI Gateway mode is active and which providers
-   * are available. The frontend uses this to adjust the model management UI.
-   */
-  getAiConfig(): Promise<AiGatewayInfo>;
-
   /** Resolve UI feature flags for the authenticated user. */
   getUiFeatureFlags(): Promise<UiFeatureFlags>;
 
@@ -990,6 +984,9 @@ export interface AdminApi {
   /** Read the Deployment Model Catalog without exposing Model Configuration. */
   getDeploymentModelCatalog(): Promise<DeploymentModelCatalog>;
 
+  /** Read deployment AI Gateway settings needed by the Deployment Model management UI. */
+  getAiGatewayInfo(): Promise<AiGatewayInfo>;
+
   /** Add a Deployment Model. The first model becomes the Deployment Default Model. */
   addDeploymentModel(name: string, config: AiModelConfig): Promise<void>;
 
@@ -1223,7 +1220,7 @@ export type AiModelProvider =
 export const DIRECT_ONLY_AI_PROVIDERS: ReadonlySet<AiModelProvider> =
     new Set<AiModelProvider>(["deepseek", "ollama"]);
 
-/** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
+/** Information about the AI gateway configuration. Returned by `AdminApi.getAiGatewayInfo()`. */
 export type AiGatewayInfo = {
   enabled: true;
   enabledProviders: AiModelProvider[];

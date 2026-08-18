@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AiChatAuthorInfo, AiModelConfig, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -304,6 +304,14 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
       models.sort((a, b) => Number(b.id === defaultModelId) - Number(a.id === defaultModelId));
     }
     return {models, defaultModelId, quickModelId};
+  }
+
+  /** Return the deployment AI Gateway settings without any credentials. */
+  getAiGatewayInfo(): AiGatewayInfo {
+    let gateway = getAiGatewayConfig(this.env);
+    return gateway
+      ? {enabled: true, enabledProviders: [...gateway.providers] as AiModelProvider[]}
+      : {enabled: false};
   }
 
   addDeploymentModel(name: string, config: AiModelConfig): void {
@@ -755,6 +763,10 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   getDeploymentModelCatalog(): Promise<DeploymentModelCatalog> {
     return this.admin.getDeploymentModelCatalog();
+  }
+
+  getAiGatewayInfo(): Promise<AiGatewayInfo> {
+    return this.admin.getAiGatewayInfo();
   }
 
   async addDeploymentModel(name: string, config: AiModelConfig): Promise<void> {
