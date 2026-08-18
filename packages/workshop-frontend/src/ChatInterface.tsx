@@ -3518,6 +3518,7 @@ export const ChatInput = ({
                 }
               }}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return;
                 if (slashCommandPicker.open && e.key === "Escape") {
                   e.preventDefault();
                   slashCommandPicker.dismiss();

@@ -270,6 +270,26 @@ describe('localized Prompt Composer', () => {
     expect(container.querySelector('[aria-label="丢弃捕获的日志"]')).not.toBeNull()
   })
 
+  it('does not send unfinished Chinese IME text when Enter confirms a candidate', async () => {
+    window.history.replaceState({}, '', '/zh')
+    const onSend = vi.fn<(...args: unknown[]) => void>()
+    await renderComposer({ onSend })
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => textarea.dispatchEvent(new CompositionEvent('compositionstart', {
+      bubbles: true,
+    })))
+    await act(async () => setTextareaValue(textarea, 'hasda'))
+    await act(async () => textarea.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+      isComposing: true,
+    })))
+
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
   it('sends a selected Chinese format with its localized reference', async () => {
     window.history.replaceState({}, '', '/zh')
     testState.outputFormats = [{
