@@ -100,6 +100,16 @@ async function createAccount(
   return { username: name, token };
 }
 
+async function getDeploymentAdminToken(publicApi: RpcStub<PublicApi>): Promise<string> {
+  const token = await publicApi.createAccount(
+    "DeploymentAdmin",
+    "Deployment Admin",
+    PASSWORD_HASH,
+  ) ?? await publicApi.login("DeploymentAdmin", PASSWORD_HASH);
+  if (token === null) throw new Error("Failed to authenticate deployment admin.");
+  return token;
+}
+
 async function openRejection(
     authenticated: RpcStub<AuthenticatedApi>,
     id: string): Promise<CodedError> {
@@ -258,12 +268,7 @@ describe("workspace session across a user-DO-only reset", () => {
 describe("Deployment Model RPC", () => {
   it("lets every user select an admin-published model without exposing its configuration", async () => {
     using publicApi = await connect();
-    const adminToken = await publicApi.createAccount(
-      "DeploymentAdmin",
-      "Deployment Admin",
-      PASSWORD_HASH,
-    );
-    if (adminToken === null) throw new Error("Failed to create deployment admin.");
+    const adminToken = await getDeploymentAdminToken(publicApi);
     using authenticatedAdmin = await publicApi.authenticate(adminToken);
     using admin = await authenticatedAdmin.getAdminApi();
     if (!admin) throw new Error("Expected deployment admin capability.");
@@ -324,4 +329,107 @@ describe("Deployment Model RPC", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("applies rotated configuration to an existing chat and blocks calls after revocation", async () => {
+    using publicApi = await connect();
+    const adminToken = await getDeploymentAdminToken(publicApi);
+    using authenticatedAdmin = await publicApi.authenticate(adminToken);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected deployment admin capability.");
+
+    await admin.addDeploymentModel("Rotatable", {
+      provider: "openai",
+      model: "gpt-before",
+      apiToken: "token-before",
+      apiUrl: "https://before.example.test/v1",
+    });
+    const modelId = (await admin.getDeploymentModelCatalog()).models
+      .find(model => model.name === "Rotatable")!.id;
+
+    const account = await createAccount(publicApi, "rotation");
+    using ordinary = await publicApi.authenticate(account.token);
+    using workspace = await ordinary.newGadget();
+    const requests: Array<{url: string; authorization: string | null; body: unknown}> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const body = await request.clone().json();
+      requests.push({
+        url: request.url,
+        authorization: request.headers.get("authorization") ??
+          request.headers.get("cf-aig-authorization"),
+        body,
+      });
+      return openAiTextResponse(`Reply ${requests.length}.`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const chatId = await workspace.newChat("First call.", modelId);
+      await vi.waitFor(async () => {
+        const chat = (await workspace.listChats()).find(candidate => candidate.id === chatId);
+        expect(chat?.activeAgent).toBeUndefined();
+        expect(requests.some(entry =>
+          (entry.body as {model?: unknown}).model === "gpt-before")).toBe(true);
+      }, {timeout: 10_000});
+      for (const entry of requests.filter(request =>
+        (request.body as {model?: unknown}).model === "gpt-before")) {
+        expect(entry.body).toMatchObject({model: "gpt-before"});
+        expect(entry.url).toBe(
+          "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/openai/responses",
+        );
+        expect(entry.authorization).toBe("Bearer test-gateway-token");
+      }
+
+      await admin.updateDeploymentModel(modelId, "Rotated", {
+        provider: "openai",
+        model: "gpt-after",
+        apiToken: "token-after",
+        apiUrl: "https://after.example.test/v1",
+      });
+      await workspace.sendChatMessage(chatId, "Second call.", modelId);
+      await vi.waitFor(async () => {
+        const chat = (await workspace.listChats()).find(candidate => candidate.id === chatId);
+        expect(chat?.activeAgent).toBeUndefined();
+        expect(requests.some(entry =>
+          (entry.body as {model?: unknown}).model === "gpt-after")).toBe(true);
+      }, {timeout: 10_000});
+      for (const entry of requests.filter(request =>
+        (request.body as {model?: unknown}).model === "gpt-after")) {
+        expect(entry.body).toMatchObject({model: "gpt-after"});
+        expect(entry.url).toBe(
+          "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/openai/responses",
+        );
+        expect(entry.authorization).toBe("Bearer test-gateway-token");
+      }
+
+      const callCountBeforeRevocation = requests.filter(entry => {
+        const requestModel = (entry.body as {model?: unknown}).model;
+        return requestModel === "gpt-before" || requestModel === "gpt-after";
+      }).length;
+      await admin.revokeDeploymentModel(modelId);
+      const blockedChatCall = await rejection(
+        workspace.sendChatMessage(chatId, "Blocked call.", modelId),
+      );
+      expect(blockedChatCall).toMatchObject({
+        message: `No such model: ${modelId}`,
+        code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+      });
+      expect(requests.filter(entry => {
+        const requestModel = (entry.body as {model?: unknown}).model;
+        return requestModel === "gpt-before" || requestModel === "gpt-after";
+      })).toHaveLength(callCountBeforeRevocation);
+      const user = exports.UserDurableObject.get(
+        exports.UserDurableObject.idFromName(account.username),
+      );
+      await expect(rejection(runInDurableObject(
+        user,
+        instance => instance.getExternalMessageChatContext(modelId),
+      ))).resolves.toMatchObject({
+        message: `No such model: ${modelId}`,
+        code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
 });

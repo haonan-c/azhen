@@ -15,10 +15,8 @@ describe("Deployment Model Catalog", () => {
     const testEnv = env as Cloudflare.Env & {
       TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
     };
-    const admin = new AdminApiImpl(
-      testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`),
-      "admin@example.com",
-    );
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
+    const admin = new AdminApiImpl(settings, "admin@example.com");
 
     await admin.addDeploymentModel("Friendly Sonnet", CONFIG);
 
@@ -51,5 +49,49 @@ describe("Deployment Model Catalog", () => {
     expect(first[0]!.id).not.toBe(gatewayModels[0]!.id);
     expect((await settings.resolveAiGatewayModelAlias(first[0]!.id))?.gatewayModelId)
         .toBe("internal-model-id");
+  });
+
+  it("keeps a stable reference through rotation and removes a revoked model", async () => {
+    const testEnv = env as Cloudflare.Env & {
+      TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
+    };
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
+    const admin = new AdminApiImpl(settings, "admin@example.com");
+
+    await admin.addDeploymentModel("Primary", CONFIG);
+    await admin.addDeploymentModel("Fallback", {...CONFIG, model: "claude-haiku-4-5"});
+    const original = await admin.getDeploymentModelCatalog();
+    const primaryId = original.models.find(model => model.name === "Primary")!.id;
+    const fallbackId = original.models.find(model => model.name === "Fallback")!.id;
+
+    const rotatedConfig: AiModelConfig = {
+      ...CONFIG,
+      apiToken: "rotated-secret-token",
+      apiUrl: "https://rotated.example.test/v1",
+    };
+    await admin.updateDeploymentModel(primaryId, "Primary rotated", rotatedConfig);
+
+    const inFlightModel = await settings.resolveAvailableModel(primaryId);
+    expect(inFlightModel?.config).toEqual(rotatedConfig);
+
+    expect(await admin.getDeploymentModelCatalog()).toEqual({
+      models: [
+        {type: "agent", id: primaryId, name: "Primary rotated"},
+        {type: "agent", id: fallbackId, name: "Fallback"},
+      ],
+      defaultModelId: primaryId,
+    });
+
+    await admin.revokeDeploymentModel(primaryId);
+
+    // A call that already resolved its record keeps that immutable snapshot, while every later
+    // resolution through the stable reference is blocked.
+    expect(inFlightModel?.config).toEqual(rotatedConfig);
+    expect(await settings.resolveAvailableModel(primaryId)).toBeUndefined();
+
+    expect(await admin.getDeploymentModelCatalog()).toEqual({
+      models: [{type: "agent", id: fallbackId, name: "Fallback"}],
+      defaultModelId: fallbackId,
+    });
   });
 });

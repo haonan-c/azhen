@@ -659,7 +659,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     };
     if (modelId) {
       result.aiModel = await admin.resolveAvailableModel(modelId);
-      if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
+      if (!result.aiModel) {
+        throw Object.assign(new Error(`No such model: ${modelId}`), {
+          code: "DEPLOYMENT_MODEL_UNAVAILABLE",
+        });
+      }
     }
 
     // Resolve the quick model (used for lightweight tasks like title generation).
@@ -669,10 +673,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async getExternalMessageChatContext(existingChatModelId: string | null): Promise<UserChatContext> {
+    // An existing conversation's stable reference is authoritative. If it was revoked, reject the
+    // new call instead of silently moving the conversation to a different Deployment Model.
+    if (existingChatModelId !== null) return this.getChatContext(existingChatModelId);
+
     let models = await this.listModels();
-    // Prefer the existing chat's model, then the user's preferred model, then the first available model.
-    let selectedModel = models.find(model => model.id === existingChatModelId)
-      ?? models.find(model => model.id === this.storage.preferredModel.get())
+    // A new externally-created conversation has no existing reference, so use the user's selection
+    // when it is still available, then the Deployment Default Model at the head of the catalog.
+    let selectedModel = models.find(model => model.id === this.storage.preferredModel.get())
       ?? models[0];
 
     return this.getChatContext(selectedModel?.id ?? null);

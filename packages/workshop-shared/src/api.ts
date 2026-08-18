@@ -993,6 +993,12 @@ export interface AdminApi {
   /** Add a Deployment Model. The first model becomes the Deployment Default Model. */
   addDeploymentModel(name: string, config: AiModelConfig): Promise<void>;
 
+  /** Rotate one Deployment Model's configuration while preserving its stable public reference. */
+  updateDeploymentModel(id: string, name: string, config: AiModelConfig): Promise<void>;
+
+  /** Revoke a Deployment Model so its stable reference cannot start any later model call. */
+  revokeDeploymentModel(id: string): Promise<void>;
+
   /** Enable or disable new account signups. Existing users can still log in while signups are closed. */
   setSignupsEnabled(enabled: boolean): Promise<void>;
 
@@ -3096,6 +3102,16 @@ export type GadgetBindingInfo = {
   resourceTitle: string;
   vendorId?: string;
 
+  /** Deployment Model status for model-backed bindings. Absent for other binding kinds. */
+  model?: {
+    /** Whether the binding provides a model directly or through an Agent Spawner. */
+    type: "aiModel" | "agentSpawner";
+    /** Stable Deployment Model reference, or null for an Agent Spawner that runs no model. */
+    modelId: string | null;
+    /** False when the referenced Deployment Model has been revoked. */
+    available: boolean;
+  };
+
   /**
    * If present, this binding is still provisional to the given chat (which is necessarily the
    * `chatId` passed to listBindings(); edges pending in other chats are never listed). It becomes
@@ -3483,6 +3499,12 @@ export interface GadgetClient extends WorkpieceClient {
    * does not exist or `newName` is reserved or already bound in this gadget.
    */
   renameBinding(oldName: string, newName: string): Promise<void>;
+
+  /**
+   * Replace the revoked Deployment Model used by one model-backed binding. The binding name and
+   * target workpiece stay unchanged. Only the workspace owner may call this method.
+   */
+  replaceUnavailableModelBinding(name: string, modelId: string): Promise<void>;
 
   /**
    * Get the blueprint annotation for the named binding, if one has been set. Annotations live on

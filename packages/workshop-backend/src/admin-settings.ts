@@ -303,13 +303,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 
   addDeploymentModel(name: string, config: AiModelConfig): void {
-    let displayName = name.trim();
-    if (!displayName) throw new Error("Model name is required.");
-    if (!config.model.trim()) throw new Error("Provider model ID is required.");
-    let gateway = getAiGatewayConfig(this.env);
-    if (gateway && !gateway.canConfigureProvider(config.provider)) {
-      throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
-    }
+    let displayName = this.#validateDeploymentModel(name, config);
 
     let profile: AiChatAuthorInfo = {
       type: "agent",
@@ -320,6 +314,39 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     if (this.storage.deploymentDefaultModelId.get() === null) {
       this.storage.deploymentDefaultModelId.put(profile.id);
     }
+  }
+
+  updateDeploymentModel(id: string, name: string, config: AiModelConfig): void {
+    let existing = this.storage.deploymentModels.get(id);
+    if (!existing) throw new Error(`No such Deployment Model: ${id}`);
+    let displayName = this.#validateDeploymentModel(name, config);
+    this.storage.deploymentModels.put({
+      profile: {...existing.profile, name: displayName},
+      config,
+    });
+  }
+
+  revokeDeploymentModel(id: string): void {
+    if (!this.storage.deploymentModels.get(id)) {
+      throw new Error(`No such Deployment Model: ${id}`);
+    }
+    this.storage.deploymentModels.delete(id);
+    if (this.storage.deploymentDefaultModelId.get() === id) {
+      this.storage.deploymentDefaultModelId.put(
+        this.storage.deploymentModels.list()[Symbol.iterator]().next().value?.profile.id ?? null,
+      );
+    }
+  }
+
+  #validateDeploymentModel(name: string, config: AiModelConfig): string {
+    let displayName = name.trim();
+    if (!displayName) throw new Error("Model name is required.");
+    if (!config.model.trim()) throw new Error("Provider model ID is required.");
+    let gateway = getAiGatewayConfig(this.env);
+    if (gateway && !gateway.canConfigureProvider(config.provider)) {
+      throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
+    }
+    return displayName;
   }
 
   resolveDeploymentModel(id: string): DeploymentModelRecord | undefined {
@@ -680,6 +707,14 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async addDeploymentModel(name: string, config: AiModelConfig): Promise<void> {
     await this.admin.addDeploymentModel(name, config);
+  }
+
+  async updateDeploymentModel(id: string, name: string, config: AiModelConfig): Promise<void> {
+    await this.admin.updateDeploymentModel(id, name, config);
+  }
+
+  async revokeDeploymentModel(id: string): Promise<void> {
+    await this.admin.revokeDeploymentModel(id);
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {

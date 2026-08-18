@@ -1870,6 +1870,69 @@ class OverseerImpl implements AgentHooks {
     this.bumpVersion([gadgetId]);
   }
 
+  async replaceUnavailableModelBinding(
+      gadgetId: WorkpieceId, name: string, modelId: string, clientUserId: string): Promise<void> {
+    if (clientUserId !== this.ownerId) {
+      throw new Error("Only the workspace owner can replace a model binding.");
+    }
+
+    let gadget = this.getGadgetRecord(gadgetId);
+    let edge = gadget.bindings[name];
+    if (!edge || edge.pending) throw new Error(`No such binding: ${name}`);
+    let gatekeeper = this.storage.gatekeepers.get(edge.target);
+    if (!gatekeeper?.creationSpec) throw new Error(`No such model binding: ${name}`);
+    let spec = gatekeeper.creationSpec;
+    let currentModelId = spec.type === "aiModel"
+        ? spec.modelId
+        : spec.type === "agentSpawner"
+        ? spec.config.modelId
+        : undefined;
+    if (currentModelId === undefined || currentModelId === null) {
+      throw new Error(`Binding "${name}" does not use a Deployment Model.`);
+    }
+
+    let admin = this.ctx.exports.AdminSettings.getByName("");
+    if (await admin.resolveAvailableModel(currentModelId)) {
+      throw new Error(`Binding "${name}" still uses an available Deployment Model.`);
+    }
+    let owner = this.users.get(this.users.idFromString(clientUserId));
+    let context = await owner.getChatContext(modelId);
+    let replacement = context.aiModel!;
+
+    if (spec.type === "aiModel") {
+      let props: LanguageModelGatekeeperProps = {
+        displayName: replacement.profile.name,
+        modelId: replacement.profile.id,
+        initiator: {
+          type: "gadget",
+          id: context.profile.id,
+          name: this.storage.title.get(),
+        },
+        metadata: {source: "model-binding", gadgetId: this.ctx.id.toString()},
+      };
+      gatekeeper.creationSpec = {type: "aiModel", modelId: replacement.profile.id};
+      gatekeeper.resourceTitle = replacement.profile.name;
+      gatekeeper.class = this.ctx.exports.LanguageModelGatekeeper({props});
+    } else if (spec.type === "agentSpawner") {
+      let config = {...spec.config, modelId: replacement.profile.id};
+      let props: AgentSpawnerBindingProps = {
+        overseerId: this.ctx.id.toString(),
+        config,
+        creatorUserId: clientUserId,
+      };
+      gatekeeper.creationSpec = {type: "agentSpawner", config};
+      gatekeeper.class = this.ctx.exports.AgentSpawnerGatekeeper({props});
+    }
+
+    this.storage.gatekeepers.put(gatekeeper);
+    this.ctx.facets.delete(`gatekeeper${gatekeeper.id}`);
+    let affectedGadgetIds = [...this.storage.gadgets.list()]
+        .filter(record => Object.values(record.bindings)
+            .some(binding => binding.target === gatekeeper.id))
+        .map(record => record.id);
+    this.bumpVersion(affectedGadgetIds);
+  }
+
   // Permanently delete a gadget: its hooks, its files, its registry entry (which carries its
   // binding map), and its running facet. Gatekeepers it bound survive, possibly orphaned. The
   // gadget's Y.Doc root can't be deleted (Yjs roots are permanent), so its files are cleared;
@@ -9332,8 +9395,25 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   async listBindings(chatId?: number): Promise<GadgetBindingInfo[]> {
     let record = this.impl.getGadgetRecord(this.id);
     // Edges pending in other chats are those chats' unaccepted proposals, so they aren't listed.
-    return this.impl.visibleBindings(record, chatId).map(([name, edge]) => {
+    let admin = this.impl.ctx.exports.AdminSettings.getByName("");
+    return Promise.all(this.impl.visibleBindings(record, chatId).map(async ([name, edge]) => {
       let gatekeeper = this.impl.storage.gatekeepers.get(edge.target);
+      let spec = gatekeeper?.creationSpec;
+      let model: GadgetBindingInfo["model"];
+      if (spec?.type === "aiModel") {
+        model = {
+          type: "aiModel",
+          modelId: spec.modelId,
+          available: !!await admin.resolveAvailableModel(spec.modelId),
+        };
+      } else if (spec?.type === "agentSpawner") {
+        model = {
+          type: "agentSpawner",
+          modelId: spec.config.modelId,
+          available: spec.config.modelId === null ||
+              !!await admin.resolveAvailableModel(spec.config.modelId),
+        };
+      }
       return {
         name,
         target: edge.target,
@@ -9341,9 +9421,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
         vendorId: gatekeeper?.creationSpec?.type === "gatekeeper"
             ? gatekeeper.creationSpec.vendorId
             : undefined,
+        ...(model ? {model} : {}),
         ...(edge.pending ? {chatId: edge.pending.chatId} : {}),
       };
-    });
+    }));
   }
 
   async getBinding(name: string): Promise<GatekeeperClient<any> | null> {
@@ -9401,6 +9482,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 
   async renameBinding(oldName: string, newName: string): Promise<void> {
     this.impl.renameBinding(this.id, oldName, newName);
+  }
+
+  async replaceUnavailableModelBinding(name: string, modelId: string): Promise<void> {
+    await this.impl.replaceUnavailableModelBinding(this.id, name, modelId, this.clientUserId);
   }
 
   #getBindingEdge(name: string): {record: GadgetRecord, edge: BindingRecord} {
@@ -9606,6 +9691,9 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   async bindWithSuggestedName(_target: WorkpieceId): Promise<string> { this.#deny(); }
   async unbind(_name: string): Promise<void> { this.#deny(); }
   async renameBinding(_oldName: string, _newName: string): Promise<void> { this.#deny(); }
+  async replaceUnavailableModelBinding(_name: string, _modelId: string): Promise<void> {
+    this.#deny();
+  }
   async getBlueprintAnnotation(_name: string): Promise<BlueprintBindingAnnotation | null> {
     this.#deny();
   }
