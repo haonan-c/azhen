@@ -61,6 +61,24 @@ a live sync, not a git submodule. See `packages/gatekeeper-ugc-ads/vendor/VENDOR
 for the pattern: record the source commit, list what was excluded and why, and don't push changes
 back upstream.
 
+## Content Research
+
+**公众号热门话题 (Official Account Hot Topic)**:
+A recurring subject observed in recent public WeChat Official Account articles for a given field
+and time window, supported by current evidence from at least two distinct accounts. One popular
+article or an AI-generated idea alone is not a hot topic.
+_Avoid_: 公众号爆款文章, 普通创意
+
+**单篇高热 (Single-Article Heat)**:
+Strong interaction on one public WeChat Official Account article without evidence that its subject
+recurs across accounts. It is an article-level signal, not a 公众号热门话题.
+_Avoid_: 公众号热门话题
+
+**公众号选题 (Official Account Content Topic)**:
+A content direction derived from one or more 公众号热门话题 for a creator to develop. It may be
+adapted to the creator's positioning, but remains distinct from the source articles that support it.
+_Avoid_: 热门文章, 文章榜单
+
 ## Workshop Surfaces
 
 **azhen / 阿珍**:

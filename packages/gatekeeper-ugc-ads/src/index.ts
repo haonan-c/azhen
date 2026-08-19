@@ -1,6 +1,6 @@
-// UGC Ads worker: vendored content-creation Agent Skills plus a small Xiaohongshu
-// content-search and image-rendering capability. The vendor auto-provisions accounts that expose a
-// read-only agent singleton (slash commands + session methods). No management UI.
+// UGC Ads worker: vendored content-creation Agent Skills plus small official-account/Xiaohongshu
+// content-search and image-rendering capabilities. The vendor auto-provisions accounts that expose
+// a read-only agent singleton (slash commands + session methods). No management UI.
 
 /** Public UGC Ads worker entrypoints. */
 export {

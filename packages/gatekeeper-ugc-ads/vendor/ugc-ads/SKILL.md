@@ -1,6 +1,6 @@
 ---
 name: ugc-ads
-description: 创作者内容搜索总控 Skill（本部署仅支持小红书）。用户发送平台名+关键词、平台链接，或要求分析博主、文章风格、热度、点赞、收藏、评论、爆款原因、选题方向时触发；小红书请求路由到热点搜集/选题分支 Skill，其余平台明确告知本部署未接入。
+description: 小红书与公众号公开内容研究总控 Skill；将自然语言的公众号热门话题、公众号选题请求路由到 gzh-explosive-content-detector，B站和抖音仍明确不可用。
 license: MIT
 metadata:
   type: orchestrator
@@ -9,10 +9,12 @@ metadata:
   routes:
     - xhs-hotnotes
     - space-xhs-hotspot
+    - gzh-explosive-content-detector
   tags:
     - creator
     - content-search
     - xiaohongshu
+    - wechat
     - viral-content
     - creator-analytics
 ---
@@ -50,7 +52,7 @@ metadata:
 
 如果用户没有指定平台，但给了链接，按链接域名判断平台。
 
-> **本部署说明**：本部署只接入了**小红书**一个数据源（TikHub，经 `env[N]` 上的 UgcAds 绑定调用，`env[N]` 指本次对话里的 UGC Ads 会话）。B站、抖音、公众号在原版里依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐 / onetotenvip 等后端本部署均未接入。遇到这些平台的请求，直接告诉用户"本部署当前只支持小红书数据查询"，不要尝试调用下面已删除的脚本/CLI，也不要编造数据。
+> **本部署说明**：本部署通过当前对话里的 UgcAds 绑定提供两条 TikHub 只读路径：小红书公开数据，以及公众号受限热门选题研究。公众号路径只查询搜索证据和实际可用互动，不抓正文，也不启用旧版深度 HTML 爆款报告。B站、抖音在原版依赖的 Agent Reach / OpenCLI / bili-cli / `DOUYIN_COMMAND` / 红狐等后端仍未接入；遇到这些平台直接说明不可用，不要编造数据。
 
 ## 路由规则
 
@@ -71,9 +73,23 @@ metadata:
 
 深入的搜索策略、时间窗、泛化词处理见 `xhs-hotnotes`；跨笔记趋势判断、选题建议见 `space-xhs-hotspot`。
 
-### 2. B站、抖音、公众号
+### 2. 公众号热门话题与公众号选题
 
-本部署未接入对应数据源（见上方"本部署说明"）。直接告知用户当前不支持，不要调用任何脚本。
+当用户用自然语言提出「公众号热门话题」「公众号选题」，或在公众号内容上下文中只输入「软件著作权」「AI Agent」等领域词时，读取并执行现有专项 Skill：
+
+```javascript
+export default async function(self, env, ctx) {
+  const routedSkill = await env[N].read("gzh-explosive-content-detector");
+  if (!routedSkill) throw new Error("Routed UGC Ads skill is unavailable.");
+  console.log(routedSkill.content);
+}
+```
+
+读取后在**当前对话**继续原任务，不需要用户再次输入斜杠命令。公众号研究必须遵循该 Skill 的证据门槛和输出结构，不套用下方通用的内容风格或「爆款原因」项目，不自动生成标题、提纲、正文或排版。不要读取 `baokuan-article-analysis`：它的旧数据源和深度 HTML 报告在本部署仍不可用。
+
+### 3. B站、抖音
+
+本部署未接入对应数据源（见上方“本部署说明”）。直接告知用户当前不支持，不要调用任何脚本。
 
 ## 输出格式
 
@@ -86,7 +102,7 @@ metadata:
 5. 爆款原因：为什么传播，适合借鉴哪一部分
 6. 下一步建议：可继续深挖的关键词、博主、选题方向
 
-如果某个平台查不了，不要编造数据。应说明原因，并给出可执行的配置方式。
+如果某个平台查不了，不要编造数据，也不要要求用户提供部署密钥；如实说明当前未接入。
 
 ## 分析维度
 
@@ -126,6 +142,7 @@ metadata:
 - 只读公开数据，不做发帖、评论、点赞等写操作。
 - 不绕过验证码、登录、风控或平台限制。
 - 小红书详情常需要搜索结果里的完整 `xsec_token` URL。
-- B站、抖音、公众号在本部署没有接入的数据源，遇到直接说明，不要编造。
-- 小红书数据由本部署的 UgcAds 会话（TikHub）提供，是唯一路径，不是兜底。
+- B站、抖音在本部署没有接入的数据源，遇到直接说明，不要编造。
+- 小红书与公众号受限研究都由本部署的 UgcAds 会话（TikHub）提供，是各自的唯一路径，不是兜底。
+- 公众号深度 HTML 爆款报告仍不可用；普通公众号研究必须路由到 `gzh-explosive-content-detector`。
 - 热度是传播信号，不等于内容质量，也不等于适合用户账号定位。

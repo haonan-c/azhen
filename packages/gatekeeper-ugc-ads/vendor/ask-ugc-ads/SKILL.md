@@ -1,13 +1,29 @@
 ---
 name: ask-ugc-ads
-description: 为 UGC 广告与社媒内容任务选择合适的 UGC Ads Skill 或工作流。用户不知道该用哪个 Skill、想了解可用能力、提出跨选题/写作/标题/视觉/复盘的多步骤需求，或直接说“Ask UGC Ads”“怎么开始”“帮我选工具”时使用。
+description: 为小红书、公众号与视频内容任务选择合适的 UGC Ads Skill 或工作流；兼容把明确的公众号热门话题、公众号选题请求路由到现有 gzh-explosive-content-detector，平台不明确时先确认再行动，同时保留其他平台的现有流程。
 ---
 
 # Ask UGC Ads
 
-你不需要记住所有 Skill。先说清用户要发布的平台、已有素材和当前卡点，再选择最短的可用路径。
+你不需要记住所有 Skill。先按下方兼容规则判断用户已经给出的信息；只有确实缺少会改变路由的信息时，才询问发布平台、已有素材或当前卡点，然后选择最短的可用路径。
 
 本 Skill 负责选择路径，并在用户已经要求交付结果时加载对应的专项 Skill 继续执行。不要凭记忆代替专项 Skill。一次最多问一个会改变路由的问题；信息足够时直接执行。
+
+## `/ask-ugc-ads` 兼容规则
+
+**显式平台或任务优先**，不要改变原有的小红书、公众号写作/排版和视频路由：
+
+- 命令后的参数或紧随其后的用户回复若明确指定小红书、视频、公众号标题、公众号排版等任务，**保持现有路由**，按下方对应表选择专项 Skill。
+- 若明确请求「公众号热门话题」「公众号选题」「最近公众号在写什么」，立即读取 `gzh-explosive-content-detector`，并在当前轮次继续研究，不要先推荐另一个斜杠命令。
+- **平台不明确时先询问**：若用户只给领域、行业或主题词（例如「软件著作权」「AI Agent」），或仅输入 `/ask-ugc-ads`，只问一个问题，例如「这个主题是要做公众号选题、小红书选题，还是视频选题？」。**得到用户明确选择后再行动**。
+- 在得到答复前，不读取任何专项 Skill，也不发起任何数据检索。用户确认平台后，在下一轮按对应现有路由继续，不重复询问已经明确的信息。
+
+例如：
+
+- `/ask-ugc-ads 软件著作权` → 先询问要做公众号、小红书还是视频选题；用户确认后再研究。
+- `/ask-ugc-ads 公众号选题：软件著作权` → 公众号选题研究。
+- `/ask-ugc-ads 小红书 软件著作权` → 保持现有小红书路由，不调用公众号研究。
+- `/ask-ugc-ads` → 先询问平台；用户确认后再进入对应流程。
 
 ## 路由后继续执行
 
@@ -25,9 +41,19 @@ export default async function(self, env, ctx) {
 }
 ```
 
-上例是“查热点、生成选题卡”的路由。其他任务把 id 换成表格中的目标 Skill 名称，例如 `space-xhs-writer`。`env[N]` 是当前对话实际提供的 UGC Ads 绑定；先从环境说明中确定名称，不要把 `N` 当成固定值。
+上例是小红书“查热点、生成选题卡”的路由。其他任务把 id 换成表格中的目标 Skill 名称，例如 `space-xhs-writer`。`env[N]` 是当前对话实际提供的 UGC Ads 绑定；先从环境说明中确定名称，不要把 `N` 当成固定值。
 
-读取成功后，立即按输出的专项说明执行。读取失败时，说明目标 Skill 无法加载；不要自行猜测专项流程，也不要重复读取。
+用户明确请求「公众号热门话题」「公众号选题」，或已经确认平台是公众号后只给出「软件著作权」「AI Agent」等领域词时，读取现有公众号 Skill；不要要求用户补输斜杠命令：
+
+```javascript
+export default async function(self, env, ctx) {
+  const routedSkill = await env[N].read("gzh-explosive-content-detector");
+  if (!routedSkill) throw new Error("Routed UGC Ads skill is unavailable.");
+  console.log(routedSkill.content);
+}
+```
+
+读取成功后，立即按输出的专项说明在**当前对话**继续用户原任务；不需要用户再次输入斜杠命令。读取失败时，说明目标 Skill 无法加载；不要自行猜测专项流程，也不要重复读取。
 
 ## 先判断任务
 
@@ -67,12 +93,12 @@ export default async function(self, env, ctx) {
 
 | 用户目标 | 推荐 Skill |
 | --- | --- |
+| 研究公众号热门话题、公众号选题或某个主题的近期公开文章证据 | `/gzh-explosive-content-detector` |
 | 为已有主题或文章生成标题 | `/baokuan-title-generator` |
 | 把文章排成公众号可用 HTML | `/space-wechat-layout` |
 | 把文章观点做成逻辑关系图 | `/space-text-logic-diagram` |
 
-本部署不能查询公众号爆款数据。不要推荐 `/baokuan-article-analysis` 或
-`/gzh-explosive-content-detector`；直接说明数据源未接入。
+`/gzh-explosive-content-detector` 使用 TikHub 的受限组合 Session，只研究公开文章快照，不抓正文。历史 `/baokuan-article-analysis` 深度 HTML 报告仍不可用，不要路由或执行它。
 
 ## 视频
 
@@ -87,7 +113,7 @@ export default async function(self, env, ctx) {
 
 - 小红书生成式封面或组图：不要推荐 `/space-xhs-cover` 或 `/space-xhs-image`；改用 `/xhs-html` 制作可编辑 HTML，再渲染 PNG。
 - AI 图表生图：不要推荐 `/space-chart-image`；结构型图表改用 `/space-text-logic-diagram`。
-- B站、抖音和公众号公开数据查询：当前未接入。不要编造数据，也不要要求用户配置部署密钥。
+- B站、抖音公开数据查询：当前未接入。不要编造数据，也不要要求用户配置部署密钥。公众号仅支持上述受限热门选题研究，不支持旧版深度 HTML 爆款报告。
 - 自动发布、点赞、评论、批量养号：UGC Ads 是只读与内容创作工具，不执行这些操作。
 
 ## 回复格式

@@ -22,7 +22,7 @@ all; this repository does not push changes back upstream.
 - `space-video` — an orchestrator that, once the above are excluded, routes to only 2 of its
   original 8 targets; not worth keeping as a separate skill.
 
-## Vendored but flagged unavailable (5 of the remaining 20)
+## Vendored but flagged unavailable (4 of the remaining 20)
 
 These were investigated in more depth than the initial exclusion pass, which only looked for
 `ffmpeg`/`npx` in the skill text. Digging into the actual scripts each one shells out to turned up
@@ -31,35 +31,50 @@ them to TikHub (which would produce data the skill author never intended, or non
 `SKILL.md` carries a prominent note explaining why it's inert here, and the original text is
 otherwise left untouched as reference:
 
-- `baokuan-article-analysis`, `gzh-explosive-content-detector` — both call the same undocumented
-  third-party endpoint (`onetotenvip.com/skill/cozeSkill/getWxCozeSkillData`), reached in
-  `baokuan-article-analysis`'s case over a raw TLS socket with certificate verification disabled.
-  Neither is Xiaohongshu-backed (both are 公众号/WeChat, while this deployment only covers 小红书/Xiaohongshu).
+- `baokuan-article-analysis` — calls an undocumented third-party endpoint
+  (`onetotenvip.com/skill/cozeSkill/getWxCozeSkillData`) over a raw TLS socket with certificate
+  verification disabled. That legacy deep-article HTML-report path remains unavailable. Bounded
+  official-account topic research is provided separately by `gzh-explosive-content-detector`; it
+  does not enable or execute this historical Skill.
 - `space-chart-image` — primary path is a runtime-native image-generation model (Codex
   `image_gen`/`image2`); its scripted fallback needs a separate `LABNANA_API_KEY`
   (`api.labnana.com`), not integrated.
 - `space-xhs-image`, `space-xhs-cover` — depend entirely on a runtime-native image-generation
   model (Codex `image_gen`) with no API fallback at all; this deployment has no such model.
 
-## Rewritten (12 of the remaining 20)
+## Rewritten (10 of the remaining 20)
 
 Shell-out instructions (`python3`/`bash`/`node ... -cli.js`) were replaced with calls against the
-`UgcAds` session capability (`env[N].searchXiaohongshuNotes()` /
-`getXiaohongshuNoteDetail()` / `getXiaohongshuCreatorProfile()`, all TikHub-backed and
-Xiaohongshu-only — B站/抖音/公众号 routes in the original multi-platform skills are explicitly
-marked unavailable rather than silently dropped) or `env[N].renderImage()` (HTML → PNG via
+`UgcAds` session capability (`env[N].searchOfficialAccountArticles()` /
+`searchXiaohongshuNotes()` / `getXiaohongshuNoteDetail()` / `getXiaohongshuCreatorProfile()`, all
+TikHub-backed; unimplemented B站/抖音 routes and the old 公众号正文/深度 HTML report remain explicitly
+unavailable rather than silently dropped) or `env[N].renderImage()` (HTML → PNG via
 Browser Rendering, replacing local ffmpeg/image-gen script references). Two skills
 (`space-xhs-note-analytics`, and the local diff-only step inside `space-xhs-hotspot`) called a
 bundled Python script that never made a network call at all; those were rewritten to tell the agent
 to write the equivalent logic itself with its own code-execution tool, since there's no `python3`
 in this runtime either way:
 
-`ugc-ads` (root orchestrator), `global-content-search`, `xhs-hotnotes`, `space-xhs-hotspot`,
-`xhs-html`, `space-text-logic-diagram`, `space-wechat-layout`, `space-xhs-buddy`,
-`space-xhs-note-analytics`.
+`ugc-ads` (root orchestrator), `global-content-search`, `gzh-explosive-content-detector`,
+`xhs-hotnotes`, `space-xhs-hotspot`, `xhs-html`, `space-text-logic-diagram`,
+`space-wechat-layout`, `space-xhs-buddy`, `space-xhs-note-analytics`.
 
-(That's 9 skills, not 12 — `xhs-hotnotes` and `space-xhs-hotspot` each needed edits in multiple
-places rather than one; the count above refers to files touched, not a stricter category split.)
+`gzh-explosive-content-detector` no longer uses its original undocumented source. It now keeps the
+user's original topic phrase, prepares at most four narrower expansions, and performs exactly one
+bounded provider-neutral UGC Ads Session call for one to five query terms. The call defaults to seven
+days, transparently replaces samples below eight unique valid articles with a locally filtered 30-day
+batch, retains at most five complete supplier records per term, reports the retained pre-deduplication
+`rawArticleCount`, canonicalizes and deduplicates WeChat article URLs, fairly selects at most 15
+articles, and fetches each selected article's available interaction counts as one logical operation.
+Same-batch searches run concurrently; interaction attempts (including the one permitted retry for
+explicit rate-limit or temporary-service failures) share a 10-attempts-per-second limiter and the
+whole research call shares one 60-second deadline. Non-global query-term search failures retain
+successful batches and are reported through `failedQueryTerms`; authentication, payment, permission,
+a search-stage deadline, or an all-term search failure still rejects the whole call. Non-fatal
+article-level interaction failures retain the source article with a safe warning. Its Agent
+instructions then distinguish cross-account recent-hot
+subjects from single-article high heat, emit only evidence-supported topics, and keep ordinary ideas
+in a separate unverified section; no deterministic server-side clustering was added.
 
 The upstream `creator-buddy` root orchestrator is exposed locally as `ugc-ads`. The
 `ask-ugc-ads` router is a local addition and is not part of the upstream snapshot.
@@ -75,10 +90,16 @@ the vendor-relative path (e.g. `"xhs-html/references/style-registry.md"`) — se
 `scripts/build-skills.mjs` and `UgcAdsSession.read()` in `src/ugc-ads.ts`.
 
 `UgcAdsSession.read()` also exposes a bundled Skill by either its Agent Catalog id or its
-vendor-relative path. The local `ask-ugc-ads` router uses this to load one selected specialist
-(for example, `"space-xhs-hotspot"`) and continue the user's task without requiring a second slash
-command. Catalog descriptions give the same `read(id)` handoff to agents handling plain-language
-requests.
+vendor-relative path. The local `ask-ugc-ads` router and the rewritten `ugc-ads` orchestrator use this
+to load one selected specialist and continue the user's task without requiring a second slash
+command. Natural-language 公众号热门话题/公众号选题 requests load
+`"gzh-explosive-content-detector"`; Xiaohongshu hotspot requests continue to load
+`"space-xhs-hotspot"`. For `/ask-ugc-ads`, an explicit platform or task keeps its existing route,
+while a bare domain/topic argument or an empty command asks one platform question and waits for the
+answer before loading any specialist or searching data. A confirmed official-account topic then
+loads the official-account specialist. Neither router enables the unavailable
+`baokuan-article-analysis` Skill.
+Catalog descriptions give the same `read(id)` handoff to agents handling plain-language requests.
 
 ## Unchanged (6 of the remaining 20)
 

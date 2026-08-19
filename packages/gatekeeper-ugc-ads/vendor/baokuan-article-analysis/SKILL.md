@@ -1,9 +1,9 @@
 ---
 name: baokuan-article-analysis
-description: Fetch and analyze WeChat Official Account hot articles / 公众号爆款文章 by sector or keywords. Use when the user asks for 爆款文章分析, 赛道爆款, 公众号爆款数据, reading counts, likes, shares, comments, title patterns, writing style, 爆款原因分析, or writing references for content creation.
+description: 历史公众号深度爆款 HTML 报告参考；此技能在本部署不可用。普通公众号热门选题研究请使用 gzh-explosive-content-detector。
 ---
 
-> **本部署说明：此技能在本部署不可用。** 它依赖的数据源（`onetotenvip.com` 的一个未文档化后端接口，脚本里以禁用 TLS 证书校验的方式直连）本部署未接入，也不打算以这种方式接入。遇到公众号爆款分析类请求，直接告知用户"本部署当前不支持公众号数据查询"，不要执行下面的脚本或编造数据。以下原文保留仅供参考。
+> **本部署说明：此技能在本部署不可用。** 它依赖的数据源（`onetotenvip.com` 的一个未文档化后端接口，脚本里以禁用 TLS 证书校验的方式直连）未接入，也不打算以这种方式接入。不要执行下面的脚本、不要生成旧版深度 HTML 报告，也不要编造数据。普通的公众号热门话题与公众号选题研究应读取 `gzh-explosive-content-detector`，使用其 TikHub 组合 Session；这不会启用本 Skill。以下原文仅作为历史参考。
 
 # 爆款文章分析
 
