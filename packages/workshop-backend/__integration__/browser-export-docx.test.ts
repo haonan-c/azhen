@@ -43,6 +43,7 @@ describe("Gadget DOCX export", () => {
     `;
     let archive = await renderDocxArchive(html, "产品发布说明");
     let documentXml = await archive.file("word/document.xml")?.async("string");
+    let stylesXml = await archive.file("word/styles.xml")?.async("string");
 
     expect(archive.file("[Content_Types].xml")).not.toBeNull();
     expect(documentXml).toContain("产品发布说明");
@@ -51,6 +52,10 @@ describe("Gadget DOCX export", () => {
     expect(documentXml).toContain("<w:numPr>");
     expect(documentXml).toContain("<w:tbl>");
     expect(documentXml).not.toContain("Toolbar command");
+    expect(stylesXml).toContain(
+      '<w:rFonts w:ascii="Arial" w:cs="Arial" w:eastAsia="Noto Sans CJK SC" w:hAnsi="Arial"/>',
+    );
+    expect(stylesXml).not.toContain('w:eastAsia="Arial"');
   });
 
   it("embeds visible images in the Word file", async () => {

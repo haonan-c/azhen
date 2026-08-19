@@ -429,7 +429,15 @@ export async function createGadgetDocxStream(
     styles: {
       default: {
         document: {
-          run: { font: "Arial", size: 22 },
+          run: {
+            font: {
+              ascii: "Arial",
+              cs: "Arial",
+              eastAsia: "Noto Sans CJK SC",
+              hAnsi: "Arial",
+            },
+            size: 22,
+          },
           paragraph: { spacing: { after: 120, line: 276 } },
         },
       },
