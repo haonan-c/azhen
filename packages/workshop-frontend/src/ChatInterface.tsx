@@ -3518,7 +3518,8 @@ export const ChatInput = ({
                 }
               }}
               onKeyDown={(e) => {
-                if (e.nativeEvent.isComposing && e.key === "Enter") return;
+                // Safari ends composition before the confirming keydown but keeps the IME key code.
+                if ((e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) && e.key === "Enter") return;
                 if (slashCommandPicker.open && e.key === "Escape") {
                   e.preventDefault();
                   slashCommandPicker.dismiss();

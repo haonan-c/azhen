@@ -301,6 +301,32 @@ describe('localized Prompt Composer', () => {
     expect(onSend).toHaveBeenCalledWith('你好', null, undefined, undefined, undefined)
   })
 
+  it('does not send pre-composition text when Safari confirms an IME candidate', async () => {
+    window.history.replaceState({}, '', '/zh')
+    const onSend = vi.fn<(...args: unknown[]) => void>()
+    await renderComposer({ onSend })
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => textarea.dispatchEvent(new CompositionEvent('compositionstart', {
+      bubbles: true,
+    })))
+    await act(async () => setTextareaValue(textarea, 'nihao'))
+    await act(async () => textarea.dispatchEvent(new CompositionEvent('compositionend', {
+      bubbles: true,
+      data: '你好',
+    })))
+    const enter = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+      isComposing: false,
+    })
+    Object.defineProperty(enter, 'keyCode', { value: 229 })
+    await act(async () => textarea.dispatchEvent(enter))
+
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
   it('sends a selected Chinese format with its localized reference', async () => {
     window.history.replaceState({}, '', '/zh')
     testState.outputFormats = [{
