@@ -28,7 +28,7 @@ export default defineConfig({
     include: ['__tests__/*.test.ts'],
     // Expected rejected Durable Object RPCs need a file-scoped unhandled-error policy. The package
     // test script runs this file separately with vitest.usage-admin.config.ts.
-    exclude: ['__tests__/usage-account-admin.test.ts'],
+    exclude: ['__tests__/usage-account-admin.test.ts', '__tests__/metered-model.test.ts'],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ['../../test-setup/assert-workerd.ts'],
   },

@@ -451,6 +451,63 @@ export type UsageCreditBalance = {
   reservedSubunits: bigint;
 };
 
+/** Bounded request for the authenticated User's own Usage Records. */
+export type UserUsageRecordPageRequest = {
+  /** Opaque cursor returned by the previous page; omit for the first page. */
+  cursor?: string;
+  /** Optional page size from 1 through 100; defaults to 50. */
+  limit?: number;
+};
+
+/** Content-free token categories reported for one model inference. */
+export type UserModelTokenUsage = {
+  /** Input tokens reported as provider cache hits. */
+  cacheHitInputTokens: bigint;
+  /** Input tokens not reported as provider cache hits. */
+  cacheMissInputTokens: bigint;
+  /** Total output tokens, already including reasoning-token detail. */
+  outputTokens: bigint;
+  /** Reasoning-token detail already included in outputTokens. */
+  reasoningTokens: bigint;
+};
+
+/** User-safe projection of one model Usage Record. */
+export type UserModelUsageRecord = {
+  /** Usage Record discriminator. */
+  kind: "model";
+  /** Opaque stable identifier safe to use as a UI list key. */
+  id: string;
+  /** Origin of this model inference. */
+  source: "agent";
+  /** Workspace that ran the inference. */
+  workspaceId: string;
+  /** Conversation that ran the inference. */
+  chatId: number;
+  /** Deployment Model selected for the inference. */
+  deploymentModelId: string;
+  /** Whether the immutable Charge Snapshot had a configured rate. */
+  pricing: "priced" | "unpriced";
+  /** Durable terminal outcome of the Metering Attempt. */
+  outcome: "settled" | "failed-before-execution" | "usage-unknown" |
+    "reconciliation-required";
+  /** Whether valid provider token categories were reported. */
+  usageStatus: "reported" | "not-reported" | "invalid-report";
+  /** Exact provider categories, or null when no valid report exists. */
+  usage: UserModelTokenUsage | null;
+  /** Exact Usage Credit charged, zero for priced-zero or Unpriced Use, or null when unresolved. */
+  chargeSubunits: bigint | null;
+  /** Canonical UTC completion time. */
+  createdAt: string;
+};
+
+/** One bounded page of the authenticated User's own Usage Records. */
+export type UserUsageRecordPage = {
+  /** Records in descending completion order. */
+  records: UserModelUsageRecord[];
+  /** Opaque cursor for the next page, or null when this page is complete. */
+  nextCursor: string | null;
+};
+
 /** Number of exact integer rate subunits in one US dollar. */
 export const USD_RATE_SUBUNITS_PER_USD = 1_000_000_000_000_000_000n;
 
@@ -918,6 +975,9 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Get the logged-in User's available and reserved Usage Credit balances. */
   getUsageCreditBalance(): Promise<UsageCreditBalance>;
+
+  /** List a bounded page of the logged-in User's own content-free Usage Records. */
+  listOwnUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage>;
 
   /**
    * Get the user's preferred model, chosen during onboarding. Returns null if the user has not

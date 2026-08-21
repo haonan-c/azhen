@@ -82,6 +82,23 @@ it("hands handlers the method and headers from any fetch input form", async () =
   ]);
 });
 
+it("gives every declining handler an independently readable request body", async () => {
+  const bodies: string[] = [];
+  const first: Handler = async (_url, _method, _headers, request) => {
+    bodies.push(`first:${await request.text()}`);
+    return null;
+  };
+  const second: Handler = async (_url, _method, _headers, request) => {
+    bodies.push(`second:${await request.text()}`);
+    return new Response(null, {status: 204});
+  };
+  new NetworkInterceptor([first, second]).install();
+
+  await fetch("https://body.test/v1", {method: "POST", body: "request-body"});
+  expect(bodies).toEqual(["first:request-body", "second:request-body"]);
+  expect(fetchedByReal).toEqual([]);
+});
+
 it("throws on an unmatched request and records it", async () => {
   const interceptor = new NetworkInterceptor([() => null]);
   interceptor.install();

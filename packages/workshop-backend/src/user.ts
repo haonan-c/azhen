@@ -13,14 +13,22 @@ import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./a
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import {
   UsageAccount,
+  type AgentModelUsageAttribution,
   type CreditReservation,
+  type ModelMeteringAttempt,
+  type ModelUsageCompletion,
+  type ModelUsageRecord,
+  type ModelUsageReservationBound,
   type UnpricedUsageDecision,
 } from "./usage-account.js";
 import type {
   AdminUsageOperationResult,
   ChargeSnapshot,
+  ModelChargeSnapshot,
   PricedChargeSnapshot,
   UsageCreditBalance,
+  UserUsageRecordPage,
+  UserUsageRecordPageRequest,
 } from "@gadgets/workshop-shared/api";
 
 const logger = createWorkshopLogger("workshop.user");
@@ -486,6 +494,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.getBalance();
   }
 
+  /** Return one bounded page of this User's content-free model Usage Records. */
+  async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
+    await this.activateUsageAccount();
+    return this.usageAccount.listUserUsageRecords(request);
+  }
+
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
   async reserveUsageCredits(
       operationId: string,
@@ -502,6 +516,41 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       Promise<UnpricedUsageDecision> {
     await this.activateUsageAccount();
     return this.usageAccount.recordUnpricedUsageDecision(operationId, chargeSnapshot);
+  }
+
+  /** Begin one trusted Agent model inference before any provider request can start. */
+  async beginModelUsage(
+      operationId: string,
+      attribution: AgentModelUsageAttribution,
+      chargeSnapshot: ModelChargeSnapshot,
+      reservationBound: ModelUsageReservationBound): Promise<ModelMeteringAttempt> {
+    await this.activateUsageAccount();
+    return this.usageAccount.beginModelUsage(
+      operationId,
+      attribution,
+      chargeSnapshot,
+      reservationBound,
+    );
+  }
+
+  /** Persist the durable provider-start handoff for one trusted Agent model inference. */
+  async markModelUsageStarted(operationId: string): Promise<ModelMeteringAttempt> {
+    await this.activateUsageAccount();
+    return this.usageAccount.markModelUsageStarted(operationId);
+  }
+
+  /** Release one trusted Agent model inference that did not reach its provider request. */
+  async failModelUsageBeforeExecution(operationId: string): Promise<ModelUsageRecord> {
+    await this.activateUsageAccount();
+    return this.usageAccount.failModelUsageBeforeExecution(operationId);
+  }
+
+  /** Complete one trusted Agent model inference from explicit provider Usage or no report. */
+  async completeModelUsage(
+      operationId: string,
+      usage: ModelUsageCompletion): Promise<ModelUsageRecord> {
+    await this.activateUsageAccount();
+    return this.usageAccount.completeModelUsage(operationId, usage);
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */

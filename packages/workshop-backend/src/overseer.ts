@@ -13,6 +13,7 @@ import {
   getModel,
   UserGatewayRouting,
 } from "./ai-models";
+import { meterAgentModelHandle } from "./metered-model.js";
 import { AgentTurnError, completeText } from "./ai-invoke";
 import {
   AiGatewayLogRetryableError,
@@ -1384,7 +1385,13 @@ class OverseerImpl implements AgentHooks {
     }
 
     await this.#runAgentTurn(
-        record.chatId, aiModel, record.initiator, record.callbackInitiated, liveChat);
+        record.chatId,
+        aiModel,
+        record.initiator,
+        record.initiatorUserId,
+        record.callbackInitiated,
+        liveChat,
+    );
   }
 
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
@@ -4013,12 +4020,20 @@ class OverseerImpl implements AgentHooks {
     });
 
     let liveChat = this.#getLiveChat(chatId);
-    let turn = this.#runAgentTurn(chatId, aiModel, initiator, callbackInitiated, liveChat);
+    let turn = this.#runAgentTurn(
+      chatId,
+      aiModel,
+      initiator,
+      initiatorUserId,
+      callbackInitiated,
+      liveChat,
+    );
     if (keepAlive) this.ctx.waitUntil(turn);
   }
 
   #runAgentTurn(chatId: number, aiModel: DeploymentModelRecord,
                 initiator: AiChatAuthorInfo,
+                initiatorUserId: string,
                 callbackInitiated: boolean,
                 liveChat: LiveChatContext): Promise<void> {
     return obsContext.with({
@@ -4027,11 +4042,12 @@ class OverseerImpl implements AgentHooks {
       chatId,
       modelId: aiModel.profile.id,
     }, () => traced("agent.run", () => this.#runAgentTurnWithContext(
-        chatId, aiModel, initiator, callbackInitiated, liveChat)));
+        chatId, aiModel, initiator, initiatorUserId, callbackInitiated, liveChat)));
   }
 
   async #runAgentTurnWithContext(chatId: number, aiModel: DeploymentModelRecord,
                                  initiator: AiChatAuthorInfo,
+                                 initiatorUserId: string,
                                  callbackInitiated: boolean,
                                  liveChat: LiveChatContext): Promise<void> {
     // When this turn is billed to the user's own Cloudflare account, we refresh their cached credit
@@ -4090,6 +4106,18 @@ class OverseerImpl implements AgentHooks {
             userGateway: byokRouting,
             metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId },
           });
+      if (aiModel.config.provider === "deepseek") {
+        chosenModel = meterAgentModelHandle(chosenModel, {
+          usageRates: this.ctx.exports.AdminSettings.getByName(""),
+          user: this.users.get(this.users.idFromString(initiatorUserId)),
+          attribution: {
+            source: "agent",
+            workspaceId: this.ctx.id.toString(),
+            chatId,
+            deploymentModelId: aiModel.profile.id,
+          },
+        });
+      }
 
       let controller = liveChat.cancelController;
       controller.signal.throwIfAborted();

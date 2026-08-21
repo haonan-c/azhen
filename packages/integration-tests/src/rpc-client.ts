@@ -77,6 +77,14 @@ export async function signUp(
   return (await api.authenticate(token)) as unknown as RpcStub<AuthenticatedApi>;
 }
 
+/** Log in one account created by signUp() using the same deterministic test-only password hash. */
+export async function signIn(
+    api: RpcStub<PublicApi>, username: string): Promise<RpcStub<AuthenticatedApi>> {
+  const token = await api.login(username, passwordHashFor(username));
+  if (!token) throw new Error(`Login failed for "${username}".`);
+  return (await api.authenticate(token)) as unknown as RpcStub<AuthenticatedApi>;
+}
+
 export type ConnectedAccount = {
   id: number;
   vendorId: string;

@@ -4,13 +4,19 @@ import {
   type AdminUsageOperationResult,
   type ChargeSnapshot,
   type InitialGrantSnapshot,
+  type ModelChargeSnapshot,
   type PricedChargeSnapshot,
   type UsageCreditBalance,
+  type UserModelUsageRecord,
+  type UserUsageRecordPage,
+  type UserUsageRecordPageRequest,
 } from "@gadgets/workshop-shared/api";
 import {
+  calculateModelChargeSubunits,
   normalizeCanonicalUtcTimestamp,
   normalizeChargeSnapshot,
   normalizeInitialGrantSnapshot,
+  type ModelTokenUsage,
 } from "./usage-rates.js";
 
 const LEDGER_PREFIX = "usageAccount:ledger:";
@@ -21,6 +27,12 @@ const INITIAL_GRANT_ID = "usage-credit-initial-grant:v1";
 const REGISTRATION_OUTBOX_KEY = "usageAccount:registrationOutbox:v1";
 const ADMIN_OPERATION_PREFIX = "usageAccount:adminOperation:";
 const REVERSAL_PREFIX = "usageAccount:reversal:";
+const MODEL_ATTEMPT_PREFIX = "usageAccount:modelAttempt:";
+const MODEL_USAGE_RECORD_PREFIX = "usageAccount:modelUsageRecord:";
+const MODEL_USAGE_TIME_INDEX_PREFIX = "usageAccount:modelUsageTimeIndex:";
+const BILLING_BLOCK_KEY = "usageAccount:billingBlock:v1";
+const DEFAULT_USER_USAGE_PAGE_LIMIT = 50;
+const MAX_USER_USAGE_PAGE_LIMIT = 100;
 
 type TransactionResult<T> = { value: T } | { error: Error };
 
@@ -37,6 +49,65 @@ type AdminLedgerAudit = {
   before: AdminUsageBalanceState;
   after: AdminUsageBalanceState;
   originalLedgerEntryId: string | null;
+};
+
+/** Content-free, host-attested dimensions for one Agent model inference. */
+export type AgentModelUsageAttribution = {
+  source: "agent";
+  workspaceId: string;
+  chatId: number;
+  deploymentModelId: string;
+};
+
+/** Conservative token categories used to reserve one priced model inference. */
+export type ModelUsageReservationBound = ModelTokenUsage;
+
+/** Exact provider-reported categories retained for one model inference. */
+export type ReportedModelUsage = ModelTokenUsage & {
+  /** Reasoning tokens are already included in outputTokens and are detail only. */
+  reasoningTokens: bigint;
+};
+
+/** Terminal provider-usage signal, including an explicit malformed-report state. */
+export type ModelUsageCompletion = ReportedModelUsage | null | "invalid-report";
+
+/** Durable lifecycle state for one Agent model inference. */
+export type ModelMeteringAttempt = {
+  operationId: string;
+  attribution: AgentModelUsageAttribution;
+  chargeSnapshot: ModelChargeSnapshot;
+  reservationBound: ModelUsageReservationBound;
+  reservationAmountSubunits: bigint;
+  reservationId: string | null;
+  state: "ready" | "started" | "settled" | "failed-before-execution" | "usage-unknown" |
+    "reconciliation-required";
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  usageRecordId?: string;
+};
+
+/** Immutable result of one completed Agent model inference. */
+export type ModelUsageRecord = {
+  id: string;
+  operationId: string;
+  attribution: AgentModelUsageAttribution;
+  chargeSnapshot: ModelChargeSnapshot;
+  reservationId: string | null;
+  ledgerEntryId: string | null;
+  outcome: "settled" | "failed-before-execution" | "usage-unknown" |
+    "reconciliation-required";
+  usageStatus: "reported" | "not-reported" | "invalid-report";
+  usage: ReportedModelUsage | null;
+  chargeSubunits: bigint | null;
+  createdAt: string;
+};
+
+/** Account-level stop raised when confirmed usage exceeds its reserved upper bound. */
+export type UsageBillingBlock = {
+  operationId: string;
+  reason: "model-usage-exceeded-reservation" | "model-usage-invalid-report";
+  createdAt: string;
 };
 
 /** Server-owned identity used only to create one bounded User Registry outbox fact. */
@@ -132,6 +203,9 @@ export type UsageAccountSnapshot = UsageCreditBalance & {
   unpricedUsageDecisions: UnpricedUsageDecision[];
   registrationOutbox: UsageUserRegistrationOutbox;
   adminOperations: AdminUsageOperationResult[];
+  modelMeteringAttempts: ModelMeteringAttempt[];
+  modelUsageRecords: ModelUsageRecord[];
+  billingBlock: UsageBillingBlock | null;
 };
 
 /**
@@ -215,6 +289,37 @@ export class UsageAccount {
     return this.storage.transactionSync(() => {
       const totals = this.ensureInitialGrant();
       return this.readSnapshot(totals);
+    });
+  }
+
+  /** Return one bounded, content-free page of this User's model Usage Records. */
+  listUserUsageRecords(request: UserUsageRecordPageRequest): UserUsageRecordPage {
+    const {cursor, limit} = normalizeUserUsageRecordPageRequest(request);
+    return this.storage.transactionSync(() => {
+      const entries = Array.from(this.storage.kv.list<string>({
+        prefix: MODEL_USAGE_TIME_INDEX_PREFIX,
+        reverse: true,
+        limit: limit + 1,
+        ...(cursor === undefined
+          ? {} : {end: MODEL_USAGE_TIME_INDEX_PREFIX + cursor}),
+      }));
+      const visible = entries.slice(0, limit);
+      const records = visible.map(([indexKey, operationId]) => {
+        const record = this.storage.kv.get<ModelUsageRecord>(
+          MODEL_USAGE_RECORD_PREFIX + operationId,
+        );
+        if (!record || indexKey !== modelUsageTimeIndexKey(record)) {
+          throw new Error("Model Usage Record index does not reconcile.");
+        }
+        assertModelUsageRecord(record, operationId);
+        return userModelUsageRecord(record);
+      });
+      return {
+        records,
+        nextCursor: entries.length > limit
+          ? visible.at(-1)![0].slice(MODEL_USAGE_TIME_INDEX_PREFIX.length)
+          : null,
+      };
     });
   }
 
@@ -338,6 +443,415 @@ export class UsageAccount {
       return {value: decision};
     });
     return unwrapTransactionResult(result);
+  }
+
+  /** Atomically create one Agent model Metering Attempt and its pricing decision. */
+  beginModelUsage(
+      operationId: string,
+      attribution: AgentModelUsageAttribution,
+      chargeSnapshot: ModelChargeSnapshot,
+      reservationBound: ModelUsageReservationBound,
+      initialGrantSnapshot?: InitialGrantSnapshot): ModelMeteringAttempt {
+    const result = this.storage.transactionSync<TransactionResult<ModelMeteringAttempt>>(() => {
+      const totals = this.ensureInitialGrant(initialGrantSnapshot);
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+      try {
+        assertNoBillingBlock(this.storage.kv.get<UsageBillingBlock>(BILLING_BLOCK_KEY));
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      let normalizedAttribution: AgentModelUsageAttribution;
+      let normalizedSnapshot: ModelChargeSnapshot;
+      let normalizedBound: ModelUsageReservationBound;
+      try {
+        normalizedAttribution = normalizeAgentModelUsageAttribution(attribution);
+        const snapshot = normalizeChargeSnapshot(chargeSnapshot);
+        if (snapshot.kind !== "model") {
+          throw new TypeError("Agent model metering requires a Model Charge Snapshot.");
+        }
+        normalizedSnapshot = snapshot;
+        normalizedBound = normalizeModelUsageReservationBound(reservationBound);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      const attemptKey = MODEL_ATTEMPT_PREFIX + operationId;
+      const existing = this.storage.kv.get<ModelMeteringAttempt>(attemptKey);
+      if (existing !== undefined) {
+        try {
+          assertModelMeteringAttempt(existing, operationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        if (!modelAttemptInputsEqual(
+          existing,
+          normalizedAttribution,
+          normalizedSnapshot,
+          normalizedBound,
+        )) {
+          return {error: new Error("Model Metering operation ID conflicts with its stored input.")};
+        }
+        return {value: existing};
+      }
+      if (this.storage.kv.get(ADMIN_OPERATION_PREFIX + operationId) !== undefined ||
+          this.storage.kv.get(MODEL_USAGE_RECORD_PREFIX + operationId) !== undefined) {
+        return {error: new Error("Operation ID already records a different Usage operation.")};
+      }
+
+      const createdAt = new Date().toISOString();
+      const reservationAmountSubunits = calculateModelChargeSubunits(
+        normalizedSnapshot,
+        normalizedBound,
+      );
+      let reservationId: string | null = null;
+      if (normalizedSnapshot.pricing === "priced") {
+        if (this.storage.kv.get(UNPRICED_DECISION_PREFIX + operationId) !== undefined ||
+            this.storage.kv.get(RESERVATION_PREFIX + operationId) !== undefined) {
+          return {error: new Error("Operation ID already records a pricing decision.")};
+        }
+        if (totals.ledgerBalanceSubunits - totals.reservedSubunits <
+            reservationAmountSubunits) {
+          return {error: new Error("Insufficient Usage Credit.")};
+        }
+        const reservation: CreditReservation = {
+          operationId,
+          amountSubunits: reservationAmountSubunits,
+          chargeSnapshot: normalizedSnapshot,
+          state: "reserved",
+          createdAt,
+        };
+        this.storage.kv.put(RESERVATION_PREFIX + operationId, reservation);
+        this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+          ...totals,
+          reservedSubunits: totals.reservedSubunits + reservationAmountSubunits,
+        });
+        reservationId = operationId;
+      } else {
+        if (this.storage.kv.get(RESERVATION_PREFIX + operationId) !== undefined ||
+            this.storage.kv.get(UNPRICED_DECISION_PREFIX + operationId) !== undefined) {
+          return {error: new Error("Operation ID already records a pricing decision.")};
+        }
+        this.storage.kv.put<UnpricedUsageDecision>(UNPRICED_DECISION_PREFIX + operationId, {
+          operationId,
+          chargeSnapshot: normalizedSnapshot,
+          createdAt,
+        });
+      }
+
+      const attempt: ModelMeteringAttempt = {
+        operationId,
+        attribution: normalizedAttribution,
+        chargeSnapshot: normalizedSnapshot,
+        reservationBound: normalizedBound,
+        reservationAmountSubunits,
+        reservationId,
+        state: "ready",
+        createdAt,
+      };
+      this.storage.kv.put(attemptKey, attempt);
+      return {value: attempt};
+    });
+    return unwrapTransactionResult(result);
+  }
+
+  /** Persist that one Agent model request is about to cross the provider boundary. */
+  markModelUsageStarted(operationId: string): ModelMeteringAttempt {
+    const result = this.storage.transactionSync<TransactionResult<ModelMeteringAttempt>>(() => {
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+      const key = MODEL_ATTEMPT_PREFIX + operationId;
+      const attempt = this.storage.kv.get<ModelMeteringAttempt>(key);
+      if (!attempt) return {error: new Error("Model Metering Attempt does not exist.")};
+      const billingBlock = this.storage.kv.get<UsageBillingBlock>(BILLING_BLOCK_KEY);
+      try {
+        assertModelMeteringAttempt(attempt, operationId);
+        assertNoBillingBlock(billingBlock, billingBlock?.operationId);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+      if (attempt.state !== "ready") return {value: attempt};
+      if (billingBlock !== undefined && billingBlock.operationId !== operationId) {
+        try {
+          this.#failModelUsageBeforeExecutionInTransaction(operationId, attempt);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        return {error: new Error("Usage Account is blocked pending billing reconciliation.")};
+      }
+      const started: ModelMeteringAttempt = {
+        ...attempt,
+        state: "started",
+        startedAt: new Date().toISOString(),
+      };
+      this.storage.kv.put(key, started);
+      return {value: started};
+    });
+    return unwrapTransactionResult(result);
+  }
+
+  /** Release one known-not-dispatched Agent inference and persist its terminal result. */
+  failModelUsageBeforeExecution(operationId: string): ModelUsageRecord {
+    const result = this.storage.transactionSync<TransactionResult<ModelUsageRecord>>(() => {
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+      const attempt = this.storage.kv.get<ModelMeteringAttempt>(MODEL_ATTEMPT_PREFIX + operationId);
+      if (!attempt) return {error: new Error("Model Metering Attempt does not exist.")};
+      try {
+        assertModelMeteringAttempt(attempt, operationId);
+        return {value: this.#failModelUsageBeforeExecutionInTransaction(operationId, attempt)};
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+    });
+    return unwrapTransactionResult(result);
+  }
+
+  /** Atomically settle, release, or hold one started Agent model inference. */
+  completeModelUsage(
+      operationId: string,
+      usage: ModelUsageCompletion): ModelUsageRecord {
+    const result = this.storage.transactionSync<TransactionResult<ModelUsageRecord>>(() => {
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+      const attemptKey = MODEL_ATTEMPT_PREFIX + operationId;
+      const attempt = this.storage.kv.get<ModelMeteringAttempt>(attemptKey);
+      if (!attempt) return {error: new Error("Model Metering Attempt does not exist.")};
+      try {
+        assertModelMeteringAttempt(attempt, operationId);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      let normalizedUsage: ReportedModelUsage | null;
+      const usageStatus: ModelUsageRecord["usageStatus"] = usage === null
+        ? "not-reported" : usage === "invalid-report" ? "invalid-report" : "reported";
+      try {
+        normalizedUsage = usage === null || usage === "invalid-report"
+          ? null : normalizeReportedModelUsage(usage);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+      const recordKey = MODEL_USAGE_RECORD_PREFIX + operationId;
+      const existingRecord = this.storage.kv.get<ModelUsageRecord>(recordKey);
+      if (existingRecord !== undefined) {
+        try {
+          assertModelUsageRecord(existingRecord, operationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        if (existingRecord.usageStatus !== usageStatus ||
+            !reportedModelUsageEqual(existingRecord.usage, normalizedUsage)) {
+          return {error: new Error("Model Metering completion conflicts with its Usage Record.")};
+        }
+        return {value: existingRecord};
+      }
+      if (attempt.state !== "started") {
+        return {error: new Error("Model Metering Attempt has not started.")};
+      }
+
+      const totals = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+      if (!totals) return {error: new Error("Usage Credit totals are missing.")};
+      try {
+        assertUsageAccountTotals(totals);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+      const completedAt = new Date().toISOString();
+      const recordId = modelUsageRecordId(operationId);
+      let outcome: ModelUsageRecord["outcome"];
+      let chargeSubunits: bigint | null = null;
+      let ledgerEntryId: string | null = null;
+
+      if (usageStatus === "invalid-report") {
+        outcome = "reconciliation-required";
+        const block: UsageBillingBlock = {
+          operationId,
+          reason: "model-usage-invalid-report",
+          createdAt: completedAt,
+        };
+        this.storage.kv.put(BILLING_BLOCK_KEY, block);
+      } else if (normalizedUsage === null) {
+        outcome = "usage-unknown";
+        if (attempt.reservationId !== null) {
+          const reservationKey = RESERVATION_PREFIX + operationId;
+          const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+          if (!reservation) return {error: new Error("Credit Reservation does not exist.")};
+          try {
+            this.assertStoredReservationConsistency(reservation, operationId);
+          } catch (error) {
+            return {error: error instanceof Error ? error : new Error(String(error))};
+          }
+          if (reservation.state !== "reserved" ||
+              totals.reservedSubunits < reservation.amountSubunits) {
+            return {error: new Error("Model Metering reservation cannot be released.")};
+          }
+          this.storage.kv.put<CreditReservation>(reservationKey, {
+            ...reservation,
+            state: "released",
+            releasedAt: completedAt,
+          });
+          this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+            ...totals,
+            reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+          });
+        }
+      } else {
+        chargeSubunits = calculateModelChargeSubunits(attempt.chargeSnapshot, normalizedUsage);
+        if (attempt.reservationId === null) {
+          outcome = "settled";
+        } else {
+          const reservationKey = RESERVATION_PREFIX + operationId;
+          const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+          if (!reservation) return {error: new Error("Credit Reservation does not exist.")};
+          try {
+            this.assertStoredReservationConsistency(reservation, operationId);
+          } catch (error) {
+            return {error: error instanceof Error ? error : new Error(String(error))};
+          }
+          if (reservation.state !== "reserved") {
+            return {error: new Error("Model Metering reservation is already terminal.")};
+          }
+          if (chargeSubunits > reservation.amountSubunits) {
+            outcome = "reconciliation-required";
+            const block: UsageBillingBlock = {
+              operationId,
+              reason: "model-usage-exceeded-reservation",
+              createdAt: completedAt,
+            };
+            this.storage.kv.put(BILLING_BLOCK_KEY, block);
+          } else {
+            if (totals.reservedSubunits < reservation.amountSubunits) {
+              return {error: new Error("Usage Credit Reservation totals do not reconcile.")};
+            }
+            ledgerEntryId = chargeLedgerEntryId(operationId);
+            if (this.storage.kv.get(LEDGER_PREFIX + ledgerEntryId) !== undefined) {
+              return {error: new Error(
+                "Usage Credit Ledger entry already exists without a Usage Record.",
+              )};
+            }
+            const ledgerEntry: CreditLedgerEntry = {
+              id: ledgerEntryId,
+              operationId,
+              kind: "usage-charge",
+              deltaSubunits: -chargeSubunits,
+              createdAt: completedAt,
+            };
+            this.storage.kv.put(LEDGER_PREFIX + ledgerEntryId, ledgerEntry);
+            this.storage.kv.put<CreditReservation>(reservationKey, {
+              ...reservation,
+              state: "settled",
+              settledAmountSubunits: chargeSubunits,
+              ledgerEntryId,
+              settledAt: completedAt,
+            });
+            this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+              ledgerBalanceSubunits: totals.ledgerBalanceSubunits - chargeSubunits,
+              reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+            });
+            outcome = "settled";
+          }
+        }
+      }
+
+      const record: ModelUsageRecord = {
+        id: recordId,
+        operationId,
+        attribution: attempt.attribution,
+        chargeSnapshot: attempt.chargeSnapshot,
+        reservationId: attempt.reservationId,
+        ledgerEntryId,
+        outcome,
+        usageStatus,
+        usage: normalizedUsage,
+        chargeSubunits,
+        createdAt: completedAt,
+      };
+      const completedAttempt: ModelMeteringAttempt = {
+        ...attempt,
+        state: outcome,
+        completedAt,
+        usageRecordId: recordId,
+      };
+      this.storage.kv.put(recordKey, record);
+      this.storage.kv.put(attemptKey, completedAttempt);
+      this.storage.kv.put(modelUsageTimeIndexKey(record), operationId);
+      return {value: record};
+    });
+    return unwrapTransactionResult(result);
+  }
+
+  #failModelUsageBeforeExecutionInTransaction(
+      operationId: string, attempt: ModelMeteringAttempt): ModelUsageRecord {
+    const recordKey = MODEL_USAGE_RECORD_PREFIX + operationId;
+    const existing = this.storage.kv.get<ModelUsageRecord>(recordKey);
+    if (existing !== undefined) {
+      assertModelUsageRecord(existing, operationId);
+      if (existing.outcome !== "failed-before-execution") {
+        throw new Error("Model Metering Attempt already has a different terminal result.");
+      }
+      return existing;
+    }
+    if (attempt.state !== "ready" && attempt.state !== "started") {
+      throw new Error("Model Metering Attempt cannot fail before execution from its current state.");
+    }
+
+    const completedAt = new Date().toISOString();
+    if (attempt.reservationId !== null) {
+      const totals = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+      const reservationKey = RESERVATION_PREFIX + operationId;
+      const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+      if (!totals || !reservation) {
+        throw new Error("Model Metering reservation cannot be released.");
+      }
+      assertUsageAccountTotals(totals);
+      this.assertStoredReservationConsistency(reservation, operationId);
+      if (reservation.state !== "reserved" ||
+          totals.reservedSubunits < reservation.amountSubunits) {
+        throw new Error("Model Metering reservation cannot be released.");
+      }
+      this.storage.kv.put<CreditReservation>(reservationKey, {
+        ...reservation,
+        state: "released",
+        releasedAt: completedAt,
+      });
+      this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+        ...totals,
+        reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+      });
+    }
+
+    const recordId = modelUsageRecordId(operationId);
+    const record: ModelUsageRecord = {
+      id: recordId,
+      operationId,
+      attribution: attempt.attribution,
+      chargeSnapshot: attempt.chargeSnapshot,
+      reservationId: attempt.reservationId,
+      ledgerEntryId: null,
+      outcome: "failed-before-execution",
+      usageStatus: "not-reported",
+      usage: null,
+      chargeSubunits: null,
+      createdAt: completedAt,
+    };
+    const completedAttempt: ModelMeteringAttempt = {
+      operationId,
+      attribution: attempt.attribution,
+      chargeSnapshot: attempt.chargeSnapshot,
+      reservationBound: attempt.reservationBound,
+      reservationAmountSubunits: attempt.reservationAmountSubunits,
+      reservationId: attempt.reservationId,
+      state: "failed-before-execution",
+      createdAt: attempt.createdAt,
+      completedAt,
+      usageRecordId: recordId,
+    };
+    this.storage.kv.put(recordKey, record);
+    this.storage.kv.put(MODEL_ATTEMPT_PREFIX + operationId, completedAttempt);
+    this.storage.kv.put(modelUsageTimeIndexKey(record), operationId);
+    return record;
   }
 
   /** Atomically settle a reservation and append its immutable Usage Charge entry. */
@@ -726,6 +1240,13 @@ export class UsageAccount {
     const adminOperationRecords = Array.from(
       this.storage.kv.list<StoredAdminUsageOperation>({prefix: ADMIN_OPERATION_PREFIX}),
     );
+    const modelMeteringAttemptRecords = Array.from(
+      this.storage.kv.list<ModelMeteringAttempt>({prefix: MODEL_ATTEMPT_PREFIX}),
+    );
+    const modelUsageRecordRecords = Array.from(
+      this.storage.kv.list<ModelUsageRecord>({prefix: MODEL_USAGE_RECORD_PREFIX}),
+    );
+    const billingBlock = this.storage.kv.get<UsageBillingBlock>(BILLING_BLOCK_KEY) ?? null;
     const registrationOutbox = this.storage.kv.get<UsageUserRegistrationOutbox>(
       REGISTRATION_OUTBOX_KEY,
     );
@@ -737,6 +1258,14 @@ export class UsageAccount {
       unpricedDecisionRecords,
       adminOperationRecords,
       Array.from(this.storage.kv.list<string>({prefix: REVERSAL_PREFIX})),
+    );
+    assertModelUsageRecordsReconcile(
+      modelMeteringAttemptRecords,
+      modelUsageRecordRecords,
+      reservationRecords,
+      unpricedDecisionRecords,
+      ledgerRecords,
+      billingBlock,
     );
     const reconciledLedgerBalanceSubunits = ledgerEntries.reduce(
       (total, entry) => total + entry.deltaSubunits,
@@ -762,6 +1291,9 @@ export class UsageAccount {
       unpricedUsageDecisions,
       registrationOutbox,
       adminOperations: adminOperationRecords.map(([, operation]) => operation.result),
+      modelMeteringAttempts: modelMeteringAttemptRecords.map(([, attempt]) => attempt),
+      modelUsageRecords: modelUsageRecordRecords.map(([, record]) => record),
+      billingBlock,
     };
   }
 }
@@ -878,6 +1410,384 @@ function assertTerminalRecordsReconcile(
 
 function chargeLedgerEntryId(operationId: string): string {
   return `usage-credit-charge:${operationId}`;
+}
+
+function assertModelUsageRecordsReconcile(
+  attemptRecords: [string, ModelMeteringAttempt][],
+  usageRecords: [string, ModelUsageRecord][],
+  reservationRecords: [string, CreditReservation][],
+  unpricedDecisionRecords: [string, UnpricedUsageDecision][],
+  ledgerRecords: [string, CreditLedgerEntry][],
+  billingBlock: UsageBillingBlock | null,
+): void {
+  const attempts = new Map<string, ModelMeteringAttempt>();
+  for (const [key, attempt] of attemptRecords) {
+    if (key !== MODEL_ATTEMPT_PREFIX + attempt.operationId ||
+        attempts.has(attempt.operationId)) {
+      throw new Error("Model Metering Attempt identity does not reconcile.");
+    }
+    assertModelMeteringAttempt(attempt, attempt.operationId);
+    attempts.set(attempt.operationId, attempt);
+  }
+
+  const reservations = new Map(
+    reservationRecords.map(([, reservation]) => [reservation.operationId, reservation]),
+  );
+  const unpricedDecisions = new Map(
+    unpricedDecisionRecords.map(([, decision]) => [decision.operationId, decision]),
+  );
+  const ledgerEntries = new Map(ledgerRecords.map(([, entry]) => [entry.id, entry]));
+  const linkedAttempts = new Set<string>();
+  for (const [key, record] of usageRecords) {
+    if (key !== MODEL_USAGE_RECORD_PREFIX + record.operationId) {
+      throw new Error("Model Usage Record identity does not reconcile.");
+    }
+    assertModelUsageRecord(record, record.operationId);
+    const attempt = attempts.get(record.operationId);
+    if (!attempt || linkedAttempts.has(record.operationId) ||
+        attempt.usageRecordId !== record.id || attempt.completedAt !== record.createdAt ||
+        attempt.state !== record.outcome ||
+        !modelAttemptInputsEqual(
+          attempt,
+          record.attribution,
+          record.chargeSnapshot,
+          attempt.reservationBound,
+        ) || attempt.reservationId !== record.reservationId) {
+      throw new Error("Model Usage Record does not reconcile with its Metering Attempt.");
+    }
+    linkedAttempts.add(record.operationId);
+
+    if (record.usageStatus === "reported") {
+      if (!record.usage || record.chargeSubunits !==
+          calculateModelChargeSubunits(record.chargeSnapshot, record.usage)) {
+        throw new Error("Model Usage Record charge does not reconcile.");
+      }
+    } else if (record.usage !== null || record.chargeSubunits !== null) {
+      throw new Error("Model Usage Record without reported Usage has a charge.");
+    }
+
+    if (attempt.chargeSnapshot.pricing === "priced") {
+      const reservation = reservations.get(record.operationId);
+      if (!reservation || record.reservationId !== record.operationId ||
+          reservation.amountSubunits !== attempt.reservationAmountSubunits ||
+          !chargeSnapshotsEqual(reservation.chargeSnapshot, attempt.chargeSnapshot)) {
+        throw new Error("Model Usage Record does not reconcile with its Credit Reservation.");
+      }
+      if (record.outcome === "settled") {
+        if (reservation.state !== "settled" ||
+            reservation.ledgerEntryId !== record.ledgerEntryId ||
+            record.ledgerEntryId === null ||
+            !ledgerEntries.has(record.ledgerEntryId)) {
+          throw new Error("Settled Model Usage Record does not reconcile with its Ledger link.");
+        }
+      } else if (record.outcome === "usage-unknown") {
+        if (reservation.state !== "released" || record.ledgerEntryId !== null) {
+          throw new Error("Unknown Model Usage Record did not release its Reservation.");
+        }
+      } else if (record.outcome === "failed-before-execution") {
+        if (reservation.state !== "released" || record.ledgerEntryId !== null) {
+          throw new Error("Failed Model Usage Record did not release its Reservation.");
+        }
+      } else if (record.outcome === "reconciliation-required") {
+        if (reservation.state !== "reserved" || record.ledgerEntryId !== null) {
+          throw new Error("Reconciliation-required Model Usage did not retain its Reservation.");
+        }
+      }
+    } else if (record.reservationId !== null || record.ledgerEntryId !== null ||
+        !unpricedDecisions.has(record.operationId)) {
+      throw new Error("Unpriced Model Usage Record pricing decision does not reconcile.");
+    }
+  }
+
+  for (const attempt of attempts.values()) {
+    const terminal = attempt.state !== "ready" && attempt.state !== "started";
+    if (terminal !== linkedAttempts.has(attempt.operationId)) {
+      throw new Error("Model Metering Attempt terminal link does not reconcile.");
+    }
+    if (attempt.chargeSnapshot.pricing === "priced") {
+      const reservation = reservations.get(attempt.operationId);
+      if (!reservation || unpricedDecisions.has(attempt.operationId)) {
+        throw new Error("Priced Model Metering Attempt pricing decision does not reconcile.");
+      }
+    } else if (!unpricedDecisions.has(attempt.operationId) ||
+        reservations.has(attempt.operationId)) {
+      throw new Error("Unpriced Model Metering Attempt pricing decision does not reconcile.");
+    }
+  }
+
+  const hasReconciliationRequiredAttempt = [...attempts.values()].some(
+    (attempt) => attempt.state === "reconciliation-required",
+  );
+  if (hasReconciliationRequiredAttempt !== (billingBlock !== null)) {
+    throw new Error("Usage Billing block presence does not reconcile with Metering Attempts.");
+  }
+  if (billingBlock !== null) {
+    assertNoBillingBlock(billingBlock, billingBlock.operationId);
+    const attempt = attempts.get(billingBlock.operationId);
+    if (!attempt || attempt.state !== "reconciliation-required") {
+      throw new Error("Usage Billing block does not reconcile with a Metering Attempt.");
+    }
+  }
+}
+
+function modelUsageRecordId(operationId: string): string {
+  return `model-usage:${operationId}`;
+}
+
+function modelUsageTimeIndexKey(record: ModelUsageRecord): string {
+  return `${MODEL_USAGE_TIME_INDEX_PREFIX}${record.createdAt}:${record.operationId}`;
+}
+
+function normalizeUserUsageRecordPageRequest(
+    value: UserUsageRecordPageRequest): {cursor?: string; limit: number} {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).some(key => key !== "cursor" && key !== "limit")) {
+    throw new TypeError("User Usage Record page request is invalid.");
+  }
+  const cursor = value.cursor;
+  if (cursor !== undefined &&
+      (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 300 ||
+       hasAsciiControlCharacter(cursor))) {
+    throw new TypeError("User Usage Record cursor is invalid.");
+  }
+  const limit = value.limit ?? DEFAULT_USER_USAGE_PAGE_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_USER_USAGE_PAGE_LIMIT) {
+    throw new TypeError("User Usage Record page limit is invalid.");
+  }
+  return {cursor, limit};
+}
+
+function userModelUsageRecord(record: ModelUsageRecord): UserModelUsageRecord {
+  const operationPrefix = "model-inference:";
+  if (!record.operationId.startsWith(operationPrefix)) {
+    throw new Error("Model Usage Record public identity is invalid.");
+  }
+  return {
+    kind: "model",
+    id: `usage-record:${record.operationId.slice(operationPrefix.length)}`,
+    source: record.attribution.source,
+    workspaceId: record.attribution.workspaceId,
+    chatId: record.attribution.chatId,
+    deploymentModelId: record.attribution.deploymentModelId,
+    pricing: record.chargeSnapshot.pricing,
+    outcome: record.outcome,
+    usageStatus: record.usageStatus,
+    usage: record.usage === null ? null : {
+      cacheHitInputTokens: record.usage.cacheHitInputTokens,
+      cacheMissInputTokens: record.usage.cacheMissInputTokens,
+      outputTokens: record.usage.outputTokens,
+      reasoningTokens: record.usage.reasoningTokens,
+    },
+    chargeSubunits: record.chargeSubunits,
+    createdAt: record.createdAt,
+  };
+}
+
+function normalizeAgentModelUsageAttribution(
+    value: AgentModelUsageAttribution): AgentModelUsageAttribution {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      !hasExactKeys(value, ["source", "workspaceId", "chatId", "deploymentModelId"]) ||
+      value.source !== "agent" || typeof value.workspaceId !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.workspaceId) ||
+      !Number.isSafeInteger(value.chatId) || value.chatId < 0 ||
+      typeof value.deploymentModelId !== "string" ||
+      !/^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,199}$/.test(value.deploymentModelId)) {
+    throw new TypeError("Agent model Usage attribution is invalid.");
+  }
+  return {...value};
+}
+
+function normalizeModelUsageReservationBound(
+    value: ModelUsageReservationBound): ModelUsageReservationBound {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      !hasExactKeys(value, ["cacheHitInputTokens", "cacheMissInputTokens", "outputTokens"]) ||
+      typeof value.cacheHitInputTokens !== "bigint" || value.cacheHitInputTokens < 0n ||
+      typeof value.cacheMissInputTokens !== "bigint" || value.cacheMissInputTokens < 0n ||
+      typeof value.outputTokens !== "bigint" || value.outputTokens < 0n) {
+    throw new TypeError("Model Usage reservation bound is invalid.");
+  }
+  return {...value};
+}
+
+function normalizeReportedModelUsage(value: ReportedModelUsage): ReportedModelUsage {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      !hasExactKeys(value, [
+        "cacheHitInputTokens",
+        "cacheMissInputTokens",
+        "outputTokens",
+        "reasoningTokens",
+      ]) || typeof value.reasoningTokens !== "bigint" || value.reasoningTokens < 0n ||
+      value.reasoningTokens > value.outputTokens) {
+    throw new TypeError("Reported model Usage is invalid.");
+  }
+  return {
+    ...normalizeModelUsageReservationBound({
+      cacheHitInputTokens: value.cacheHitInputTokens,
+      cacheMissInputTokens: value.cacheMissInputTokens,
+      outputTokens: value.outputTokens,
+    }),
+    reasoningTokens: value.reasoningTokens,
+  };
+}
+
+function modelAttemptInputsEqual(
+  attempt: ModelMeteringAttempt,
+  attribution: AgentModelUsageAttribution,
+  snapshot: ModelChargeSnapshot,
+  reservationBound: ModelUsageReservationBound,
+): boolean {
+  return attempt.attribution.source === attribution.source &&
+    attempt.attribution.workspaceId === attribution.workspaceId &&
+    attempt.attribution.chatId === attribution.chatId &&
+    attempt.attribution.deploymentModelId === attribution.deploymentModelId &&
+    chargeSnapshotsEqual(attempt.chargeSnapshot, snapshot) &&
+    attempt.reservationBound.cacheHitInputTokens === reservationBound.cacheHitInputTokens &&
+    attempt.reservationBound.cacheMissInputTokens === reservationBound.cacheMissInputTokens &&
+    attempt.reservationBound.outputTokens === reservationBound.outputTokens;
+}
+
+function reportedModelUsageEqual(
+    left: ReportedModelUsage | null, right: ReportedModelUsage | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.cacheHitInputTokens === right.cacheHitInputTokens &&
+    left.cacheMissInputTokens === right.cacheMissInputTokens &&
+    left.outputTokens === right.outputTokens &&
+    left.reasoningTokens === right.reasoningTokens;
+}
+
+function assertModelMeteringAttempt(
+    attempt: ModelMeteringAttempt, expectedOperationId: string): void {
+  const baseKeys = [
+    "operationId",
+    "attribution",
+    "chargeSnapshot",
+    "reservationBound",
+    "reservationAmountSubunits",
+    "reservationId",
+    "state",
+    "createdAt",
+  ];
+  if (typeof attempt !== "object" || attempt === null || Array.isArray(attempt) ||
+      attempt.operationId !== expectedOperationId ||
+      operationIdValidationError(expectedOperationId) !== undefined ||
+      typeof attempt.reservationAmountSubunits !== "bigint" ||
+      attempt.reservationAmountSubunits < 0n ||
+      typeof attempt.createdAt !== "string" ||
+      (attempt.state !== "ready" && attempt.state !== "started" &&
+       attempt.state !== "settled" && attempt.state !== "failed-before-execution" &&
+       attempt.state !== "usage-unknown" && attempt.state !== "reconciliation-required")) {
+    throw new Error("Model Metering Attempt does not reconcile.");
+  }
+  try {
+    normalizeAgentModelUsageAttribution(attempt.attribution);
+    const snapshot = normalizeChargeSnapshot(attempt.chargeSnapshot);
+    if (snapshot.kind !== "model") throw new TypeError("Expected a model snapshot.");
+    normalizeModelUsageReservationBound(attempt.reservationBound);
+    if (attempt.reservationAmountSubunits !== calculateModelChargeSubunits(
+      attempt.chargeSnapshot,
+      attempt.reservationBound,
+    )) throw new TypeError("Reservation amount does not match its snapshot and bound.");
+    normalizeCanonicalUtcTimestamp(attempt.createdAt, "Model Metering Attempt creation time");
+    if (attempt.startedAt !== undefined) {
+      normalizeCanonicalUtcTimestamp(attempt.startedAt, "Model Metering Attempt start time");
+    }
+    if (attempt.completedAt !== undefined) {
+      normalizeCanonicalUtcTimestamp(attempt.completedAt, "Model Metering Attempt completion time");
+    }
+  } catch {
+    throw new Error("Model Metering Attempt does not reconcile.");
+  }
+  if ((attempt.chargeSnapshot.pricing === "priced") !==
+      (attempt.reservationId === expectedOperationId)) {
+    throw new Error("Model Metering Attempt pricing decision does not reconcile.");
+  }
+  if (attempt.state === "ready") {
+    if (!hasExactKeys(attempt, baseKeys)) {
+      throw new Error("Ready Model Metering Attempt has terminal fields.");
+    }
+    return;
+  }
+  if (attempt.state === "started") {
+    if (!hasExactKeys(attempt, [...baseKeys, "startedAt"]) ||
+        attempt.startedAt === undefined) {
+      throw new Error("Started Model Metering Attempt has terminal fields.");
+    }
+    return;
+  }
+  const terminalKeys = attempt.state === "failed-before-execution"
+    ? [...baseKeys, "completedAt", "usageRecordId"]
+    : [...baseKeys, "startedAt", "completedAt", "usageRecordId"];
+  if (!hasExactKeys(attempt, terminalKeys) || !attempt.completedAt || !attempt.usageRecordId ||
+      (attempt.state === "failed-before-execution"
+        ? attempt.startedAt !== undefined : attempt.startedAt === undefined)) {
+    throw new Error("Terminal Model Metering Attempt is incomplete.");
+  }
+}
+
+function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: string): void {
+  if (typeof record !== "object" || record === null || Array.isArray(record) ||
+      !hasExactKeys(record, [
+        "id",
+        "operationId",
+        "attribution",
+        "chargeSnapshot",
+        "reservationId",
+        "ledgerEntryId",
+        "outcome",
+        "usageStatus",
+        "usage",
+        "chargeSubunits",
+        "createdAt",
+      ]) ||
+      record.id !== modelUsageRecordId(expectedOperationId) ||
+      record.operationId !== expectedOperationId ||
+      operationIdValidationError(expectedOperationId) !== undefined ||
+      typeof record.createdAt !== "string" ||
+      (record.outcome !== "settled" && record.outcome !== "failed-before-execution" &&
+       record.outcome !== "usage-unknown" && record.outcome !== "reconciliation-required") ||
+      (record.usageStatus !== "reported" && record.usageStatus !== "not-reported" &&
+       record.usageStatus !== "invalid-report") ||
+      (record.usageStatus === "reported") !== (record.usage !== null) ||
+      (record.chargeSubunits !== null &&
+       (typeof record.chargeSubunits !== "bigint" || record.chargeSubunits < 0n))) {
+    throw new Error("Model Usage Record does not reconcile.");
+  }
+  if ((record.outcome === "settled" && record.usageStatus !== "reported") ||
+      ((record.outcome === "failed-before-execution" || record.outcome === "usage-unknown") &&
+       record.usageStatus !== "not-reported") ||
+      (record.outcome === "reconciliation-required" &&
+       record.usageStatus !== "reported" && record.usageStatus !== "invalid-report") ||
+      (record.outcome !== "settled" && record.ledgerEntryId !== null)) {
+    throw new Error("Model Usage Record terminal state does not reconcile.");
+  }
+  try {
+    normalizeAgentModelUsageAttribution(record.attribution);
+    const snapshot = normalizeChargeSnapshot(record.chargeSnapshot);
+    if (snapshot.kind !== "model") throw new TypeError("Expected a model snapshot.");
+    if (record.usage !== null) normalizeReportedModelUsage(record.usage);
+    normalizeCanonicalUtcTimestamp(record.createdAt, "Model Usage Record time");
+  } catch {
+    throw new Error("Model Usage Record does not reconcile.");
+  }
+}
+
+function assertNoBillingBlock(
+    block: UsageBillingBlock | undefined, allowedOperationId?: string): void {
+  if (block === undefined) return;
+  if (typeof block !== "object" || block === null ||
+      operationIdValidationError(block.operationId) !== undefined ||
+      block.reason !== "model-usage-exceeded-reservation" &&
+      block.reason !== "model-usage-invalid-report") {
+    throw new Error("Usage Billing block does not reconcile.");
+  }
+  try {
+    normalizeCanonicalUtcTimestamp(block.createdAt, "Usage Billing block time");
+  } catch {
+    throw new Error("Usage Billing block does not reconcile.");
+  }
+  if (block.operationId !== allowedOperationId) {
+    throw new Error("Usage Account is blocked pending billing reconciliation.");
+  }
 }
 
 function assertInitialGrant(entry: CreditLedgerEntry): void {
@@ -1239,7 +2149,7 @@ function assertReservationLedgerConsistency(
     operationIdValidationError(expectedOperationId) !== undefined ||
     reservation.operationId !== expectedOperationId ||
     typeof reservation.amountSubunits !== "bigint" ||
-    reservation.amountSubunits <= 0n ||
+    reservation.amountSubunits < 0n ||
     typeof reservation.createdAt !== "string" ||
     reservation.createdAt.length === 0
   ) {

@@ -72,6 +72,7 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   https://chatgpt.com/c/6a86debf-e1b0-83e8-ab39-820338fd0d56
 - Independent #46 acceptance oracle: ISSUE-46-ACCEPTANCE-ORACLE.md
 - ChatGPT Pro #46 task: PRO-ISSUE-46-TASK.md
+- ChatGPT Pro #46 source archive: SOURCE-ARCHIVE-ISSUE-46.md
 - Independent #47 acceptance oracle: ISSUE-47-ACCEPTANCE-ORACLE.md
 - Independent #48 acceptance oracle: ISSUE-48-ACCEPTANCE-ORACLE.md
 - Independent #49 acceptance oracle: ISSUE-49-ACCEPTANCE-ORACLE.md
