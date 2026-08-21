@@ -743,6 +743,152 @@ export type ChargeSnapshot = ModelChargeSnapshot | GatekeeperChargeSnapshot;
 export type PricedChargeSnapshot =
     PricedModelChargeSnapshot | PricedGatekeeperChargeSnapshot;
 
+/** Default number of registered Users returned by one administrator Registry search. */
+export const ADMIN_USAGE_USER_SEARCH_DEFAULT_LIMIT = 25;
+
+/** Maximum number of registered Users returned by one administrator Registry search. */
+export const ADMIN_USAGE_USER_SEARCH_MAX_LIMIT = 100;
+
+/** Bounded directory fields for one User in the authoritative deployment User Registry. */
+export type AdminUsageRegisteredUser = {
+  /** Opaque stable reference accepted by later administrator Usage Account operations. */
+  registeredUserRef: string;
+  /** Server-verified User identity captured at first Usage Credit activation. */
+  identity: string;
+  /** Bounded display name captured at first Usage Credit activation. */
+  displayName: string;
+  /** Canonical UTC time when the Registry first accepted this User. */
+  registeredAt: string;
+  /** Canonical UTC time when this User first activated Usage Credits. */
+  activatedAt: string;
+};
+
+/** One bounded keyset search request for the authoritative deployment User Registry. */
+export type AdminUsageUserSearchRequest = {
+  /** Optional case-insensitive identity or display-name prefix; empty lists all registered Users. */
+  query?: string;
+  /** Optional opaque cursor returned by the preceding page for the same normalized query. */
+  cursor?: string;
+  /** Optional page size from 1 through ADMIN_USAGE_USER_SEARCH_MAX_LIMIT. */
+  limit?: number;
+};
+
+/** One stable snapshot page from the authoritative deployment User Registry. */
+export type AdminUsageUserSearchResult = {
+  /** Registered Users in deterministic activation order. */
+  users: AdminUsageRegisteredUser[];
+  /** Opaque cursor for the next page in the same snapshot, or null when the snapshot is complete. */
+  nextCursor: string | null;
+};
+
+/** Exact authoritative balance components captured around one administrator correction. */
+export type AdminUsageBalanceState = {
+  /** Sum of every immutable Credit Ledger Entry delta. */
+  ledgerBalanceSubunits: bigint;
+  /** Sum of every active Credit Reservation amount. */
+  reservedSubunits: bigint;
+  /** Credit available for new reservations: ledger balance minus reserved Credit. */
+  availableSubunits: bigint;
+};
+
+/** Supported append-only administrator Usage Account correction. */
+export type AdminUsageOperationKind =
+    "grant" | "deduct" | "reconcile-balance" | "reverse";
+
+/** Auditable result of one idempotent administrator Usage Account correction. */
+export type AdminUsageOperationResult = {
+  /** Correction kind selected by the administrator capability. */
+  kind: AdminUsageOperationKind;
+  /** Immutable appended Credit Ledger Entry, or null for an explicit reconciliation no-op. */
+  ledgerEntryId: string | null;
+  /** Immutable original Ledger Entry linked by a reversal, or null for other corrections. */
+  originalLedgerEntryId: string | null;
+  /** Exact signed delta created by the service; zero only for a reconciliation no-op. */
+  deltaSubunits: bigint;
+  /** Authenticated administrator identity bound by the server capability. */
+  actorUserId: string;
+  /** Trimmed bounded administrator reason retained for audit. */
+  reason: string;
+  /** Canonical UTC time created in the authoritative User transaction. */
+  createdAt: string;
+  /** Authoritative values immediately before the correction. */
+  before: AdminUsageBalanceState;
+  /** Authoritative values immediately after the correction. */
+  after: AdminUsageBalanceState;
+  /** True only when reconciliation already matched the requested exact target and appended no entry. */
+  noOp: boolean;
+};
+
+/** Administrator request to append a positive Usage Credit grant. */
+export type AdminUsageGrantRequest = {
+  /** Opaque target returned by Registry search. */
+  registeredUserRef: string;
+  /** Stable client retry identity for this correction. */
+  operationId: string;
+  /** Strictly positive Usage Credit amount in exact integer subunits. */
+  amountSubunits: bigint;
+  /** Required bounded human explanation. */
+  reason: string;
+};
+
+/** Administrator request to append a service-signed Usage Credit deduction. */
+export type AdminUsageDeductRequest = {
+  /** Opaque target returned by Registry search. */
+  registeredUserRef: string;
+  /** Stable client retry identity for this correction. */
+  operationId: string;
+  /** Strictly positive magnitude that the service converts to a negative Ledger delta. */
+  amountSubunits: bigint;
+  /** Required bounded human explanation. */
+  reason: string;
+};
+
+/** Administrator request to append the exact delta needed to reach one Ledger balance. */
+export type AdminUsageReconcileRequest = {
+  /** Opaque target returned by Registry search. */
+  registeredUserRef: string;
+  /** Stable client retry identity for this correction. */
+  operationId: string;
+  /** Exact signed target Ledger balance in Usage Credit subunits. */
+  targetBalanceSubunits: bigint;
+  /** Required bounded human explanation. */
+  reason: string;
+};
+
+/** Administrator request to reverse one immutable Credit Ledger Entry exactly once. */
+export type AdminUsageReverseRequest = {
+  /** Opaque target returned by Registry search. */
+  registeredUserRef: string;
+  /** Stable client retry identity for this correction. */
+  operationId: string;
+  /** Immutable original Ledger Entry identifier; the client supplies no delta or reversal amount. */
+  originalLedgerEntryId: string;
+  /** Required bounded human explanation. */
+  reason: string;
+};
+
+/**
+ * Administrator-only capability for authoritative User Registry search and Usage Account
+ * corrections. It is minted only through an already-authorized AdminApi and never returns a User
+ * Durable Object capability.
+ */
+export interface AdminUsageApi {
+  /** Search only the authoritative Registry without waking or fabricating User Durable Objects. */
+  searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult>;
+
+  /** Append one exact positive administrator grant to a registered User. */
+  grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult>;
+
+  /** Append one exact negative administrator deduction to a registered User. */
+  deduct(request: AdminUsageDeductRequest): Promise<AdminUsageOperationResult>;
+
+  /** Append one exact compensating entry, or record an explicit no-op, for a registered User. */
+  reconcileBalance(request: AdminUsageReconcileRequest): Promise<AdminUsageOperationResult>;
+
+  /** Append one exact linked Credit Reversal for a registered User. */
+  reverse(request: AdminUsageReverseRequest): Promise<AdminUsageOperationResult>;
+}
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
@@ -1289,6 +1435,9 @@ export type AdminFormat = {
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
+
+  /** Mint the administrator-only Registry and Usage Account correction sub-capability. */
+  getUsageApi(): Promise<RpcStub<AdminUsageApi>>;
 
   /** Read the authoritative Usage Rate version and its immutable, secret-free history. */
   getUsageRates(): Promise<UsageRateAdminView>;

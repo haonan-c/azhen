@@ -1,6 +1,6 @@
 # Usage Credits delivery work log
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 ## Objective
 
@@ -66,7 +66,12 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - Final #43 Codex Security diff scan: ISSUE-43-FINAL-SECURITY-SCAN.md
 - Independent #44 acceptance oracle: ISSUE-44-ACCEPTANCE-ORACLE.md
 - Independent #45 acceptance oracle: ISSUE-45-ACCEPTANCE-ORACLE.md
+- Final #45 independent verification: ISSUE-45-VERIFICATION.md
+- ChatGPT Pro #45 task: PRO-ISSUE-45-TASK.md
+- ChatGPT Pro #45 conversation:
+  https://chatgpt.com/c/6a86debf-e1b0-83e8-ab39-820338fd0d56
 - Independent #46 acceptance oracle: ISSUE-46-ACCEPTANCE-ORACLE.md
+- ChatGPT Pro #46 task: PRO-ISSUE-46-TASK.md
 - Independent #47 acceptance oracle: ISSUE-47-ACCEPTANCE-ORACLE.md
 - Independent #48 acceptance oracle: ISSUE-48-ACCEPTANCE-ORACLE.md
 - Independent #49 acceptance oracle: ISSUE-49-ACCEPTANCE-ORACLE.md
@@ -240,5 +245,66 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   SHA-256 `43f7bb69c08edbec54de78b280a3a287b9155176bee42af1c7ac5e87546145af`;
   relative-path-NUL-content aggregate
   `92afb5019e7847bc5e7a3d1c9c18f847b3474ef34bc69ac4d980ad114186b8ee`.
+- ChatGPT Pro later produced a superseding final delivery after continuing the same review. The
+  verified outer ZIP is 49,414 bytes with SHA-256
+  `650e6c15f92116659673a423ab364168dd8e7d557bb458d7866cdcf4d9514024`; its byte/hash sidecars,
+  metadata JSON, ZIP integrity, and all seven governed member hashes matched. The standalone patch
+  is 9,151 bytes with SHA-256
+  `2ee944c74adc97ddc2bf40945101697ef42556aa0a8a7d5c870eb4e19722308b`.
+- Independent comparison showed that the URL-identifier and content-free duplicate-error fixes were
+  already present. One additional correction was justified and applied surgically: reconstruct the
+  immutable Initial Grant Snapshot from its four allowed fields before writing the User Ledger, so
+  arbitrary runtime properties cannot survive in financial evidence. Added a real workerd regression
+  that searches the complete stored snapshot for secret and URL sentinels.
+- Revalidated the superseding correction with Node 24.19.0: focused Usage Rate/Usage Account workerd
+  tests passed 93/93; focused real WebSocket/Cap'n Web tests passed 2/2; the full backend package
+  passed 422 unit tests plus all RPC/browser integrations; `pnpm lint:check`, `pnpm build`, and the
+  full root `pnpm test` all exited 0. The current cross-Issue release dry-run again produced 19 Workers,
+  85 modules, and 33 asset blobs with no upload, promotion, or deployment.
+- Superseding dry-run evidence: 28,344,824 bytes; manifest SHA-256
+  `4892e74b40da203f9f98517c5538e7e077751fc9e3303c8245794e85bfe208bc`;
+  relative-path-and-file-hash aggregate
+  `ecc638912a12112ec84d993c8cb757b3277af64dc33048afaf82c249429b229d`.
 - #44 remains open: #43 is still open, and the accepted implementation is an uncommitted local
   working-tree candidate because commit and push are outside the User's granted authority.
+
+### 2026-08-20 — ChatGPT Pro Issue #45 launch
+
+- Prepared and independently verified the credential-scanned #45 source archive from commit
+  `29cfcf62856dee50ed2d681a1e2d137062f2d09c`: 5,389,465 bytes; SHA-256
+  `8389b692cafd870c52de00398cd508a48299f7a44085021a04930efb35026f25`.
+- Verified all 1,032 archive source members against the internal manifest. The default Gitleaks
+  findings were synthetic test fixtures or stable billing identifiers; the reviewed scan returned
+  zero findings. The archive excludes Git metadata, dependencies, build output, state, databases,
+  browser data, and credential files.
+- Because the ChatGPT file picker does not attach ZIP archives, transported the exact archive as a
+  reversible Base64 text document. The wrapper is 7,185,957 bytes with SHA-256
+  `5c8dd7db20cf8f67e0532b7b859069b0d3cb17dac1c8e2a644bd0be3886beb55`; a local decode reproduced the
+  original ZIP byte-for-byte and the task requires Pro to repeat that verification before analysis.
+- Sent the complete `PRO-ISSUE-45-TASK.md` and the source wrapper to a separate ChatGPT Pro Work
+  conversation at <https://chatgpt.com/c/6a86debf-e1b0-83e8-ab39-820338fd0d56>. Pro is working; no
+  response, patch, or conclusion has yet been accepted.
+
+### 2026-08-20 — ChatGPT Pro delivery and final #45 validation
+
+- Downloaded and independently verified Pro's 153,252-byte delivery ZIP, report, patch, replacements,
+  member manifest, and sidecars. The ZIP SHA-256 is
+  `7ea08f2c86352047c0b714d10049bff513ce9a541b4627b74f97fb542013a43e`.
+- Replayed the patch in a disposable source copy and verified all 11 replacement post-images. Did
+  not copy the replacement tree wholesale because it would regress newer #44 financial validation.
+- Implemented the compatible Registry, activation, administrator operation, audit, idempotency,
+  pagination, privacy, and RPC behavior. Independent follow-up fixed bounded Unicode fallback,
+  double-ended prefix-index SQL, malformed Registration Fact tests, and narrow negative-test error
+  isolation.
+- Final specification, standards, and security reviews found no actionable P0-P3 issue and no
+  reportable security finding. The final security snapshot covered 31/31 code/config files.
+- Repeated the complete repository gates with exact CI tools: Node 24.19.0, pnpm 11.17.0, and
+  Wrangler 4.119.0. Frozen install, lint, build, root test, and `git diff --check` all exited 0. Root
+  test reported 1,643 pass / 7 skip / 0 fail.
+- The exact-toolchain release dry-run produced 19 Workers / 85 modules / 33 asset blobs / 28,364,275
+  bytes. Manifest SHA-256:
+  `c585f8c2ca0fd5f8ec6642c71d06f484483ed342123f1d9bd12a88852faab2ff`; aggregate SHA-256:
+  `a6edf1d5c5481771bda877a1f0f01f59773ba51f07c344e7236889cbc95e311e`.
+- Full evidence and limitations are in `ISSUE-45-VERIFICATION.md`. #45 remains open because #43 is
+  open and all accepted implementation changes remain local, uncommitted, and unpushed under the
+  User's authority boundary.

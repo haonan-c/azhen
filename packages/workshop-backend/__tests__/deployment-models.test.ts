@@ -2,6 +2,11 @@ import { env, runInDurableObject } from "cloudflare:test";
 import type { AiModelConfig } from "@gadgets/workshop-shared/api";
 import { describe, expect, it, vi } from "vitest";
 import { AdminApiImpl, type AdminSettings } from "../src/admin-settings.js";
+import type {UserDurableObject} from "../src/user.js";
+
+const users = (env as unknown as {
+  TEST_USER: DurableObjectNamespace<UserDurableObject>;
+}).TEST_USER;
 
 const CONFIG: AiModelConfig = {
   provider: "anthropic",
@@ -16,8 +21,8 @@ describe("Deployment Model Catalog", () => {
       TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
     };
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
-    const admin = new AdminApiImpl(settings, "admin@example.com");
-    const otherAdmin = new AdminApiImpl(settings, "other-admin@example.com");
+    const admin = new AdminApiImpl(settings, "admin@example.com", users);
+    const otherAdmin = new AdminApiImpl(settings, "other-admin@example.com", users);
 
     await admin.addDeploymentModel("Friendly Sonnet", CONFIG);
 
@@ -60,7 +65,7 @@ describe("Deployment Model Catalog", () => {
       TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
     };
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
-    const admin = new AdminApiImpl(settings, "admin@example.com");
+    const admin = new AdminApiImpl(settings, "admin@example.com", users);
 
     await admin.addDeploymentModel("Primary", CONFIG);
     await admin.addDeploymentModel("Fallback", {...CONFIG, model: "claude-haiku-4-5"});
@@ -115,7 +120,7 @@ describe("Deployment Model Catalog", () => {
       TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
     };
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName(`test-${crypto.randomUUID()}`);
-    const admin = new AdminApiImpl(settings, "admin@example.com");
+    const admin = new AdminApiImpl(settings, "admin@example.com", users);
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
 
     try {

@@ -1,7 +1,7 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
-import { RpcTarget } from 'capnweb';
+import { RpcStub, RpcTarget } from 'capnweb';
 import { validateRpc } from 'capnweb-validate';
 import { collection, createTypedStorage } from '@gadgets/typed-storage';
 import { createWorkshopLogger } from "./observability";
@@ -15,6 +15,11 @@ import { formatBlueprintsManifestVersion, installFormatBlueprints } from './form
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
 import { getAiGatewayConfig } from './ai-gateway.js';
 import { UsageRateRegistry, validateUsageRateChangeReason } from './usage-rates.js';
+import {
+  UsageUserRegistry,
+  type ResolvedUsageUser,
+} from './usage-user-registry.js';
+import type {UsageUserRegistrationFact} from './usage-account.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -84,6 +89,7 @@ type AdminSettingsStorage = ReturnType<typeof makeAdminSettingsStorage>;
 export class AdminSettings extends DurableObject<Cloudflare.Env> {
   private storage: AdminSettingsStorage;
   private usageRates: UsageRateRegistry;
+  private usageUsers: UsageUserRegistry;
   private users: DurableObjectNamespace<UserDurableObject>;
   // Every bound gatekeeper, keyed by vendor id. Deployment-global (from env bindings), so admin
   // resource listing needs no user context.
@@ -100,6 +106,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
     this.storage = makeAdminSettingsStorage(ctx.storage);
     this.usageRates = new UsageRateRegistry(ctx.storage);
+    this.usageUsers = new UsageUserRegistry(ctx.storage);
     this.users = this.ctx.exports.UserDurableObject;
     this.vendors = buildGatekeeperVendorMap(env);
   }
@@ -324,6 +331,22 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   issueGatekeeperChargeSnapshot(
       vendorId: string, billingMethodKey: string): GatekeeperChargeSnapshot {
     return this.usageRates.issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
+  }
+
+  /** Idempotently consume one committed User Usage Account registration outbox fact. */
+  registerUsageUser(fact: UsageUserRegistrationFact) {
+    return this.usageUsers.register(fact);
+  }
+
+  /** Search only the authoritative User Registry through its bounded snapshot contract. */
+  searchRegisteredUsageUsers(
+      request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
+    return this.usageUsers.search(request);
+  }
+
+  /** Resolve one opaque registered-User reference for the server-only administrator facade. */
+  resolveRegisteredUsageUser(registeredUserRef: string): ResolvedUsageUser | null {
+    return this.usageUsers.resolve(registeredUserRef);
   }
 
   getDeploymentModelCatalog(): DeploymentModelCatalog {
@@ -770,6 +793,190 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 }
 
+function assertExactRpcObject(
+    value: unknown, requiredKeys: readonly string[], optionalKeys: readonly string[] = []):
+    asserts value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Administrator Usage request is invalid.");
+  }
+  const keys = Object.keys(value);
+  const allowed = new Set([...requiredKeys, ...optionalKeys]);
+  if (requiredKeys.some(key => !keys.includes(key)) || keys.some(key => !allowed.has(key))) {
+    throw new TypeError("Administrator Usage request is invalid.");
+  }
+}
+
+function normalizeRegisteredUserRef(value: unknown): string {
+  if (typeof value !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+    throw new TypeError("Registered User reference is invalid.");
+  }
+  return value;
+}
+
+function normalizeAdminUsageOperationId(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value) ||
+      value === "usage-credit-initial-grant:v1") {
+    throw new TypeError("Administrator operation ID is invalid.");
+  }
+  return value;
+}
+
+function normalizeAdminUsageReason(value: unknown): string {
+  if (typeof value !== "string" || value.length > 1_000 || value.trim().length === 0 ||
+      value.includes("\u0000")) {
+    throw new TypeError("Administrator correction reason is invalid.");
+  }
+  return value.trim();
+}
+
+function normalizeAdminUsageSearchRequest(
+    request: AdminUsageUserSearchRequest): AdminUsageUserSearchRequest {
+  assertExactRpcObject(request, [], ["query", "cursor", "limit"]);
+  return {
+    ...(request.query === undefined ? {} : {query: request.query}),
+    ...(request.cursor === undefined ? {} : {cursor: request.cursor}),
+    ...(request.limit === undefined ? {} : {limit: request.limit}),
+  };
+}
+
+function normalizeAdminUsageGrantRequest(request: AdminUsageGrantRequest): AdminUsageGrantRequest {
+  assertExactRpcObject(
+    request,
+    ["registeredUserRef", "operationId", "amountSubunits", "reason"],
+  );
+  if (typeof request.amountSubunits !== "bigint" || request.amountSubunits <= 0n) {
+    throw new TypeError("Administrator Credit amount must be a positive bigint.");
+  }
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    operationId: normalizeAdminUsageOperationId(request.operationId),
+    amountSubunits: request.amountSubunits,
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
+function normalizeAdminUsageDeductRequest(
+    request: AdminUsageDeductRequest): AdminUsageDeductRequest {
+  return normalizeAdminUsageGrantRequest(request);
+}
+
+function normalizeAdminUsageReconcileRequest(
+    request: AdminUsageReconcileRequest): AdminUsageReconcileRequest {
+  assertExactRpcObject(
+    request,
+    ["registeredUserRef", "operationId", "targetBalanceSubunits", "reason"],
+  );
+  if (typeof request.targetBalanceSubunits !== "bigint") {
+    throw new TypeError("Administrator reconciliation target must be a bigint.");
+  }
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    operationId: normalizeAdminUsageOperationId(request.operationId),
+    targetBalanceSubunits: request.targetBalanceSubunits,
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
+function normalizeAdminUsageReverseRequest(
+    request: AdminUsageReverseRequest): AdminUsageReverseRequest {
+  assertExactRpcObject(
+    request,
+    ["registeredUserRef", "operationId", "originalLedgerEntryId", "reason"],
+  );
+  if (typeof request.originalLedgerEntryId !== "string" ||
+      request.originalLedgerEntryId.length === 0 ||
+      request.originalLedgerEntryId.length > 500 ||
+      hasAsciiControlCharacter(request.originalLedgerEntryId)) {
+    throw new TypeError("Original Credit Ledger Entry identifier is invalid.");
+  }
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    operationId: normalizeAdminUsageOperationId(request.operationId),
+    originalLedgerEntryId: request.originalLedgerEntryId,
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint < 32 || codePoint === 127) return true;
+  }
+  return false;
+}
+
+/** Administrator-only Registry and User Usage Account correction capability. */
+@validateRpc()
+export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
+  constructor(
+      private admin: DurableObjectStub<AdminSettings>,
+      private users: DurableObjectNamespace<UserDurableObject>,
+      private adminUserId: string) {
+    super();
+  }
+
+  searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
+    return this.admin.searchRegisteredUsageUsers(normalizeAdminUsageSearchRequest(request));
+  }
+
+  async grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult> {
+    const normalized = normalizeAdminUsageGrantRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    return user.adminGrantUsageCredits(
+      normalized.operationId,
+      normalized.amountSubunits,
+      normalized.reason,
+      this.adminUserId,
+    );
+  }
+
+  async deduct(request: AdminUsageDeductRequest): Promise<AdminUsageOperationResult> {
+    const normalized = normalizeAdminUsageDeductRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    return user.adminDeductUsageCredits(
+      normalized.operationId,
+      normalized.amountSubunits,
+      normalized.reason,
+      this.adminUserId,
+    );
+  }
+
+  async reconcileBalance(
+      request: AdminUsageReconcileRequest): Promise<AdminUsageOperationResult> {
+    const normalized = normalizeAdminUsageReconcileRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    return user.adminReconcileUsageCreditBalance(
+      normalized.operationId,
+      normalized.targetBalanceSubunits,
+      normalized.reason,
+      this.adminUserId,
+    );
+  }
+
+  async reverse(request: AdminUsageReverseRequest): Promise<AdminUsageOperationResult> {
+    const normalized = normalizeAdminUsageReverseRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    return user.adminReverseUsageCreditEntry(
+      normalized.operationId,
+      normalized.originalLedgerEntryId,
+      normalized.reason,
+      this.adminUserId,
+    );
+  }
+
+  async #resolveUser(
+      registeredUserRef: string): Promise<DurableObjectStub<UserDurableObject>> {
+    const resolved = await this.admin.resolveRegisteredUsageUser(registeredUserRef);
+    if (!resolved) throw new Error("Registered User does not exist.");
+    try {
+      return this.users.get(this.users.idFromString(resolved.userDoId));
+    } catch (error) {
+      throw new Error("Registered User target is invalid.", {cause: error});
+    }
+  }
+}
+
 // Capability for managing deployment-wide admin settings, obtained via
 // AuthenticatedApi.getAdminApi() (which is null for non-admins). The admin access check happens once
 // when the capability is minted in server.ts, so these methods don't re-check. This is a thin
@@ -781,15 +988,23 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 export class AdminApiImpl extends RpcTarget implements AdminApi {
   /**
    * `adminUserId` is the requesting admin's identity. It is forwarded to RBAC-gated gatekeepers
-   * when listing resources and recorded as the actor in Usage Rate audits. It is plain data, not a
-   * user-DO dependency.
+   * when listing resources and recorded as the actor in Usage Rate audits and User Usage Account
+   * corrections. It is plain data, not a User Durable Object dependency.
    */
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
+  constructor(
+      private admin: DurableObjectStub<AdminSettings>,
+      private adminUserId: string,
+      private users: DurableObjectNamespace<UserDurableObject>) {
     super();
   }
 
   getSettings(): Promise<AdminSettingsView> {
     return this.admin.getSettings(this.adminUserId);
+  }
+
+  async getUsageApi(): Promise<RpcStub<AdminUsageApi>> {
+    // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
+    return new AdminUsageApiImpl(this.admin, this.users, this.adminUserId);
   }
 
   getUsageRates(): Promise<UsageRateAdminView> {

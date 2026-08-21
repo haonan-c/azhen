@@ -24,9 +24,17 @@ const TEST_CHARGE_SNAPSHOT: PricedGatekeeperChargeSnapshot = {
   chargeSubunits: 1n,
 };
 
-function newUser() {
-  const id = users.idFromName(`usage-rate-${crypto.randomUUID()}`);
-  return users.get(id);
+async function newUser() {
+  const username = `usage-rate-${crypto.randomUUID()}`;
+  const id = users.idFromName(username);
+  const user = users.get(id);
+  const token = await user.createAccount(
+    username,
+    username,
+    new Uint8Array([8, 6, 4, 2]),
+  );
+  if (token === null) throw new Error("Failed to create Usage Rate test User.");
+  return user;
 }
 
 describe("Usage Rate initial grant connection", () => {
@@ -34,13 +42,14 @@ describe("Usage Rate initial grant connection", () => {
     const admin = new AdminApiImpl(
       testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       "rate-admin@example.com",
+      users,
     );
     const amountSubunits = 2_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const rates = await admin.updateUsageRates(
       [{kind: "initial-grant", amountSubunits}],
       "Increase the grant for future Users",
     );
-    const user = newUser();
+    const user = await newUser();
 
     expect(await user.getUsageCreditBalance()).toEqual({
       availableSubunits: amountSubunits,
@@ -65,13 +74,14 @@ describe("Usage Rate initial grant connection", () => {
     const admin = new AdminApiImpl(
       testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       "rate-admin@example.com",
+      users,
     );
     const grantSubunits = 3_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const rates = await admin.updateUsageRates(
       [{kind: "initial-grant", amountSubunits: grantSubunits}],
       "Increase the grant before the User reserves",
     );
-    const user = newUser();
+    const user = await newUser();
     const held = 100n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
     const reservation = await user.reserveUsageCredits(
@@ -102,7 +112,7 @@ describe("Usage Rate initial grant connection", () => {
 
   it("settles from the reservation snapshot after the current rate changes", async () => {
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const rateA = 10n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const rateB = 20n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const rateVersionA = await admin.updateUsageRates([{
@@ -116,7 +126,7 @@ describe("Usage Rate initial grant connection", () => {
       "snapshot.operation.v1",
     );
     if (snapshotA.pricing !== "priced") throw new Error("Expected the first priced snapshot.");
-    const user = newUser();
+    const user = await newUser();
     const reservation = await user.reserveUsageCredits(
       "snapshot-rate-change",
       rateA,
@@ -169,7 +179,7 @@ describe("Usage Rate initial grant connection", () => {
       throw new Error("Expected an Unpriced Gatekeeper snapshot.");
     }
     const unpriced = issued satisfies UnpricedGatekeeperChargeSnapshot;
-    const user = newUser();
+    const user = await newUser();
 
     const first = await user.recordUnpricedUsageDecision("unpriced-use", unpriced);
     expect(await user.recordUnpricedUsageDecision("unpriced-use", unpriced)).toEqual(first);
@@ -211,7 +221,7 @@ describe("Usage Rate initial grant connection", () => {
     if (issued.pricing !== "unpriced") {
       throw new Error("Expected an Unpriced Cloudflare model snapshot.");
     }
-    const user = newUser();
+    const user = await newUser();
 
     const decision = await user.recordUnpricedUsageDecision(
       "unpriced-cloudflare-model",

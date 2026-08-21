@@ -188,6 +188,28 @@ export function normalizeChargeSnapshot(value: unknown): ChargeSnapshot {
   };
 }
 
+/** Validate and reconstruct one content-free Initial Grant Snapshot. */
+export function normalizeInitialGrantSnapshot(value: unknown): InitialGrantSnapshot {
+  if (typeof value !== "object" || value === null ||
+      !("kind" in value) || value.kind !== "initial-grant" ||
+      !("usageRateVersion" in value) ||
+      typeof value.usageRateVersion !== "bigint" || value.usageRateVersion <= 0n ||
+      !("issuedAt" in value) || !("amountSubunits" in value) ||
+      typeof value.amountSubunits !== "bigint" || value.amountSubunits < 0n) {
+    throw new TypeError("Initial Grant Snapshot is invalid.");
+  }
+  const issuedAt = normalizeCanonicalUtcTimestamp(
+    value.issuedAt,
+    "Initial Grant Snapshot issuance time",
+  );
+  return {
+    kind: "initial-grant",
+    usageRateVersion: value.usageRateVersion,
+    issuedAt,
+    amountSubunits: value.amountSubunits,
+  };
+}
+
 /** Validate and normalize the required administrator reason before crossing a Durable Object RPC. */
 export function validateUsageRateChangeReason(reason: unknown): string {
   return validateRequiredText(reason, "Usage Rate change reason", 1_000);

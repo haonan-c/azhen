@@ -17,8 +17,8 @@ import {
   type UnpricedUsageDecision,
 } from "./usage-account.js";
 import type {
+  AdminUsageOperationResult,
   ChargeSnapshot,
-  InitialGrantSnapshot,
   PricedChargeSnapshot,
   UsageCreditBalance,
 } from "@gadgets/workshop-shared/api";
@@ -298,7 +298,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     this.storage = makeUserStorage(ctx.storage);
-    this.usageAccount = new UsageAccount(ctx.storage);
+    this.usageAccount = new UsageAccount(ctx.storage, () => {
+      if (!this.storage.created.get()) {
+        throw new Error("A User account must exist before its Usage Account can be activated.");
+      }
+      const profile = this.storage.profile.get();
+      return {
+        userDoId: this.ctx.id.toString(),
+        identity: profile.id,
+        displayName: profile.name,
+      };
+    });
     this.adminSettings = this.ctx.exports.AdminSettings;
 
     this.vendors = buildGatekeeperVendorMap(env);
@@ -453,9 +463,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.storage.profile.get();
   }
 
+  /**
+   * Activate this existing User's Usage Account and deliver its stable registration outbox fact.
+   */
+  async activateUsageAccount(): Promise<void> {
+    if (!this.storage.created.get()) {
+      throw new Error("A User account must exist before its Usage Account can be activated.");
+    }
+    const initialGrantSnapshot = this.usageAccount.isInitialized()
+      ? undefined
+      : await this.adminSettings.getByName("").issueInitialGrantSnapshot();
+    const outbox = this.usageAccount.activate(initialGrantSnapshot);
+    if (outbox.deliveredAt !== undefined) return;
+
+    await this.adminSettings.getByName("").registerUsageUser(outbox.fact);
+    this.usageAccount.acknowledgeRegistration(outbox.fact.registrationEventId);
+  }
+
   /** Return this User's authoritative available and reserved Usage Credit balance. */
   async getUsageCreditBalance(): Promise<UsageCreditBalance> {
-    return this.usageAccount.getBalance(await this.#initialGrantSnapshotIfNeeded());
+    await this.activateUsageAccount();
+    return this.usageAccount.getBalance();
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
@@ -463,12 +491,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       amountSubunits: bigint,
       chargeSnapshot: PricedChargeSnapshot): Promise<CreditReservation> {
-    return this.usageAccount.reserve(
-      operationId,
-      amountSubunits,
-      chargeSnapshot,
-      await this.#initialGrantSnapshotIfNeeded(),
-    );
+    await this.activateUsageAccount();
+    return this.usageAccount.reserve(operationId, amountSubunits, chargeSnapshot);
   }
 
   /** Persist one trusted Unpriced Usage decision without changing this User's Credit. */
@@ -476,33 +500,66 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       chargeSnapshot: Extract<ChargeSnapshot, {pricing: "unpriced"}>):
       Promise<UnpricedUsageDecision> {
-    return this.usageAccount.recordUnpricedUsageDecision(
-      operationId,
-      chargeSnapshot,
-      await this.#initialGrantSnapshotIfNeeded(),
-    );
-  }
-
-  async #initialGrantSnapshotIfNeeded(): Promise<InitialGrantSnapshot | undefined> {
-    if (this.usageAccount.isInitialized()) return undefined;
-    return this.adminSettings.getByName("").issueInitialGrantSnapshot();
+    await this.activateUsageAccount();
+    return this.usageAccount.recordUnpricedUsageDecision(operationId, chargeSnapshot);
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */
   async settleUsageCredits(
       operationId: string, amountSubunits: bigint): Promise<CreditReservation> {
-    return this.usageAccount.settle(
-      operationId,
-      amountSubunits,
-      await this.#initialGrantSnapshotIfNeeded(),
-    );
+    await this.activateUsageAccount();
+    return this.usageAccount.settle(operationId, amountSubunits);
   }
 
   /** Release this User's reservation for a trusted internal metering operation. */
   async releaseUsageCredits(operationId: string): Promise<CreditReservation> {
-    return this.usageAccount.release(
+    await this.activateUsageAccount();
+    return this.usageAccount.release(operationId);
+  }
+
+  /** Apply one registered-User administrator grant without calling AdminSettings. */
+  adminGrantUsageCredits(
+      operationId: string,
+      amountSubunits: bigint,
+      reason: string,
+      actorUserId: string): AdminUsageOperationResult {
+    return this.usageAccount.adminGrant(operationId, amountSubunits, reason, actorUserId);
+  }
+
+  /** Apply one registered-User administrator deduction without calling AdminSettings. */
+  adminDeductUsageCredits(
+      operationId: string,
+      amountSubunits: bigint,
+      reason: string,
+      actorUserId: string): AdminUsageOperationResult {
+    return this.usageAccount.adminDeduct(operationId, amountSubunits, reason, actorUserId);
+  }
+
+  /** Apply one registered-User exact balance reconciliation without calling AdminSettings. */
+  adminReconcileUsageCreditBalance(
+      operationId: string,
+      targetBalanceSubunits: bigint,
+      reason: string,
+      actorUserId: string): AdminUsageOperationResult {
+    return this.usageAccount.adminReconcileBalance(
       operationId,
-      await this.#initialGrantSnapshotIfNeeded(),
+      targetBalanceSubunits,
+      reason,
+      actorUserId,
+    );
+  }
+
+  /** Apply one registered-User exact Credit Reversal without calling AdminSettings. */
+  adminReverseUsageCreditEntry(
+      operationId: string,
+      originalLedgerEntryId: string,
+      reason: string,
+      actorUserId: string): AdminUsageOperationResult {
+    return this.usageAccount.adminReverse(
+      operationId,
+      originalLedgerEntryId,
+      reason,
+      actorUserId,
     );
   }
 

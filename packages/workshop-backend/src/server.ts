@@ -573,7 +573,11 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let adminUserId = this.#userId.name!;
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
-    return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId);
+    return new AdminApiImpl(
+      this.adminSettings.getByName(""),
+      adminUserId,
+      this.users,
+    );
   }
 }
 
@@ -657,7 +661,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     }
 
     let userId = this.users.idFromName(split[0]);
-    await this.users.get(userId).authenticate(split[1]);
+    const user = this.users.get(userId);
+    await user.authenticate(split[1]);
+    await user.activateUsageAccount();
     recordAnalytics(this.ctx, this.env, {
       event_name: "user_authenticated",
       user_id: userId.toString(),
@@ -674,8 +680,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     let email = this.accessPayload.email as string;
     let userId = this.users.idFromName(email);
     let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
-    let accountCreated =
-        await this.users.get(userId).authenticateFromCfAccess(email, signupsEnabled);
+    const user = this.users.get(userId);
+    let accountCreated = await user.authenticateFromCfAccess(email, signupsEnabled);
+    await user.activateUsageAccount();
     if (accountCreated) {
       recordAnalytics(this.ctx, this.env, {
         event_name: "account_created",

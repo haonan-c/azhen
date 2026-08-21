@@ -37,6 +37,9 @@ export default defineConfig({
   ],
   test: {
     include: ["__integration__/*.test.ts"],
+    // Registry negative RPCs need a file-scoped unhandled-error policy. The package test script
+    // runs this file separately with vitest.usage-registry-rpc.config.ts.
+    exclude: ["__integration__/usage-registry-rpc.test.ts"],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ["../../test-setup/assert-workerd.ts"],
     // Whichever test runs first pays for workerd booting and instantiating the whole backend

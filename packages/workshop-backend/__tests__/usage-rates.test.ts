@@ -7,6 +7,7 @@ import {
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
 import { AdminApiImpl, type AdminSettings } from "../src/admin-settings.js";
+import type {UserDurableObject} from "../src/user.js";
 import { releasedModelUsageRateCatalog } from "../src/usage-rate-catalog.js";
 import {
   UsageRateRegistry,
@@ -20,6 +21,10 @@ function usageRatesNamespace() {
   };
   return testEnv.TEST_ADMIN_SETTINGS;
 }
+
+const users = (env as unknown as {
+  TEST_USER: DurableObjectNamespace<UserDurableObject>;
+}).TEST_USER;
 
 function newUsageRates() {
   return usageRatesNamespace().getByName(`usage-rates-${crypto.randomUUID()}`);
@@ -167,7 +172,7 @@ describe("Deployment Usage Rates", () => {
     );
     expect(views.every(view => view.current.version === 1n)).toBe(true);
     expect(views.every(view => view.versions.length === 1 && view.audits.length === 0)).toBe(true);
-    const admin = new AdminApiImpl(settings, "restart-admin@example.com");
+    const admin = new AdminApiImpl(settings, "restart-admin@example.com", users);
     const expected = await admin.updateUsageRates(
       [{kind: "report-time-zone", timeZone: "Asia/Kathmandu"}],
       "Persist one changed version across restart",
@@ -321,7 +326,7 @@ describe("Deployment Usage Rates", () => {
 
   it("creates an immutable version and actor-bound audit from one admin change set", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const before = await admin.getUsageRates();
 
     const after = await admin.updateUsageRates([
@@ -406,7 +411,7 @@ describe("Deployment Usage Rates", () => {
 
   it("does not create a version or audit for one valid no-op change set", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const before = await admin.getUsageRates();
 
     const after = await admin.updateUsageRates([
@@ -434,7 +439,7 @@ describe("Deployment Usage Rates", () => {
 
   it("keeps distinct Gatekeeper rate tuples distinct when identifiers contain colons", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
 
     const after = await admin.updateUsageRates([
       {
@@ -460,7 +465,7 @@ describe("Deployment Usage Rates", () => {
 
   it("records only effective members from a mixed change set", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const grantSubunits = 2_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
     const after = await admin.updateUsageRates([
@@ -480,7 +485,7 @@ describe("Deployment Usage Rates", () => {
 
   it("rejects an exact duplicate Gatekeeper tuple without echoing its key", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const before = await admin.getUsageRates();
     const forbiddenSentinel = "forbidden-usage-rate-secret-sentinel";
 
@@ -578,8 +583,8 @@ describe("Deployment Usage Rates", () => {
 
   it("preserves both concurrent administrator patches without a lost update", async () => {
     const settings = newUsageRates();
-    const firstAdmin = new AdminApiImpl(settings, "first-admin@example.com");
-    const secondAdmin = new AdminApiImpl(settings, "second-admin@example.com");
+    const firstAdmin = new AdminApiImpl(settings, "first-admin@example.com", users);
+    const secondAdmin = new AdminApiImpl(settings, "second-admin@example.com", users);
     await firstAdmin.getUsageRates();
     const grantSubunits = 2_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
@@ -664,7 +669,7 @@ describe("Deployment Usage Rates", () => {
 
   it("serializes a model snapshot with a concurrent rate update without mixed fields", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     await admin.getUsageRates();
 
     const [updated, concurrentSnapshot] = await Promise.all([
@@ -731,7 +736,7 @@ describe("Deployment Usage Rates", () => {
       configurationGap: true,
     });
 
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     await admin.updateUsageRates([{
       kind: "gatekeeper-operation-rate",
       vendorId: "github",
@@ -780,7 +785,7 @@ describe("Deployment Usage Rates", () => {
 
   it("changes the future initial grant and one model multiplier without changing other models", async () => {
     const settings = newUsageRates();
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const initialGrantSubunits = 2_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
     const after = await admin.updateUsageRates([
@@ -1168,7 +1173,7 @@ describe("Deployment Usage Rates", () => {
       new UsageRateRegistry(state.storage, () => new Date(firstIssuedAt))
           .issueInitialGrantSnapshot());
 
-    const admin = new AdminApiImpl(settings, "rate-admin@example.com");
+    const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);
     const secondAmount = 2_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     await admin.updateUsageRates(
       [{kind: "initial-grant", amountSubunits: secondAmount}],
