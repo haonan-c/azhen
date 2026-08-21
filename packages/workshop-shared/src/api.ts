@@ -437,6 +437,20 @@ export const createAuthError = authErrors.create;
 /** Reads the machine-readable code from an authentication failure. */
 export const getAuthErrorCode = authErrors.getCode;
 
+/**
+ * Number of exact integer subunits in one Usage Credit. The 10^18 scale keeps amounts exact even
+ * when later metering applies very small provider rates.
+ */
+export const USAGE_CREDIT_SUBUNITS_PER_CREDIT = 1_000_000_000_000_000_000n;
+
+/** The authenticated User's authoritative Usage Credit balance. */
+export type UsageCreditBalance = {
+  /** Credit that can be reserved for new Metered Use, in exact integer subunits. */
+  availableSubunits: bigint;
+  /** Credit currently held by active Credit Reservations, in exact integer subunits. */
+  reservedSubunits: bigint;
+};
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
@@ -463,6 +477,9 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Resolve UI feature flags for the authenticated user. */
   getUiFeatureFlags(): Promise<UiFeatureFlags>;
+
+  /** Get the logged-in User's available and reserved Usage Credit balances. */
+  getUsageCreditBalance(): Promise<UsageCreditBalance>;
 
   /**
    * Get the user's preferred model, chosen during onboarding. Returns null if the user has not

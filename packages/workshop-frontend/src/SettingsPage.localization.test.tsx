@@ -9,20 +9,29 @@ const testState = vi.hoisted(() => ({
   addToast: vi.fn<(toast: unknown) => void>(),
   whoami: vi.fn<() => Promise<{ id: string; name: string }>>(),
   hasPasswordLogin: vi.fn<() => Promise<boolean>>(),
+  getUsageCreditBalance: vi.fn<() => Promise<{
+    availableSubunits: bigint;
+    reservedSubunits: bigint;
+  }>>(async () => ({
+    availableSubunits: 1_000_000_000_000_000_000_000n,
+    reservedSubunits: 0n,
+  })),
 }))
 
 vi.mock('@cloudflare/kumo', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@cloudflare/kumo')>()),
   useKumoToastManager: () => ({ add: testState.addToast }),
 }))
-vi.mock('./AuthContext', () => ({
-  useAuthenticatedApi: () => ({
-    authenticatedApi: {
-      whoami: testState.whoami,
-      hasPasswordLogin: testState.hasPasswordLogin,
-    },
-  }),
-}))
+vi.mock('./AuthContext', () => {
+  const authenticatedApi = {
+    whoami: testState.whoami,
+    hasPasswordLogin: testState.hasPasswordLogin,
+    getUsageCreditBalance: testState.getUsageCreditBalance,
+  }
+  return {
+    useAuthenticatedApi: () => ({ authenticatedApi }),
+  }
+})
 vi.mock('./ServerConfigContext', () => ({
   useCloudflareLimitsEnabled: () => false,
 }))

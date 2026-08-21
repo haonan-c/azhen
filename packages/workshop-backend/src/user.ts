@@ -11,6 +11,8 @@ import type { AdminSettings, DeploymentModelRecord } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { UsageAccount, type CreditReservation } from "./usage-account.js";
+import type { UsageCreditBalance } from "@gadgets/workshop-shared/api";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -271,6 +273,7 @@ async function checkGatekeeperVendorFilter(
 /** Durable Object that stores information about a user. */
 export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private storage: UserStorage;
+  private usageAccount: UsageAccount;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
 
@@ -286,6 +289,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     this.storage = makeUserStorage(ctx.storage);
+    this.usageAccount = new UsageAccount(ctx.storage);
     this.adminSettings = this.ctx.exports.AdminSettings;
 
     this.vendors = buildGatekeeperVendorMap(env);
@@ -438,6 +442,28 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async whoami(): Promise<AiChatAuthorInfo> {
     return this.storage.profile.get();
+  }
+
+  /** Return this User's authoritative available and reserved Usage Credit balance. */
+  async getUsageCreditBalance(): Promise<UsageCreditBalance> {
+    return this.usageAccount.getBalance();
+  }
+
+  /** Reserve this User's Usage Credit for a trusted internal metering operation. */
+  async reserveUsageCredits(
+      operationId: string, amountSubunits: bigint): Promise<CreditReservation> {
+    return this.usageAccount.reserve(operationId, amountSubunits);
+  }
+
+  /** Settle this User's reservation for a trusted internal metering operation. */
+  async settleUsageCredits(
+      operationId: string, amountSubunits: bigint): Promise<CreditReservation> {
+    return this.usageAccount.settle(operationId, amountSubunits);
+  }
+
+  /** Release this User's reservation for a trusted internal metering operation. */
+  async releaseUsageCredits(operationId: string): Promise<CreditReservation> {
+    return this.usageAccount.release(operationId);
   }
 
   /** Like whoami(), but returns null if the account was never initialized. */

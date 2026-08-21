@@ -19,6 +19,7 @@ export default defineConfig({
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_ADMIN_SETTINGS: { className: 'AdminSettings', useSQLite: true },
+          TEST_USER: { className: 'UserDurableObject', useSQLite: true },
         },
       },
     }),

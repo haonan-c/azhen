@@ -132,6 +132,11 @@ The administrator-owned provider, model identity, and credentials that make a De
 available. Non-administrator users cannot view or change it.
 _Avoid_: Model selection, user model settings
 
+**Platform-funded Model Use**:
+Use of a Deployment Model through credentials and provider funds owned by the Workshop Deployment.
+Users cannot supply a model account or provider balance for this use.
+_Avoid_: BYOK, user-funded model use
+
 **Model Selection**:
 A user's choice among the Deployment Models available for a conversation. It does not change a
 model's provider, identity, credentials, or deployment availability.
@@ -141,6 +146,86 @@ _Avoid_: Model setup, model configuration
 An administrator action that makes a Deployment Model unavailable for every later call, including
 calls from existing conversations and applications.
 _Avoid_: Hide model, remove from menu
+
+## Usage and Credits
+
+**Usage Credit (使用额度)**:
+The internal consumable balance that pays for Metered Use. It is separate from reward points and
+from a model provider's external credit balance.
+_Avoid_: 积分, reward point, Cloudflare credit
+
+**Metered Use (计量用量)**:
+An actual model inference or a business operation sent through a Gatekeeper, including automated
+system use. Workshop-internal RPC traffic is operational telemetry, not Metered Use.
+_Avoid_: HTTP request count, internal RPC count
+
+**Billable API Operation (API 计费操作)**:
+One business operation requested through a Gatekeeper. Internal retries, pagination, and HTTP
+requests do not create additional Billable API Operations.
+_Avoid_: HTTP request, RPC request
+
+**Usage Rate (用量费率)**:
+The rule that converts Metered Use into a Usage Credit deduction. Model use follows the provider's
+official token rates with a deployment multiplier; API use has a rate for each Gatekeeper method.
+_Avoid_: Provider invoice, reward rate
+
+**Credit Conversion Rate (额度换算率)**:
+The deployment-wide number of Usage Credits represented by one US dollar of metered cost.
+_Avoid_: Exchange rate, pricing multiplier
+
+**Charge Snapshot (计费快照)**:
+The Usage Rate, pricing multiplier, and Credit Conversion Rate that apply to one Usage Record.
+Later pricing changes do not change a Charge Snapshot.
+_Avoid_: Current price, provider invoice
+
+**Usage Charge (用量扣费)**:
+A Usage Credit deduction recorded in the Credit Ledger for Metered Use. New Metered Use is blocked
+when the Usage Principal has insufficient Usage Credit.
+_Avoid_: Provider charge, simulated charge
+
+**Unpriced Use (未定价用量)**:
+Metered Use for which no Usage Rate exists. It is recorded but creates no Usage Charge.
+_Avoid_: Free tier, failed use
+
+**Usage Record (用量记录)**:
+A statement of one Metered Use attributed to its Usage Principal and relevant Workshop context.
+It is separate from the balance change that the use may cause.
+_Avoid_: 额度流水, request log
+
+**Metering Attempt (计量尝试)**:
+The lifecycle record for an attempt to begin Metered Use, from reservation through start and a
+terminal result. It may end before Metered Use occurs and is therefore not a Usage Record.
+_Avoid_: Usage Record, request log
+
+**Usage Summary Fact (用量汇总事实)**:
+A content-free aggregate for one canonical UTC time bucket and set of reporting dimensions,
+retained to rebuild deployment reports. It is not an event detail and is not authoritative for a
+User's balance or Credit Ledger.
+_Avoid_: Usage Record, analytics event, Credit Ledger Entry
+
+**Usage Source (用量来源)**:
+The origin of Metered Use, such as an Agent conversation, a Gadget, system assistance for a
+Workspace, or an automated task.
+_Avoid_: Usage Principal, Gatekeeper
+
+**Credit Ledger Entry (额度流水)**:
+A statement of one change to a User's Usage Credit balance, such as a grant, deduction, adjustment,
+or reversal. It is separate from the Usage Record that may explain the change.
+_Avoid_: 用量记录, provider invoice
+
+**Credit Reversal (额度冲正)**:
+A Credit Ledger Entry that offsets an incorrect earlier entry while preserving the original entry.
+_Avoid_: Delete charge, refund for result quality
+
+**Credit Reservation (额度预留)**:
+Usage Credit held before Metered Use begins and later settled against its confirmed charge or
+released. It is not a Credit Ledger deduction.
+_Avoid_: Credit deduction, estimated charge
+
+**Usage Principal (用量主体)**:
+The User responsible for Metered Use. Direct use belongs to the initiating User; automated use
+belongs to the owner of its Workspace.
+_Avoid_: Workspace owner for all use, request caller
 
 ## Chinese UI Language
 

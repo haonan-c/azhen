@@ -10,7 +10,7 @@
     "pretypes:check": "pnpm paraglide:compile",
     "types:check": "tsc --noEmit",
     "pretest": "pnpm paraglide:compile",
-    "test": "vitest run",
+    "test": "vitest run --exclude '**/first-party-copy.test.mjs' && vitest run first-party-copy.test.mjs --maxWorkers=1",
     "preview": "vite preview",
     "clean": "rm -rf dist"
   },
