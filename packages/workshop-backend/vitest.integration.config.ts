@@ -6,6 +6,11 @@ const EXPECTED_OPEN_ERROR_CODES = new Set([
   "WORKSPACE_NOT_FOUND",
   "WORKSPACE_ACCESS_DENIED",
 ]);
+const EXPECTED_USAGE_RATE_ERROR_MESSAGES = new Set([
+  "Usage Rate change reason must be a non-empty string of at most 1000 characters.",
+  "Model identifier must be a stable provider model identifier of at most 200 characters.",
+  "Usage Rate change key appears more than once.",
+]);
 
 export default defineConfig({
   esbuild: {
@@ -47,6 +52,9 @@ export default defineConfig({
       // Cap'n Web also reports the rejected future capability independently from the awaited
       // revoked-model call asserted by the Deployment Model RPC test.
       if (code === "DEPLOYMENT_MODEL_UNAVAILABLE") return false;
+      // Cap'n Web reports the rejected AdminApi call independently from the rejection that the
+      // Usage Rate RPC test awaits and checks exactly.
+      if (EXPECTED_USAGE_RATE_ERROR_MESSAGES.has(error.message)) return false;
       // The reset-recovery tests abort every Durable Object mid-session; capabilities that were
       // held across the abort (e.g. the fire-and-forget AdminSettings install kicked off by the
       // fetch handler) reject on their own schedule, independent of any awaited call.

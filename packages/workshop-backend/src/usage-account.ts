@@ -1,13 +1,19 @@
 import {
-  USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+  type ChargeSnapshot,
+  type InitialGrantSnapshot,
+  type PricedChargeSnapshot,
   type UsageCreditBalance,
 } from "@gadgets/workshop-shared/api";
+import {
+  normalizeCanonicalUtcTimestamp,
+  normalizeChargeSnapshot,
+} from "./usage-rates.js";
 
 const LEDGER_PREFIX = "usageAccount:ledger:";
 const RESERVATION_PREFIX = "usageAccount:reservation:";
+const UNPRICED_DECISION_PREFIX = "usageAccount:unpricedDecision:";
 const TOTALS_KEY = "usageAccount:totals:v1";
 const INITIAL_GRANT_ID = "usage-credit-initial-grant:v1";
-const INITIAL_GRANT_SUBUNITS = 1_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
 type TransactionResult<T> = { value: T } | { error: Error };
 
@@ -16,19 +22,30 @@ type UsageAccountTotals = {
   reservedSubunits: bigint;
 };
 
+type UnpricedChargeSnapshot = Extract<ChargeSnapshot, {pricing: "unpriced"}>;
+
 /** One immutable statement of a change to a User's Usage Credit balance. */
 export type CreditLedgerEntry = {
   id: string;
   operationId: string;
-  kind: "initial-grant" | "usage-charge";
   deltaSubunits: bigint;
   createdAt: string;
-};
+} & (
+  | {
+      kind: "initial-grant";
+      initialGrantSnapshot: InitialGrantSnapshot;
+    }
+  | {
+      kind: "usage-charge";
+      initialGrantSnapshot?: never;
+    }
+);
 
 /** One durable Credit Reservation and its terminal idempotency result. */
 export type CreditReservation = {
   operationId: string;
   amountSubunits: bigint;
+  chargeSnapshot: PricedChargeSnapshot;
   state: "reserved" | "settled" | "released";
   createdAt: string;
   settledAmountSubunits?: bigint;
@@ -37,11 +54,22 @@ export type CreditReservation = {
   releasedAt?: string;
 };
 
+/** One durable zero-charge pricing decision for an Unpriced Metered Use. */
+export type UnpricedUsageDecision = {
+  /** Stable trusted operation identity. */
+  operationId: string;
+  /** Immutable zero-charge snapshot and visible configuration gap. */
+  chargeSnapshot: UnpricedChargeSnapshot;
+  /** Canonical UTC time when the User Usage Account persisted the decision. */
+  createdAt: string;
+};
+
 /** Reconciled authoritative state returned to internal callers and focused tests. */
 export type UsageAccountSnapshot = UsageCreditBalance & {
   ledgerBalanceSubunits: bigint;
   ledgerEntries: CreditLedgerEntry[];
   reservations: CreditReservation[];
+  unpricedUsageDecisions: UnpricedUsageDecision[];
 };
 
 /**
@@ -50,10 +78,23 @@ export type UsageAccountSnapshot = UsageCreditBalance & {
 export class UsageAccount {
   constructor(private readonly storage: DurableObjectStorage) {}
 
+  /** Return whether this account already has its singular initial grant and matching totals. */
+  isInitialized(): boolean {
+    const grant = this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + INITIAL_GRANT_ID);
+    const totals = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+    if (grant === undefined && totals === undefined) return false;
+    if (grant === undefined || totals === undefined) {
+      throw new Error("Usage Credit initial grant and totals do not reconcile.");
+    }
+    assertInitialGrant(grant);
+    assertUsageAccountTotals(totals);
+    return true;
+  }
+
   /** Return authoritative balances, lazily creating the versioned initial grant exactly once. */
-  getBalance(): UsageCreditBalance {
+  getBalance(initialGrantSnapshot?: InitialGrantSnapshot): UsageCreditBalance {
     return this.storage.transactionSync(() => {
-      const totals = this.ensureInitialGrant();
+      const totals = this.ensureInitialGrant(initialGrantSnapshot);
       return {
         availableSubunits: totals.ledgerBalanceSubunits - totals.reservedSubunits,
         reservedSubunits: totals.reservedSubunits,
@@ -70,9 +111,13 @@ export class UsageAccount {
   }
 
   /** Atomically reserve positive Credit for one stable operation ID. */
-  reserve(operationId: string, amountSubunits: bigint): CreditReservation {
+  reserve(
+      operationId: string,
+      amountSubunits: bigint,
+      chargeSnapshot: PricedChargeSnapshot,
+      initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
     const result = this.storage.transactionSync<TransactionResult<CreditReservation>>(() => {
-      const totals = this.ensureInitialGrant();
+      const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
       if (typeof amountSubunits !== "bigint" || amountSubunits <= 0n) {
@@ -80,13 +125,29 @@ export class UsageAccount {
           error: new TypeError("A Credit Reservation amount must be a positive bigint."),
         };
       }
+      let normalizedChargeSnapshot: PricedChargeSnapshot;
+      try {
+        const normalized = normalizeChargeSnapshot(chargeSnapshot);
+        if (normalized.pricing !== "priced") {
+          throw new TypeError("A Credit Reservation requires a priced Charge Snapshot.");
+        }
+        normalizedChargeSnapshot = normalized;
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
 
       const key = RESERVATION_PREFIX + operationId;
+      if (this.storage.kv.get(UNPRICED_DECISION_PREFIX + operationId) !== undefined) {
+        return {
+          error: new Error("Operation ID already records an Unpriced Usage decision."),
+        };
+      }
       const existing = this.storage.kv.get<CreditReservation>(key);
-      if (existing) {
-        if (existing.amountSubunits !== amountSubunits) {
+      if (existing !== undefined) {
+        if (existing.amountSubunits !== amountSubunits ||
+            !chargeSnapshotsEqual(existing.chargeSnapshot, normalizedChargeSnapshot)) {
           return {
-            error: new Error("Operation ID already used with a different reservation amount."),
+            error: new Error("Operation ID already used with different reservation inputs."),
           };
         }
         this.assertStoredReservationConsistency(existing, operationId);
@@ -100,6 +161,7 @@ export class UsageAccount {
       const reservation: CreditReservation = {
         operationId,
         amountSubunits,
+        chargeSnapshot: normalizedChargeSnapshot,
         state: "reserved",
         createdAt: new Date().toISOString(),
       };
@@ -113,10 +175,64 @@ export class UsageAccount {
     return unwrapTransactionResult(result);
   }
 
+  /** Persist one explicit zero-charge Unpriced decision without changing Credit totals. */
+  recordUnpricedUsageDecision(
+      operationId: string,
+      chargeSnapshot: UnpricedChargeSnapshot,
+      initialGrantSnapshot?: InitialGrantSnapshot): UnpricedUsageDecision {
+    const result = this.storage.transactionSync<TransactionResult<UnpricedUsageDecision>>(() => {
+      this.ensureInitialGrant(initialGrantSnapshot);
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+
+      let normalizedChargeSnapshot: UnpricedChargeSnapshot;
+      try {
+        const normalized = normalizeChargeSnapshot(chargeSnapshot);
+        if (normalized.pricing !== "unpriced") {
+          throw new TypeError("An Unpriced Usage decision requires an Unpriced Charge Snapshot.");
+        }
+        normalizedChargeSnapshot = normalized;
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      if (this.storage.kv.get(RESERVATION_PREFIX + operationId) !== undefined) {
+        return {error: new Error("Operation ID already records a priced Credit Reservation.")};
+      }
+      const key = UNPRICED_DECISION_PREFIX + operationId;
+      const existing = this.storage.kv.get<UnpricedUsageDecision>(key);
+      if (existing !== undefined) {
+        try {
+          assertUnpricedUsageDecision(existing, operationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        if (!chargeSnapshotsEqual(existing.chargeSnapshot, normalizedChargeSnapshot)) {
+          return {
+            error: new Error("Operation ID already records a different Unpriced Usage decision."),
+          };
+        }
+        return {value: existing};
+      }
+
+      const decision: UnpricedUsageDecision = {
+        operationId,
+        chargeSnapshot: normalizedChargeSnapshot,
+        createdAt: new Date().toISOString(),
+      };
+      this.storage.kv.put(key, decision);
+      return {value: decision};
+    });
+    return unwrapTransactionResult(result);
+  }
+
   /** Atomically settle a reservation and append its immutable Usage Charge entry. */
-  settle(operationId: string, settledAmountSubunits: bigint): CreditReservation {
+  settle(
+      operationId: string,
+      settledAmountSubunits: bigint,
+      initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
     const result = this.storage.transactionSync<TransactionResult<CreditReservation>>(() => {
-      const totals = this.ensureInitialGrant();
+      const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
       if (typeof settledAmountSubunits !== "bigint" || settledAmountSubunits < 0n) {
@@ -182,9 +298,11 @@ export class UsageAccount {
   }
 
   /** Atomically release a reservation without changing the immutable Credit Ledger. */
-  release(operationId: string): CreditReservation {
+  release(
+      operationId: string,
+      initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
     const result = this.storage.transactionSync<TransactionResult<CreditReservation>>(() => {
-      const totals = this.ensureInitialGrant();
+      const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
 
@@ -216,7 +334,7 @@ export class UsageAccount {
     return unwrapTransactionResult(result);
   }
 
-  private ensureInitialGrant(): UsageAccountTotals {
+  private ensureInitialGrant(snapshot?: InitialGrantSnapshot): UsageAccountTotals {
     const key = LEDGER_PREFIX + INITIAL_GRANT_ID;
     const existingGrant = this.storage.kv.get<CreditLedgerEntry>(key);
     const existingTotals = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
@@ -232,12 +350,19 @@ export class UsageAccount {
       throw new Error("Usage Credit totals exist without the initial grant.");
     }
 
+    if (snapshot === undefined) {
+      throw new Error("An Initial Grant Snapshot is required for a new Usage Account.");
+    }
+    const createdAt = new Date().toISOString();
+    const initialGrantSnapshot = snapshot;
+    assertInitialGrantSnapshot(initialGrantSnapshot);
     const entry: CreditLedgerEntry = {
       id: INITIAL_GRANT_ID,
       operationId: INITIAL_GRANT_ID,
       kind: "initial-grant",
-      deltaSubunits: INITIAL_GRANT_SUBUNITS,
-      createdAt: new Date().toISOString(),
+      deltaSubunits: initialGrantSnapshot.amountSubunits,
+      createdAt,
+      initialGrantSnapshot: structuredClone(initialGrantSnapshot),
     };
     const totals: UsageAccountTotals = {
       ledgerBalanceSubunits: entry.deltaSubunits,
@@ -266,7 +391,15 @@ export class UsageAccount {
       this.storage.kv.list<CreditReservation>({ prefix: RESERVATION_PREFIX }),
     );
     const reservations = reservationRecords.map(([, reservation]) => reservation);
-    assertTerminalRecordsReconcile(ledgerRecords, reservationRecords);
+    const unpricedDecisionRecords = Array.from(
+      this.storage.kv.list<UnpricedUsageDecision>({prefix: UNPRICED_DECISION_PREFIX}),
+    );
+    const unpricedUsageDecisions = unpricedDecisionRecords.map(([, decision]) => decision);
+    assertTerminalRecordsReconcile(
+      ledgerRecords,
+      reservationRecords,
+      unpricedDecisionRecords,
+    );
     const reconciledLedgerBalanceSubunits = ledgerEntries.reduce(
       (total, entry) => total + entry.deltaSubunits,
       0n,
@@ -288,6 +421,7 @@ export class UsageAccount {
       ledgerBalanceSubunits: totals.ledgerBalanceSubunits,
       ledgerEntries,
       reservations,
+      unpricedUsageDecisions,
     };
   }
 }
@@ -295,6 +429,7 @@ export class UsageAccount {
 function assertTerminalRecordsReconcile(
   ledgerRecords: [string, CreditLedgerEntry][],
   reservationRecords: [string, CreditReservation][],
+  unpricedDecisionRecords: [string, UnpricedUsageDecision][],
 ): void {
   const ledgerById = new Map<string, CreditLedgerEntry>();
   let initialGrantCount = 0;
@@ -339,6 +474,19 @@ function assertTerminalRecordsReconcile(
       throw new Error("Usage Credit Ledger contains an orphan Usage Charge.");
     }
   }
+
+  const reservationOperationIds = new Set(
+    reservationRecords.map(([, reservation]) => reservation.operationId),
+  );
+  for (const [key, decision] of unpricedDecisionRecords) {
+    if (key !== UNPRICED_DECISION_PREFIX + decision.operationId) {
+      throw new Error("Unpriced Usage decision identity does not reconcile.");
+    }
+    assertUnpricedUsageDecision(decision, decision.operationId);
+    if (reservationOperationIds.has(decision.operationId)) {
+      throw new Error("One operation cannot be both priced and Unpriced.");
+    }
+  }
 }
 
 function chargeLedgerEntryId(operationId: string): string {
@@ -350,11 +498,31 @@ function assertInitialGrant(entry: CreditLedgerEntry): void {
     entry.id !== INITIAL_GRANT_ID ||
     entry.operationId !== INITIAL_GRANT_ID ||
     entry.kind !== "initial-grant" ||
-    entry.deltaSubunits !== INITIAL_GRANT_SUBUNITS ||
     typeof entry.createdAt !== "string" ||
     entry.createdAt.length === 0
   ) {
     throw new Error("Usage Credit initial grant does not reconcile.");
+  }
+  assertInitialGrantSnapshot(entry.initialGrantSnapshot);
+  if (entry.deltaSubunits !== entry.initialGrantSnapshot.amountSubunits) {
+    throw new Error("Usage Credit initial grant does not reconcile.");
+  }
+}
+
+function assertInitialGrantSnapshot(snapshot: InitialGrantSnapshot): void {
+  if (
+    typeof snapshot !== "object" || snapshot === null ||
+    snapshot.kind !== "initial-grant" ||
+    typeof snapshot.usageRateVersion !== "bigint" || snapshot.usageRateVersion <= 0n ||
+    typeof snapshot.issuedAt !== "string" ||
+    typeof snapshot.amountSubunits !== "bigint" || snapshot.amountSubunits < 0n
+  ) {
+    throw new Error("Initial Usage Credit grant snapshot is invalid.");
+  }
+  try {
+    normalizeCanonicalUtcTimestamp(snapshot.issuedAt, "Initial Grant Snapshot issuance time");
+  } catch {
+    throw new Error("Initial Usage Credit grant snapshot is invalid.");
   }
 }
 
@@ -383,6 +551,13 @@ function assertReservationLedgerConsistency(
     typeof reservation.createdAt !== "string" ||
     reservation.createdAt.length === 0
   ) {
+    throw new Error("Usage Credit Reservation does not reconcile.");
+  }
+  try {
+    if (normalizeChargeSnapshot(reservation.chargeSnapshot).pricing !== "priced") {
+      throw new TypeError("Credit Reservation snapshot is not priced.");
+    }
+  } catch {
     throw new Error("Usage Credit Reservation does not reconcile.");
   }
 
@@ -442,6 +617,23 @@ function assertReservationLedgerConsistency(
   }
 }
 
+function assertUnpricedUsageDecision(
+    decision: UnpricedUsageDecision,
+    expectedOperationId: string): void {
+  if (operationIdValidationError(expectedOperationId) !== undefined ||
+      decision.operationId !== expectedOperationId ||
+      typeof decision.createdAt !== "string" || decision.createdAt.length === 0) {
+    throw new Error("Unpriced Usage decision does not reconcile.");
+  }
+  try {
+    if (normalizeChargeSnapshot(decision.chargeSnapshot).pricing !== "unpriced") {
+      throw new TypeError("Unpriced Usage decision snapshot is priced.");
+    }
+  } catch {
+    throw new Error("Unpriced Usage decision does not reconcile.");
+  }
+}
+
 function unwrapTransactionResult<T>(result: TransactionResult<T>): T {
   if ("error" in result) throw result.error;
   return result.value;
@@ -455,4 +647,33 @@ function operationIdValidationError(operationId: string): TypeError | undefined 
     return new TypeError("Operation ID is reserved for the initial Usage Credit grant.");
   }
   return undefined;
+}
+
+function chargeSnapshotsEqual(left: ChargeSnapshot, right: ChargeSnapshot): boolean {
+  if (left.kind !== right.kind || left.pricing !== right.pricing ||
+      left.usageRateVersion !== right.usageRateVersion || left.issuedAt !== right.issuedAt) {
+    return false;
+  }
+  if (left.kind === "gatekeeper" && right.kind === "gatekeeper") {
+    return left.vendorId === right.vendorId &&
+      left.billingMethodKey === right.billingMethodKey &&
+      left.chargeSubunits === right.chargeSubunits;
+  }
+  if (left.kind !== "model" || right.kind !== "model") return false;
+  if (left.catalogVersion !== right.catalogVersion || left.provider !== right.provider ||
+      left.model !== right.model) return false;
+  if (left.pricing === "unpriced" && right.pricing === "unpriced") return true;
+  if (left.pricing !== "priced" || right.pricing !== "priced") return false;
+  return left.providerModelVersion === right.providerModelVersion &&
+    left.rateTier === right.rateTier &&
+    left.tokenRates.cacheHitUsdSubunitsPerMillion ===
+      right.tokenRates.cacheHitUsdSubunitsPerMillion &&
+    left.tokenRates.cacheMissUsdSubunitsPerMillion ===
+      right.tokenRates.cacheMissUsdSubunitsPerMillion &&
+    left.tokenRates.outputUsdSubunitsPerMillion ===
+      right.tokenRates.outputUsdSubunitsPerMillion &&
+    left.multiplier.numerator === right.multiplier.numerator &&
+    left.multiplier.denominator === right.multiplier.denominator &&
+    left.creditConversion.numerator === right.creditConversion.numerator &&
+    left.creditConversion.denominator === right.creditConversion.denominator;
 }

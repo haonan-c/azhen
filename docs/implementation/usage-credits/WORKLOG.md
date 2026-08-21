@@ -221,3 +221,24 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   hardening candidates. Copied its canonical artifacts to `.codex-artifacts/usage-credits/`.
 - #43 remains open because the accepted implementation is still an uncommitted local working-tree
   change and the User explicitly prohibited commit and push in this request.
+
+### 2026-08-20 — ChatGPT Pro correction and final #44 validation
+
+- Sent the credential-scanned #44 source archive to ChatGPT Pro and retained the conversation at
+  <https://chatgpt.com/c/6a867aea-aeb0-83e8-b156-157b101ac732>.
+- Source archive baseline: commit `29cfcf62856dee50ed2d681a1e2d137062f2d09c`; 5,380,141 bytes;
+  SHA-256 `eaf9b979f820d0790d99c3626d824bdfda6d1b5fd12c6d6bc56a64da5595966f`.
+- Downloaded and independently audited Pro's 38,042-byte delivery ZIP with SHA-256
+  `a2dc34ac8ebf728624ef260d3ce3b0b4241866d971c9b8af284d9fa8f4598b9e`. Its sidecars,
+  internal member manifest, isolated patch application, and replacement bytes all matched.
+- Reproduced and accepted Pro's three narrow corrections: reject URL-like model identifiers,
+  make duplicate-key errors content-free, and refresh the official pricing verification date.
+- Under Node 24.19.0, final focused workerd tests passed 92/92 and the real local WebSocket/Cap'n Web
+  Usage Rate filter passed 2 tests. Backend full tests, frozen install, workspace lint/build/test,
+  `pnpm lint`, whitespace checks, and a 19-Worker release dry-run all exited 0.
+- Final dry-run evidence: 19 Workers / 85 modules / 33 asset blobs / 28,304,800 bytes; manifest
+  SHA-256 `43f7bb69c08edbec54de78b280a3a287b9155176bee42af1c7ac5e87546145af`;
+  relative-path-NUL-content aggregate
+  `92afb5019e7847bc5e7a3d1c9c18f847b3474ef34bc69ac4d980ad114186b8ee`.
+- #44 remains open: #43 is still open, and the accepted implementation is an uncommitted local
+  working-tree candidate because commit and push are outside the User's granted authority.

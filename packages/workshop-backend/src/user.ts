@@ -11,8 +11,17 @@ import type { AdminSettings, DeploymentModelRecord } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
-import { UsageAccount, type CreditReservation } from "./usage-account.js";
-import type { UsageCreditBalance } from "@gadgets/workshop-shared/api";
+import {
+  UsageAccount,
+  type CreditReservation,
+  type UnpricedUsageDecision,
+} from "./usage-account.js";
+import type {
+  ChargeSnapshot,
+  InitialGrantSnapshot,
+  PricedChargeSnapshot,
+  UsageCreditBalance,
+} from "@gadgets/workshop-shared/api";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -446,24 +455,55 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Return this User's authoritative available and reserved Usage Credit balance. */
   async getUsageCreditBalance(): Promise<UsageCreditBalance> {
-    return this.usageAccount.getBalance();
+    return this.usageAccount.getBalance(await this.#initialGrantSnapshotIfNeeded());
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
   async reserveUsageCredits(
-      operationId: string, amountSubunits: bigint): Promise<CreditReservation> {
-    return this.usageAccount.reserve(operationId, amountSubunits);
+      operationId: string,
+      amountSubunits: bigint,
+      chargeSnapshot: PricedChargeSnapshot): Promise<CreditReservation> {
+    return this.usageAccount.reserve(
+      operationId,
+      amountSubunits,
+      chargeSnapshot,
+      await this.#initialGrantSnapshotIfNeeded(),
+    );
+  }
+
+  /** Persist one trusted Unpriced Usage decision without changing this User's Credit. */
+  async recordUnpricedUsageDecision(
+      operationId: string,
+      chargeSnapshot: Extract<ChargeSnapshot, {pricing: "unpriced"}>):
+      Promise<UnpricedUsageDecision> {
+    return this.usageAccount.recordUnpricedUsageDecision(
+      operationId,
+      chargeSnapshot,
+      await this.#initialGrantSnapshotIfNeeded(),
+    );
+  }
+
+  async #initialGrantSnapshotIfNeeded(): Promise<InitialGrantSnapshot | undefined> {
+    if (this.usageAccount.isInitialized()) return undefined;
+    return this.adminSettings.getByName("").issueInitialGrantSnapshot();
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */
   async settleUsageCredits(
       operationId: string, amountSubunits: bigint): Promise<CreditReservation> {
-    return this.usageAccount.settle(operationId, amountSubunits);
+    return this.usageAccount.settle(
+      operationId,
+      amountSubunits,
+      await this.#initialGrantSnapshotIfNeeded(),
+    );
   }
 
   /** Release this User's reservation for a trusted internal metering operation. */
   async releaseUsageCredits(operationId: string): Promise<CreditReservation> {
-    return this.usageAccount.release(operationId);
+    return this.usageAccount.release(
+      operationId,
+      await this.#initialGrantSnapshotIfNeeded(),
+    );
   }
 
   /** Like whoami(), but returns null if the account was never initialized. */

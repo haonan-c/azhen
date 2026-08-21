@@ -2,12 +2,22 @@ import { exports } from "cloudflare:workers";
 import { newWebSocketRpcSession, type RpcStub } from "capnweb";
 import {
   USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+  type PricedGatekeeperChargeSnapshot,
   type PublicApi,
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
 
 const PASSWORD_HASH = new Uint8Array([4, 3, 2, 1]);
 const INITIAL_BALANCE = 1_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
+const TEST_CHARGE_SNAPSHOT: PricedGatekeeperChargeSnapshot = {
+  kind: "gatekeeper",
+  pricing: "priced",
+  usageRateVersion: 1n,
+  issuedAt: "2026-08-19T15:00:00.000Z",
+  vendorId: "test",
+  billingMethodKey: "test.operation.v1",
+  chargeSubunits: 1n,
+};
 
 async function connect(): Promise<RpcStub<PublicApi>> {
   const response = await exports.default.fetch(new Request("https://workshop.invalid/api", {
@@ -46,7 +56,8 @@ describe("Usage Account across Cap'n Web", () => {
     const firstUser = exports.UserDurableObject.get(
       exports.UserDurableObject.idFromName(firstAccount.username),
     );
-    await firstUser.reserveUsageCredits("rpc-isolation-hold", held);
+    await firstUser.reserveUsageCredits(
+      "rpc-isolation-hold", held, TEST_CHARGE_SNAPSHOT);
 
     await expect(first.getUsageCreditBalance()).resolves.toEqual({
       availableSubunits: INITIAL_BALANCE - held,

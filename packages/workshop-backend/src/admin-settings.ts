@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -14,6 +14,7 @@ import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
 import { getAiGatewayConfig } from './ai-gateway.js';
+import { UsageRateRegistry, validateUsageRateChangeReason } from './usage-rates.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -82,6 +83,7 @@ type AdminSettingsStorage = ReturnType<typeof makeAdminSettingsStorage>;
  */
 export class AdminSettings extends DurableObject<Cloudflare.Env> {
   private storage: AdminSettingsStorage;
+  private usageRates: UsageRateRegistry;
   private users: DurableObjectNamespace<UserDurableObject>;
   // Every bound gatekeeper, keyed by vendor id. Deployment-global (from env bindings), so admin
   // resource listing needs no user context.
@@ -97,6 +99,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     super(ctx, env);
 
     this.storage = makeAdminSettingsStorage(ctx.storage);
+    this.usageRates = new UsageRateRegistry(ctx.storage);
     this.users = this.ctx.exports.UserDurableObject;
     this.vendors = buildGatekeeperVendorMap(env);
   }
@@ -294,6 +297,33 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   getAdminConfig(): AdminConfig {
     return this.#config();
+  }
+
+  /** Return the current deployment Usage Rates and their immutable history. */
+  getUsageRates(): UsageRateAdminView {
+    return this.usageRates.getAdminView();
+  }
+
+  /** Atomically apply effective Usage Rate changes and bind any new audit to the administrator. */
+  updateUsageRates(
+      changes: UsageRateChange[], reason: string, actorUserId: string): UsageRateAdminView {
+    return this.usageRates.update(changes, reason, actorUserId);
+  }
+
+  /** Issue the current initial grant as immutable ordinary data for one fresh User. */
+  issueInitialGrantSnapshot(): InitialGrantSnapshot {
+    return this.usageRates.issueInitialGrantSnapshot();
+  }
+
+  /** Issue immutable current model pricing as ordinary data for one trusted Metered Use. */
+  issueModelChargeSnapshot(provider: AiModelProvider, model: string): ModelChargeSnapshot {
+    return this.usageRates.issueModelChargeSnapshot(provider, model);
+  }
+
+  /** Issue immutable current Gatekeeper pricing as ordinary data for one trusted Metered Use. */
+  issueGatekeeperChargeSnapshot(
+      vendorId: string, billingMethodKey: string): GatekeeperChargeSnapshot {
+    return this.usageRates.issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
   }
 
   getDeploymentModelCatalog(): DeploymentModelCatalog {
@@ -746,12 +776,13 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 // validation+forwarding facade over the AdminSettings DO — fully user-independent — so a disabled
 // gatekeeper/resource can't be re-enabled via a crafted request, and the client never receives a
 // stub to the DO's internal methods. Covers branding, agent instructions, signups, and gatekeeper
-// connector/resource availability; authentication config stays env-var driven.
+// connector/resource availability, and Usage Rates; authentication config stays env-var driven.
 @validateRpc()
 export class AdminApiImpl extends RpcTarget implements AdminApi {
   /**
-   * `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
-   * resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
+   * `adminUserId` is the requesting admin's identity. It is forwarded to RBAC-gated gatekeepers
+   * when listing resources and recorded as the actor in Usage Rate audits. It is plain data, not a
+   * user-DO dependency.
    */
   constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
     super();
@@ -759,6 +790,16 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   getSettings(): Promise<AdminSettingsView> {
     return this.admin.getSettings(this.adminUserId);
+  }
+
+  getUsageRates(): Promise<UsageRateAdminView> {
+    return this.admin.getUsageRates();
+  }
+
+  async updateUsageRates(
+      changes: UsageRateChange[], reason: string): Promise<UsageRateAdminView> {
+    const normalizedReason = validateUsageRateChangeReason(reason);
+    return await this.admin.updateUsageRates(changes, normalizedReason, this.adminUserId);
   }
 
   getDeploymentModelCatalog(): Promise<DeploymentModelCatalog> {

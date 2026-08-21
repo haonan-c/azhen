@@ -451,6 +451,298 @@ export type UsageCreditBalance = {
   reservedSubunits: bigint;
 };
 
+/** Number of exact integer rate subunits in one US dollar. */
+export const USD_RATE_SUBUNITS_PER_USD = 1_000_000_000_000_000_000n;
+
+/** A non-negative exact rational number in normalized form. */
+export type ExactRatio = {
+  /** Non-negative numerator. */
+  numerator: bigint;
+  /** Positive denominator. */
+  denominator: bigint;
+};
+
+/** Exact provider prices in USD subunits per one million tokens. */
+export type ModelTokenRates = {
+  /** Price for one million input tokens reported as a provider cache hit. */
+  cacheHitUsdSubunitsPerMillion: bigint;
+  /** Price for one million input tokens not reported as a provider cache hit. */
+  cacheMissUsdSubunitsPerMillion: bigint;
+  /** Price for one million output tokens, including reasoning-token detail. */
+  outputUsdSubunitsPerMillion: bigint;
+};
+
+/** A named tier in one model's daily UTC rate schedule. */
+export type DailyUtcModelRateTier = {
+  /** Stable tier identifier copied into a Charge Snapshot. */
+  id: string;
+  /** Exact token prices for this tier. */
+  tokenRates: ModelTokenRates;
+};
+
+/** One half-open minute range in a daily UTC rate schedule. */
+export type DailyUtcModelRateInterval = {
+  /** UTC minute of day included in this interval, from 0 through 1,439. */
+  startMinuteInclusive: number;
+  /** UTC minute of day excluded from this interval, from 1 through 1,440. */
+  endMinuteExclusive: number;
+  /** Tier selected throughout the interval. */
+  tier: string;
+};
+
+/** A deterministic provider rate schedule that repeats each UTC day. */
+export type DailyUtcModelRateSchedule = {
+  /** Schedule discriminator. */
+  kind: "daily-utc";
+  /** Tier selected when no interval contains the current UTC minute. */
+  defaultTier: string;
+  /** Complete set of named tiers. */
+  tiers: DailyUtcModelRateTier[];
+  /** Non-overlapping half-open UTC minute ranges. */
+  intervals: DailyUtcModelRateInterval[];
+};
+
+/** One model in an immutable deployment Usage Rate version. */
+export type ModelUsageRateCatalogEntry = {
+  /** Provider that accepts the model identifier. */
+  provider: AiModelProvider;
+  /** Stable provider model identifier used by the deployment. */
+  model: string;
+  /** Provider release version represented by this catalog entry. */
+  providerModelVersion: string;
+  /** Exact daily UTC provider-price schedule. */
+  schedule: DailyUtcModelRateSchedule;
+  /** Deployment multiplier applied to the complete provider cost. */
+  multiplier: ExactRatio;
+};
+
+/** One configured fixed Credit rate for a caller-visible Gatekeeper business operation. */
+export type GatekeeperOperationRate = {
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Stable business-method key owned by the Gatekeeper. */
+  billingMethodKey: string;
+  /** Exact Credit charged for one caller-visible operation. */
+  amountSubunits: bigint;
+};
+
+/** One complete immutable deployment Usage Rate version. */
+export type UsageRateVersion = {
+  /** Monotonic version number assigned by the authoritative AdminSettings Durable Object. */
+  version: bigint;
+  /** Canonical UTC time when this version became current. */
+  effectiveAt: string;
+  /** Repository-owned released model catalog copied into this version. */
+  catalogVersion: string;
+  /** Exact Credits issued for one US dollar of provider cost. */
+  creditConversion: ExactRatio;
+  /** Exact initial Usage Credit grant for a new User. */
+  initialGrantSubunits: bigint;
+  /** IANA time zone used by later Usage reports. */
+  reportTimeZone: string;
+  /** Complete model catalog, schedules, and deployment multipliers. */
+  modelCatalog: ModelUsageRateCatalogEntry[];
+  /** Complete configured Gatekeeper business-operation rates. */
+  gatekeeperOperationRates: GatekeeperOperationRate[];
+};
+
+/** Complete non-secret configuration values captured before or after one audited rate change. */
+export type UsageRateAuditValues = Omit<UsageRateVersion, "version" | "effectiveAt">;
+
+/** One secret-free administrator change record linking immutable Usage Rate versions. */
+export type UsageRateAudit = {
+  /** Version that was current before the change. */
+  previousVersion: bigint;
+  /** Version created by the change. */
+  newVersion: bigint;
+  /** Authenticated administrator identity bound by the server. */
+  actorUserId: string;
+  /** Canonical UTC time assigned by the server. */
+  changedAt: string;
+  /** Required human explanation for the change. */
+  reason: string;
+  /** Complete non-secret configuration values before the change. */
+  oldValues: UsageRateAuditValues;
+  /** Complete non-secret configuration values after the change. */
+  newValues: UsageRateAuditValues;
+  /** Validated typed changes applied to the previous version. */
+  changes: UsageRateChange[];
+};
+
+/** Complete administrator view of deployment Usage Rates and immutable history. */
+export type UsageRateAdminView = {
+  /** Current authoritative version. */
+  current: UsageRateVersion;
+  /** All immutable versions in ascending version order. */
+  versions: UsageRateVersion[];
+  /** All administrator change records in ascending version order. */
+  audits: UsageRateAudit[];
+  /** Catalog version shipped by the running repository release. */
+  releasedCatalogVersion: string;
+  /** Whether an administrator must explicitly adopt a newer released catalog. */
+  catalogUpdateAvailable: boolean;
+};
+
+/** A validated administrator request to change one deployment Usage Rate setting. */
+export type UsageRateChange =
+  | {
+      /** Change the exact Credits-per-USD conversion. */
+      kind: "credit-conversion";
+      /** New positive conversion ratio. */
+      value: ExactRatio;
+    }
+  | {
+      /** Change the initial grant for Users created later. */
+      kind: "initial-grant";
+      /** New non-negative grant in exact Credit subunits. */
+      amountSubunits: bigint;
+    }
+  | {
+      /** Change the IANA time zone used by later reports. */
+      kind: "report-time-zone";
+      /** New canonical or supported IANA time-zone identifier. */
+      timeZone: string;
+    }
+  | {
+      /** Change one model's deployment multiplier. */
+      kind: "model-multiplier";
+      /** Model provider. */
+      provider: AiModelProvider;
+      /** Stable provider model identifier. */
+      model: string;
+      /** New non-negative multiplier. */
+      value: ExactRatio;
+    }
+  | {
+      /** Add, replace, or remove one Gatekeeper business-operation rate. */
+      kind: "gatekeeper-operation-rate";
+      /** Stable Gatekeeper vendor identifier. */
+      vendorId: string;
+      /** Stable business-method key owned by the Gatekeeper. */
+      billingMethodKey: string;
+      /** Exact per-operation Credit, or null to remove the configured rate. */
+      amountSubunits: bigint | null;
+    }
+  | {
+      /** Explicitly copy the repository's released model catalog into a new version. */
+      kind: "adopt-released-model-catalog";
+    };
+
+/** Immutable initial Usage Credit grant facts issued for one not-yet-initialized User. */
+export type InitialGrantSnapshot = {
+  /** Snapshot discriminator. */
+  kind: "initial-grant";
+  /** Usage Rate version current when the snapshot was issued. */
+  usageRateVersion: bigint;
+  /** Canonical UTC time assigned when the snapshot was issued. */
+  issuedAt: string;
+  /** Exact Usage Credit grant in Credit subunits. */
+  amountSubunits: bigint;
+};
+
+/** Immutable pricing facts for one configured model call. */
+export type PricedModelChargeSnapshot = {
+  /** Metered-use kind. */
+  kind: "model";
+  /** Confirms that a model rate was configured. */
+  pricing: "priced";
+  /** Usage Rate version current at the pricing linearization point. */
+  usageRateVersion: bigint;
+  /** Canonical UTC time assigned at the pricing linearization point. */
+  issuedAt: string;
+  /** Released catalog copied into the selected Usage Rate version. */
+  catalogVersion: string;
+  /** Model provider. */
+  provider: AiModelProvider;
+  /** Stable provider model identifier. */
+  model: string;
+  /** Provider release version selected by the catalog. */
+  providerModelVersion: string;
+  /** UTC schedule tier selected at the pricing linearization point. */
+  rateTier: string;
+  /** Exact provider prices selected for the call. */
+  tokenRates: ModelTokenRates;
+  /** Deployment multiplier captured for the call. */
+  multiplier: ExactRatio;
+  /** Credits-per-USD conversion captured for the call. */
+  creditConversion: ExactRatio;
+};
+
+/** Explicit zero-charge configuration gap for one model identifier. */
+export type UnpricedModelChargeSnapshot = {
+  /** Metered-use kind. */
+  kind: "model";
+  /** Confirms that no model rate was configured. */
+  pricing: "unpriced";
+  /** Usage Rate version current at the pricing linearization point. */
+  usageRateVersion: bigint;
+  /** Canonical UTC time assigned at the pricing linearization point. */
+  issuedAt: string;
+  /** Released catalog copied into the selected Usage Rate version. */
+  catalogVersion: string;
+  /** Model provider. */
+  provider: AiModelProvider;
+  /** Stable provider model identifier that has no configured rate. */
+  model: string;
+  /** Exact zero Credit charge required for an Unpriced Use. */
+  chargeSubunits: 0n;
+  /** Explicit signal that deployment configuration needs attention. */
+  configurationGap: true;
+};
+
+/** Immutable priced or Unpriced decision for one model call. */
+export type ModelChargeSnapshot =
+    PricedModelChargeSnapshot | UnpricedModelChargeSnapshot;
+
+/** Immutable fixed-rate facts for one configured Gatekeeper business operation. */
+export type PricedGatekeeperChargeSnapshot = {
+  /** Metered-use kind. */
+  kind: "gatekeeper";
+  /** Confirms that an operation rate was configured, including an explicit zero rate. */
+  pricing: "priced";
+  /** Usage Rate version current at the pricing linearization point. */
+  usageRateVersion: bigint;
+  /** Canonical UTC time assigned at the pricing linearization point. */
+  issuedAt: string;
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Stable caller-visible business-method key. */
+  billingMethodKey: string;
+  /** Exact Credit charged for one caller-visible operation. */
+  chargeSubunits: bigint;
+};
+
+/** Explicit zero-charge configuration gap for one Gatekeeper business operation. */
+export type UnpricedGatekeeperChargeSnapshot = {
+  /** Metered-use kind. */
+  kind: "gatekeeper";
+  /** Confirms that no operation rate was configured. */
+  pricing: "unpriced";
+  /** Usage Rate version current at the pricing linearization point. */
+  usageRateVersion: bigint;
+  /** Canonical UTC time assigned at the pricing linearization point. */
+  issuedAt: string;
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Stable caller-visible business-method key with no configured rate. */
+  billingMethodKey: string;
+  /** Exact zero Credit charge required for an Unpriced Use. */
+  chargeSubunits: 0n;
+  /** Explicit signal that deployment configuration needs attention. */
+  configurationGap: true;
+};
+
+/** Immutable priced or Unpriced decision for one Gatekeeper business operation. */
+export type GatekeeperChargeSnapshot =
+    PricedGatekeeperChargeSnapshot | UnpricedGatekeeperChargeSnapshot;
+
+/** Any immutable priced or Unpriced decision that can explain Metered Use. */
+export type ChargeSnapshot = ModelChargeSnapshot | GatekeeperChargeSnapshot;
+
+/** A configured model or Gatekeeper snapshot that can back a positive Credit Reservation. */
+export type PricedChargeSnapshot =
+    PricedModelChargeSnapshot | PricedGatekeeperChargeSnapshot;
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
@@ -990,13 +1282,19 @@ export type AdminFormat = {
 /**
  * Capability for managing deployment-wide admin settings, obtained via
  * AuthenticatedApi.getAdminApi() (which is null for non-admins). The access check happens when the
- * capability is minted, so these methods don't re-check. Covers Deployment Models, branding,
- * agent instructions, and which gatekeeper connectors/resources are offered — NOT authentication
- * config (that's env-var driven). Each setter throws on invalid input.
+ * capability is minted, so these methods don't re-check. Covers Deployment Models, Usage Rates,
+ * branding, agent instructions, and which gatekeeper connectors/resources are offered — NOT
+ * authentication config (that's env-var driven). Each setter throws on invalid input.
  */
 export interface AdminApi {
   /** Read all admin-managed settings for the admin UI in one call. */
   getSettings(): Promise<AdminSettingsView>;
+
+  /** Read the authoritative Usage Rate version and its immutable, secret-free history. */
+  getUsageRates(): Promise<UsageRateAdminView>;
+
+  /** Atomically apply effective Usage Rate changes, or return unchanged for a semantic no-op. */
+  updateUsageRates(changes: UsageRateChange[], reason: string): Promise<UsageRateAdminView>;
 
   /** Read the Deployment Model Catalog without exposing Model Configuration. */
   getDeploymentModelCatalog(): Promise<DeploymentModelCatalog>;

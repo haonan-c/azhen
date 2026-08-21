@@ -1,18 +1,28 @@
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
-import { newWebSocketRpcSession, type RpcStub } from "capnweb";
+import { newWebSocketRpcSession, RpcStub, RpcTarget } from "capnweb";
 import {
   createOpenGadgetError,
   getOpenGadgetErrorCode,
   OPEN_GADGET_ERROR_CODES,
   SUGGESTED_MODELS,
   type AuthenticatedApi,
+  type ChargeSnapshot,
   type OpenGadgetErrorCode,
   type PublicApi,
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it, vi } from "vitest";
 
 type CodedError = Error & { code?: unknown };
+
+class ChargeSnapshotEchoTarget extends RpcTarget {
+  readonly calls: ChargeSnapshot[][] = [];
+
+  roundTrip(snapshots: ChargeSnapshot[]): ChargeSnapshot[] {
+    this.calls.push(snapshots);
+    return snapshots;
+  }
+}
 
 function openAiTextResponse(text: string): Response {
   const item = {
@@ -539,4 +549,193 @@ describe("Deployment Model RPC", () => {
     }
   });
 
+});
+
+describe("Usage Rate Admin RPC", () => {
+  it("enforces authorization and preserves exact audited bigint changes", async () => {
+    using publicApi = await connect();
+
+    const ordinaryAccount = await createAccount(publicApi, "rateordinary");
+    using ordinary = publicApi.authenticate(ordinaryAccount.token);
+    expect(await ordinary.getAdminApi()).toBeNull();
+
+    const adminToken = await getDeploymentAdminToken(publicApi);
+    using authenticatedAdmin = publicApi.authenticate(adminToken);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected deployment admin capability.");
+
+    const before = await admin.getUsageRates();
+    const flash = before.current.modelCatalog.find(
+      entry => entry.provider === "deepseek" && entry.model === "deepseek-v4-flash",
+    );
+    expect(flash?.schedule.tiers.find(tier => tier.id === "peak")?.tokenRates).toEqual({
+      cacheHitUsdSubunitsPerMillion: 14_000_000_000_000_000n,
+      cacheMissUsdSubunitsPerMillion: 440_000_000_000_000_000n,
+      outputUsdSubunitsPerMillion: 1_320_000_000_000_000_000n,
+    });
+    const exactGrant = 9_007_199_254_740_993n;
+    const forbiddenSentinel = "FORBIDDEN_USAGE_RATE_SECRET_SENTINEL";
+    const forbiddenApiUrl = `https://${forbiddenSentinel}.invalid/v1`;
+    const changeWithForbiddenExtras = {
+      kind: "initial-grant" as const,
+      amountSubunits: exactGrant,
+      apiToken: forbiddenSentinel,
+      apiUrl: forbiddenApiUrl,
+      requestBody: forbiddenSentinel,
+    };
+    expect(exactGrant).toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
+
+    const blankReasonError = await rejection(admin.updateUsageRates(
+      [changeWithForbiddenExtras],
+      " \t ",
+    ));
+    expect(blankReasonError.message).toBe(
+      "Usage Rate change reason must be a non-empty string of at most 1000 characters.",
+    );
+    expect(JSON.stringify({
+      name: blankReasonError.name,
+      message: blankReasonError.message,
+      stack: blankReasonError.stack,
+      enumerable: {...blankReasonError},
+    })).not.toContain(forbiddenSentinel);
+    expect(await admin.getUsageRates()).toEqual(before);
+
+    const modelUrlError = await rejection(admin.updateUsageRates([{
+      kind: "model-multiplier",
+      provider: "deepseek",
+      model: forbiddenApiUrl,
+      value: {numerator: 1n, denominator: 1n},
+    }], "Reject an API URL passed as a model identifier"));
+    expect(modelUrlError.message).toBe(
+      "Model identifier must be a stable provider model identifier of at most 200 characters.",
+    );
+    expect(JSON.stringify({
+      name: modelUrlError.name,
+      message: modelUrlError.message,
+      stack: modelUrlError.stack,
+      enumerable: {...modelUrlError},
+    })).not.toContain(forbiddenSentinel);
+    expect(await admin.getUsageRates()).toEqual(before);
+
+    const forbiddenStableId = forbiddenSentinel.toLowerCase().replaceAll("_", "-");
+    const duplicateKeyError = await rejection(admin.updateUsageRates([
+      {
+        kind: "gatekeeper-operation-rate",
+        vendorId: forbiddenStableId,
+        billingMethodKey: "duplicate.test.v1",
+        amountSubunits: 1n,
+      },
+      {
+        kind: "gatekeeper-operation-rate",
+        vendorId: forbiddenStableId,
+        billingMethodKey: "duplicate.test.v1",
+        amountSubunits: 2n,
+      },
+    ], "Reject one duplicate composite key"));
+    expect(duplicateKeyError.message).toBe("Usage Rate change key appears more than once.");
+    expect(JSON.stringify({
+      name: duplicateKeyError.name,
+      message: duplicateKeyError.message,
+      stack: duplicateKeyError.stack,
+      enumerable: {...duplicateKeyError},
+    })).not.toContain(forbiddenStableId);
+    expect(await admin.getUsageRates()).toEqual(before);
+
+    const reason = "Set an exact initial grant across Cap'n Web";
+    const after = await admin.updateUsageRates([changeWithForbiddenExtras], reason);
+
+    expect(after.current.version).toBe(before.current.version + 1n);
+    expect(after.current.initialGrantSubunits).toBe(exactGrant);
+    expect(typeof after.current.initialGrantSubunits).toBe("bigint");
+    expect(after.versions).toHaveLength(before.versions.length + 1);
+    expect(after.audits).toHaveLength(before.audits.length + 1);
+    expect(after.audits.at(-1)).toEqual({
+      previousVersion: before.current.version,
+      newVersion: after.current.version,
+      actorUserId: "deploymentadmin",
+      changedAt: after.current.effectiveAt,
+      reason,
+      oldValues: {
+        catalogVersion: before.current.catalogVersion,
+        creditConversion: before.current.creditConversion,
+        initialGrantSubunits: before.current.initialGrantSubunits,
+        reportTimeZone: before.current.reportTimeZone,
+        modelCatalog: before.current.modelCatalog,
+        gatekeeperOperationRates: before.current.gatekeeperOperationRates,
+      },
+      newValues: {
+        catalogVersion: after.current.catalogVersion,
+        creditConversion: after.current.creditConversion,
+        initialGrantSubunits: after.current.initialGrantSubunits,
+        reportTimeZone: after.current.reportTimeZone,
+        modelCatalog: after.current.modelCatalog,
+        gatekeeperOperationRates: after.current.gatekeeperOperationRates,
+      },
+      changes: [{
+        kind: "initial-grant",
+        amountSubunits: exactGrant,
+      }],
+    });
+    const serialized = JSON.stringify(after, (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value);
+    expect(serialized).not.toContain(forbiddenSentinel);
+  });
+
+  it("round-trips issued Charge Snapshots through a real Cap'n Web callback", async () => {
+    using publicApi = await connect();
+
+    const adminToken = await getDeploymentAdminToken(publicApi);
+    using authenticatedAdmin = publicApi.authenticate(adminToken);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected deployment admin capability.");
+
+    const settings = exports.AdminSettings.getByName("");
+    const pricedModel = await settings.issueModelChargeSnapshot(
+      "deepseek",
+      "deepseek-v4-flash",
+    );
+    if (pricedModel.pricing !== "priced") {
+      throw new Error("Expected the released DeepSeek model to be priced.");
+    }
+    const unpricedGatekeeper = await settings.issueGatekeeperChargeSnapshot(
+      "capnweb-test",
+      `unconfigured-${crypto.randomUUID()}`,
+    );
+    if (unpricedGatekeeper.pricing !== "unpriced") {
+      throw new Error("Expected the unconfigured Gatekeeper operation to be Unpriced.");
+    }
+
+    const snapshots: ChargeSnapshot[] = [pricedModel, unpricedGatekeeper];
+    const echoTarget = new ChargeSnapshotEchoTarget();
+    using echo = new RpcStub(echoTarget);
+    using rateViewPromise = admin.getUsageRates();
+    using echoedPerVersion = await rateViewPromise.versions.map(
+      () => echo.roundTrip(snapshots),
+    );
+
+    expect(echoedPerVersion.length).toBeGreaterThan(0);
+    expect(echoTarget.calls).toHaveLength(echoedPerVersion.length);
+    expect(echoTarget.calls).toEqual(Array.from(echoedPerVersion));
+    for (const echoed of echoedPerVersion) {
+      expect(echoed).toEqual(snapshots);
+      const [echoedModel, echoedGatekeeper] = echoed;
+      if (echoedModel?.kind !== "model" || echoedModel.pricing !== "priced") {
+        throw new Error("Expected a priced model snapshot after the round-trip.");
+      }
+      if (echoedGatekeeper?.kind !== "gatekeeper" ||
+          echoedGatekeeper.pricing !== "unpriced") {
+        throw new Error("Expected an Unpriced Gatekeeper snapshot after the round-trip.");
+      }
+      expect(typeof echoedModel.usageRateVersion).toBe("bigint");
+      expect(typeof echoedModel.tokenRates.cacheHitUsdSubunitsPerMillion).toBe("bigint");
+      expect(typeof echoedModel.tokenRates.cacheMissUsdSubunitsPerMillion).toBe("bigint");
+      expect(typeof echoedModel.tokenRates.outputUsdSubunitsPerMillion).toBe("bigint");
+      expect(typeof echoedModel.multiplier.numerator).toBe("bigint");
+      expect(typeof echoedModel.creditConversion.denominator).toBe("bigint");
+      expect(typeof echoedGatekeeper.usageRateVersion).toBe("bigint");
+      expect(typeof echoedGatekeeper.chargeSubunits).toBe("bigint");
+      expect(echoedGatekeeper.chargeSubunits).toBe(0n);
+      expect(echoedGatekeeper.configurationGap).toBe(true);
+    }
+  });
 });

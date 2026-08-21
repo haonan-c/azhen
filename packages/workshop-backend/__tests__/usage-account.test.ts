@@ -1,13 +1,45 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { USAGE_CREDIT_SUBUNITS_PER_CREDIT } from "@gadgets/workshop-shared/api";
+import {
+  USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+  type InitialGrantSnapshot,
+  type PricedGatekeeperChargeSnapshot,
+} from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
 import { UsageAccount } from "../src/usage-account.js";
 import type { UserDurableObject } from "../src/user.js";
 
-const users = (env as unknown as {
+const testEnv = env as unknown as {
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
-}).TEST_USER;
+};
+const users = testEnv.TEST_USER;
 const INITIAL_BALANCE = 1_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
+const TEST_INITIAL_GRANT_SNAPSHOT: InitialGrantSnapshot = {
+  kind: "initial-grant",
+  usageRateVersion: 1n,
+  issuedAt: "2026-08-19T14:00:00.000Z",
+  amountSubunits: INITIAL_BALANCE,
+};
+const TEST_CHARGE_SNAPSHOT: PricedGatekeeperChargeSnapshot = {
+  kind: "gatekeeper",
+  pricing: "priced",
+  usageRateVersion: 1n,
+  issuedAt: "2026-08-19T15:00:00.000Z",
+  vendorId: "test",
+  billingMethodKey: "test.operation.v1",
+  chargeSubunits: 1n,
+};
+const TEST_LATER_GRANT_SNAPSHOT: InitialGrantSnapshot = {
+  ...TEST_INITIAL_GRANT_SNAPSHOT,
+  usageRateVersion: 2n,
+  issuedAt: "2026-08-19T15:00:00.000Z",
+  amountSubunits: 2_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+};
+const TEST_ALTERNATE_CHARGE_SNAPSHOT: PricedGatekeeperChargeSnapshot = {
+  ...TEST_CHARGE_SNAPSHOT,
+  usageRateVersion: 2n,
+  issuedAt: "2026-08-19T16:00:00.000Z",
+  chargeSubunits: 2n,
+};
 
 function newUser() {
   const id = users.idFromName(`usage-${crypto.randomUUID()}`);
@@ -28,21 +60,47 @@ async function invokeFirstCallFailure(
     account: UsageAccount, failure: FirstCallFailure): Promise<unknown> {
   switch (failure) {
     case "reserved-reserve-id":
-      return account.reserve("usage-credit-initial-grant:v1", 1n);
+      return account.reserve(
+        "usage-credit-initial-grant:v1",
+        1n,
+        TEST_CHARGE_SNAPSHOT,
+        TEST_INITIAL_GRANT_SNAPSHOT,
+      );
     case "invalid-reserve-amount":
-      return account.reserve("invalid-reserve-amount", 1 as unknown as bigint);
+      return account.reserve(
+        "invalid-reserve-amount",
+        1 as unknown as bigint,
+        TEST_CHARGE_SNAPSHOT,
+        TEST_INITIAL_GRANT_SNAPSHOT,
+      );
     case "invalid-settle-id":
-      return account.settle(undefined as unknown as string, 0n);
+      return account.settle(
+        undefined as unknown as string,
+        0n,
+        TEST_INITIAL_GRANT_SNAPSHOT,
+      );
     case "invalid-settle-amount":
-      return account.settle("invalid-settle-amount", 1 as unknown as bigint);
+      return account.settle(
+        "invalid-settle-amount",
+        1 as unknown as bigint,
+        TEST_INITIAL_GRANT_SNAPSHOT,
+      );
     case "invalid-release-id":
-      return account.release(undefined as unknown as string);
+      return account.release(
+        undefined as unknown as string,
+        TEST_INITIAL_GRANT_SNAPSHOT,
+      );
     case "insufficient-reserve":
-      return account.reserve("insufficient-reserve", INITIAL_BALANCE + 1n);
+      return account.reserve(
+        "insufficient-reserve",
+        INITIAL_BALANCE + 1n,
+        TEST_CHARGE_SNAPSHOT,
+        TEST_INITIAL_GRANT_SNAPSHOT,
+      );
     case "missing-settlement":
-      return account.settle("missing-settlement", 0n);
+      return account.settle("missing-settlement", 0n, TEST_INITIAL_GRANT_SNAPSHOT);
     case "missing-release":
-      return account.release("missing-release");
+      return account.release("missing-release", TEST_INITIAL_GRANT_SNAPSHOT);
   }
 }
 
@@ -78,6 +136,91 @@ const FIRST_CALL_FAILURES = [
 ] as const satisfies readonly (readonly [FirstCallFailure, string, string])[];
 
 describe("User Usage Account", () => {
+  it("does not invent an initial grant without a versioned snapshot", async () => {
+    const {stub} = newUser();
+
+    const result = await runInDurableObject(stub, (_instance, state) => {
+      const account = new UsageAccount(state.storage);
+      let caught: Error | undefined;
+      try {
+        account.getBalance();
+      } catch (error) {
+        caught = error instanceof Error ? error : new Error(String(error));
+      }
+      return {
+        error: caught && {name: caught.name, message: caught.message},
+        ledger: Array.from(state.storage.kv.list({prefix: "usageAccount:ledger:"})),
+        totals: state.storage.kv.get("usageAccount:totals:v1"),
+      };
+    });
+
+    expect(result).toEqual({
+      error: {
+        name: "Error",
+        message: "An Initial Grant Snapshot is required for a new Usage Account.",
+      },
+      ledger: [],
+      totals: undefined,
+    });
+  });
+
+  it.each([
+    "not-a-time",
+    "2026-08-19T14:00:00Z",
+    "2026-08-19T10:00:00.000-04:00",
+  ])("rejects a non-canonical initial grant time without writing state: %s", async issuedAt => {
+    const {stub} = newUser();
+
+    const result = await runInDurableObject(stub, (_instance, state) => {
+      let caught: Error | undefined;
+      try {
+        new UsageAccount(state.storage).getBalance({
+          ...TEST_INITIAL_GRANT_SNAPSHOT,
+          issuedAt,
+        });
+      } catch (error) {
+        caught = error instanceof Error ? error : new Error(String(error));
+      }
+      return {
+        error: caught && {name: caught.name, message: caught.message},
+        ledger: Array.from(state.storage.kv.list({prefix: "usageAccount:ledger:"})),
+        totals: state.storage.kv.get("usageAccount:totals:v1"),
+      };
+    });
+
+    expect(result).toEqual({
+      error: {
+        name: "Error",
+        message: "Initial Usage Credit grant snapshot is invalid.",
+      },
+      ledger: [],
+      totals: undefined,
+    });
+  });
+
+  it("keeps the first committed Initial Grant Snapshot", async () => {
+    const {stub} = newUser();
+
+    const result = await runInDurableObject(stub, (_instance, state) => {
+      const account = new UsageAccount(state.storage);
+      const firstBalance = account.getBalance(TEST_INITIAL_GRANT_SNAPSHOT);
+      const secondBalance = account.getBalance(TEST_LATER_GRANT_SNAPSHOT);
+      return {firstBalance, secondBalance, snapshot: account.getSnapshot()};
+    });
+
+    expect(result.firstBalance).toEqual({
+      availableSubunits: INITIAL_BALANCE,
+      reservedSubunits: 0n,
+    });
+    expect(result.secondBalance).toEqual(result.firstBalance);
+    expect(result.snapshot.ledgerEntries).toEqual([
+      expect.objectContaining({
+        deltaSubunits: INITIAL_BALANCE,
+        initialGrantSnapshot: TEST_INITIAL_GRANT_SNAPSHOT,
+      }),
+    ]);
+  });
+
   it.each(FIRST_CALL_FAILURES)(
     "commits exactly one initial grant before rejecting first call %s",
     async (failure, errorName, errorMessage) => {
@@ -178,7 +321,7 @@ describe("User Usage Account", () => {
     const tooMuch = 1_001n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
     await expect(runInDurableObject(stub, (instance) =>
-      instance.reserveUsageCredits("too-expensive", tooMuch)))
+      instance.reserveUsageCredits("too-expensive", tooMuch, TEST_CHARGE_SNAPSHOT)))
       .rejects.toThrow("Insufficient Usage Credit.");
 
     const snapshot = await runInDurableObject(stub, (_instance, state) =>
@@ -196,7 +339,8 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
 
     await expect(runInDurableObject(stub, (instance) =>
-      instance.reserveUsageCredits("first-operation-fails", INITIAL_BALANCE + 1n)))
+      instance.reserveUsageCredits(
+        "first-operation-fails", INITIAL_BALANCE + 1n, TEST_CHARGE_SNAPSHOT)))
       .rejects.toThrow("Insufficient Usage Credit.");
 
     const ledgerEntries = await runInDurableObject(stub, (_instance, state) =>
@@ -218,7 +362,8 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
 
     await expect(runInDurableObject(stub, (instance) =>
-      instance.reserveUsageCredits("usage-credit-initial-grant:v1", 1n)))
+      instance.reserveUsageCredits(
+        "usage-credit-initial-grant:v1", 1n, TEST_CHARGE_SNAPSHOT)))
       .rejects.toThrow("Operation ID is reserved for the initial Usage Credit grant.");
 
     const snapshot = await runInDurableObject(stub, (_instance, state) =>
@@ -230,10 +375,10 @@ describe("User Usage Account", () => {
   it("rejects non-positive reservations and negative settlements", async () => {
     const { stub } = newUser();
     await expect(runInDurableObject(stub, (instance) =>
-      instance.reserveUsageCredits("zero", 0n)))
+      instance.reserveUsageCredits("zero", 0n, TEST_CHARGE_SNAPSHOT)))
       .rejects.toThrow("A Credit Reservation amount must be a positive bigint.");
 
-    await stub.reserveUsageCredits("negative-settlement", 10n);
+    await stub.reserveUsageCredits("negative-settlement", 10n, TEST_CHARGE_SNAPSHOT);
     await expect(runInDurableObject(stub, (instance) =>
       instance.settleUsageCredits("negative-settlement", -1n)))
       .rejects.toThrow("A settled Credit amount must be a non-negative bigint.");
@@ -254,8 +399,10 @@ describe("User Usage Account", () => {
     const amount = 600n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
     const results = await Promise.allSettled([
-      runInDurableObject(stub, (instance) => instance.reserveUsageCredits("first", amount)),
-      runInDurableObject(stub, (instance) => instance.reserveUsageCredits("second", amount)),
+      runInDurableObject(stub, (instance) =>
+        instance.reserveUsageCredits("first", amount, TEST_CHARGE_SNAPSHOT)),
+      runInDurableObject(stub, (instance) =>
+        instance.reserveUsageCredits("second", amount, TEST_CHARGE_SNAPSHOT)),
     ]);
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
@@ -270,11 +417,20 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
     const amount = 250n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
-    const first = await stub.reserveUsageCredits("stable-reserve", amount);
-    expect(await stub.reserveUsageCredits("stable-reserve", amount)).toEqual(first);
+    const first = await stub.reserveUsageCredits(
+      "stable-reserve", amount, TEST_CHARGE_SNAPSHOT);
+    expect(await stub.reserveUsageCredits(
+      "stable-reserve", amount, TEST_CHARGE_SNAPSHOT)).toEqual(first);
     await expect(runInDurableObject(stub, (instance) =>
-      instance.reserveUsageCredits("stable-reserve", amount + 1n)))
-      .rejects.toThrow("Operation ID already used with a different reservation amount.");
+      instance.reserveUsageCredits("stable-reserve", amount + 1n, TEST_CHARGE_SNAPSHOT)))
+      .rejects.toThrow("Operation ID already used with different reservation inputs.");
+    await expect(runInDurableObject(stub, (instance) =>
+      instance.reserveUsageCredits(
+        "stable-reserve",
+        amount,
+        TEST_ALTERNATE_CHARGE_SNAPSHOT,
+      )))
+      .rejects.toThrow("Operation ID already used with different reservation inputs.");
 
     const snapshot = await runInDurableObject(stub, (_instance, state) =>
       new UsageAccount(state.storage).getSnapshot());
@@ -292,9 +448,9 @@ describe("User Usage Account", () => {
 
     const [first, second] = await Promise.all([
       runInDurableObject(stub, (instance) =>
-        instance.reserveUsageCredits("concurrent-retry", amount)),
+        instance.reserveUsageCredits("concurrent-retry", amount, TEST_CHARGE_SNAPSHOT)),
       runInDurableObject(stub, (instance) =>
-        instance.reserveUsageCredits("concurrent-retry", amount)),
+        instance.reserveUsageCredits("concurrent-retry", amount, TEST_CHARGE_SNAPSHOT)),
     ]);
 
     expect(second).toEqual(first);
@@ -307,7 +463,7 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
     const held = 800n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const charged = 300n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("settled-use", held);
+    await stub.reserveUsageCredits("settled-use", held, TEST_CHARGE_SNAPSHOT);
 
     const settled = await stub.settleUsageCredits("settled-use", charged);
 
@@ -338,7 +494,7 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
     const held = 100n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const charged = 40n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("duplicate-settlement", held);
+    await stub.reserveUsageCredits("duplicate-settlement", held, TEST_CHARGE_SNAPSHOT);
 
     const first = await stub.settleUsageCredits("duplicate-settlement", charged);
     expect(await stub.settleUsageCredits("duplicate-settlement", charged)).toEqual(first);
@@ -357,7 +513,7 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
     const held = 70n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const charged = 55n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("concurrent-settlement", held);
+    await stub.reserveUsageCredits("concurrent-settlement", held, TEST_CHARGE_SNAPSHOT);
 
     const [first, second] = await Promise.all([
       runInDurableObject(stub, (instance) =>
@@ -377,7 +533,7 @@ describe("User Usage Account", () => {
   it("rejects settlement above the reservation without a partial charge", async () => {
     const { stub } = newUser();
     const held = 10n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("over-settlement", held);
+    await stub.reserveUsageCredits("over-settlement", held, TEST_CHARGE_SNAPSHOT);
 
     await expect(runInDurableObject(stub, (instance) =>
       instance.settleUsageCredits("over-settlement", held + 1n)))
@@ -395,7 +551,7 @@ describe("User Usage Account", () => {
   it("releases a reservation idempotently without a Ledger entry", async () => {
     const { stub } = newUser();
     const amount = 75n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("released-use", amount);
+    await stub.reserveUsageCredits("released-use", amount, TEST_CHARGE_SNAPSHOT);
 
     const released = await stub.releaseUsageCredits("released-use");
 
@@ -417,14 +573,14 @@ describe("User Usage Account", () => {
   it("rejects conflicting terminal transitions", async () => {
     const first = newUser().stub;
     const amount = USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await first.reserveUsageCredits("release-then-settle", amount);
+    await first.reserveUsageCredits("release-then-settle", amount, TEST_CHARGE_SNAPSHOT);
     await first.releaseUsageCredits("release-then-settle");
     await expect(runInDurableObject(first, (instance) =>
       instance.settleUsageCredits("release-then-settle", amount)))
       .rejects.toThrow("A released Credit Reservation cannot be settled.");
 
     const second = newUser().stub;
-    await second.reserveUsageCredits("settle-then-release", amount);
+    await second.reserveUsageCredits("settle-then-release", amount, TEST_CHARGE_SNAPSHOT);
     await second.settleUsageCredits("settle-then-release", amount);
     await expect(runInDurableObject(second, (instance) =>
       instance.releaseUsageCredits("settle-then-release")))
@@ -435,9 +591,9 @@ describe("User Usage Account", () => {
     const { stub } = newUser();
     const charged = 125n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const held = 200n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("charged", charged);
+    await stub.reserveUsageCredits("charged", charged, TEST_CHARGE_SNAPSHOT);
     await stub.settleUsageCredits("charged", charged);
-    await stub.reserveUsageCredits("active-hold", held);
+    await stub.reserveUsageCredits("active-hold", held, TEST_CHARGE_SNAPSHOT);
 
     const snapshot = await runInDurableObject(stub, (_instance, state) =>
       new UsageAccount(state.storage).getSnapshot());
@@ -478,7 +634,7 @@ describe("User Usage Account", () => {
   it("detects a settled Reservation whose Usage Charge link is broken", async () => {
     const { stub } = newUser();
     const amount = 10n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("broken-charge-link", amount);
+    await stub.reserveUsageCredits("broken-charge-link", amount, TEST_CHARGE_SNAPSHOT);
     await stub.settleUsageCredits("broken-charge-link", amount);
 
     await runInDurableObject(stub, (_instance, state) => {
@@ -541,7 +697,7 @@ describe("User Usage Account", () => {
 
   it("rejects replay when a settled zero-value Usage Charge is missing", async () => {
     const { stub } = newUser();
-    await stub.reserveUsageCredits("missing-zero-charge", 1n);
+    await stub.reserveUsageCredits("missing-zero-charge", 1n, TEST_CHARGE_SNAPSHOT);
     await stub.settleUsageCredits("missing-zero-charge", 0n);
 
     await runInDurableObject(stub, (_instance, state) => {
@@ -563,12 +719,14 @@ describe("User Usage Account", () => {
     const amount = 33n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 
     await expect(runInDurableObject(stub, async (instance, state) => {
-      await instance.reserveUsageCredits("lost-reserve-response", amount);
+      await instance.reserveUsageCredits(
+        "lost-reserve-response", amount, TEST_CHARGE_SNAPSHOT);
       state.abort("lost reserve response");
     })).rejects.toThrow("lost reserve response");
 
     const restarted = users.get(id);
-    await expect(restarted.reserveUsageCredits("lost-reserve-response", amount))
+    await expect(restarted.reserveUsageCredits(
+      "lost-reserve-response", amount, TEST_CHARGE_SNAPSHOT))
       .resolves.toMatchObject({
         operationId: "lost-reserve-response",
         amountSubunits: amount,
@@ -584,7 +742,7 @@ describe("User Usage Account", () => {
     const { id, stub } = newUser();
     const held = 60n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
     const charged = 45n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
-    await stub.reserveUsageCredits("lost-settle-response", held);
+    await stub.reserveUsageCredits("lost-settle-response", held, TEST_CHARGE_SNAPSHOT);
 
     await expect(runInDurableObject(stub, async (instance, state) => {
       await instance.settleUsageCredits("lost-settle-response", charged);
