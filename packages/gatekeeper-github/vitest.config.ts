@@ -12,7 +12,7 @@ export default defineConfig({
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
         durableObjects: {
           TEST_GITHUB_GATEKEEPER: {
-            className: "GitHubGatekeeperImpl",
+            className: "GitHubBillingTestGatekeeper",
             useSQLite: true,
           },
           TEST_GITHUB_USER_ACCOUNT: { className: "UserAccount", useSQLite: true },

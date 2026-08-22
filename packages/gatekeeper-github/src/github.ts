@@ -126,6 +126,16 @@ type GitHubGatekeeperImplProps = {
   issueNumber?: number;
 };
 
+/** Durable handoffs exposed only to the package's fault-injection subclass. */
+export type GitHubActionHandoff =
+  | "claim-persisted"
+  | "preflight-persisted"
+  | "dispatch-marker-persisted"
+  | "provider-response-received"
+  | "accepted-persisted";
+
+const GITHUB_ACTION_HANDOFF = Symbol.for("gadgets.github.action-handoff-test");
+
 type Cached<T> = {
   fetchedAt: number;
   value: T;
@@ -298,10 +308,14 @@ type GitHubActionExecutionRow = {
   actionId: number;
   providerIdempotencyKey?: string;
   state: GitHubActionExecutionState;
-  argumentsHash: string;
-  targetCategory: GitHubActionClaim["targetCategory"];
+  argumentsHash?: string;
+  targetCategory?: GitHubActionClaim["targetCategory"];
   providerResultId?: number;
   enrichmentPending?: true;
+};
+
+type GitHubEnrichmentRecoveryRow = {
+  executionKey: string;
 };
 
 type GitHubDispatchResult = {
@@ -1482,6 +1496,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   #pendingActionsCache?: GitHubAction[];
   #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+  #enrichmentRecoveries = new Map<string, Promise<void>>();
+
+  protected async [GITHUB_ACTION_HANDOFF](_handoff: GitHubActionHandoff): Promise<void> {}
 
   #userAccount() {
     return this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
@@ -3293,7 +3310,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GitHubRepoSession | GitHubIssue | GitHubPullRequest> {
-    await this.#resumeAcceptedEnrichments();
+    this.ctx.waitUntil(this.#resumeAcceptedEnrichments());
     const queue = approvalQueue.dup();
     const externalAccountId = this.ctx.props.userObjectId;
     switch (this.ctx.props.resourceKind) {
@@ -3386,6 +3403,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return this.#finishBillableAction(key, row, "unknown", this.#getActionRecord(actionId));
       }
       await this.ctx.storage.sync();
+      await this[GITHUB_ACTION_HANDOFF]("claim-persisted");
     }
     if (!row) throw new Error("GitHub Action execution claim was not persisted.");
 
@@ -3406,9 +3424,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
 
     this.#putActionRecord(actionId, record);
+    await this.ctx.storage.sync();
+    await this[GITHUB_ACTION_HANDOFF]("preflight-persisted");
     row = { ...row, state: "provider-dispatching" };
     this.ctx.storage.kv.put(key, row);
     await this.ctx.storage.sync();
+    await this[GITHUB_ACTION_HANDOFF]("dispatch-marker-persisted");
 
     const mutationActivity = new GitHubOperationActivityTracker();
     let dispatched: GitHubDispatchResult;
@@ -3429,6 +3450,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     if (dispatched.accepted === false) {
       return this.#finishBillableAction(key, row, "failed-before-execution", record);
     }
+    await this[GITHUB_ACTION_HANDOFF]("provider-response-received");
 
     row = {
       ...row,
@@ -3437,7 +3459,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         : { providerResultId: dispatched.providerResultId }),
       ...(dispatched.enrichmentPending ? { enrichmentPending: true } : {}),
     };
-    const result = this.#finishBillableAction(
+    const result = await this.#finishBillableAction(
       key,
       row,
       "accepted",
@@ -3451,6 +3473,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async #resumeAcceptedEnrichment(key: string): Promise<void> {
+    const active = this.#enrichmentRecoveries.get(key);
+    if (active) return await active;
+    const work = this.#resumeAcceptedEnrichmentImpl(key).finally(() => {
+      if (this.#enrichmentRecoveries.get(key) === work) {
+        this.#enrichmentRecoveries.delete(key);
+      }
+    });
+    this.#enrichmentRecoveries.set(key, work);
+    return await work;
+  }
+
+  async #resumeAcceptedEnrichmentImpl(key: string): Promise<void> {
     const row = this.ctx.storage.kv.get<GitHubActionExecutionRow>(key);
     if (row?.state !== "accepted" || !row.enrichmentPending) return;
     const record = this.#getActionRecord(row.actionId);
@@ -3465,9 +3499,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         activity,
         () => this.#enrichReviewAliases(action, realId, reviewId),
       );
-      this.ctx.storage.kv.put<GitHubActionExecutionRow>(key, {
-        ...row,
-        enrichmentPending: undefined,
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.kv.put<GitHubActionExecutionRow>(key, {
+          ...row,
+          enrichmentPending: undefined,
+        });
+        this.ctx.storage.kv.delete(this.#enrichmentRecoveryKey(row.billingOperationId));
       });
       await this.ctx.storage.sync();
     } catch (error) {
@@ -3479,25 +3516,33 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async #resumeAcceptedEnrichments(): Promise<void> {
-    for (const [key, row] of this.ctx.storage.kv.list<GitHubActionExecutionRow>({
-      prefix: "execution:",
+    for (const [, pending] of this.ctx.storage.kv.list<GitHubEnrichmentRecoveryRow>({
+      prefix: "enrichment:",
     })) {
-      if (row.state === "accepted" && row.enrichmentPending) {
-        await this.#resumeAcceptedEnrichment(key);
-      }
+      await this.#resumeAcceptedEnrichment(pending.executionKey);
     }
   }
 
-  #finishBillableAction(
+  #enrichmentRecoveryKey(billingOperationId: string): string {
+    return `enrichment:${billingOperationId}`;
+  }
+
+  async #finishBillableAction(
     key: string,
     row: GitHubActionExecutionRow,
     outcome: ActionExecutionOutcome,
     record?: StoredActionRecord,
     commit?: () => void,
     revertInfo?: GitHubRevertInfo,
-  ): ActionExecutionResult {
+  ): Promise<ActionExecutionResult> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.kv.put<GitHubActionExecutionRow>(key, { ...row, state: outcome });
+      if (outcome === "accepted" && row.enrichmentPending) {
+        this.ctx.storage.kv.put<GitHubEnrichmentRecoveryRow>(
+          this.#enrichmentRecoveryKey(row.billingOperationId),
+          { executionKey: key },
+        );
+      }
       if (record) {
         this.ctx.storage.kv.delete(this.#actionRecordKey(row.actionId));
         record.state = outcome === "accepted" ? "approved" : outcome === "unknown" ? "unknown" : "failed";
@@ -3507,6 +3552,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
       commit?.();
     });
+    await this.ctx.storage.sync();
+    if (outcome === "accepted") {
+      await this[GITHUB_ACTION_HANDOFF]("accepted-persisted");
+    }
     this.#pendingActionsCache = undefined;
     return { outcome };
   }

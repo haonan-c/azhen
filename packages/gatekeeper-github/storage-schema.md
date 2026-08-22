@@ -41,6 +41,9 @@ No per-user SQL tables are used.
 - `execution:<billingOperationId>` -> the durable provider execution claim. It stores the Action ID,
   SHA-256 parameter hash, target category, provider idempotency key when present, execution phase,
   provider result ID when known, and whether accepted review-comment alias enrichment is pending.
+- `enrichment:<billingOperationId>` -> a content-free pointer to an accepted execution whose review
+  comment aliases still need enrichment. Session creation schedules these indexed rows for
+  background recovery without scanning or blocking on the permanent execution history.
 
 The parameter hash is only recovery evidence. It is not a Usage dimension and is not copied into
 financial records. Provider execution phases are `applying`, `preflighting`,

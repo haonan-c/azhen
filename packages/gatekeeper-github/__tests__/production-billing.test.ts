@@ -75,6 +75,21 @@ describe("production GitHub billing wiring", () => {
       .toBe("github-test-operation-1");
   });
 
+  it("settles an upstream success before authorization withholds the result", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(repoResponse())));
+
+    const result = await harness().metadataWithheld("metadata-withheld");
+
+    expect(result.resultVisible).toBe(false);
+    expect(result.trace.events).toEqual([
+      expect.stringMatching(/^begin:github\.repository\.metadata\.read\.v1:/),
+      "operation-id:github-test-operation-1",
+      "mark-started:github-test-operation-1",
+      "complete:github-test-operation-1:executed",
+    ]);
+    expect(result.trace.observations).toHaveLength(1);
+  });
+
   it("charges one business operation across three GitHub pages", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const page = Number(new URL(String(input)).searchParams.get("page"));
@@ -134,6 +149,29 @@ describe("production GitHub billing wiring", () => {
     expect(result.duplicate).toEqual({ outcome: "accepted" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    { handoff: "claim-persisted", outcome: "accepted", providerCalls: 1 },
+    { handoff: "preflight-persisted", outcome: "accepted", providerCalls: 1 },
+    { handoff: "dispatch-marker-persisted", outcome: "unknown", providerCalls: 0 },
+    { handoff: "provider-response-received", outcome: "unknown", providerCalls: 1 },
+    { handoff: "accepted-persisted", outcome: "accepted", providerCalls: 1 },
+  ] as const)(
+    "recovers a durable handoff fault after $handoff without an unsafe create replay",
+    async ({ handoff, outcome, providerCalls }) => {
+      const fetchMock = vi.fn(async () => Response.json({ ...issueResponse(), number: 27 }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const parent = harness();
+      const name = `fault-${handoff}`;
+      expect(await parent.crashCreateIssueAtHandoff(name, handoff))
+        .toEqual({ outcome: "unknown" });
+      const recovered = await parent.recoverCreateIssueAfterFault(name);
+
+      expect(recovered).toEqual({ outcome });
+      expect(fetchMock).toHaveBeenCalledTimes(providerCalls);
+    },
+  );
 
   it("holds a lost create response and never replays it", async () => {
     const fetchMock = vi.fn(async () => { throw new Error("response lost"); });

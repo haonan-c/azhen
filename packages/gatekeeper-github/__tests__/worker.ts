@@ -1,25 +1,63 @@
 import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import type {
   ActionDescription,
+  ActionExecution,
+  ActionExecutionResult,
   ApprovalQueue,
   BillableOperationOutcome,
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import githubWorker, { GitHubGatekeeperImpl } from "../src/github.js";
+import githubWorker, {
+  GitHubGatekeeperImpl,
+  type GitHubActionHandoff,
+} from "../src/github.js";
 
 export default githubWorker;
 export { GitHubGatekeeperImpl };
+
+type FaultInjectingProps = {
+  testFaultAt?: GitHubActionHandoff;
+};
+
+const GITHUB_ACTION_HANDOFF = Symbol.for("gadgets.github.action-handoff-test");
+class GitHubActionHandoffFault extends Error {}
+
+/** Production implementation with one package-test-only durable crash hook. */
+export class GitHubBillingTestGatekeeper extends GitHubGatekeeperImpl {
+  override async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    try {
+      return await super.applyAction(actionId, execution);
+    } catch (error) {
+      if (error instanceof GitHubActionHandoffFault) return { outcome: "unknown" };
+      throw error;
+    }
+  }
+
+  protected async [GITHUB_ACTION_HANDOFF](handoff: GitHubActionHandoff): Promise<void> {
+    const faultAt = (this.ctx.props as typeof this.ctx.props & FaultInjectingProps).testFaultAt;
+    if (faultAt !== handoff) return;
+    const consumedKey = `test-fault-consumed:${handoff}`;
+    if (this.ctx.storage.kv.get(consumedKey)) return;
+    this.ctx.storage.kv.put(consumedKey, true);
+    await this.ctx.storage.sync();
+    throw new GitHubActionHandoffFault(`Injected GitHub billing crash after ${handoff}.`);
+  }
+}
 
 type GatekeeperClass<T, Props> = (options: { props: Props }) => DurableObjectClass<T>;
 
 type TestExports = {
   UserAccount: DurableObjectNamespace<UserAccount>;
-  GitHubGatekeeperImpl: GatekeeperClass<GitHubGatekeeperImpl, {
+  GitHubBillingTestGatekeeper: GatekeeperClass<GitHubGatekeeperImpl, {
     userObjectId: string;
     resourceKind: "repo" | "issue" | "pull";
     owner: string;
     repo: string;
     issueNumber?: number;
+    testFaultAt?: GitHubActionHandoff;
   }>;
 };
 
@@ -42,6 +80,8 @@ class RecordingApprovalQueue extends RpcTarget {
   readonly trace: BillingTrace = { events: [], observations: [], actions: [] };
   #operationNumber = 0;
 
+  constructor(private authorizeError?: Error) { super(); }
+
   async beginBillableOperation(methodKey: string, externalAccountId: string) {
     const operationId = `github-test-operation-${++this.#operationNumber}`;
     this.trace.events.push(`begin:${methodKey}:${externalAccountId}`);
@@ -50,6 +90,7 @@ class RecordingApprovalQueue extends RpcTarget {
 
   async authorizeObservation(description: ObservationDescription) {
     this.trace.observations.push(description);
+    if (this.authorizeError) throw this.authorizeError;
   }
 
   async submitAction(id: number, description: ActionDescription) {
@@ -72,6 +113,25 @@ export class GitHubBillingTestParent extends DurableObject {
     if (!("getMetadata" in session)) throw new Error("Expected repository Session.");
     const result = await session.getMetadata();
     return { result, trace: queue.trace };
+  }
+
+  async metadataWithheld(name: string) {
+    const { queue, session } = await this.#session(
+      name,
+      "repo",
+      undefined,
+      new Error("Observation withheld."),
+    );
+    using _session = session;
+    if (!("getMetadata" in session)) throw new Error("Expected repository Session.");
+    let resultVisible = true;
+    try {
+      await session.getMetadata();
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Observation withheld.") throw error;
+      resultVisible = false;
+    }
+    return { resultVisible, trace: queue.trace };
   }
 
   async listIssues(name: string) {
@@ -108,6 +168,24 @@ export class GitHubBillingTestParent extends DurableObject {
     const first = await gatekeeper.applyAction(action.id, execution);
     const duplicate = await gatekeeper.applyAction(action.id, execution);
     return { action, first, duplicate };
+  }
+
+  async crashCreateIssueAtHandoff(name: string, faultAt: GitHubActionHandoff) {
+    const { gatekeeper, queue, session } = await this.#session(name, "repo", faultAt);
+    using _session = session;
+    if (!("createIssue" in session)) throw new Error("Expected repository Session.");
+    using _issue = await session.createIssue({ title: "Fixture" });
+    const action = this.#action(queue);
+    const execution = { billingOperationId: `create-${name}`, mode: "execute" } as const;
+    return await gatekeeper.applyAction(action.id, execution);
+  }
+
+  async recoverCreateIssueAfterFault(name: string) {
+    const { gatekeeper } = await this.#session(name, "repo");
+    return await gatekeeper.applyAction(1, {
+      billingOperationId: `create-${name}`,
+      mode: "recover",
+    });
   }
 
   async applyIssueTitle(name: string) {
@@ -226,17 +304,23 @@ export class GitHubBillingTestParent extends DurableObject {
     return action;
   }
 
-  async #session(name: string, resourceKind: "repo" | "issue" | "pull") {
-    const queue = new RecordingApprovalQueue();
+  async #session(
+    name: string,
+    resourceKind: "repo" | "issue" | "pull",
+    testFaultAt?: GitHubActionHandoff,
+    authorizeError?: Error,
+  ) {
+    const queue = new RecordingApprovalQueue(authorizeError);
     const accountId = this.#exports().UserAccount.newUniqueId().toString();
     const gatekeeper = this.ctx.facets.get<GitHubGatekeeperImpl>(name, () => ({
-      class: this.#exports().GitHubGatekeeperImpl({
+      class: this.#exports().GitHubBillingTestGatekeeper({
         props: {
           userObjectId: accountId,
           resourceKind,
           owner: "owner",
           repo: "repo",
           ...(resourceKind === "repo" ? {} : { issueNumber: 1 }),
+          ...(testFaultAt ? { testFaultAt } : {}),
         },
       }),
     }));

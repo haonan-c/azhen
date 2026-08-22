@@ -44,6 +44,8 @@ let interceptor: NetworkInterceptor;
 let issuePages = 0;
 let retryIssueList = false;
 let issueListRetryReturned = false;
+let repoEtagMode = false;
+let repoConditionalRequests = 0;
 let issueCreates = 0;
 let loseCreateResponse = false;
 let issueReads = 0;
@@ -116,7 +118,7 @@ function pullRequest(number: number) {
   };
 }
 
-const githubHandler: Handler = async (url, method, _headers, request) => {
+const githubHandler: Handler = async (url, method, headers, request) => {
   if (url.hostname === "github.com" &&
       url.pathname === "/login/oauth/access_token" && method === "POST") {
     return Response.json({
@@ -131,6 +133,13 @@ const githubHandler: Handler = async (url, method, _headers, request) => {
     return Response.json([{ email: "fixture@example.com", primary: true, verified: true }]);
   }
   if (method === "GET" && url.pathname === "/repos/fixture-owner/private-repo-marker") {
+    if (repoEtagMode) {
+      if (headers.get("if-none-match") === "fixture-etag") {
+        repoConditionalRequests++;
+        return new Response(null, { status: 304, headers: { ETag: "fixture-etag" } });
+      }
+      return Response.json(repository(), { headers: { ETag: "fixture-etag" } });
+    }
     return Response.json(repository());
   }
   if (url.pathname === "/repos/fixture-owner/private-repo-marker/issues") {
@@ -316,6 +325,8 @@ async function newGitHubUser(prefix: string): Promise<{
   issuePages = 0;
   retryIssueList = false;
   issueListRetryReturned = false;
+  repoEtagMode = false;
+  repoConditionalRequests = 0;
   issueCreates = 0;
   loseCreateResponse = false;
   issueReads = 0;
@@ -489,6 +500,37 @@ describe.sequential("GitHub billing production Worker contract", () => {
       disposeUser(context);
     }
   });
+
+  it("charges each metadata call once when GitHub revalidates the cached ETag with 304", async () => {
+    const context = await newGitHubUser("githubetag");
+    try {
+      repoEtagMode = true;
+      using gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub repository resource.");
+      using session = await gatekeeper.openSession() as RpcStub<GitHubRepo>;
+      const before = await context.user.getUsageCreditBalance();
+
+      expect((await session.getMetadata()).fullName).toBe("fixture-owner/private-repo-marker");
+      await new Promise(done => setTimeout(done, 30_100));
+      expect((await session.getMetadata()).fullName).toBe("fixture-owner/private-repo-marker");
+
+      expect(repoConditionalRequests).toBe(1);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - 2n * READ_CHARGE,
+      });
+      const records = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper" &&
+          record.billingMethodKey === "github.repository.metadata.read.v1");
+      expect(records).toHaveLength(2);
+    } finally {
+      repoEtagMode = false;
+      disposeUser(context);
+    }
+  }, 45_000);
 
   it("uses one charge and operation for a lazy three-page cursor", async () => {
     const context = await newGitHubUser("githubpages");
@@ -870,6 +912,8 @@ describe.sequential("GitHub billing production Worker contract", () => {
       session[Symbol.dispose]();
       using reopenedGatekeeper = await context.workspace.getGatekeeperById(gatekeeperId);
       using _reopenedSession = await reopenedGatekeeper.openSession() as RpcStub<GitHubPullRequest>;
+      await waitFor("the accepted review enrichment retry", async () =>
+        reviewEnrichmentReads === 2 ? true : null);
       expect(reviewCalls).toBe(1);
       expect(reviewEnrichmentReads).toBe(2);
       expect(await context.user.getUsageCreditBalance()).toEqual({
@@ -969,5 +1013,48 @@ describe.sequential("GitHub billing production Worker contract", () => {
       .toContain("github.issue.details.read.v1");
     expect(new Set([...firstRecords, ...secondRecords].map(record => record.externalAccountId)).size)
       .toBe(1);
+  });
+
+  it("keeps one settled cursor charge after early disposal, reconnect, and Worker restart", async () => {
+    const context = await newGitHubUser("githubcursorrestart");
+    let originalDisposed = false;
+    try {
+      const workspaceId = (await context.workspace.getMetadata()).id;
+      const gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub repository resource.");
+      const gatekeeperId = await gatekeeper.getId();
+      const session = await gatekeeper.openSession() as RpcStub<GitHubRepo>;
+      const before = await context.user.getUsageCreditBalance();
+      const cursor = await session.listIssues({ resultsPerPage: 50 });
+
+      expect(await cursor.next()).toHaveLength(50);
+      cursor[Symbol.dispose]();
+      session[Symbol.dispose]();
+      gatekeeper[Symbol.dispose]();
+      disposeUser(context);
+      originalDisposed = true;
+
+      await harness.server.update(options => options);
+      using reopenedPublicApi = connect(harness.url);
+      using reopenedUser = await signIn(reopenedPublicApi, context.username);
+      using reopenedWorkspace = await reopenedUser.openGadget(workspaceId);
+      using reopenedGatekeeper = await reopenedWorkspace.getGatekeeperById(gatekeeperId);
+      using _firstReopenedSession = await reopenedGatekeeper.openSession() as RpcStub<GitHubRepo>;
+      using _secondReopenedSession = await reopenedGatekeeper.openSession() as RpcStub<GitHubRepo>;
+
+      expect(await reopenedUser.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - READ_CHARGE,
+      });
+      const records = (await reopenedUser.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper" &&
+          record.billingMethodKey === "github.repository.issues.list.v1");
+      expect(records).toHaveLength(1);
+    } finally {
+      if (!originalDisposed) disposeUser(context);
+    }
   });
 });
