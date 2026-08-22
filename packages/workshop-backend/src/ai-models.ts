@@ -27,6 +27,10 @@ import {
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
+import {
+  isMeteredModelProvider, meterModelHandle, type ModelMeteringOptions,
+} from "./metered-model.js";
+import type { UsageAttribution } from "./usage-attribution.js";
 
  /**
   * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
@@ -50,7 +54,8 @@ type GatewayMetadata = {
   automated?: true;
 };
 
-type GatewayMetadataContext = {
+/** Which Gadgets operation a model call belongs to, reported to AI Gateway for attribution. */
+export type GatewayMetadataContext = {
   source: "chat" | "thread-title" | "gadget-title" | "model-binding";
   gadgetId?: string;
   chatId?: number;
@@ -60,6 +65,12 @@ type ModelRoutingOptions = {
   sessionAffinity?: string;
   userGateway?: UserGatewayRouting;
   metadata?: GatewayMetadataContext;
+  /**
+   * Usage metering for every stream the returned handle runs. Required: `getModel()` is the one
+   * seam every Deployment Model invocation source passes through, so a source that cannot name its
+   * Usage Principal and its UsageSource cannot reach a provider at all.
+   */
+  metering: ModelMeteringOptions;
 };
 
 /**
@@ -352,14 +363,31 @@ function makeHandle(args: HandleArgs): ModelHandle {
 }
 
 /**
- * Resolve an AiModelConfig to a ModelHandle, choosing among three routing modes: the user's own
- * AI Gateway (BYOK unified billing), the platform's AI Gateway (free tier), or direct provider
+ * Resolve an AiModelConfig to a metered ModelHandle, choosing among three routing modes: the user's
+ * own AI Gateway (BYOK unified billing), the platform's AI Gateway (free tier), or direct provider
  * access with the config's own credentials. The handle carries the matching AI Gateway log route
  * for cost accounting, when there is one.
+ *
+ * This is the single seam between an invocation source and a provider, so metering is applied here
+ * for every source -- Agent steps, compaction, titles, binding naming, Gadget model bindings and
+ * unattended work alike -- rather than being re-established at each call site.
  */
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
-                         options: ModelRoutingOptions = {}): ModelHandle {
+                         options: ModelRoutingOptions): ModelHandle {
+  let handle = routeModel(env, config, initiator, options);
+  // A provider whose Usage report this deployment cannot parse is reported rather than charged
+  // from an estimate; see isMeteredModelProvider.
+  return isMeteredModelProvider(handle.model.provider)
+      ? meterModelHandle(handle, options.metering)
+      : handle;
+}
+
+// Choose the routing for one model call. Callers get the metered handle from getModel(); nothing
+// outside this module may take the unmetered one.
+function routeModel(env: Cloudflare.Env, config: AiModelConfig,
+                    initiator: AiChatAuthorInfo,
+                    options: ModelRoutingOptions): ModelHandle {
   // These providers have no AI Gateway route. Existing BYOK models remain usable when either a
   // platform or user Gateway is active, and always retain their own credentials.
   if (DIRECT_ONLY_AI_PROVIDERS.has(config.provider)) {
@@ -682,6 +710,16 @@ export type LanguageModelGatekeeperProps = {
   modelId?: string,
   initiator: AiChatAuthorInfo,
   metadata?: GatewayMetadataContext,
+  /**
+   * Host-attested Usage attribution for every inference this binding runs: the workspace owner as
+   * Usage Principal, source "gadget". The workspace mints it when the binding is created, so no
+   * Gadget code can choose who pays. `gadgetId` is absent because one model binding serves
+   * whichever of the workspace's gadgets bind it.
+   *
+   * Absent only on a binding older than Usage metering that the workspace could not re-mint,
+   * meaning an ownerless workspace with nobody to charge; such a binding refuses to run.
+   */
+  attribution?: UsageAttribution,
 };
 
 export class LanguageModelGatekeeper
@@ -714,8 +752,13 @@ export class LanguageModelGatekeeper
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
       : Promise<LanguageModelBinding> {
     let admin = this.ctx.exports.AdminSettings.getByName("");
+    let users = this.ctx.exports.UserDurableObject;
     let props = this.ctx.props;
     return new LanguageModelBindingImpl(async () => {
+      let attribution = props.attribution;
+      if (!attribution) {
+        throw new Error("This model binding has no Usage Principal to charge. Reconnect it.");
+      }
       let record = props.modelId
           ? await admin.resolveAvailableModel(props.modelId)
           : undefined;
@@ -723,6 +766,11 @@ export class LanguageModelGatekeeper
       let config = record.config;
       return getModel(this.env, config, props.initiator, {
         metadata: props.metadata,
+        metering: {
+          usageRates: admin,
+          user: users.get(users.idFromString(attribution.principal.userId)),
+          attribution: {...attribution, deploymentModelId: record.profile.id},
+        },
       });
     });
   }
@@ -757,7 +805,7 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
   async run(options: {prompt: string, systemPrompt?: string}): Promise<string> {
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs?
-    // TODO: Account LLM costs back to the calling gadget.
+    // Usage is metered on the handle (source "gadget"), so this call charges the workspace owner.
     return await completeText(await this.resolveModel(), {
       prompt: options.prompt,
       systemPrompt: options.systemPrompt,

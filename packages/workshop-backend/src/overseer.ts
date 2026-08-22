@@ -12,8 +12,10 @@ import {
   LanguageModelGatekeeperProps,
   getModel,
   UserGatewayRouting,
+  type GatewayMetadataContext,
+  type ModelHandle,
 } from "./ai-models";
-import { meterAgentModelHandle, type ModelUsageOperation } from "./metered-model.js";
+import { type ModelUsageOperation } from "./metered-model.js";
 import type { ModelUsageReservationBound } from "./usage-account.js";
 import { AgentTurnError, completeText } from "./ai-invoke";
 import {
@@ -911,6 +913,9 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       //   2 = paid work carries a required host-attested Usage attribution. Active Agent records
       //       are migrated when their legacy initiator User ID proves the Principal; bound hooks
       //       carry the Workspace owner Principal. Ambiguous legacy Actions stay fail-closed.
+      //   3 = every AI model binding carries a required Usage attribution. Bindings created before
+      //       this are re-minted charging the Workspace owner; an ownerless workspace has none to
+      //       re-mint, so its bindings are left refusing to run.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1286,25 +1291,36 @@ class OverseerImpl implements AgentHooks {
     return normalizeUsageAttribution(record.attribution);
   }
 
+  // Usage attribution for a model binding this workspace hands to its Gadgets. The workspace owner
+  // pays: a Gadget runs on the owner's workspace and is reachable by whoever the owner shared it
+  // with, so no caller-supplied identity may redirect the charge.
+  modelBindingAttribution(): UsageAttribution {
+    if (!this.ownerId) throw new Error("A model binding needs a workspace owner to charge.");
+    return this.usageAttribution(this.ownerId, "gadget");
+  }
+
+  // The active Agent turn's attribution, relabeled as the host's own assistance to that turn.
+  // Work the user never asked for -- compaction summaries, binding naming, delayed-approval
+  // continuations -- keeps the turn's Usage Principal but is charged under its own source.
+  systemAssistanceAttribution(chatId: number): UsageAttribution {
+    let causal = this.activeAgentAttribution(chatId);
+    if (causal.workspaceId !== this.ctx.id.toString() || causal.chatId !== chatId) {
+      throw new Error("Active Agent Usage attribution does not match this Chat.");
+    }
+    return normalizeUsageAttribution({...causal, source: "system-assistance", chatId});
+  }
+
   createPendingSystemAssistance(
       chatId: number, cause: PendingSystemAssistanceRecord["cause"]):
       PendingSystemAssistanceRecord {
     let active = this.storage.activeAgents.get(chatId);
     if (!active) throw new Error("Active Agent Usage attribution is missing.");
-    let causal = normalizeUsageAttribution(active.attribution);
-    if (causal.workspaceId !== this.ctx.id.toString() || causal.chatId !== chatId) {
-      throw new Error("Active Agent Usage attribution does not match this Chat.");
-    }
     let record: PendingSystemAssistanceRecord = {
       id: `system-assistance:${crypto.randomUUID()}`,
       turnId: active.turnId,
       chatId,
       modelId: active.modelId,
-      attribution: normalizeUsageAttribution({
-        ...causal,
-        source: "system-assistance",
-        chatId,
-      }),
+      attribution: this.systemAssistanceAttribution(chatId),
       state: "waiting",
       cause,
     };
@@ -2002,6 +2018,37 @@ class OverseerImpl implements AgentHooks {
       this.storage.version.put(2);
     });
 
+    if (this.storage.version.get() === 2) {
+      // Model bindings created before Usage metering carry props with no attribution, so their
+      // inference cannot name a Usage Principal. Re-mint each one against the owner, exactly as
+      // replaceUnavailableModelBinding rebuilds props, rather than leaving it refusing to run.
+      // Skipped for an ownerless workspace: there is nobody to charge, and the migration must stay
+      // synchronous (it runs in the constructor), so it cannot go looking for one.
+      let reminted: number[] = [];
+      this.ctx.storage.transactionSync(() => {
+        if (this.ownerId) for (let gk of Array.from(this.storage.gatekeepers.list())) {
+          if (gk.creationSpec?.type !== "aiModel") continue;
+          let props: LanguageModelGatekeeperProps = {
+            displayName: gk.resourceTitle ?? "AI model",
+            modelId: gk.creationSpec.modelId,
+            // The owner's profile id needs an async lookup, so these carry the owner's stable
+            // workspace-side id instead. It only names the user in AI Gateway's attribution
+            // metadata; nothing bills off it.
+            initiator: {type: "gadget", id: this.ownerId, name: this.storage.title.get()},
+            metadata: {source: "model-binding", gadgetId: this.ctx.id.toString()},
+            attribution: this.modelBindingAttribution(),
+          };
+          gk.class = this.ctx.exports.LanguageModelGatekeeper({props});
+          this.storage.gatekeepers.put(gk);
+          reminted.push(gk.id);
+        }
+        this.storage.version.put(3);
+      });
+      // Drop each stale facet so the next use instantiates the gatekeeper from the new props.
+      // A model binding keeps no facet state of its own, so nothing is lost.
+      for (let id of reminted) this.ctx.facets.delete(`gatekeeper${id}`);
+    }
+
     this.logger.info("migrated workspace storage", {
       event: "storage.migration.completed", durationMs: Date.now() - startedAt,
     });
@@ -2366,6 +2413,7 @@ class OverseerImpl implements AgentHooks {
           name: this.storage.title.get(),
         },
         metadata: {source: "model-binding", gadgetId: this.ctx.id.toString()},
+        attribution: this.modelBindingAttribution(),
       };
       gatekeeper.creationSpec = {type: "aiModel", modelId: replacement.profile.id};
       gatekeeper.resourceTitle = replacement.profile.name;
@@ -4243,7 +4291,8 @@ class OverseerImpl implements AgentHooks {
       let titleMessage = prepared.message?.trim() || prepared.slashCommand?.args.trim() ||
         prepared.skillName || (prepared.slashCommand ? "Slash command" : "") ||
         `[user attached ${canonicalAttachments?.length ?? 0} attachment(s)]`;
-      this.generateThreadTitle(chatId, titleMessage, userMeta.quickModel, userMeta.profile);
+      this.generateThreadTitle(chatId, titleMessage, userMeta.quickModel, userMeta.profile,
+          this.usageAttribution(clientUser.id.toString(), "system-assistance", {chatId}));
     }
 
     this.recordGadgetAnalytics({
@@ -4696,26 +4745,41 @@ class OverseerImpl implements AgentHooks {
       }
 
       let sessionAffinity = await computeSessionAffinity(this.ctx.id.toString(), chatId);
-      let chosenModel = getModel(
-          this.env, aiModel.config, initiator, {
-            sessionAffinity,
-            userGateway: byokRouting,
-            metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId },
-          });
-      if (aiModel.config.provider === "deepseek") {
-        chosenModel = meterAgentModelHandle(chosenModel, {
-          usageRates: this.ctx.exports.AdminSettings.getByName(""),
-          user: this.users.get(this.users.idFromString(attribution.principal.userId)),
-          attribution: {
-            ...attribution,
-            deploymentModelId: aiModel.profile.id,
-          },
+      let routing = {
+        sessionAffinity,
+        userGateway: byokRouting,
+        metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId } as const,
+      };
+      let usageRates = this.ctx.exports.AdminSettings.getByName("");
+      let principal = this.users.get(this.users.idFromString(attribution.principal.userId));
+      // Every step of the loop below streams from this handle, and each stream is metered on its
+      // own: a turn is never charged as one model call.
+      let chosenModel = getModel(this.env, aiModel.config, initiator, {
+        ...routing,
+        metering: {
+          usageRates,
+          user: principal,
+          attribution: {...attribution, deploymentModelId: aiModel.profile.id},
+          // Recoverable per-chat operation identity, so a restarted turn resumes the Attempt it
+          // began instead of opening a second one. Only the loop's own steps take part: the
+          // one-shot handles below run at most once and use ephemeral operation ids.
           operations: {
             acquire: input => this.acquireModelUsageOperation(chatId, input),
             finish: operationId => this.finishModelUsageOperation(chatId, operationId),
           },
-        });
-      }
+        },
+      });
+      let summaryHandle = getModel(this.env, aiModel.config, initiator, {
+        ...routing,
+        metering: {
+          usageRates,
+          user: principal,
+          attribution: {
+            ...this.systemAssistanceAttribution(chatId),
+            deploymentModelId: aiModel.profile.id,
+          },
+        },
+      });
 
       let controller = liveChat.cancelController;
       controller.signal.throwIfAborted();
@@ -4733,6 +4797,7 @@ class OverseerImpl implements AgentHooks {
             initiator, callbackInitiated, {
               checkpoint,
               modelConfig: aiModel.config,
+              summaryHandle,
               measuredTokens: this.getChatMetaOrThrow(chatId).totalTokens ?? 0,
             });
         if (newCheckpoint) this.#commitChatCompaction(chatId, newCheckpoint);
@@ -5273,14 +5338,31 @@ class OverseerImpl implements AgentHooks {
     return taken;
   }
 
+  // Resolve a metered handle for one host-initiated quick-model call: binding naming and the two
+  // title generators. These run at most once each, so they take getModel()'s default ephemeral
+  // operation identity -- the recoverable per-chat identity belongs to the Agent loop's steps.
+  #quickModel(quick: {model: DeploymentModelRecord, initiator: AiChatAuthorInfo},
+              attribution: UsageAttribution,
+              metadata?: GatewayMetadataContext): ModelHandle {
+    return getModel(this.env, quick.model.config, quick.initiator, {
+      metadata,
+      metering: {
+        usageRates: this.ctx.exports.AdminSettings.getByName(""),
+        user: this.users.get(this.users.idFromString(attribution.principal.userId)),
+        attribution: {...attribution, deploymentModelId: quick.model.profile.id},
+      },
+    });
+  }
+
   // Choose a binding name for a resource using the quick model, validated and deduped. Returns
   // undefined on any failure (error, timeout, invalid or colliding output) so the caller can
   // fall back to a deterministic name.
   async generateBindingName(
       subject: string, takenNames: Set<string>,
-      quick: {config: AiModelConfig, initiator: AiChatAuthorInfo}): Promise<string | undefined> {
+      quick: {model: DeploymentModelRecord, initiator: AiChatAuthorInfo},
+      attribution: UsageAttribution): Promise<string | undefined> {
     try {
-      let model = getModel(this.env, quick.config, quick.initiator);
+      let model = this.#quickModel(quick, attribution);
       let result = await completeText(model, {
         signal: AbortSignal.timeout(10_000),
         prompt:
@@ -5313,12 +5395,12 @@ class OverseerImpl implements AgentHooks {
   // Returns undefined when no quick model is configured (callers fall back to deterministic
   // names).
   async #getNamingQuickModel()
-      : Promise<{config: AiModelConfig, initiator: AiChatAuthorInfo} | undefined> {
+      : Promise<{model: DeploymentModelRecord, initiator: AiChatAuthorInfo} | undefined> {
     if (!this.ownerId) return undefined;
     try {
       let userMeta = await this.#ownerUserDo().getChatContext(null);
       return userMeta.quickModel
-          ? {config: userMeta.quickModel, initiator: userMeta.profile}
+          ? {model: userMeta.quickModel, initiator: userMeta.profile}
           : undefined;
     } catch (err) {
       this.logger.warn("failed to resolve quick model for binding naming", {
@@ -5515,6 +5597,8 @@ class OverseerImpl implements AgentHooks {
 
     if (anythingToName) {
       let quick = await this.#getNamingQuickModel();
+      // Naming runs inside the turn that needs the names, so it keeps that turn's Usage Principal.
+      let namingAttribution = this.systemAssistanceAttribution(chatId);
 
       // Name one resource: reuse the target's existing name in scope when there is one, else ask
       // the quick model, else fall back to the gatekeeper's suggested binding name (suffixed to
@@ -5525,7 +5609,9 @@ class OverseerImpl implements AgentHooks {
           let existing = nameByTarget.get(target);
           if (existing !== undefined) return existing;
         }
-        let name = quick ? await this.generateBindingName(subject, taken, quick) : undefined;
+        let name = quick
+            ? await this.generateBindingName(subject, taken, quick, namingAttribution)
+            : undefined;
         if (name === undefined) {
           let suggested: string | undefined;
           if (target !== undefined && this.storage.gatekeepers.get(target)) {
@@ -5975,12 +6061,13 @@ class OverseerImpl implements AgentHooks {
 
   // Auto-generate a title for the given
   async generateThreadTitle(chatId: number, initialMessage: string,
-                            modelConfig: AiModelConfig,
-                            initiator: AiChatAuthorInfo): Promise<void> {
+                            quickModel: DeploymentModelRecord,
+                            initiator: AiChatAuthorInfo,
+                            attribution: UsageAttribution): Promise<void> {
     try {
-      let model = getModel(this.env, modelConfig, initiator, {
-        metadata: { source: "thread-title", gadgetId: this.ctx.id.toString(), chatId },
-      });
+      let model = this.#quickModel(
+          {model: quickModel, initiator}, attribution,
+          { source: "thread-title", gadgetId: this.ctx.id.toString(), chatId });
 
       let result = await completeText(model, {
         // TODO: Is there a better way to convince the LLM just to summarize and not to follow
@@ -6013,8 +6100,6 @@ class OverseerImpl implements AgentHooks {
         let owner = this.users.get(this.users.idFromString(this.ownerId));
         await owner.updateTitle(this.ctx.id.toString(), result);
       }
-
-      // TODO: Should we track costs for title generation? It's pretty negligible.
     } catch (err) {
       // Oh well, just leave the title as "New Chat".
       this.logger.warn("error generating chat title", {
@@ -6024,8 +6109,9 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Generate a title for the whole gadget, called only after code starts being written.
-  async generateGadgetTitle(chatId: number, modelConfig: AiModelConfig,
-                            initiator: AiChatAuthorInfo) {
+  async generateGadgetTitle(chatId: number, quickModel: DeploymentModelRecord,
+                            initiator: AiChatAuthorInfo,
+                            attribution: UsageAttribution) {
     try {
       let parts: string[] = [];
 
@@ -6035,9 +6121,9 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
-      let model = getModel(this.env, modelConfig, initiator, {
-        metadata: { source: "gadget-title", gadgetId: this.ctx.id.toString(), chatId },
-      });
+      let model = this.#quickModel(
+          {model: quickModel, initiator}, attribution,
+          { source: "gadget-title", gadgetId: this.ctx.id.toString(), chatId });
 
       let gadgetTitle = await completeText(model, {
         prompt: "Below is the log of a chat session that led to a coding agent writing " +
@@ -8295,7 +8381,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       let userMeta = await this.#clientUser.getChatContext(null);
       if (userMeta.quickModel) {
         bindingName = await this.impl.generateBindingName(
-            title, taken, {config: userMeta.quickModel, initiator: userMeta.profile});
+            title, taken, {model: userMeta.quickModel, initiator: userMeta.profile},
+            this.impl.usageAttribution(this.clientUserId, "system-assistance",
+                chatId === undefined ? {} : {chatId}));
       }
       bindingName ??= fallbackBindingName("GADGET", name => taken.has(name));
     } else if (chatNames?.has(bindingName)) {
@@ -8511,6 +8599,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         name: this.impl.storage.title.get(),
       },
       metadata: { source: "model-binding", gadgetId: this.impl.ctx.id.toString() },
+      attribution: this.impl.modelBindingAttribution(),
     }
 
     let creationSpec: GatekeeperCreationSpec = {
@@ -9318,7 +9407,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // code -- creations/binding additions only -- doesn't count: it writes no code version, so
     // the first *code* merge after it still sees isFirstChange and generates the title then.)
     if (isFirstChange && codeUpdates.length > 0 && userMeta.quickModel) {
-      this.impl.generateGadgetTitle(chatId, userMeta.quickModel, userMeta.profile);
+      this.impl.generateGadgetTitle(chatId, userMeta.quickModel, userMeta.profile,
+          this.impl.usageAttribution(
+              this.#clientUser.id.toString(), "system-assistance", {chatId}));
     }
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",

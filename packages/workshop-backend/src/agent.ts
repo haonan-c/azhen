@@ -165,6 +165,12 @@ export type CompactionContext = {
   /** The chosen model, whose window and reserved response capacity size the prompt budget. */
   modelConfig: AiModelConfig;
 
+  /**
+   * The same model, metered as system assistance rather than as an Agent step: a compaction summary
+   * is host-initiated work the user never asked for, so it is attributed apart from the turn.
+   */
+  summaryHandle: ModelHandle;
+
   /** The total tokens reported for the last measured model step, or zero if none are available. */
   measuredTokens: number;
 };
@@ -2338,10 +2344,10 @@ export async function runAgent(
           content: "Create the context handoff now. Do not continue the conversation.",
           timestamp: Date.now(),
         });
-        // Like title generation, this call's usage is deliberately not billed to the chat. It
-        // carries the turn's largest prompt, so it needs the response cap most: without it a model
-        // that charges the response to the same window would reject the request outright.
-        let summary = (await completeText(handle, {
+        // Metered as system assistance (see CompactionContext.summaryHandle). It carries the
+        // turn's largest prompt, so it needs the response cap most: without it a model that charges
+        // the response to the same window would reject the request outright.
+        let summary = (await completeText(compaction.summaryHandle, {
           systemPrompt: COMPACTION_SYSTEM_PROMPT,
           messages: summaryMessages,
           maxTokens: maxOutputTokens,

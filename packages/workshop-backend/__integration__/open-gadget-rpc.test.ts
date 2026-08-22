@@ -501,8 +501,11 @@ describe("Deployment Model RPC", () => {
     expect(context).toEqual({
       profile: expect.objectContaining({id: account.username}),
       quickModel: expect.objectContaining({
-        model: "legacy-provider-model",
-        apiToken: "deployment-secret",
+        profile: expect.objectContaining({id: deploymentModelId}),
+        config: expect.objectContaining({
+          model: "legacy-provider-model",
+          apiToken: "deployment-secret",
+        }),
       }),
     });
     await expect(runInDurableObject(

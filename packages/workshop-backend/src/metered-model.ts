@@ -13,10 +13,15 @@ import type {
 } from "./usage-account.js";
 import type { UserDurableObject } from "./user.js";
 import { createWorkshopLogger } from "./observability.js";
-import type { ModelChargeSnapshot } from "@gadgets/workshop-shared/api";
+import type { AiModelProvider, ModelChargeSnapshot } from "@gadgets/workshop-shared/api";
 
 const MAX_SSE_LINE_BYTES = 1_048_576;
 const logger = createWorkshopLogger("workshop.metered-model");
+
+// Providers whose streamed response carries a Usage report this adapter can parse into exact
+// token categories. Metering a provider means observing its own report -- never estimating -- so a
+// provider joins this set only together with a parser for its report shape.
+const METERED_PROVIDERS: ReadonlySet<string> = new Set<AiModelProvider>(["deepseek"]);
 
 type UsageRateIssuer = Pick<
   DurableObjectStub<AdminSettings>,
@@ -42,13 +47,26 @@ export type ModelUsageOperationLifecycle = {
   finish(operationId: string): void;
 };
 
-/** Trusted dependencies and content-free dimensions for one Agent model handle. */
-export type AgentModelMeteringOptions = {
+/** Trusted dependencies and content-free dimensions for one metered model handle. */
+export type ModelMeteringOptions = {
   usageRates: UsageRateIssuer;
   user: ModelUsageAccount;
   attribution: ModelUsageAttribution;
   operations?: ModelUsageOperationLifecycle;
 };
+
+/**
+ * Whether this deployment can meter inference from `provider`.
+ *
+ * Metering reads the provider's own Usage report, so an unparsed provider is reported here rather
+ * than charged from an estimate. `getModel()` refuses to meter what this returns false for, which
+ * keeps the pass-through explicit at the one chokepoint instead of hidden per call site.
+ *
+ * Takes pi's own `Model.provider` string, which is what a resolved handle carries.
+ */
+export function isMeteredModelProvider(provider: string): boolean {
+  return METERED_PROVIDERS.has(provider);
+}
 
 /**
  * Return a conservative DeepSeek-V4 input-token bound derived from the final JSON payload.
@@ -78,11 +96,16 @@ export function deepSeekInputTokenUpperBound(
   return inputCapacity;
 }
 
-/** Meter each DeepSeek Agent stream independently without changing other model sources. */
-export function meterAgentModelHandle(
-    handle: ModelHandle, options: AgentModelMeteringOptions): ModelHandle {
-  if (handle.model.provider !== "deepseek") {
-    throw new TypeError("Agent DeepSeek metering can wrap only a DeepSeek model handle.");
+/**
+ * Meter every stream from one model handle, whatever invocation source holds it.
+ *
+ * Each `stream()` call is one independent Metering Attempt, so an Agent turn's steps, a compaction
+ * summary and a Gadget model binding each charge on their own rather than as one turn-sized call.
+ */
+export function meterModelHandle(
+    handle: ModelHandle, options: ModelMeteringOptions): ModelHandle {
+  if (!isMeteredModelProvider(handle.model.provider)) {
+    throw new TypeError("Model metering can wrap only a metered provider's model handle.");
   }
 
   return {

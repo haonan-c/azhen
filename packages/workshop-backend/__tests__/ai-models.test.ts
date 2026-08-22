@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
+import {
+  isMeteredModelProvider, meterModelHandle, type ModelMeteringOptions,
+} from "../src/metered-model.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
 // the returned handle's model descriptor (baseUrl/id/api) and log route, and request-level
@@ -42,6 +45,50 @@ function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   } as Cloudflare.Env;
 }
 
+// Metering the routing tests must not need a live Usage Account: these record which lifecycle
+// calls getModel() made, which is exactly what distinguishes a metered provider from a
+// passed-through one. The real persistence is covered by metered-model.test.ts.
+const meteringCalls: string[] = [];
+
+function stubMetering(): ModelMeteringOptions {
+  return {
+    usageRates: {
+      issueModelChargeSnapshot: async (provider: string, model: string) => {
+        meteringCalls.push(`issue:${provider}:${model}`);
+        return {
+          kind: "model", pricing: "unpriced", usageRateVersion: 1n,
+          issuedAt: "1970-01-01T00:00:00.000Z", catalogVersion: "test",
+          provider, model, chargeSubunits: 0n, configurationGap: true,
+        };
+      },
+    },
+    user: {
+      beginModelUsage: async () => { meteringCalls.push("begin"); },
+      markModelUsageStarted: async () => { meteringCalls.push("start"); },
+      failModelUsageBeforeExecution: async () => { meteringCalls.push("fail"); },
+      completeModelUsage: async () => {
+        meteringCalls.push("complete");
+        return {outcome: "usage-unknown"};
+      },
+    },
+    attribution: {
+      principal: {version: 1, kind: "user", userId: "a".repeat(64)},
+      source: "agent",
+      workspaceId: "b".repeat(64),
+      deploymentModelId: "routing-test-model",
+    },
+    // The stubs stand in for Durable Object stubs whose methods this adapter only ever calls.
+  } as unknown as ModelMeteringOptions;
+}
+
+// Every getModel() call here supplies metering, because the signature requires it: an invocation
+// source that cannot name its Usage Principal cannot reach a provider.
+function routeModel(
+    workerEnv: Cloudflare.Env, config: AiModelConfig, initiator: AiChatAuthorInfo,
+    options: Omit<Parameters<typeof getModel>[3], "metering"> = {}): ModelHandle {
+  return getModel(workerEnv, config, initiator, {...options, metering: stubMetering()});
+}
+
 type CapturedRequest = { url: string; headers: Headers; body: string };
 
 const capturedRequests: CapturedRequest[] = [];
@@ -75,7 +122,7 @@ describe("getModel AI Gateway routing", () => {
   });
 
   it("routes non-Workers providers through the platform gateway", async () => {
-    const handle = getModel(env(), ANTHROPIC_CONFIG, INITIATOR, {
+    const handle = routeModel(env(), ANTHROPIC_CONFIG, INITIATOR, {
       metadata: { source: "chat", gadgetId: "gadget-123", chatId: 7 },
     });
 
@@ -111,7 +158,7 @@ describe("getModel AI Gateway routing", () => {
     // the provider verbatim (taking precedence over the gateway's stored keys), so the documented
     // stored-key flow passes the gateway token as the SDK API key. The adapter rejects injected
     // fetch, so only the descriptor is asserted here; the header behavior is the SDK's.
-    const handle = getModel(env(), {
+    const handle = routeModel(env(), {
       provider: "google",
       model: "gemini-2.5-flash",
       apiToken: "ignored-in-gateway-mode",
@@ -129,7 +176,7 @@ describe("getModel AI Gateway routing", () => {
   });
 
   it("preserves gadget automation metadata", async () => {
-    const handle = getModel(env(), ANTHROPIC_CONFIG, GADGET_INITIATOR, {
+    const handle = routeModel(env(), ANTHROPIC_CONFIG, GADGET_INITIATOR, {
       metadata: { source: "thread-title", gadgetId: "gadget-456", chatId: 8 },
     });
 
@@ -147,13 +194,13 @@ describe("getModel AI Gateway routing", () => {
     { CF_AI_GATEWAY_ACCOUNT_ID: undefined },
     { CF_AI_GATEWAY_API_TOKEN: undefined },
   ])("requires gateway credentials whenever gateway mode is enabled", (overrides) => {
-    expect(() => getModel(env(overrides), ANTHROPIC_CONFIG, INITIATOR)).toThrow(
+    expect(() => routeModel(env(overrides), ANTHROPIC_CONFIG, INITIATOR)).toThrow(
         "CF_AI_GATEWAY_ACCOUNT_ID and CF_AI_GATEWAY_API_TOKEN (a Run + Read token) are required " +
         "when CF_AI_GATEWAY is set.");
   });
 
   it("rejects conflicting Workers AI routing configuration", () => {
-    expect(() => getModel(env({
+    expect(() => routeModel(env({
       CF_AI_GATEWAY_WAI: "workers-ai-gateway",
       CF_AI_GATEWAY_WAI_DIRECT: "true",
     }), WORKERS_AI_CONFIG, INITIATOR)).toThrow(
@@ -161,7 +208,7 @@ describe("getModel AI Gateway routing", () => {
   });
 
   it("prioritizes a connected user's Gateway over platform routing", async () => {
-    const handle = getModel(env(), WORKERS_AI_CONFIG, INITIATOR, {
+    const handle = routeModel(env(), WORKERS_AI_CONFIG, INITIATOR, {
       userGateway: { accountId: "user-account-id", apiKey: "user-token" },
       metadata: { source: "chat", gadgetId: "gadget-789", chatId: 9 },
     });
@@ -193,7 +240,7 @@ describe("getModel AI Gateway routing", () => {
   }, 15000);
 
   it("speaks the provider's native API on a connected user's Gateway", async () => {
-    const handle = getModel(env(), ANTHROPIC_CONFIG, INITIATOR, {
+    const handle = routeModel(env(), ANTHROPIC_CONFIG, INITIATOR, {
       userGateway: { accountId: "user-account-id", apiKey: "user-token" },
     });
 
@@ -215,7 +262,7 @@ describe("getModel AI Gateway routing", () => {
   }, 15000);
 
   it("routes Workers AI to its REST endpoint when explicitly configured direct", async () => {
-    const handle = getModel(
+    const handle = routeModel(
         env({ CF_AI_GATEWAY_WAI_DIRECT: "true" }),
         WORKERS_AI_CONFIG,
         INITIATOR,
@@ -238,7 +285,7 @@ describe("getModel AI Gateway routing", () => {
   }, 15000);
 
   it("routes same-account Workers AI through the platform gateway by default", () => {
-    const handle = getModel(env(), WORKERS_AI_CONFIG, INITIATOR);
+    const handle = routeModel(env(), WORKERS_AI_CONFIG, INITIATOR);
 
     expect(handle.model.api).toBe("openai-completions");
     expect(handle.model.id).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
@@ -252,7 +299,7 @@ describe("getModel AI Gateway routing", () => {
   });
 
   it("uses an explicit Workers AI gateway override", () => {
-    const handle = getModel(
+    const handle = routeModel(
         env({ CF_AI_GATEWAY_WAI: "workers-ai-gateway" }), WORKERS_AI_CONFIG, INITIATOR);
 
     expect(handle.model.baseUrl).toBe(
@@ -271,7 +318,7 @@ describe("getModel direct routing", () => {
   });
 
   it("uses the provider defaults and the config's own credentials", async () => {
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "anthropic",
       model: "claude-sonnet-4-5",
       apiToken: "direct-api-token",
@@ -290,7 +337,7 @@ describe("getModel direct routing", () => {
   it("uses the config's own account and token for direct Workers AI", async () => {
     // Outside gateway mode, Workers AI is BYOK like any other provider: credentials come from
     // the model config (never from env, which only configures gateway mode).
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       ...WORKERS_AI_CONFIG,
       accountId: "user-account-id",
       apiToken: "user-token",
@@ -312,13 +359,13 @@ describe("getModel direct routing", () => {
     { accountId: "user-account-id", apiToken: "" },
   ])("requires config credentials for direct Workers AI", (overrides) => {
     // Pre-BYOK configs (saved when Workers AI needed no credentials) fail with a clear message.
-    expect(() => getModel(env({ CF_AI_GATEWAY: undefined }),
+    expect(() => routeModel(env({ CF_AI_GATEWAY: undefined }),
         { ...WORKERS_AI_CONFIG, ...overrides }, INITIATOR))
         .toThrow("This Workers AI model has no Cloudflare credentials.");
   });
 
   it("appends /v1 to an Ollama server base URL", () => {
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "ollama",
       model: "qwen3:8b",
       apiToken: "",
@@ -332,7 +379,7 @@ describe("getModel direct routing", () => {
   it("sends no Authorization header for an Ollama config without an API key", async () => {
     // An empty token means local auth: a strict local proxy may reject an unexpected bearer
     // token, so no Authorization header is sent at all (matching the pre-pi provider).
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "ollama",
       model: "qwen3:8b",
       apiToken: "",
@@ -345,7 +392,7 @@ describe("getModel direct routing", () => {
   }, 15000);
 
   it("sends the configured Ollama API key as a bearer token", async () => {
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "ollama",
       model: "qwen3:8b",
       apiToken: "ollama-token",
@@ -359,7 +406,7 @@ describe("getModel direct routing", () => {
   it("strips a legacy /api (or /v1) suffix from an Ollama base URL", () => {
     // Configs saved before the pi migration store the native-API base (".../api").
     for (const apiUrl of ["http://my-ollama:11434/api", "http://my-ollama:11434/v1/"]) {
-      const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
         provider: "ollama",
         model: "qwen3:8b",
         apiToken: "",
@@ -370,7 +417,7 @@ describe("getModel direct routing", () => {
   });
 
   it("routes DeepSeek to its official API with the config's own bearer token", async () => {
-    const handle = getModel(env({
+    const handle = routeModel(env({
       CF_AI_GATEWAY_PROVIDERS: "anthropic,deepseek",
     }), {
       provider: "deepseek",
@@ -397,7 +444,7 @@ describe("getModel direct routing", () => {
   }, 15000);
 
   it("keeps Ollama direct when platform and user gateways are configured", async () => {
-    const handle = getModel(env({
+    const handle = routeModel(env({
       CF_AI_GATEWAY_PROVIDERS: "anthropic,ollama",
     }), {
       provider: "ollama",
@@ -418,7 +465,7 @@ describe("getModel direct routing", () => {
   }, 15000);
 
   it("lets a DeepSeek config override the base URL (proxy)", () => {
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "deepseek",
       model: "deepseek-v4-flash",
       apiToken: "deepseek-token",
@@ -454,7 +501,7 @@ describe("PDF attachment bridging", () => {
   }
 
   it("sends Anthropic PDFs as document blocks", async () => {
-    const handle = getModel(env(), ANTHROPIC_CONFIG, INITIATOR);
+    const handle = routeModel(env(), ANTHROPIC_CONFIG, INITIATOR);
     const body = await capturePdfRequest(handle) as
         { messages: { content: { type: string; source?: { media_type: string } }[] }[] };
 
@@ -473,7 +520,7 @@ describe("PDF attachment bridging", () => {
   }, 15000);
 
   it("sends OpenAI PDFs as input_file parts", async () => {
-    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "openai",
       model: "gpt-5.2",
       apiToken: "direct-api-token",
@@ -493,4 +540,49 @@ describe("PDF attachment bridging", () => {
       image_url: "data:image/png;base64,iVBOR",
     }));
   }, 15000);
+});
+
+describe("getModel Usage metering chokepoint", () => {
+  beforeEach(() => {
+    capturedRequests.length = 0;
+    meteringCalls.length = 0;
+  });
+
+  it("meters one Attempt per stream from a metered provider", async () => {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+      apiToken: "deepseek-token",
+    }, INITIATOR);
+
+    await captureRequest(handle, handle.model.maxTokens);
+    expect(meteringCalls).toEqual([
+      "issue:deepseek:deepseek-v4-flash", "begin", "start", "complete",
+    ]);
+
+    // A second step of the same loop is a second Attempt, never a continuation of the first.
+    capturedRequests.length = 0;
+    await captureRequest(handle, handle.model.maxTokens);
+    expect(meteringCalls.filter(call => call === "begin")).toHaveLength(2);
+  }, 15000);
+
+  it("passes a provider it cannot meter through without an Attempt", async () => {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), ANTHROPIC_CONFIG, INITIATOR);
+
+    await captureRequest(handle);
+    expect(meteringCalls).toEqual([]);
+  }, 15000);
+
+  it("names exactly the providers whose own Usage report it can read", () => {
+    expect(isMeteredModelProvider("deepseek")).toBe(true);
+    for (const provider of ["anthropic", "openai", "google", "cloudflare", "ollama"]) {
+      expect(isMeteredModelProvider(provider)).toBe(false);
+    }
+  });
+
+  it("refuses to wrap a handle whose provider it cannot meter", () => {
+    const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), ANTHROPIC_CONFIG, INITIATOR);
+    expect(() => meterModelHandle(handle, stubMetering()))
+        .toThrow(/only a metered provider/);
+  });
 });

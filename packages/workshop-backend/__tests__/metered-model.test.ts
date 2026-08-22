@@ -4,7 +4,7 @@ import type { AdminSettings } from "../src/admin-settings.js";
 import { getModel } from "../src/ai-models.js";
 import {
   deepSeekInputTokenUpperBound,
-  meterAgentModelHandle,
+  type ModelMeteringOptions,
   type ModelUsageOperation,
 } from "../src/metered-model.js";
 import {
@@ -37,16 +37,18 @@ const TEST_USAGE_PRINCIPAL = {
   userId: "0".repeat(64),
 };
 
-function deepSeekHandle() {
+// Every handle here comes from getModel(), the one seam an invocation source reaches a provider
+// through, so these tests exercise metering exactly as the real call sites get it.
+function deepSeekHandle(metering: ModelMeteringOptions, model = "deepseek-v4-flash") {
   return getModel({CF_AI_GATEWAY: undefined} as Cloudflare.Env, {
     provider: "deepseek",
-    model: "deepseek-v4-flash",
+    model,
     apiToken: "dummy-deepseek-token",
   }, {
     type: "user",
     id: "metered-model@example.com",
     name: "Metered Model",
-  });
+  }, {metering});
 }
 
 function deepSeekSse(usage: Record<string, unknown>): Response {
@@ -148,7 +150,7 @@ describe("DeepSeek Agent model metering", () => {
       chatId: 90,
       deploymentModelId: "deepseek-agent-restart-operation",
     };
-    const interrupted = meterAgentModelHandle(deepSeekHandle(), {
+    const interrupted = deepSeekHandle({
       usageRates: settings,
       operations,
       attribution,
@@ -173,7 +175,7 @@ describe("DeepSeek Agent model metering", () => {
     }, {maxRetries: 0, maxTokens: 8}).result();
     expect(persisted).toBeDefined();
 
-    const resumed = meterAgentModelHandle(deepSeekHandle(), {
+    const resumed = deepSeekHandle({
       usageRates: settings,
       operations,
       attribution,
@@ -387,7 +389,7 @@ describe("DeepSeek Agent model metering", () => {
     const before = await user.getUsageCreditBalance();
     let providerCalls = 0;
 
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: settings,
       user,
       attribution: {
@@ -456,7 +458,7 @@ describe("DeepSeek Agent model metering", () => {
 
   it("releases the reservation and records unknown Usage when no Usage frame arrives", async () => {
     const user = await newUser();
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -497,7 +499,7 @@ describe("DeepSeek Agent model metering", () => {
     const user = await newUser();
     const before = await user.getUsageCreditBalance();
     let providerCalls = 0;
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -542,7 +544,7 @@ describe("DeepSeek Agent model metering", () => {
   it("settles explicit Usage even when the provider stream fails afterwards", async () => {
     const user = await newUser();
     const before = await user.getUsageCreditBalance();
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -583,19 +585,7 @@ describe("DeepSeek Agent model metering", () => {
   it("ignores the floating pi model cost and settles only from the Charge Snapshot", async () => {
     const user = await newUser();
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
-    const base = deepSeekHandle();
-    const handle = meterAgentModelHandle({
-      ...base,
-      model: {
-        ...base.model,
-        cost: {
-          input: 9_999_999_999,
-          output: 8_888_888_888,
-          cacheRead: 7_777_777_777,
-          cacheWrite: 6_666_666_666,
-        },
-      },
-    }, {
+    const handle = deepSeekHandle({
       usageRates: settings,
       user,
       attribution: {
@@ -606,13 +596,22 @@ describe("DeepSeek Agent model metering", () => {
         deploymentModelId: "deepseek-agent-ignore-pi-cost",
       },
     });
+    const pricedModel = {
+      ...handle.model,
+      cost: {
+        input: 9_999_999_999,
+        output: 8_888_888_888,
+        cacheRead: 7_777_777_777,
+        cacheWrite: 6_666_666_666,
+      },
+    };
     const usage = {
       cacheHitInputTokens: 3n,
       cacheMissInputTokens: 8n,
       outputTokens: 5n,
       reasoningTokens: 2n,
     };
-    const result = await handle.stream(handle.model, {
+    const result = await handle.stream(pricedModel, {
       messages: [{role: "user", content: "hello", timestamp: 0}],
     }, {
       maxRetries: 0,
@@ -650,7 +649,7 @@ describe("DeepSeek Agent model metering", () => {
       },
     };
     let providerCalls = 0;
-    const first = meterAgentModelHandle(deepSeekHandle(), options);
+    const first = deepSeekHandle(options);
     const firstResult = await first.stream(first.model, {
       messages: [{role: "user", content: "short", timestamp: 0}],
     }, {
@@ -681,7 +680,7 @@ describe("DeepSeek Agent model metering", () => {
     expect(blocked.reservations[0]).toMatchObject({state: "reserved"});
     expect(blocked.ledgerEntries.filter(entry => entry.kind === "usage-charge")).toEqual([]);
 
-    const second = meterAgentModelHandle(deepSeekHandle(), {
+    const second = deepSeekHandle({
       ...options,
       attribution: {...options.attribution, chatId: 11},
     });
@@ -794,7 +793,7 @@ describe("DeepSeek Agent model metering", () => {
       "test-admin@example.com",
     );
     let providerCalls = 0;
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -837,7 +836,7 @@ describe("DeepSeek Agent model metering", () => {
     };
     const streamOptions = {maxRetries: 0, maxTokens: 8};
     let capturedBound: ModelUsageReservationBound | undefined;
-    const probe = meterAgentModelHandle(deepSeekHandle(), {
+    const probe = deepSeekHandle({
       usageRates,
       user: {
         async beginModelUsage(_operationId, _attribution, _snapshot, bound) {
@@ -875,7 +874,7 @@ describe("DeepSeek Agent model metering", () => {
     );
 
     let providerCalls = 0;
-    const makeHandle = (chatId: number) => meterAgentModelHandle(deepSeekHandle(), {
+    const makeHandle = (chatId: number) => deepSeekHandle({
       usageRates,
       user,
       attribution: {
@@ -921,7 +920,7 @@ describe("DeepSeek Agent model metering", () => {
   it("does not call the provider when Charge Snapshot issuance fails", async () => {
     const user = await newUser();
     let providerCalls = 0;
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: {
         issueModelChargeSnapshot: async () => {
           throw new Error("stubbed snapshot issuance failure");
@@ -961,7 +960,7 @@ describe("DeepSeek Agent model metering", () => {
     const user = await newUser();
     let providerCalls = 0;
     let operationId = "";
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user: {
         async beginModelUsage(...args) {
@@ -1019,7 +1018,7 @@ describe("DeepSeek Agent model metering", () => {
       reasoningTokens: 1n,
     };
     let operationId = "";
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user: {
         async beginModelUsage(...args) {
@@ -1078,7 +1077,7 @@ describe("DeepSeek Agent model metering", () => {
 
   it("distinguishes an explicit all-zero Usage report from no Usage report", async () => {
     const user = await newUser();
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -1239,16 +1238,7 @@ describe("DeepSeek Agent model metering", () => {
     const user = await newUser();
     const before = await user.getUsageCreditBalance();
     const unknownModel = "deepseek-unpriced-test-model";
-    const baseHandle = getModel({CF_AI_GATEWAY: undefined} as Cloudflare.Env, {
-      provider: "deepseek",
-      model: unknownModel,
-      apiToken: "dummy-deepseek-token",
-    }, {
-      type: "user",
-      id: "metered-model@example.com",
-      name: "Metered Model",
-    });
-    const handle = meterAgentModelHandle(baseHandle, {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -1258,7 +1248,7 @@ describe("DeepSeek Agent model metering", () => {
         chatId: 100,
         deploymentModelId: "deepseek-agent-unpriced",
       },
-    });
+    }, unknownModel);
 
     const result = await handle.stream(handle.model, {
       messages: [{role: "user", content: "hello", timestamp: 0}],
@@ -1300,7 +1290,7 @@ describe("DeepSeek Agent model metering", () => {
 
   it("holds and blocks a malformed explicit Usage report without storing its body", async () => {
     const user = await newUser();
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
@@ -1384,7 +1374,7 @@ describe("DeepSeek Agent model metering", () => {
     }],
   ])("fails closed for a %s Usage frame", async (_case, usage) => {
     const user = await newUser();
-    const handle = meterAgentModelHandle(deepSeekHandle(), {
+    const handle = deepSeekHandle({
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
