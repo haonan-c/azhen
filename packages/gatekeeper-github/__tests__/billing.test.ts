@@ -4,6 +4,7 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
+  GitHubCursorBilling,
   GitHubOperationActivityTracker,
   githubActionRecoveryDisposition,
   runGitHubRead,
@@ -44,6 +45,42 @@ function makeAuthorizer(options: { trace: string[]; authorizeError?: Error }) {
 }
 
 describe("GitHub read billing coordinator", () => {
+  it("keeps one operation across lazy cursor pages", async () => {
+    const trace: string[] = [];
+    const billing = await GitHubCursorBilling.begin(
+      makeAuthorizer({ trace }),
+      "opaque-github-account",
+      METHOD,
+      { title: "List GitHub issues", description: "List GitHub issues" },
+    );
+
+    expect(trace).toEqual([
+      `begin:${METHOD.methodKey}:opaque-github-account`,
+      "operation-id",
+    ]);
+
+    expect(await billing.next(async () => {
+      trace.push("upstream:page-1");
+      return ["one"];
+    })).toEqual(["one"]);
+    expect(await billing.next(async () => {
+      trace.push("upstream:page-2");
+      return ["two"];
+    })).toEqual(["two"]);
+    billing[Symbol.dispose]();
+
+    expect(trace).toEqual([
+      `begin:${METHOD.methodKey}:opaque-github-account`,
+      "operation-id",
+      "mark-started",
+      "upstream:page-1",
+      "complete:executed",
+      "authorize:github-operation-1",
+      "upstream:page-2",
+      "dispose",
+    ]);
+  });
+
   it("settles one multi-request operation before authorization", async () => {
     const trace: string[] = [];
     const result = await runGitHubRead(

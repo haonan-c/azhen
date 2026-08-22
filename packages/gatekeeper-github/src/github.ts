@@ -42,6 +42,7 @@ import {
 } from "./billing-methods.js";
 import {
   currentGitHubOperationActivity,
+  GitHubCursorBilling,
   githubActionRecoveryDisposition,
   runGitHubRead,
   withGitHubOperationActivity,
@@ -290,6 +291,7 @@ type GitHubActionExecutionRow = {
   providerIdempotencyKey?: string;
   state: GitHubActionExecutionState;
   providerResultId?: number;
+  enrichmentPending?: true;
 };
 
 type GitHubDispatchResult = {
@@ -297,7 +299,7 @@ type GitHubDispatchResult = {
   providerResultId?: number;
   revertInfo?: GitHubRevertInfo;
   commit?: () => void;
-  enrich?: () => Promise<void>;
+  enrichmentPending?: true;
 };
 
 const NONCE_BYTES = 32;
@@ -867,23 +869,35 @@ class ArrayCursor<T> extends RpcTarget implements Cursor<T> {
 }
 
 @validateRpc()
-class PrefetchedCursor<T> extends RpcTarget implements Cursor<T> {
-  #inner: Cursor<T>;
-  #first: T[] | null;
-  #hasFirst = true;
+class BillableCursor<T> extends RpcTarget implements Cursor<T> {
+  #create: () => Promise<Cursor<T>>;
+  #billing: GitHubCursorBilling;
+  #inner?: Cursor<T>;
+  #done = false;
 
-  constructor(inner: Cursor<T>, first: T[] | null) {
+  constructor(create: () => Promise<Cursor<T>>, billing: GitHubCursorBilling) {
     super();
-    this.#inner = inner;
-    this.#first = first;
+    this.#create = create;
+    this.#billing = billing;
   }
 
   async next(): Promise<T[] | null> {
-    if (this.#hasFirst) {
-      this.#hasFirst = false;
-      return this.#first;
+    if (this.#done) return null;
+    const result = await this.#billing.next(async () => {
+      this.#inner ??= await this.#create();
+      return await this.#inner.next();
+    });
+    if (result === null) {
+      this.#done = true;
+      this.#billing[Symbol.dispose]();
     }
-    return await this.#inner.next();
+    return result;
+  }
+
+  [Symbol.dispose](): void {
+    this.#billing[Symbol.dispose]();
+    const inner = this.#inner as Cursor<T> & Partial<Disposable> | undefined;
+    inner?.[Symbol.dispose]?.();
   }
 }
 
@@ -3294,7 +3308,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         throw new Error("GitHub Action execution identity conflicts with its durable claim.");
       }
       const disposition = githubActionRecoveryDisposition(row.state);
-      if (disposition.kind === "terminal") return { outcome: disposition.outcome };
+      if (disposition.kind === "terminal") {
+        await this.#resumeAcceptedEnrichment(key);
+        return { outcome: disposition.outcome };
+      }
       if (disposition.kind === "unknown") {
         return this.#finishBillableAction(key, row, "unknown", this.#getActionRecord(actionId));
       }
@@ -3355,9 +3372,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       return this.#finishBillableAction(key, row, "failed-before-execution", record);
     }
 
-    row = dispatched.providerResultId === undefined
-      ? row
-      : { ...row, providerResultId: dispatched.providerResultId };
+    row = {
+      ...row,
+      ...(dispatched.providerResultId === undefined
+        ? {}
+        : { providerResultId: dispatched.providerResultId }),
+      ...(dispatched.enrichmentPending ? { enrichmentPending: true } : {}),
+    };
     const result = this.#finishBillableAction(
       key,
       row,
@@ -3367,16 +3388,36 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       dispatched.revertInfo,
     );
     this.#clearCaches();
-    if (dispatched.enrich) {
-      try {
-        await withGitHubOperationActivity(mutationActivity, dispatched.enrich);
-      } catch {
-        logger.warn("failed to enrich an accepted GitHub Action", {
-          event: "action.accepted.enrichment.failed",
-        });
-      }
-    }
+    await this.#resumeAcceptedEnrichment(key);
     return result;
+  }
+
+  async #resumeAcceptedEnrichment(key: string): Promise<void> {
+    const row = this.ctx.storage.kv.get<GitHubActionExecutionRow>(key);
+    if (row?.state !== "accepted" || !row.enrichmentPending) return;
+    const record = this.#getActionRecord(row.actionId);
+    if (record?.action.type !== "postReview" || row.providerResultId === undefined) return;
+    const action = record.action;
+    const reviewId = row.providerResultId;
+
+    try {
+      const realId = this.#requireActionTarget(action.pullId, "Pull request");
+      const activity = new GitHubOperationActivityTracker();
+      await withGitHubOperationActivity(
+        activity,
+        () => this.#enrichReviewAliases(action, realId, reviewId),
+      );
+      this.ctx.storage.kv.put<GitHubActionExecutionRow>(key, {
+        ...row,
+        enrichmentPending: undefined,
+      });
+      await this.ctx.storage.sync();
+    } catch (error) {
+      logger.warn("failed to enrich an accepted GitHub Action", {
+        event: "action.accepted.enrichment.failed",
+        error,
+      });
+    }
   }
 
   #finishBillableAction(
@@ -3543,7 +3584,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         ));
         return {
           providerResultId: review.id,
-          enrich: async () => this.#enrichReviewAliases(action, realId, review.id),
+          enrichmentPending: action.review.diffComments?.length ? true : undefined,
         };
       }
       case "replyToDiffComment": {
@@ -3959,17 +4000,13 @@ async function runSessionCursorRead<T>(
   create: () => Promise<Cursor<T>>,
   description: Omit<ObservationDescription, "billingOperationId">,
 ): Promise<Cursor<T>> {
-  return await runSessionRead(
+  const billing = await GitHubCursorBilling.begin(
     queue,
     externalAccountId,
-    method,
-    async () => {
-      const cursor = await create();
-      const first = await cursor.next();
-      return new PrefetchedCursor(cursor, first);
-    },
-    () => description,
+    GITHUB_READ_BILLING_METHODS[method],
+    description,
   );
+  return new BillableCursor(create, billing);
 }
 
 @validateRpc()
@@ -4247,20 +4284,22 @@ class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPullRequest
   }
 
   async readDiff(options?: GitHubPageOptions): Promise<GitHubPullRequestDiff> {
-    return await runSessionRead(
+    const billing = await GitHubCursorBilling.begin(
       this.approvalQueue,
       this.externalAccountId,
-      "GitHubPullRequest.readDiff",
-      async () => {
-        const diff = await this.gatekeeper.pullDiff(this.logicalId, options?.resultsPerPage ?? 20);
-        const first = await diff.files.next();
-        return { ...diff, files: new PrefetchedCursor(diff.files, first) };
-      },
-      () => ({
+      GITHUB_READ_BILLING_METHODS["GitHubPullRequest.readDiff"],
+      {
         title: `Read diff for #${this.logicalId}`,
         description: `Read the diff for pull request #${this.logicalId}.`,
-      }),
+      },
     );
+    const diff = await billing.next(
+      () => this.gatekeeper.pullDiff(this.logicalId, options?.resultsPerPage ?? 20),
+    );
+    return {
+      ...diff,
+      files: new BillableCursor(async () => diff.files, billing),
+    };
   }
 
   async readDiffThreads(options?: GitHubPageOptions): Promise<Cursor<GitHubDiffThread>> {

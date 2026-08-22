@@ -189,4 +189,31 @@ describe("production GitHub billing wiring", () => {
     expect(result.duplicate).toEqual({ outcome: "failed-before-execution" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("recovers review alias enrichment without replaying the accepted review", async () => {
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => Response.json({ id: 71 }))
+      .mockImplementationOnce(async () => new Response("failed", { status: 500 }))
+      .mockImplementationOnce(async () => Response.json([{
+        id: 72,
+        pull_request_review_id: 71,
+        html_url: "https://github.com/owner/repo/pull/1#discussion_r72",
+        body: "Review comment",
+        user: repoResponse().owner,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+        path: "src/file.ts",
+        line: 1,
+        side: "RIGHT",
+        subject_type: "line",
+      }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await harness().applyReviewWithRecoverableEnrichment("review-enrichment");
+
+    expect(result.first).toEqual({ outcome: "accepted" });
+    expect(result.duplicate).toEqual({ outcome: "accepted" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map(([, init]) => init?.method)).toEqual(["POST", "GET", "GET"]);
+  });
 });

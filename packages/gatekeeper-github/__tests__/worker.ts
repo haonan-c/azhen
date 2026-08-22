@@ -135,6 +135,25 @@ export class GitHubBillingTestParent extends DurableObject {
     return { action, first, duplicate };
   }
 
+  async applyReviewWithRecoverableEnrichment(name: string) {
+    const { gatekeeper, queue, session } = await this.#session(name, "pull");
+    using _session = session;
+    if (!("postReview" in session)) throw new Error("Expected pull request Session.");
+    await session.postReview({
+      revision: { baseSha: "base-sha", headSha: "head-sha" },
+      decision: "comment",
+      diffComments: [{
+        target: { path: "src/file.ts", subjectType: "line", line: 1, side: "new" },
+        bodyMarkdown: "Review comment",
+      }],
+    });
+    const action = this.#action(queue);
+    const execution = { billingOperationId: `review-${name}`, mode: "execute" } as const;
+    const first = await gatekeeper.applyAction(action.id, execution);
+    const duplicate = await gatekeeper.applyAction(action.id, execution);
+    return { first, duplicate };
+  }
+
   async writeInventory(name: string) {
     const actions: Array<{ name: string; description: ActionDescription }> = [];
     const collect = async (

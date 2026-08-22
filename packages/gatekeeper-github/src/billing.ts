@@ -119,6 +119,101 @@ async function completeQuietly(
   }
 }
 
+/** Billing state retained by one paged GitHub read until its cursor is exhausted or disposed. */
+export class GitHubCursorBilling implements Disposable {
+  readonly #authorizer: GitHubReadAuthorizer;
+  readonly #operation: DisposableBillableOperation;
+  readonly #operationId: string;
+  readonly #description: Omit<ObservationDescription, "billingOperationId">;
+  readonly #activity = new GitHubOperationActivityTracker();
+  #started = false;
+  #settled = false;
+  #disposed = false;
+  #authorizationError?: unknown;
+
+  private constructor(
+    authorizer: GitHubReadAuthorizer,
+    operation: DisposableBillableOperation,
+    operationId: string,
+    description: Omit<ObservationDescription, "billingOperationId">,
+  ) {
+    this.#authorizer = authorizer;
+    this.#operation = operation;
+    this.#operationId = operationId;
+    this.#description = description;
+  }
+
+  /** Begin one logical cursor operation without starting provider work. */
+  static async begin(
+    authorizer: GitHubReadAuthorizer,
+    externalAccountId: string,
+    method: GitHubBillingMethod,
+    description: Omit<ObservationDescription, "billingOperationId">,
+  ): Promise<GitHubCursorBilling> {
+    const operation = await authorizer.beginBillableOperation(
+      method.methodKey,
+      externalAccountId,
+    );
+    try {
+      const operationId = await operation.getOperationId();
+      return new GitHubCursorBilling(authorizer, operation, operationId, description);
+    } catch (error) {
+      await completeQuietly(operation, "failed-before-execution");
+      operation[Symbol.dispose]();
+      throw error;
+    }
+  }
+
+  /** Run the next page inside this cursor's original operation identity. */
+  async next<T>(read: () => Promise<T>): Promise<T> {
+    if (this.#authorizationError !== undefined) throw this.#authorizationError;
+    if (!this.#started) {
+      try {
+        await this.#operation.markStarted();
+        this.#started = true;
+      } catch (error) {
+        await completeQuietly(this.#operation, "failed-before-execution");
+        this[Symbol.dispose]();
+        throw error;
+      }
+    }
+
+    let result: T;
+    try {
+      result = await withGitHubOperationActivity(this.#activity, read);
+    } catch (error) {
+      if (!this.#settled) {
+        await completeQuietly(this.#operation, this.#activity.failureOutcome());
+        this.#settled = true;
+        this[Symbol.dispose]();
+      }
+      throw error;
+    }
+
+    if (!this.#settled) {
+      await this.#operation.complete("executed");
+      this.#settled = true;
+      try {
+        await this.#authorizer.authorizeObservation({
+          ...this.#description,
+          billingOperationId: this.#operationId,
+        });
+      } catch (error) {
+        this.#authorizationError = error;
+        this[Symbol.dispose]();
+        throw error;
+      }
+    }
+    return result;
+  }
+
+  [Symbol.dispose](): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#operation[Symbol.dispose]();
+  }
+}
+
 /** Run one caller-visible GitHub read through the shared billing lifecycle. */
 export async function runGitHubRead<T>(
   authorizer: GitHubReadAuthorizer,
