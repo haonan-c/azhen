@@ -14,7 +14,7 @@ function operation(methodKey: string): GoogleBillingMethod {
   return { methodKey, rateUnit: "operation", quantity: 1 };
 }
 
-/** Stable billing registry for Gmail, Google Docs, and Google Sheets reads. */
+/** Stable billing registry for Google caller-visible business reads. */
 export const GOOGLE_BILLING_METHODS = {
   "GmailThreadCursor.next": operation("google.gmail.thread-list.next-page"),
   "GmailThread.getMetadata": operation("google.gmail.thread.get-metadata"),
@@ -29,9 +29,17 @@ export const GOOGLE_BILLING_METHODS = {
   ),
   "GoogleSpreadsheetSession.readRange": operation("google.sheets.spreadsheet.read-range"),
   "GoogleSpreadsheetSession.readRanges": operation("google.sheets.spreadsheet.read-ranges"),
+  "GoogleCalendarSession.getCalendar": operation("google.calendar.calendar.get-metadata"),
+  "GoogleCalendarSession.listEvents": operation("google.calendar.event.list"),
+  "GoogleCalendarSession.checkAvailability": operation("google.calendar.availability.check"),
+  "BigQuerySession.query": operation("google.bigquery.query.execute"),
+  "BigQuerySession.dryRun": operation("google.bigquery.query.dry-run"),
+  "BigQuerySession.listDatasets": operation("google.bigquery.dataset.list"),
+  "BigQuerySession.listTables": operation("google.bigquery.table.list"),
+  "BigQuerySession.describeTable": operation("google.bigquery.table.describe"),
 } as const satisfies Record<string, GoogleBillingMethod>;
 
-/** Stable billing registry for approved Gmail and Google Docs writes. */
+/** Stable billing registry for approved Google writes. */
 export const GOOGLE_WRITE_BILLING_METHODS = {
   "GmailSession.send": operation("google.gmail.message.send"),
   "GmailThread.archive": operation("google.gmail.thread.archive"),
@@ -43,6 +51,8 @@ export const GOOGLE_WRITE_BILLING_METHODS = {
   "GmailMessage.forward": operation("google.gmail.message.forward"),
   "GoogleDocSession.replaceText": operation("google.docs.document.replace-text"),
   "GoogleDocSession.appendText": operation("google.docs.document.append-text"),
+  "GoogleCalendarSession.createEvent": operation("google.calendar.event.create"),
+  "GoogleCalendarSession.updateEvent": operation("google.calendar.event.update"),
 } as const satisfies Record<string, GoogleBillingMethod>;
 
 /** Public capability accessors that make no upstream business request. */
@@ -50,6 +60,8 @@ export const GOOGLE_LOCAL_READ_METHODS = [
   "GmailSession.listThreads",
   "GmailSession.search",
   "GmailMessage.thread",
+  "GoogleCalendarSession.getCapabilities",
+  "BigQuerySession.getProject",
 ] as const;
 
 /** A public Google read that performs a Billable API Operation. */

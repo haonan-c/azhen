@@ -17,6 +17,14 @@ export default defineConfig({
             className: "GoogleSheetsGatekeeperImpl",
             useSQLite: true,
           },
+          TEST_GOOGLE_CALENDAR_GATEKEEPER: {
+            className: "GoogleCalendarGatekeeperImpl",
+            useSQLite: true,
+          },
+          TEST_BIGQUERY_GATEKEEPER: {
+            className: "BigQueryGatekeeperImpl",
+            useSQLite: true,
+          },
           GOOGLE_BILLING_TEST_PARENT: {
             className: "GoogleBillingTestParent",
             useSQLite: true,

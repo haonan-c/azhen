@@ -2907,6 +2907,10 @@ type GoogleCalendarUpdateAction = GoogleCalendarActionBase & {
 
 type GoogleCalendarAction = GoogleCalendarCreateAction | GoogleCalendarUpdateAction;
 
+type PreparedGoogleCalendarAction =
+  | { type: "create"; action: GoogleCalendarCreateAction }
+  | { type: "update"; action: GoogleCalendarUpdateAction; previous: CalendarEventPatch };
+
 type GoogleCalendarRevertInfo =
   | {
       type: "createdEvent";
@@ -3063,6 +3067,7 @@ export class GoogleCalendarGatekeeperImpl
         this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
     return stub.getAccessToken(opts);
   });
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
 
   // Revert data for already-applied actions, keyed by action id. The overseer no longer round-trips
   // revert info through applyAction()/revertAction(), so we persist it in our own storage.
@@ -3105,53 +3110,91 @@ export class GoogleCalendarGatekeeperImpl
       api,
       this.ctx.props.calendarId,
       this.ctx.props.availabilityMode,
+      this.ctx.props.userObjectId,
       approvalQueue.dup(),
       pendingActions,
       calendarIds => this.#prepareAvailabilityCalendarObservation(calendarIds),
     );
   }
 
-  async applyAction(actionId: number): Promise<void> {
-    let pendingActions = new PendingActionStore<GoogleCalendarAction>(this.ctx.storage.kv);
-    let action = pendingActions.get(actionId);
-    if (!action) {
-      throw new Error(`Unknown pending Google Calendar action: ${actionId}`);
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This Google Calendar Action predates billing. Reject it and submit the change again.",
+      );
     }
 
-    let api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
-    switch (action.type) {
-      case "createEvent": {
-        let created = await api.createEvent(action.calendarId, action.event, action.sendUpdates);
-        pendingActions.remove(actionId);
-        this.ctx.storage.kv.put<GoogleCalendarRevertInfo>(this.#revertKey(actionId), {
-          type: "createdEvent",
-          calendarId: action.calendarId,
-          eventId: created.id,
-          sendUpdates: action.sendUpdates,
-        });
-        return;
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
       }
-      case "updateEvent": {
-        let oldEvent = await api.getEvent(action.calendarId, action.eventId);
-        let previous = priorCalendarPatch(oldEvent, action.patch);
-        await api.patchEvent(
-          action.calendarId, action.eventId,
-          eventPatchToGoogle(action.patch), action.sendUpdates);
-        pendingActions.remove(actionId);
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return work;
+  }
+
+  #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const pendingActions = new PendingActionStore<GoogleCalendarAction>(this.ctx.storage.kv);
+    const api = new GoogleCalendarApi(opts => this.#getAccessToken(opts));
+    return runGoogleBillableAction<GoogleCalendarAction, PreparedGoogleCalendarAction>({
+      storage: durableGoogleActionExecutionStorage(this.ctx.storage),
+      actionId,
+      execution,
+      getPending: () => pendingActions.get(actionId),
+      removePending: () => pendingActions.remove(actionId),
+      prepare: async action => {
+        if (action.type === "createEvent") return { type: "create", action };
+        const oldEvent = await api.getEvent(action.calendarId, action.eventId);
+        const start = action.patch.start ?? oldEvent.start;
+        const end = action.patch.end ?? oldEvent.end;
+        validateEventTimes(start, end);
+        return {
+          type: "update",
+          action,
+          previous: priorCalendarPatch(oldEvent, action.patch),
+        };
+      },
+      execute: async (prepared, activity) => {
+        const billedApi = api.withActivity(activity);
+        if (prepared.type === "create") {
+          const action = prepared.action;
+          const created = await billedApi.createEvent(
+            action.calendarId,
+            action.event,
+            action.sendUpdates,
+          );
+          this.ctx.storage.kv.put<GoogleCalendarRevertInfo>(this.#revertKey(actionId), {
+            type: "createdEvent",
+            calendarId: action.calendarId,
+            eventId: created.id,
+            sendUpdates: action.sendUpdates,
+          });
+          return;
+        }
+        const action = prepared.action;
+        await billedApi.patchEvent(
+          action.calendarId,
+          action.eventId,
+          eventPatchToGoogle(action.patch),
+          action.sendUpdates,
+        );
         this.ctx.storage.kv.put<GoogleCalendarRevertInfo>(this.#revertKey(actionId), {
           type: "updatedEvent",
           calendarId: action.calendarId,
           eventId: action.eventId,
-          previous,
+          previous: prepared.previous,
           sendUpdates: action.sendUpdates,
         });
-        return;
-      }
-      default: {
-        const _exhaustive: never = action;
-        throw new Error(`unknown action type: ${String(_exhaustive)}`);
-      }
-    }
+      },
+    });
   }
 
   async rejectAction(actionId: number): Promise<void | {restart?: boolean}> {
@@ -3293,6 +3336,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
   #api: GoogleCalendarApi;
   #calendarId: string;
   #availabilityMode: CalendarAvailabilityMode;
+  #externalAccountId: string;
   #approvalQueue: RpcStub<ApprovalQueue>;
   #pendingActions: PendingActionStore<GoogleCalendarAction>;
   #observeAvailabilityCalendars: (calendarIds: string[]) => Promise<ObserverCheck<string>>;
@@ -3301,6 +3345,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     api: GoogleCalendarApi,
     calendarId: string,
     availabilityMode: CalendarAvailabilityMode,
+    externalAccountId: string,
     approvalQueue: RpcStub<ApprovalQueue>,
     pendingActions: PendingActionStore<GoogleCalendarAction>,
     observeAvailabilityCalendars: (calendarIds: string[]) => Promise<ObserverCheck<string>>,
@@ -3309,6 +3354,7 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
     this.#api = api;
     this.#calendarId = calendarId;
     this.#availabilityMode = availabilityMode;
+    this.#externalAccountId = externalAccountId;
     this.#approvalQueue = approvalQueue;
     this.#pendingActions = pendingActions;
     this.#observeAvailabilityCalendars = observeAvailabilityCalendars;
@@ -3319,28 +3365,36 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
   }
 
   async getCalendar(): Promise<GoogleCalendarInfo> {
-    let calendar = await this.#api.getCalendar(this.#calendarId);
-    await this.#approvalQueue.authorizeObservation({
-      title: "Read Google Calendar metadata",
-      description: `Read metadata for Google Calendar ${calendar.summary} (${calendar.id}).`,
-    });
-    return calendar;
+    return runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS["GoogleCalendarSession.getCalendar"],
+      activity => this.#api.withActivity(activity).getCalendar(this.#calendarId),
+      calendar => ({
+        title: "Read Google Calendar metadata",
+        description: `Read metadata for Google Calendar ${calendar.summary} (${calendar.id}).`,
+      }),
+    );
   }
 
   async listEvents(opts: CalendarListEventsOptions): Promise<CalendarEvent[]> {
     validateCalendarTimeWindow(opts.timeMin, opts.timeMax, 366);
-    let events = await this.#api.listEvents(this.#calendarId, opts);
-    let simulated = applyPendingCalendarActions(events, this.#pendingActions.list(), opts);
-
-    await this.#approvalQueue.authorizeObservation({
-      title: "List Google Calendar events",
-      description:
-          `List ${simulated.length} event(s) on calendar ${this.#calendarId} from ` +
-          `${opts.timeMin.toISOString()} to ${opts.timeMax.toISOString()}.` +
-          (opts.includeDescriptions ? " Event descriptions are included." : ""),
-    });
-
-    return simulated;
+    return runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS["GoogleCalendarSession.listEvents"],
+      async activity => {
+        let events = await this.#api.withActivity(activity).listEvents(this.#calendarId, opts);
+        return applyPendingCalendarActions(events, this.#pendingActions.list(), opts);
+      },
+      simulated => ({
+        title: "List Google Calendar events",
+        description:
+            `List ${simulated.length} event(s) on calendar ${this.#calendarId} from ` +
+            `${opts.timeMin.toISOString()} to ${opts.timeMax.toISOString()}.` +
+            (opts.includeDescriptions ? " Event descriptions are included." : ""),
+      }),
+    );
   }
 
   async checkAvailability(opts: {
@@ -3366,24 +3420,31 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
           "\"All calendars visible to me\" to check other calendars' availability.");
     }
 
-    let availability = await this.#api.freeBusy({...opts, people});
-    let successfulForeign = availability
-        .filter(result => foreign.includes(result.email) && !result.error)
-        .map(result => result.email);
-    let check = successfulForeign.length > 0
-        ? await this.#observeAvailabilityCalendars(successfulForeign)
-        : {pendingSets: [], commit() {}};
-
-    await this.#approvalQueue.authorizeObservation({
-      title: "Check Google Calendar availability",
-      description:
-          `Check free/busy availability for ${summarizePeople(people)} from ` +
-          `${opts.timeMin.toISOString()} to ${opts.timeMax.toISOString()}. ` +
-          "Only busy time blocks are returned; event details are not read.",
-      excludeObservers: check.excludeObservers,
-    });
+    let check: ObserverCheck<string> = {pendingSets: [], commit() {}};
+    let availability = await runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS["GoogleCalendarSession.checkAvailability"],
+      async activity => {
+        let result = await this.#api.withActivity(activity).freeBusy({...opts, people});
+        let successfulForeign = result
+            .filter(item => foreign.includes(item.email) && !item.error)
+            .map(item => item.email);
+        check = successfulForeign.length > 0
+            ? await this.#observeAvailabilityCalendars(successfulForeign)
+            : {pendingSets: [], commit() {}};
+        return result;
+      },
+      () => ({
+        title: "Check Google Calendar availability",
+        description:
+            `Check free/busy availability for ${summarizePeople(people)} from ` +
+            `${opts.timeMin.toISOString()} to ${opts.timeMax.toISOString()}. ` +
+            "Only busy time blocks are returned; event details are not read.",
+        excludeObservers: check.excludeObservers,
+      }),
+    );
     check.commit();
-
     return availability;
   }
 
@@ -3411,6 +3472,10 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
             (event.attendees?.length ? ` Attendees: ${event.attendees.map(a => a.email).join(", ")}.` : "") +
             ` Send updates: ${action.sendUpdates}.`,
         implementsRevert: true,
+        billing: googleActionBilling(
+          "GoogleCalendarSession.createEvent",
+          this.#externalAccountId,
+        ),
       });
     } catch (error) {
       this.#pendingActions.remove(actionId);
@@ -3425,17 +3490,8 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
   ): Promise<void> {
     if (!eventId.trim()) throw new Error("eventId is required.");
     if (Object.keys(patch).length === 0) throw new Error("patch must change at least one field.");
-    if (patch.start !== undefined || patch.end !== undefined) {
-      // Validate the resulting start/end pair. If only one side is patched, fetch the event to
-      // get the other side.
-      let start = patch.start;
-      let end = patch.end;
-      if (start === undefined || end === undefined) {
-        let current = await this.#api.getEvent(this.#calendarId, eventId);
-        start ??= current.start;
-        end ??= current.end;
-      }
-      validateEventTimes(start, end);
+    if (patch.start !== undefined && patch.end !== undefined) {
+      validateEventTimes(patch.start, patch.end);
     }
     let action: GoogleCalendarAction = {
       type: "updateEvent",
@@ -3455,6 +3511,10 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
             `${summarizeCalendarPatch(patch)}. ` +
             `Send updates: ${action.sendUpdates}.`,
         implementsRevert: true,
+        billing: googleActionBilling(
+          "GoogleCalendarSession.updateEvent",
+          this.#externalAccountId,
+        ),
       });
     } catch (error) {
       this.#pendingActions.remove(actionId);
@@ -3527,6 +3587,7 @@ export class BigQueryGatekeeperImpl
     return new BigQuerySessionImpl(
       api,
       approvalQueue.dup(),
+      this.ctx.props.userObjectId,
       this.ctx.props.scopedProjectId,
       this.ctx.props.scopedDatasetId,
       this.ctx.props.scopedTableId,
@@ -3646,10 +3707,17 @@ export class BigQueryGatekeeperImpl
   }
 }
 
+type BigQueryRead<T> = {
+  result: T;
+  datasets: { projectId: string; datasetId: string }[];
+  description: Omit<ObservationDescription, "billingOperationId">;
+};
+
 @validateRpc()
 class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   #api: BigQueryApi;
   #approvalQueue: RpcStub<ApprovalQueue>;
+  #externalAccountId: string;
   #scopedProjectId?: string;
   #scopedDatasetId?: string;
   #scopedTableId?: string;
@@ -3661,6 +3729,7 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   constructor(
     api: BigQueryApi,
     approvalQueue: RpcStub<ApprovalQueue>,
+    externalAccountId: string,
     scopedProjectId: string | undefined,
     scopedDatasetId: string | undefined,
     scopedTableId: string | undefined,
@@ -3670,10 +3739,36 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     super();
     this.#api = api;
     this.#approvalQueue = approvalQueue;
+    this.#externalAccountId = externalAccountId;
     this.#scopedProjectId = scopedProjectId;
     this.#scopedDatasetId = scopedDatasetId;
     this.#scopedTableId = scopedTableId;
     this.#observe = observe;
+  }
+
+  async #runRead<T>(
+    method: GoogleBillableReadMethod,
+    read: (api: BigQueryApi) => Promise<BigQueryRead<T>>,
+  ): Promise<T> {
+    let check: ObserverCheck<{ projectId: string; datasetId: string }> = {
+      pendingSets: [],
+      commit() {},
+    };
+    const operation = await runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS[method],
+      async activity => {
+        const result = await read(this.#api.withActivity(activity));
+        check = result.datasets.length > 0
+          ? await this.#observe(result.datasets)
+          : {pendingSets: [], commit() {}};
+        return result;
+      },
+      result => ({...result.description, excludeObservers: check.excludeObservers}),
+    );
+    check.commit();
+    return operation.result;
   }
 
   // Authorize an observation that reveals data belonging to specific dataset(s), tracking them and
@@ -3804,73 +3899,73 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   // --- API ---------------------------------------------------------------
 
   async query(sql: string, opts?: BigQueryQueryOptions): Promise<BigQueryQueryResult> {
-    let billingProject = this.#billingProject();
-    let defaultDataset = this.#effectiveDataset(opts);
-    let maxBytes = opts?.maximumBytesBilled ?? DEFAULT_MAX_BYTES_BILLED;
+    return this.#runRead("BigQuerySession.query", async api => {
+      let billingProject = this.#billingProject();
+      let defaultDataset = this.#effectiveDataset(opts);
+      let maxBytes = opts?.maximumBytesBilled ?? DEFAULT_MAX_BYTES_BILLED;
 
-    // Always dry-run first to enforce scope and get a cost estimate. Dry-runs are free
-    // (BigQuery doesn't bill for them), and the response includes `referencedTables`
-    // parsed by Google's own SQL engine — the only reliable way to check scope on
-    // arbitrary SQL.
-    let estimate = await this.#api.dryRun(billingProject, sql, {
-      defaultDataset, params: opts?.params,
+      // The dry-run, query submit, and every poll belong to this one caller-visible operation.
+      let estimate = await api.dryRun(billingProject, sql, {
+        defaultDataset, params: opts?.params,
+      });
+      this.#assertReadOnlyEstimate(estimate);
+      this.#checkScopedTables(estimate.referencedTables);
+      if (estimate.bytesProcessed > maxBytes) {
+        throw new Error(
+          `Query would process ${(estimate.bytesProcessed / 1e9).toFixed(2)} GB, exceeding the ` +
+          `limit of ${(maxBytes / 1e9).toFixed(2)} GB. Pass a higher \`maximumBytesBilled\` to ` +
+          `override.`);
+      }
+
+      let result = await api.query(billingProject, sql, {
+        ...opts,
+        defaultDataset,
+        maximumBytesBilled: maxBytes,
+      });
+      let preview = sql.replace(/\s+/g, " ").trim().slice(0, 200);
+      return {
+        result,
+        datasets: BigQuerySessionImpl.#datasetsFromReferencedTables(estimate.referencedTables),
+        description: {
+          title: `BigQuery query: ${preview}`,
+          description:
+            `SQL preview: \`${preview}\`${sql.length > preview.length ? "..." : ""}\n` +
+            (defaultDataset ? `Default dataset: \`${defaultDataset}\`\n` : "") +
+            `Billing project: \`${billingProject}\`\n` +
+            `Referenced tables: ${estimate.referencedTables.join(", ")}\n` +
+            `Estimated bytes processed: ${estimate.bytesProcessed.toLocaleString()}\n` +
+            `Maximum bytes billed: ${maxBytes.toLocaleString()}.`,
+          prohibitAllSharing: true,
+        },
+      };
     });
-    this.#assertReadOnlyEstimate(estimate);
-    this.#checkScopedTables(estimate.referencedTables);
-    if (estimate.bytesProcessed > maxBytes) {
-      throw new Error(
-        `Query would process ${(estimate.bytesProcessed / 1e9).toFixed(2)} GB, exceeding the ` +
-        `limit of ${(maxBytes / 1e9).toFixed(2)} GB. Pass a higher \`maximumBytesBilled\` to ` +
-        `override.`);
-    }
-
-    let preview = sql.replace(/\s+/g, " ").trim().slice(0, 200);
-    await this.#authorizeDatasets(
-      BigQuerySessionImpl.#datasetsFromReferencedTables(estimate.referencedTables), {
-      title: `BigQuery query: ${preview}`,
-      description:
-        `SQL preview: \`${preview}\`${sql.length > preview.length ? "..." : ""}\n` +
-        (defaultDataset ? `Default dataset: \`${defaultDataset}\`\n` : "") +
-        `Billing project: \`${billingProject}\`\n` +
-        `Referenced tables: ${estimate.referencedTables.join(", ")}\n` +
-        `Estimated bytes processed: ${estimate.bytesProcessed.toLocaleString()}\n` +
-        `Maximum bytes billed: ${maxBytes.toLocaleString()}.`,
-      prohibitAllSharing: true,
-    });
-
-    let result = await this.#api.query(billingProject, sql, {
-      ...opts,
-      defaultDataset,
-      maximumBytesBilled: maxBytes,
-    });
-
-    return result;
   }
 
   async dryRun(
     sql: string,
     opts?: Pick<BigQueryQueryOptions, "defaultDataset" | "params">,
   ): Promise<BigQueryDryRunResult> {
-    let billingProject = this.#billingProject();
-    let defaultDataset = this.#effectiveDataset(opts);
-
-    let estimate = await this.#api.dryRun(billingProject, sql, {
-      defaultDataset, params: opts?.params,
+    return this.#runRead("BigQuerySession.dryRun", async api => {
+      let billingProject = this.#billingProject();
+      let defaultDataset = this.#effectiveDataset(opts);
+      let estimate = await api.dryRun(billingProject, sql, {
+        defaultDataset, params: opts?.params,
+      });
+      this.#assertReadOnlyEstimate(estimate);
+      this.#checkScopedTables(estimate.referencedTables);
+      let preview = sql.replace(/\s+/g, " ").trim().slice(0, 100);
+      return {
+        result: estimate,
+        datasets: BigQuerySessionImpl.#datasetsFromReferencedTables(estimate.referencedTables),
+        description: {
+          title: `BigQuery dry run: ${preview}`,
+          description:
+            `Estimated bytes processed: ${estimate.bytesProcessed.toLocaleString()}\n` +
+            `Referenced tables: ${estimate.referencedTables.join(", ") || "(none)"}`,
+          prohibitAllSharing: true,
+        },
+      };
     });
-    this.#assertReadOnlyEstimate(estimate);
-    this.#checkScopedTables(estimate.referencedTables);
-
-    let preview = sql.replace(/\s+/g, " ").trim().slice(0, 100);
-    await this.#authorizeDatasets(
-      BigQuerySessionImpl.#datasetsFromReferencedTables(estimate.referencedTables), {
-      title: `BigQuery dry run: ${preview}`,
-      description:
-        `Estimated bytes processed: ${estimate.bytesProcessed.toLocaleString()}\n` +
-        `Referenced tables: ${estimate.referencedTables.join(", ") || "(none)"}`,
-      prohibitAllSharing: true,
-    });
-
-    return estimate;
   }
 
   async getProject(): Promise<BigQueryProject> {
@@ -3885,69 +3980,75 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
   }
 
   async listDatasets(projectId?: string): Promise<BigQueryDataset[]> {
-    if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
-      throw new Error(
-        `Cannot list datasets in "${projectId}" — this connection is scoped to ` +
-        `"${this.#scopedProjectId}".`);
-    }
-    let p = this.#scopedProjectId ?? projectId;
-    if (!p) {
-      throw new Error("listDatasets requires a projectId when the session is unscoped.");
-    }
+    return this.#runRead("BigQuerySession.listDatasets", async api => {
+      if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
+        throw new Error(
+          `Cannot list datasets in "${projectId}" — this connection is scoped to ` +
+          `"${this.#scopedProjectId}".`);
+      }
+      let p = this.#scopedProjectId ?? projectId;
+      if (!p) {
+        throw new Error("listDatasets requires a projectId when the session is unscoped.");
+      }
 
-    if (this.#scopedDatasetId) {
-      let dataset = await this.#api.getDataset(p, this.#scopedDatasetId);
-      await this.#authorizeDatasets([{ projectId: p, datasetId: this.#scopedDatasetId }], {
-        title: `List datasets in ${p}`,
-        description: `Returned scoped dataset \`${p}.${this.#scopedDatasetId}\` (1 dataset).`,
-        prohibitAllSharing: true,
-      });
-      return [dataset];
-    }
+      if (this.#scopedDatasetId) {
+        let dataset = await api.getDataset(p, this.#scopedDatasetId);
+        return {
+          result: [dataset],
+          datasets: [{ projectId: p, datasetId: this.#scopedDatasetId }],
+          description: {
+            title: `List datasets in ${p}`,
+            description: `Returned scoped dataset \`${p}.${this.#scopedDatasetId}\` (1 dataset).`,
+            prohibitAllSharing: true,
+          },
+        };
+      }
 
-    let result = await this.#api.listDatasets(p);
-    // Listing reveals each dataset's existence/name, so attribute to all of them.
-    await this.#authorizeDatasets(result.map(ds => ({ projectId: p, datasetId: ds.datasetId })), {
-      title: `List datasets in ${p}`,
-      description: `Listed ${result.length} dataset(s) in \`${p}\`.`,
-      prohibitAllSharing: true,
+      let result = await api.listDatasets(p);
+      return {
+        result,
+        datasets: result.map(ds => ({ projectId: p, datasetId: ds.datasetId })),
+        description: {
+          title: `List datasets in ${p}`,
+          description: `Listed ${result.length} dataset(s) in \`${p}\`.`,
+          prohibitAllSharing: true,
+        },
+      };
     });
-    return result;
   }
 
   async listTables(datasetId?: string, projectId?: string): Promise<BigQueryTable[]> {
-    if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
-      throw new Error(
-        `Cannot list tables in project "${projectId}" — this connection is scoped to ` +
-        `"${this.#scopedProjectId}".`);
-    }
-    if (this.#scopedDatasetId && datasetId && datasetId !== this.#scopedDatasetId) {
-      throw new Error(
-        `Cannot list tables in dataset "${datasetId}" — this connection is scoped to ` +
-        `"${this.#scopedDatasetId}".`);
-    }
-    let p = this.#scopedProjectId ?? projectId;
-    let d = this.#scopedDatasetId ?? datasetId;
-    if (!p) throw new Error("listTables requires a projectId when the session is unscoped.");
-    if (!d) throw new Error("listTables requires a datasetId when the session is unscoped.");
+    return this.#runRead("BigQuerySession.listTables", async api => {
+      if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
+        throw new Error(
+          `Cannot list tables in project "${projectId}" — this connection is scoped to ` +
+          `"${this.#scopedProjectId}".`);
+      }
+      if (this.#scopedDatasetId && datasetId && datasetId !== this.#scopedDatasetId) {
+        throw new Error(
+          `Cannot list tables in dataset "${datasetId}" — this connection is scoped to ` +
+          `"${this.#scopedDatasetId}".`);
+      }
+      let p = this.#scopedProjectId ?? projectId;
+      let d = this.#scopedDatasetId ?? datasetId;
+      if (!p) throw new Error("listTables requires a projectId when the session is unscoped.");
+      if (!d) throw new Error("listTables requires a datasetId when the session is unscoped.");
 
-    if (this.#scopedTableId) {
-      let { table } = await this.#api.getTable(p, d, this.#scopedTableId);
-      await this.#authorizeDatasets([{ projectId: p, datasetId: d }], {
-        title: `List tables in ${p}.${d}`,
-        description: `Returned scoped table \`${p}.${d}.${this.#scopedTableId}\` (1 table).`,
-        prohibitAllSharing: true,
-      });
-      return [table];
-    }
-
-    let result = await this.#api.listTables(p, d);
-    await this.#authorizeDatasets([{ projectId: p, datasetId: d }], {
-      title: `List tables in ${p}.${d}`,
-      description: `Listed ${result.length} table(s) in \`${p}.${d}\`.`,
-      prohibitAllSharing: true,
+      let result = this.#scopedTableId
+        ? [(await api.getTable(p, d, this.#scopedTableId)).table]
+        : await api.listTables(p, d);
+      return {
+        result,
+        datasets: [{ projectId: p, datasetId: d }],
+        description: {
+          title: `List tables in ${p}.${d}`,
+          description: this.#scopedTableId
+            ? `Returned scoped table \`${p}.${d}.${this.#scopedTableId}\` (1 table).`
+            : `Listed ${result.length} table(s) in \`${p}.${d}\`.`,
+          prohibitAllSharing: true,
+        },
+      };
     });
-    return result;
   }
 
   async describeTable(
@@ -3955,35 +4056,40 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     datasetId?: string,
     projectId?: string,
   ): Promise<{ table: BigQueryTable; schema: BigQueryField[] }> {
-    if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
-      throw new Error(
-        `Cannot describe table in project "${projectId}" — this connection is scoped to ` +
-        `"${this.#scopedProjectId}".`);
-    }
-    if (this.#scopedDatasetId && datasetId && datasetId !== this.#scopedDatasetId) {
-      throw new Error(
-        `Cannot describe table in dataset "${datasetId}" — this connection is scoped to ` +
-        `"${this.#scopedDatasetId}".`);
-    }
-    if (this.#scopedTableId && tableId && tableId !== this.#scopedTableId) {
-      throw new Error(
-        `Cannot describe table "${tableId}" — this connection is scoped to ` +
-        `"${this.#scopedTableId}".`);
-    }
-    let p = this.#scopedProjectId ?? projectId;
-    let d = this.#scopedDatasetId ?? datasetId;
-    let t = this.#scopedTableId ?? tableId;
-    if (!p) throw new Error("describeTable requires a projectId when the session is unscoped.");
-    if (!d) throw new Error("describeTable requires a datasetId when the session is unscoped.");
-    if (!t) throw new Error("describeTable requires a tableId when the session is unscoped.");
+    return this.#runRead("BigQuerySession.describeTable", async api => {
+      if (this.#scopedProjectId && projectId && projectId !== this.#scopedProjectId) {
+        throw new Error(
+          `Cannot describe table in project "${projectId}" — this connection is scoped to ` +
+          `"${this.#scopedProjectId}".`);
+      }
+      if (this.#scopedDatasetId && datasetId && datasetId !== this.#scopedDatasetId) {
+        throw new Error(
+          `Cannot describe table in dataset "${datasetId}" — this connection is scoped to ` +
+          `"${this.#scopedDatasetId}".`);
+      }
+      if (this.#scopedTableId && tableId && tableId !== this.#scopedTableId) {
+        throw new Error(
+          `Cannot describe table "${tableId}" — this connection is scoped to ` +
+          `"${this.#scopedTableId}".`);
+      }
+      let p = this.#scopedProjectId ?? projectId;
+      let d = this.#scopedDatasetId ?? datasetId;
+      let t = this.#scopedTableId ?? tableId;
+      if (!p) throw new Error("describeTable requires a projectId when the session is unscoped.");
+      if (!d) throw new Error("describeTable requires a datasetId when the session is unscoped.");
+      if (!t) throw new Error("describeTable requires a tableId when the session is unscoped.");
 
-    let result = await this.#api.getTable(p, d, t);
-    await this.#authorizeDatasets([{ projectId: p, datasetId: d }], {
-      title: `Describe ${p}.${d}.${t}`,
-      description:
-        `Described table \`${p}.${d}.${t}\` (${result.schema.length} columns).`,
-      prohibitAllSharing: true,
+      let result = await api.getTable(p, d, t);
+      return {
+        result,
+        datasets: [{ projectId: p, datasetId: d }],
+        description: {
+          title: `Describe ${p}.${d}.${t}`,
+          description:
+            `Described table \`${p}.${d}.${t}\` (${result.schema.length} columns).`,
+          prohibitAllSharing: true,
+        },
+      };
     });
-    return result;
   }
 }

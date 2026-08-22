@@ -6,13 +6,21 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import googleWorker, {
+  BigQueryGatekeeperImpl,
+  GoogleCalendarGatekeeperImpl,
   GmailGatekeeperImpl,
   GoogleDocGatekeeperImpl,
   GoogleSheetsGatekeeperImpl,
 } from "../src/google.js";
 
 export default googleWorker;
-export { GmailGatekeeperImpl, GoogleDocGatekeeperImpl, GoogleSheetsGatekeeperImpl };
+export {
+  BigQueryGatekeeperImpl,
+  GmailGatekeeperImpl,
+  GoogleCalendarGatekeeperImpl,
+  GoogleDocGatekeeperImpl,
+  GoogleSheetsGatekeeperImpl,
+};
 
 type GatekeeperClass<T, Props> = (options: { props: Props }) => DurableObjectClass<T>;
 
@@ -28,6 +36,15 @@ type TestExports = {
   GoogleSheetsGatekeeperImpl: GatekeeperClass<GoogleSheetsGatekeeperImpl, {
     userObjectId: string;
     spreadsheetId: string;
+  }>;
+  GoogleCalendarGatekeeperImpl: GatekeeperClass<GoogleCalendarGatekeeperImpl, {
+    userObjectId: string;
+    calendarId: string;
+    availabilityMode: "thisCalendar";
+  }>;
+  BigQueryGatekeeperImpl: GatekeeperClass<BigQueryGatekeeperImpl, {
+    userObjectId: string;
+    scopedProjectId: string;
   }>;
 };
 
@@ -142,6 +159,137 @@ export class GoogleBillingTestParent extends DurableObject {
       queueStub,
     );
     return { ranges: await session.readRanges(["Sheet1!A1:B1"]), trace: queue.trace };
+  }
+
+  async readCalendar(name: string) {
+    const queue = new RecordingApprovalQueue();
+    const gatekeeper = this.ctx.facets.get<GoogleCalendarGatekeeperImpl>(name, () => ({
+      class: this.#exports().GoogleCalendarGatekeeperImpl({
+        props: {
+          userObjectId: this.#accountId(),
+          calendarId: "calendar@example.com",
+          availabilityMode: "thisCalendar",
+        },
+      }),
+    }));
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using session = await gatekeeper.startSession(queueStub);
+    const timeMin = new Date("2026-08-22T12:00:00Z");
+    const timeMax = new Date("2026-08-23T12:00:00Z");
+    const calendar = await session.getCalendar();
+    const events = await session.listEvents({ timeMin, timeMax });
+    const availability = await session.checkAvailability({
+      people: ["calendar@example.com"],
+      timeMin,
+      timeMax,
+    });
+    return { calendar, events, availability, trace: queue.trace };
+  }
+
+  async readCalendarFailure(name: string) {
+    const queue = new RecordingApprovalQueue();
+    const gatekeeper = this.ctx.facets.get<GoogleCalendarGatekeeperImpl>(name, () => ({
+      class: this.#exports().GoogleCalendarGatekeeperImpl({
+        props: {
+          userObjectId: this.#accountId(),
+          calendarId: "calendar@example.com",
+          availabilityMode: "thisCalendar",
+        },
+      }),
+    }));
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using session = await gatekeeper.startSession(queueStub);
+    try {
+      await session.listEvents({
+        timeMin: new Date("2026-08-22T12:00:00Z"),
+        timeMax: new Date("2026-08-23T12:00:00Z"),
+      });
+      return { error: undefined, trace: queue.trace };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error), trace: queue.trace };
+    }
+  }
+
+  async createCalendarEvent(name: string) {
+    const queue = new RecordingApprovalQueue();
+    const gatekeeper = this.ctx.facets.get<GoogleCalendarGatekeeperImpl>(name, () => ({
+      class: this.#exports().GoogleCalendarGatekeeperImpl({
+        props: {
+          userObjectId: this.#accountId(),
+          calendarId: "calendar@example.com",
+          availabilityMode: "thisCalendar",
+        },
+      }),
+    }));
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using session = await gatekeeper.startSession(queueStub);
+    await session.createEvent({
+      title: "Planning",
+      start: { kind: "dateTime", dateTime: new Date("2026-08-22T13:00:00Z") },
+      end: { kind: "dateTime", dateTime: new Date("2026-08-22T14:00:00Z") },
+    });
+    const action = queue.trace.actions[0];
+    if (!action) throw new Error("Google Calendar did not submit its Action.");
+    const eventsBeforeApply = [...queue.trace.events];
+    const result = await gatekeeper.applyAction(action.id, {
+      billingOperationId: `calendar-create-operation-${name}`,
+      mode: "execute",
+    });
+    return { result, eventsBeforeApply, trace: queue.trace };
+  }
+
+  async submitPartialCalendarUpdate(name: string) {
+    const queue = new RecordingApprovalQueue();
+    const gatekeeper = this.ctx.facets.get<GoogleCalendarGatekeeperImpl>(name, () => ({
+      class: this.#exports().GoogleCalendarGatekeeperImpl({
+        props: {
+          userObjectId: this.#accountId(),
+          calendarId: "calendar@example.com",
+          availabilityMode: "thisCalendar",
+        },
+      }),
+    }));
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using session = await gatekeeper.startSession(queueStub);
+    await session.updateEvent("event-1", {
+      start: { kind: "dateTime", dateTime: new Date("2026-08-22T15:00:00Z") },
+    });
+    return { trace: queue.trace };
+  }
+
+  async readBigQuery(name: string) {
+    const queue = new RecordingApprovalQueue();
+    const gatekeeper = this.ctx.facets.get<BigQueryGatekeeperImpl>(name, () => ({
+      class: this.#exports().BigQueryGatekeeperImpl({
+        props: { userObjectId: this.#accountId(), scopedProjectId: "test-project" },
+      }),
+    }));
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using session = await gatekeeper.startSession(queueStub);
+    const sql = "SELECT name FROM `test-project.analytics.people`";
+    const query = await session.query(sql);
+    const estimate = await session.dryRun(sql);
+    const datasets = await session.listDatasets();
+    const tables = await session.listTables("analytics");
+    const description = await session.describeTable("people", "analytics");
+    return { query, estimate, datasets, tables, description, trace: queue.trace };
+  }
+
+  async readBigQueryFailure(name: string) {
+    const queue = new RecordingApprovalQueue();
+    const gatekeeper = this.ctx.facets.get<BigQueryGatekeeperImpl>(name, () => ({
+      class: this.#exports().BigQueryGatekeeperImpl({
+        props: { userObjectId: this.#accountId(), scopedProjectId: "test-project" },
+      }),
+    }));
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using session = await gatekeeper.startSession(queueStub);
+    try {
+      await session.describeTable("people", "analytics");
+      return { error: undefined, trace: queue.trace };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error), trace: queue.trace };
+    }
   }
 
   async sendGmail(name: string) {

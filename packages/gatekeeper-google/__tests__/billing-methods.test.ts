@@ -18,6 +18,14 @@ const EXPECTED_READ_METHOD_KEYS = [
   "google.sheets.spreadsheet.get-metadata",
   "google.sheets.spreadsheet.read-range",
   "google.sheets.spreadsheet.read-ranges",
+  "google.calendar.calendar.get-metadata",
+  "google.calendar.event.list",
+  "google.calendar.availability.check",
+  "google.bigquery.query.execute",
+  "google.bigquery.query.dry-run",
+  "google.bigquery.dataset.list",
+  "google.bigquery.table.list",
+  "google.bigquery.table.describe",
 ] as const;
 
 const EXPECTED_WRITE_METHOD_KEYS = [
@@ -31,10 +39,12 @@ const EXPECTED_WRITE_METHOD_KEYS = [
   "google.gmail.message.forward",
   "google.docs.document.replace-text",
   "google.docs.document.append-text",
+  "google.calendar.event.create",
+  "google.calendar.event.update",
 ] as const;
 
 describe("Google Billable Method inventory", () => {
-  it("fixes every Gmail, Docs, and Sheets read key", () => {
+  it("fixes every Google business read key", () => {
     const entries = Object.values(GOOGLE_BILLING_METHODS);
 
     expect(entries.map(entry => entry.methodKey)).toEqual(EXPECTED_READ_METHOD_KEYS);
@@ -43,7 +53,7 @@ describe("Google Billable Method inventory", () => {
       .toBe(true);
   });
 
-  it("fixes every approved Gmail and Docs write key", () => {
+  it("fixes every approved Google write key", () => {
     const entries = Object.values(GOOGLE_WRITE_BILLING_METHODS);
 
     expect(entries.map(entry => entry.methodKey)).toEqual(EXPECTED_WRITE_METHOD_KEYS);
@@ -57,6 +67,8 @@ describe("Google Billable Method inventory", () => {
       "GmailSession.listThreads",
       "GmailSession.search",
       "GmailMessage.thread",
+      "GoogleCalendarSession.getCapabilities",
+      "BigQuerySession.getProject",
     ]);
   });
 

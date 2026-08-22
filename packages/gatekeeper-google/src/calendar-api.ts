@@ -11,6 +11,7 @@ import type {
   PersonAvailability,
 } from "./calendar-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperationActivity } from "./billing.js";
 
 const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
 
@@ -168,7 +169,15 @@ export function validateCalendarTimeWindow(timeMin: Date, timeMax: Date, maxDays
 }
 
 export class GoogleCalendarApi {
-  constructor(private getAccessToken: AccessTokenProvider) {}
+  constructor(
+    private getAccessToken: AccessTokenProvider,
+    private activity?: GoogleOperationActivity,
+  ) {}
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: GoogleOperationActivity): GoogleCalendarApi {
+    return new GoogleCalendarApi(this.getAccessToken, activity);
+  }
 
   async #fetch<T>(path: string, init?: RequestInit): Promise<T> {
     // Built from the caller's headers so anything they set wins; these are only defaults. Note a
@@ -182,7 +191,7 @@ export class GoogleCalendarApi {
     let response = await fetchWithAuthRetry(`${CALENDAR_API_BASE}${path}`, {
       ...init,
       headers,
-    }, this.getAccessToken);
+    }, this.getAccessToken, { activity: this.activity });
 
     if (!response.ok) {
       let text = await response.text();
