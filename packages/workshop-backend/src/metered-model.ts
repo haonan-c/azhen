@@ -6,13 +6,14 @@ import {
 import type { AdminSettings } from "./admin-settings.js";
 import type { ModelHandle } from "./ai-models.js";
 import type {
-  AgentModelUsageAttribution,
+  ModelUsageAttribution,
   ModelUsageCompletion,
   ModelUsageReservationBound,
   ReportedModelUsage,
 } from "./usage-account.js";
 import type { UserDurableObject } from "./user.js";
 import { createWorkshopLogger } from "./observability.js";
+import type { ModelChargeSnapshot } from "@gadgets/workshop-shared/api";
 
 const MAX_SSE_LINE_BYTES = 1_048_576;
 const logger = createWorkshopLogger("workshop.metered-model");
@@ -28,11 +29,25 @@ type ModelUsageAccount = Pick<
   "completeModelUsage"
 >;
 
+/** Persisted identity and financial input for one recoverable Agent inference. */
+export type ModelUsageOperation = {
+  operationId: string;
+  chargeSnapshot: ModelChargeSnapshot;
+  reservationBound: ModelUsageReservationBound;
+};
+
+/** Host persistence hooks that make a restarted Agent inference idempotent. */
+export type ModelUsageOperationLifecycle = {
+  acquire(input: Omit<ModelUsageOperation, "operationId">): ModelUsageOperation;
+  finish(operationId: string): void;
+};
+
 /** Trusted dependencies and content-free dimensions for one Agent model handle. */
 export type AgentModelMeteringOptions = {
   usageRates: UsageRateIssuer;
   user: ModelUsageAccount;
-  attribution: AgentModelUsageAttribution;
+  attribution: ModelUsageAttribution;
+  operations?: ModelUsageOperationLifecycle;
 };
 
 /**
@@ -77,9 +92,18 @@ export function meterAgentModelHandle(
       return handle.lastResponse;
     },
     stream(model, context, streamOptions = {}) {
-      const operationId = `model-inference:${crypto.randomUUID()}`;
+      const operations = options.operations ?? {
+        acquire: (input: Omit<ModelUsageOperation, "operationId">) => ({
+          operationId: `model-inference:${crypto.randomUUID()}`,
+          ...input,
+        }),
+        finish: () => {},
+      };
+      let operation: ModelUsageOperation | undefined;
       const usageObserver = new DeepSeekSseUsageObserver();
       let began = false;
+      let terminalBeforeExecution = false;
+      let operationFinished = false;
       let lastMessage: AssistantMessage | undefined;
       const callerFetch = streamOptions.fetch ?? globalThis.fetch;
       const callerOnPayload = streamOptions.onPayload;
@@ -95,20 +119,24 @@ export function meterAgentModelHandle(
             model.contextWindow,
             outputLimit,
           );
-          const snapshot = await options.usageRates.issueModelChargeSnapshot(
+          const issuedSnapshot = await options.usageRates.issueModelChargeSnapshot(
             "deepseek",
             model.id,
           );
-          const reservationBound = reservationBoundFor(
-            snapshot,
+          const issuedBound = reservationBoundFor(
+            issuedSnapshot,
             inputBound,
             BigInt(outputLimit),
           );
+          operation = operations.acquire({
+            chargeSnapshot: issuedSnapshot,
+            reservationBound: issuedBound,
+          });
           await options.user.beginModelUsage(
-            operationId,
+            operation.operationId,
             options.attribution,
-            snapshot,
-            reservationBound,
+            operation.chargeSnapshot,
+            operation.reservationBound,
           );
           began = true;
           return finalPayload;
@@ -117,11 +145,13 @@ export function meterAgentModelHandle(
           if (!began) {
             throw new Error("Model Metering Attempt was not persisted before provider fetch.");
           }
+          if (!operation) throw new Error("Model Usage operation is unavailable.");
           try {
-            await options.user.markModelUsageStarted(operationId);
+            await options.user.markModelUsageStarted(operation.operationId);
           } catch (error) {
             try {
-              await options.user.failModelUsageBeforeExecution(operationId);
+              await options.user.failModelUsageBeforeExecution(operation.operationId);
+              terminalBeforeExecution = true;
             } catch (cleanupError) {
               // The provider remains uncalled. A failed cleanup keeps the Reservation fail-closed.
               logger.error("failed to release model billing before provider execution", {
@@ -149,10 +179,11 @@ export function meterAgentModelHandle(
               outer.push(event);
               continue;
             }
+            if (!operation) throw new Error("Model Usage operation is unavailable.");
             const usage = usageObserver.reportedUsage();
             let record: Awaited<ReturnType<ModelUsageAccount["completeModelUsage"]>>;
             try {
-              record = await options.user.completeModelUsage(operationId, usage);
+              record = await options.user.completeModelUsage(operation.operationId, usage);
             } catch (error) {
               logger.error("failed to complete model billing", {
                 event: "model.metering.complete.failed",
@@ -160,6 +191,8 @@ export function meterAgentModelHandle(
               });
               throw error;
             }
+            operations.finish(operation.operationId);
+            operationFinished = true;
             if (record.outcome === "reconciliation-required") {
               logger.error("model billing requires reconciliation", {
                 event: "model.metering.reconciliation.required",
@@ -169,6 +202,9 @@ export function meterAgentModelHandle(
             outer.push(event);
           }
         } catch {
+          if (operation && !operationFinished && (!began || terminalBeforeExecution)) {
+            operations.finish(operation.operationId);
+          }
           if (lastMessage) {
             outer.push(billingFailureEvent(lastMessage));
           } else {

@@ -18,6 +18,10 @@ import {
   normalizeInitialGrantSnapshot,
   type ModelTokenUsage,
 } from "./usage-rates.js";
+import {
+  normalizeUsageAttribution,
+  type UsageAttribution,
+} from "./usage-attribution.js";
 
 const LEDGER_PREFIX = "usageAccount:ledger:";
 const RESERVATION_PREFIX = "usageAccount:reservation:";
@@ -51,11 +55,8 @@ type AdminLedgerAudit = {
   originalLedgerEntryId: string | null;
 };
 
-/** Content-free, host-attested dimensions for one Agent model inference. */
-export type AgentModelUsageAttribution = {
-  source: "agent";
-  workspaceId: string;
-  chatId: number;
+/** Content-free, host-attested dimensions for one model inference. */
+export type ModelUsageAttribution = UsageAttribution & {
   deploymentModelId: string;
 };
 
@@ -74,7 +75,7 @@ export type ModelUsageCompletion = ReportedModelUsage | null | "invalid-report";
 /** Durable lifecycle state for one Agent model inference. */
 export type ModelMeteringAttempt = {
   operationId: string;
-  attribution: AgentModelUsageAttribution;
+  attribution: ModelUsageAttribution;
   chargeSnapshot: ModelChargeSnapshot;
   reservationBound: ModelUsageReservationBound;
   reservationAmountSubunits: bigint;
@@ -91,7 +92,7 @@ export type ModelMeteringAttempt = {
 export type ModelUsageRecord = {
   id: string;
   operationId: string;
-  attribution: AgentModelUsageAttribution;
+  attribution: ModelUsageAttribution;
   chargeSnapshot: ModelChargeSnapshot;
   reservationId: string | null;
   ledgerEntryId: string | null;
@@ -448,7 +449,7 @@ export class UsageAccount {
   /** Atomically create one Agent model Metering Attempt and its pricing decision. */
   beginModelUsage(
       operationId: string,
-      attribution: AgentModelUsageAttribution,
+      attribution: ModelUsageAttribution,
       chargeSnapshot: ModelChargeSnapshot,
       reservationBound: ModelUsageReservationBound,
       initialGrantSnapshot?: InitialGrantSnapshot): ModelMeteringAttempt {
@@ -462,11 +463,11 @@ export class UsageAccount {
         return {error: error instanceof Error ? error : new Error(String(error))};
       }
 
-      let normalizedAttribution: AgentModelUsageAttribution;
+      let normalizedAttribution: ModelUsageAttribution;
       let normalizedSnapshot: ModelChargeSnapshot;
       let normalizedBound: ModelUsageReservationBound;
       try {
-        normalizedAttribution = normalizeAgentModelUsageAttribution(attribution);
+        normalizedAttribution = normalizeModelUsageAttribution(attribution);
         const snapshot = normalizeChargeSnapshot(chargeSnapshot);
         if (snapshot.kind !== "model") {
           throw new TypeError("Agent model metering requires a Model Charge Snapshot.");
@@ -1567,7 +1568,18 @@ function userModelUsageRecord(record: ModelUsageRecord): UserModelUsageRecord {
     id: `usage-record:${record.operationId.slice(operationPrefix.length)}`,
     source: record.attribution.source,
     workspaceId: record.attribution.workspaceId,
-    chatId: record.attribution.chatId,
+    ...(record.attribution.chatId !== undefined
+      ? {chatId: record.attribution.chatId}
+      : {}),
+    ...(record.attribution.gadgetId !== undefined
+      ? {gadgetId: record.attribution.gadgetId}
+      : {}),
+    ...(record.attribution.automationId !== undefined
+      ? {automationId: record.attribution.automationId}
+      : {}),
+    ...(record.attribution.automationRunId !== undefined
+      ? {automationRunId: record.attribution.automationRunId}
+      : {}),
     deploymentModelId: record.attribution.deploymentModelId,
     pricing: record.chargeSnapshot.pricing,
     outcome: record.outcome,
@@ -1583,18 +1595,19 @@ function userModelUsageRecord(record: ModelUsageRecord): UserModelUsageRecord {
   };
 }
 
-function normalizeAgentModelUsageAttribution(
-    value: AgentModelUsageAttribution): AgentModelUsageAttribution {
+function normalizeModelUsageAttribution(
+    value: ModelUsageAttribution): ModelUsageAttribution {
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
-      !hasExactKeys(value, ["source", "workspaceId", "chatId", "deploymentModelId"]) ||
-      value.source !== "agent" || typeof value.workspaceId !== "string" ||
-      !/^[0-9a-f]{64}$/.test(value.workspaceId) ||
-      !Number.isSafeInteger(value.chatId) || value.chatId < 0 ||
+      Object.keys(value).some(key => key !== "deploymentModelId" &&
+        key !== "principal" && key !== "source" && key !== "workspaceId" &&
+        key !== "chatId" && key !== "gadgetId" && key !== "automationId" &&
+        key !== "automationRunId") ||
       typeof value.deploymentModelId !== "string" ||
       !/^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,199}$/.test(value.deploymentModelId)) {
-    throw new TypeError("Agent model Usage attribution is invalid.");
+    throw new TypeError("Model Usage attribution is invalid.");
   }
-  return {...value};
+  const {deploymentModelId, ...attribution} = value;
+  return {...normalizeUsageAttribution(attribution), deploymentModelId};
 }
 
 function normalizeModelUsageReservationBound(
@@ -1632,13 +1645,19 @@ function normalizeReportedModelUsage(value: ReportedModelUsage): ReportedModelUs
 
 function modelAttemptInputsEqual(
   attempt: ModelMeteringAttempt,
-  attribution: AgentModelUsageAttribution,
+  attribution: ModelUsageAttribution,
   snapshot: ModelChargeSnapshot,
   reservationBound: ModelUsageReservationBound,
 ): boolean {
-  return attempt.attribution.source === attribution.source &&
+  return attempt.attribution.principal.version === attribution.principal.version &&
+    attempt.attribution.principal.kind === attribution.principal.kind &&
+    attempt.attribution.principal.userId === attribution.principal.userId &&
+    attempt.attribution.source === attribution.source &&
     attempt.attribution.workspaceId === attribution.workspaceId &&
     attempt.attribution.chatId === attribution.chatId &&
+    attempt.attribution.gadgetId === attribution.gadgetId &&
+    attempt.attribution.automationId === attribution.automationId &&
+    attempt.attribution.automationRunId === attribution.automationRunId &&
     attempt.attribution.deploymentModelId === attribution.deploymentModelId &&
     chargeSnapshotsEqual(attempt.chargeSnapshot, snapshot) &&
     attempt.reservationBound.cacheHitInputTokens === reservationBound.cacheHitInputTokens &&
@@ -1679,7 +1698,7 @@ function assertModelMeteringAttempt(
     throw new Error("Model Metering Attempt does not reconcile.");
   }
   try {
-    normalizeAgentModelUsageAttribution(attempt.attribution);
+    normalizeModelUsageAttribution(attempt.attribution);
     const snapshot = normalizeChargeSnapshot(attempt.chargeSnapshot);
     if (snapshot.kind !== "model") throw new TypeError("Expected a model snapshot.");
     normalizeModelUsageReservationBound(attempt.reservationBound);
@@ -1761,7 +1780,7 @@ function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: s
     throw new Error("Model Usage Record terminal state does not reconcile.");
   }
   try {
-    normalizeAgentModelUsageAttribution(record.attribution);
+    normalizeModelUsageAttribution(record.attribution);
     const snapshot = normalizeChargeSnapshot(record.chargeSnapshot);
     if (snapshot.kind !== "model") throw new TypeError("Expected a model snapshot.");
     if (record.usage !== null) normalizeReportedModelUsage(record.usage);

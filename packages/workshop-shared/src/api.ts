@@ -471,6 +471,15 @@ export type UserModelTokenUsage = {
   reasoningTokens: bigint;
 };
 
+/** Causal origin of one Metered Use. */
+export type UsageSource =
+  | "agent"
+  | "gadget"
+  | "direct-user"
+  | "system-assistance"
+  | "hook"
+  | "scheduled";
+
 /** User-safe projection of one model Usage Record. */
 export type UserModelUsageRecord = {
   /** Usage Record discriminator. */
@@ -478,11 +487,17 @@ export type UserModelUsageRecord = {
   /** Opaque stable identifier safe to use as a UI list key. */
   id: string;
   /** Origin of this model inference. */
-  source: "agent";
+  source: UsageSource;
   /** Workspace that ran the inference. */
   workspaceId: string;
   /** Conversation that ran the inference. */
-  chatId: number;
+  chatId?: number;
+  /** App that ran the inference, when applicable. */
+  gadgetId?: WorkpieceId;
+  /** Stable unattended automation identifier, when applicable. */
+  automationId?: string;
+  /** Stable identifier for one unattended automation run, when applicable. */
+  automationRunId?: string;
   /** Deployment Model selected for the inference. */
   deploymentModelId: string;
   /** Whether the immutable Charge Snapshot had a configured rate. */

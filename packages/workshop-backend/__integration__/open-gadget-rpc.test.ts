@@ -55,6 +55,86 @@ function openAiTextResponse(text: string): Response {
       "data: [DONE]\n\n", {headers: {"content-type": "text/event-stream"}});
 }
 
+function deepSeekTextResponse(text: string): Response {
+  const frames = [
+    {
+      id: "chatcmpl-restart",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "deepseek-v4-flash",
+      usage: null,
+      choices: [{index: 0, delta: {role: "assistant", content: text}, finish_reason: null}],
+    },
+    {
+      id: "chatcmpl-restart",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "deepseek-v4-flash",
+      choices: [{index: 0, delta: {}, finish_reason: "stop"}],
+      usage: {
+        prompt_tokens: 2,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 2,
+        completion_tokens: 1,
+        completion_tokens_details: {reasoning_tokens: 0},
+        total_tokens: 3,
+      },
+    },
+  ];
+  return new Response(
+      frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join("") +
+      "data: [DONE]\n\n",
+      {headers: {"content-type": "text/event-stream"}});
+}
+
+function gatedDeepSeekResponse(onUsage: () => void, release: Promise<void>): Response {
+  const encoder = new TextEncoder();
+  const usage = encoder.encode(`data: ${JSON.stringify({
+    id: "chatcmpl-restart-gated",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "deepseek-v4-flash",
+    choices: [],
+    usage: {
+      prompt_tokens: 2,
+      prompt_cache_hit_tokens: 0,
+      prompt_cache_miss_tokens: 2,
+      completion_tokens: 1,
+      completion_tokens_details: {reasoning_tokens: 0},
+      total_tokens: 3,
+    },
+  })}\n\n`);
+  const terminal = encoder.encode(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-restart-gated",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "deepseek-v4-flash",
+        choices: [{
+          index: 0,
+          delta: {role: "assistant", content: "old response"},
+          finish_reason: "stop",
+        }],
+      })}\n\ndata: [DONE]\n\n`);
+  let stage = 0;
+  return new Response(new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (stage === 0) {
+        stage = 1;
+        controller.enqueue(usage);
+        return;
+      }
+      if (stage === 1) {
+        stage = 2;
+        onUsage();
+        await release;
+        controller.enqueue(terminal);
+        controller.close();
+      }
+    },
+  }), {headers: {"content-type": "text/event-stream"}});
+}
+
 const PASSWORD_HASH = new Uint8Array([1, 2, 3]);
 // Also whitelisted in vitest.integration.config.ts onUnhandledError: capabilities held across
 // the injected abort reject on their own schedule.
@@ -235,6 +315,93 @@ describe("user-DO reset flags", () => {
     // Permanently broken, not fail-once: the fresh-stub-per-call design rests on this.
     const nativeErr2 = await rejection(userStub.listModels());
     expect(nativeErr2.message).toBe("Application called abortAllDurableObjects().");
+  });
+});
+
+describe("legacy paid work without a Usage Principal", () => {
+  it("rejects a pending Action before resolving its upstream gatekeeper", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "legacyaction");
+    using authenticated = await publicApi.authenticate(account.token);
+    using workspace = await authenticated.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
+    const chatId = await workspace.newChat("Legacy pending action.", null);
+    const overseer = exports.OverseerDurableObject.get(
+      exports.OverseerDurableObject.idFromString(workspaceId),
+    );
+    await runInDurableObject(overseer, (instance) => {
+      const impl = (instance as any).impl;
+      impl.storage.actions.put({
+        id: 999,
+        gatekeeperId: 999,
+        caller: {from: "agent", chatId},
+        createdAt: new Date(),
+        state: "pending",
+        type: "action",
+        action: 1,
+        description: {title: "Legacy action", awaitDecision: true},
+      });
+    });
+    const result = await runInDurableObject(overseer, async (instance) => {
+      const impl = (instance as any).impl;
+      const action = impl.storage.actions.get(999);
+      try {
+        await impl.applyPendingAction(
+          action,
+          {type: "user", id: account.username, name: account.username},
+          false,
+        );
+      } catch (error) {
+        return {
+          error: error instanceof Error ? error.message : String(error),
+          state: impl.storage.actions.get(999).state,
+        };
+      }
+      throw new Error("Legacy Action unexpectedly reached its upstream gatekeeper.");
+    });
+    expect(result).toEqual({error: "Usage attribution is invalid.", state: "pending"});
+  });
+
+  it("clears a legacy active Agent without calling its provider after restart", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "legacyactive");
+    using authenticated = await publicApi.authenticate(account.token);
+    const workspace = await authenticated.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
+    const chatId = await workspace.newChat("Legacy active work.", null);
+    const overseer = exports.OverseerDurableObject.get(
+      exports.OverseerDurableObject.idFromString(workspaceId),
+    );
+    await runInDurableObject(overseer, (instance) => {
+      const impl = (instance as any).impl;
+      const meta = impl.storage.chatMeta.get(chatId);
+      meta.activeAgent = {type: "agent", id: "legacy-model", name: "Legacy model"};
+      impl.storage.chatMeta.put(meta);
+      impl.storage.activeAgents.put({
+        chatId,
+        modelId: "legacy-model",
+        initiator: meta.activeAgent,
+        callbackInitiated: false,
+      });
+      impl.storage.version.put(1);
+    });
+    workspace[Symbol.dispose]();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await rejection(runInDurableObject(overseer, (_instance, state) => {
+        state.abort(USER_DO_ABORT_REASON);
+      }));
+      using reopened = await authenticated.openGadget(workspaceId);
+      await vi.waitFor(async () => {
+        expect((await reopened.listChats()).find(chat => chat.id === chatId)?.activeAgent)
+            .toBeUndefined();
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect((await authenticated.listOwnUsageRecords({limit: 10})).records).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
@@ -549,6 +716,92 @@ describe("Deployment Model RPC", () => {
     }
   });
 
+});
+
+describe("active Agent Usage Principal across a real DO abort", () => {
+  it("reuses the persisted Metering operation and settles one charge after resume", async () => {
+    using adminPublicApi = await connect();
+    const adminToken = await getDeploymentAdminToken(adminPublicApi);
+    using authenticatedAdmin = await adminPublicApi.authenticate(adminToken);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected deployment admin capability.");
+    await admin.addDeploymentModel("Restarted DeepSeek", {
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+      apiToken: "restart-deepseek-token",
+      apiUrl: "https://restart-deepseek.test/v1",
+    });
+    const modelId = (await admin.getDeploymentModelCatalog()).models
+        .find(model => model.name === "Restarted DeepSeek")!.id;
+    using ownerPublicApi = await connect();
+    const ownerAccount = await createAccount(ownerPublicApi, "restartowner");
+    using owner = await ownerPublicApi.authenticate(ownerAccount.token);
+    const principalAccount = await createAccount(ownerPublicApi, "principalrestart");
+    using ownerWorkspace = await owner.newGadget();
+    const workspaceId = (await ownerWorkspace.getMetadata()).id;
+    const collaborator = await ownerWorkspace.addCollaborator(principalAccount.username, "build");
+    if (!collaborator) throw new Error("Expected the Usage Principal collaborator.");
+    const ownerBefore = await owner.getUsageCreditBalance();
+    const principalPublicApi = await connect();
+    const principal = await principalPublicApi.authenticate(principalAccount.token);
+    const before = await principal.getUsageCreditBalance();
+    const workspace = await principal.openGadget(workspaceId);
+    let releaseFirst!: () => void;
+    const firstReleased = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let usageSeen = false;
+    let agentRequests = 0;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const payload = JSON.parse(String(init?.body)) as {tools?: unknown};
+      if (!Array.isArray(payload.tools) || payload.tools.length === 0) {
+        return deepSeekTextResponse("Restart title");
+      }
+      agentRequests += 1;
+      return agentRequests === 1
+        ? gatedDeepSeekResponse(() => { usageSeen = true; }, firstReleased)
+        : deepSeekTextResponse("resumed response");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const chat = workspace.newChat("Resume after the abort.", modelId);
+      void chat.catch(() => {});
+      await vi.waitFor(() => { expect(usageSeen).toBe(true); });
+      workspace[Symbol.dispose]();
+      principal[Symbol.dispose]();
+      principalPublicApi[Symbol.dispose]();
+
+      expect(await ownerWorkspace.removeCollaborator(collaborator.profile.id, []))
+          .toEqual([expect.objectContaining({profile: collaborator.profile})]);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      releaseFirst();
+
+      using resumedOwnerPublicApi = await connect();
+      using resumedOwner = await resumedOwnerPublicApi.authenticate(ownerAccount.token);
+      using resumedWorkspace = await resumedOwner.openGadget(workspaceId);
+      using resumedPrincipalPublicApi = await connect();
+      using resumedPrincipal = await resumedPrincipalPublicApi.authenticate(principalAccount.token);
+      await vi.waitFor(async () => {
+        const records = await resumedPrincipal.listOwnUsageRecords({limit: 10});
+        const balance = await resumedPrincipal.getUsageCreditBalance();
+        const ownerBalance = await resumedOwner.getUsageCreditBalance();
+        const chats = await resumedWorkspace.listChats();
+        expect(agentRequests).toBe(2);
+        expect(records.records).toHaveLength(1);
+        expect(records.records[0]).toMatchObject({
+          source: "agent",
+          outcome: "settled",
+          workspaceId,
+          chatId: 0,
+        });
+        expect(balance.reservedSubunits).toBe(0n);
+        expect(balance.availableSubunits).toBeLessThan(before.availableSubunits);
+        expect(ownerBalance).toEqual(ownerBefore);
+        expect(chats[0]?.activeAgent).toBeUndefined();
+      }, {timeout: 15_000});
+    } finally {
+      releaseFirst();
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("Usage Rate Admin RPC", () => {

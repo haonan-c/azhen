@@ -1,6 +1,7 @@
 import { DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { ScheduleDriver } from "../src/schedule-driver.js";
 import type { ScheduleSummary } from "../src/types.js";
+import type { HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
 
 export { default } from "../src/worker.js";
 export * from "../src/worker.js";
@@ -67,7 +68,8 @@ class TestCallback extends RpcTarget {
 
 /** Test-only persistent hook initiator. */
 export class TestHooks extends WorkerEntrypoint {
-  async startHook(): Promise<{ callback: TestCallback; approvalQueue: TestApprovalQueue }> {
+  async startHook(_run?: HookRunMetadata):
+      Promise<{ callback: TestCallback; approvalQueue: TestApprovalQueue }> {
     events.push("start");
     await pauseIfBlocked("start");
     if (mode === "start-reject") throw new Error("opaque admission rejection");

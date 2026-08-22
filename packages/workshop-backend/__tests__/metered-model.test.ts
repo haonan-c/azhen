@@ -5,6 +5,7 @@ import { getModel } from "../src/ai-models.js";
 import {
   deepSeekInputTokenUpperBound,
   meterAgentModelHandle,
+  type ModelUsageOperation,
 } from "../src/metered-model.js";
 import {
   UsageAccount,
@@ -25,6 +26,16 @@ async function newUser() {
   if (token === null) throw new Error("Failed to create metered-model test User.");
   return user;
 }
+
+function usagePrincipal(user: {id: {toString(): string}}) {
+  return {version: 1 as const, kind: "user" as const, userId: user.id.toString()};
+}
+
+const TEST_USAGE_PRINCIPAL = {
+  version: 1 as const,
+  kind: "user" as const,
+  userId: "0".repeat(64),
+};
 
 function deepSeekHandle() {
   return getModel({CF_AI_GATEWAY: undefined} as Cloudflare.Env, {
@@ -117,6 +128,178 @@ function usageThenStreamError(usage: Record<string, unknown>): Response {
 }
 
 describe("DeepSeek Agent model metering", () => {
+  it("reuses one persisted operation after an interrupted provider attempt", async () => {
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
+    let persisted: ModelUsageOperation | undefined;
+    const operations = {
+      acquire(input: Omit<ModelUsageOperation, "operationId">) {
+        persisted ??= {operationId: `model-inference:${crypto.randomUUID()}`, ...input};
+        return persisted;
+      },
+      finish(operationId: string) {
+        if (persisted?.operationId === operationId) persisted = undefined;
+      },
+    };
+    const operationIds: string[] = [];
+    const attribution = {
+      principal: TEST_USAGE_PRINCIPAL,
+      source: "agent" as const,
+      workspaceId: "9".repeat(64),
+      chatId: 90,
+      deploymentModelId: "deepseek-agent-restart-operation",
+    };
+    const interrupted = meterAgentModelHandle(deepSeekHandle(), {
+      usageRates: settings,
+      operations,
+      attribution,
+      user: {
+        async beginModelUsage(operationId) {
+          operationIds.push(operationId);
+          return undefined as never;
+        },
+        async markModelUsageStarted() {
+          throw new Error("simulated process interruption");
+        },
+        async failModelUsageBeforeExecution() {
+          throw new Error("simulated process interruption");
+        },
+        async completeModelUsage() {
+          throw new Error("interrupted attempt must not complete");
+        },
+      },
+    });
+    await interrupted.stream(interrupted.model, {
+      messages: [{role: "user", content: "before restart", timestamp: 0}],
+    }, {maxRetries: 0, maxTokens: 8}).result();
+    expect(persisted).toBeDefined();
+
+    const resumed = meterAgentModelHandle(deepSeekHandle(), {
+      usageRates: settings,
+      operations,
+      attribution,
+      user: {
+        async beginModelUsage(operationId) {
+          operationIds.push(operationId);
+          return undefined as never;
+        },
+        async markModelUsageStarted() {},
+        async failModelUsageBeforeExecution() {},
+        async completeModelUsage() {
+          return {outcome: "settled"} as never;
+        },
+      },
+    });
+    const result = await resumed.stream(resumed.model, {
+      messages: [{role: "user", content: "before restart", timestamp: 0}],
+    }, {
+      maxRetries: 0,
+      maxTokens: 8,
+      fetch: (async () => deepSeekSse({
+        prompt_tokens: 1,
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2,
+      })) as typeof fetch,
+    }).result();
+
+    expect(result.stopReason).toBe("stop");
+    expect(operationIds).toHaveLength(2);
+    expect(new Set(operationIds).size).toBe(1);
+    expect(persisted).toBeUndefined();
+  });
+
+  it("binds a persisted Usage Principal to the charged User account", async () => {
+    const user = await newUser();
+    const otherUser = await newUser();
+    const snapshot = await testEnv.TEST_ADMIN_SETTINGS.getByName("")
+      .issueModelChargeSnapshot("deepseek", "deepseek-v4-flash");
+    const attribution = {
+      principal: {
+        version: 1 as const,
+        kind: "user" as const,
+        userId: user.id.toString(),
+      },
+      source: "agent" as const,
+      workspaceId: "a".repeat(64),
+      chatId: 1,
+      deploymentModelId: "deepseek-agent-principal",
+    };
+    const bound = {
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 1n,
+      outputTokens: 1n,
+    };
+
+    const attempt = await user.beginModelUsage(
+      `model-inference:${crypto.randomUUID()}`,
+      attribution,
+      snapshot,
+      bound,
+    );
+    expect(attempt.attribution).toEqual(attribution);
+
+    await expect(runInDurableObject(otherUser, instance => instance.beginModelUsage(
+      `model-inference:${crypto.randomUUID()}`,
+      attribution,
+      snapshot,
+      bound,
+    ))).rejects.toThrow("Usage Principal does not match this Usage Account.");
+
+    await expect(runInDurableObject(user, instance => instance.beginModelUsage(
+      `model-inference:${crypto.randomUUID()}`,
+      {
+        source: "agent",
+        workspaceId: attribution.workspaceId,
+        chatId: attribution.chatId,
+        deploymentModelId: attribution.deploymentModelId,
+      } as never,
+      snapshot,
+      bound,
+    ))).rejects.toThrow("Usage Principal is required for paid work.");
+  });
+
+  it("persists scheduled source and automation dimensions independently from Principal", async () => {
+    const owner = await newUser();
+    const snapshot = await testEnv.TEST_ADMIN_SETTINGS.getByName("")
+      .issueModelChargeSnapshot("deepseek", "deepseek-v4-flash");
+    const operationId = `model-inference:${crypto.randomUUID()}`;
+    const attribution = {
+      principal: usagePrincipal(owner),
+      source: "scheduled" as const,
+      workspaceId: "b".repeat(64),
+      gadgetId: 7,
+      automationId: "schedule-1",
+      automationRunId: "run-1",
+      deploymentModelId: "deepseek-scheduled-principal",
+    };
+
+    const attempt = await owner.beginModelUsage(operationId, attribution, snapshot, {
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 1n,
+      outputTokens: 1n,
+    });
+    expect(attempt.attribution).toEqual(attribution);
+    await owner.markModelUsageStarted(operationId);
+    await owner.completeModelUsage(operationId, {
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+    });
+
+    await expect(owner.listUsageRecords({limit: 1})).resolves.toEqual({
+      records: [expect.objectContaining({
+        source: "scheduled",
+        workspaceId: attribution.workspaceId,
+        gadgetId: attribution.gadgetId,
+        automationId: attribution.automationId,
+        automationRunId: attribution.automationRunId,
+      })],
+      nextCursor: null,
+    });
+  });
+
   it("reserves the complete remaining context after validating the serialized payload", () => {
     const payload = {
       model: "deepseek-v4-flash",
@@ -208,6 +391,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: settings,
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "a".repeat(64),
         chatId: 7,
@@ -276,6 +460,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "b".repeat(64),
         chatId: 8,
@@ -316,6 +501,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "b".repeat(64),
         chatId: 81,
@@ -360,6 +546,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "c".repeat(64),
         chatId: 9,
@@ -412,6 +599,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: settings,
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "6".repeat(64),
         chatId: 60,
@@ -454,6 +642,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent" as const,
         workspaceId: "d".repeat(64),
         chatId: 10,
@@ -515,6 +704,7 @@ describe("DeepSeek Agent model metering", () => {
     const snapshot = await testEnv.TEST_ADMIN_SETTINGS.getByName("")
       .issueModelChargeSnapshot("deepseek", "deepseek-v4-flash");
     const attribution = {
+      principal: usagePrincipal(user),
       source: "agent" as const,
       workspaceId: "7".repeat(64),
       chatId: 70,
@@ -567,6 +757,7 @@ describe("DeepSeek Agent model metering", () => {
       .issueModelChargeSnapshot("deepseek", "deepseek-v4-flash");
     const operationId = `model-inference:${crypto.randomUUID()}`;
     await user.beginModelUsage(operationId, {
+      principal: usagePrincipal(user),
       source: "agent",
       workspaceId: "4".repeat(64),
       chatId: 41,
@@ -607,6 +798,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "e".repeat(64),
         chatId: 12,
@@ -663,6 +855,7 @@ describe("DeepSeek Agent model metering", () => {
         },
       },
       attribution: {
+        principal: TEST_USAGE_PRINCIPAL,
         source: "agent",
         workspaceId: "5".repeat(64),
         chatId: 51,
@@ -686,6 +879,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates,
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "5".repeat(64),
         chatId,
@@ -735,6 +929,7 @@ describe("DeepSeek Agent model metering", () => {
       },
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "3".repeat(64),
         chatId: 30,
@@ -781,6 +976,7 @@ describe("DeepSeek Agent model metering", () => {
           user.failModelUsageBeforeExecution(...args),
       },
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "4".repeat(64),
         chatId: 40,
@@ -838,6 +1034,7 @@ describe("DeepSeek Agent model metering", () => {
           user.failModelUsageBeforeExecution(...args),
       },
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "5".repeat(64),
         chatId: 50,
@@ -885,6 +1082,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "f".repeat(64),
         chatId: 13,
@@ -943,6 +1141,7 @@ describe("DeepSeek Agent model metering", () => {
     if (snapshotA.pricing !== "priced") throw new Error("Expected a priced DeepSeek snapshot.");
     const operationId = `model-inference:${crypto.randomUUID()}`;
     const attribution = {
+      principal: usagePrincipal(user),
       source: "agent" as const,
       workspaceId: "8".repeat(64),
       chatId: 80,
@@ -1004,6 +1203,7 @@ describe("DeepSeek Agent model metering", () => {
       reasoningTokens: 1n,
     };
     await user.beginModelUsage(operationId, {
+      principal: usagePrincipal(user),
       source: "agent",
       workspaceId: "9".repeat(64),
       chatId: 90,
@@ -1052,6 +1252,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "0".repeat(64),
         chatId: 100,
@@ -1103,6 +1304,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "1".repeat(64),
         chatId: 14,
@@ -1186,6 +1388,7 @@ describe("DeepSeek Agent model metering", () => {
       usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
       user,
       attribution: {
+        principal: usagePrincipal(user),
         source: "agent",
         workspaceId: "2".repeat(64),
         chatId: 200,

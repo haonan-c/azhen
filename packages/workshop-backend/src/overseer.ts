@@ -1,7 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, ObserverBindingFailureCode, OpenGadgetObserverFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OBSERVER_BINDING_FAILURE_CODES, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, ObserverBindingFailureCode, OpenGadgetObserverFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OBSERVER_BINDING_FAILURE_CODES, OPEN_GADGET_ERROR_CODES, resolveSiteName, type ModelChargeSnapshot } from '@gadgets/workshop-shared/api';
+import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind, type HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -13,7 +13,8 @@ import {
   getModel,
   UserGatewayRouting,
 } from "./ai-models";
-import { meterAgentModelHandle } from "./metered-model.js";
+import { meterAgentModelHandle, type ModelUsageOperation } from "./metered-model.js";
+import type { ModelUsageReservationBound } from "./usage-account.js";
 import { AgentTurnError, completeText } from "./ai-invoke";
 import {
   AiGatewayLogRetryableError,
@@ -48,9 +49,116 @@ import {
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
 import { renderGadgetDocx, renderGadgetPdf } from "./browser-export";
+import {
+  normalizeUsageAttribution,
+  type UsageAttribution,
+  type UsageSource,
+} from "./usage-attribution.js";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
+
+const ATTRIBUTED_GADGET_CONTEXT_MODULE = String.raw`
+import { AsyncLocalStorage } from "node:async_hooks";
+import { DurableObject, restore, RpcStub } from "cloudflare:workers";
+
+const usageInvocation = new AsyncLocalStorage();
+const asyncRun = AsyncLocalStorage.prototype.run;
+const asyncGetStore = AsyncLocalStorage.prototype.getStore;
+const reflectApply = Reflect.apply;
+const reflectGet = Reflect.get;
+const TrustedProxy = Proxy;
+const objectEntries = Object.entries;
+const objectFromEntries = Object.fromEntries;
+const arrayIsArray = Array.isArray;
+const arrayMap = Array.prototype.map;
+
+function wrapBinding(binding) {
+  return new TrustedProxy(binding, {
+    get(target, prop) {
+      const method = reflectGet(target, prop, target);
+      if (typeof method !== "function" || typeof prop === "symbol") return method;
+      return (...args) => {
+        const invocation = reflectApply(asyncGetStore, usageInvocation, []);
+        if (invocation === undefined) {
+          throw new Error("A host-attested Usage invocation is required.");
+        }
+        return target.__workshopInvoke(invocation, String(prop), args);
+      };
+    },
+  });
+}
+
+function wrapEnv(env) {
+  return objectFromEntries(
+      reflectApply(arrayMap, objectEntries(env), [
+        ([name, binding]) => [name, wrapBinding(binding)],
+      ]));
+}
+
+function invokeWithUsage(target, invocation, methodName, args) {
+  if (typeof methodName !== "string" || methodName === "__workshopInvoke" ||
+      !arrayIsArray(args)) {
+    throw new TypeError("Invalid Gadget invocation.");
+  }
+  const method = reflectGet(target, methodName, target);
+  if (typeof method !== "function") throw new TypeError("No such Gadget method: " + methodName);
+  return reflectApply(asyncRun, usageInvocation,
+      [invocation, () => reflectApply(method, target, args)]);
+}
+
+function wrapRestoredTarget(target) {
+  return new TrustedProxy(target, {
+    get(inner, prop) {
+      if (prop === "__workshopInvoke") {
+        return (invocation, methodName, args) =>
+          invokeWithUsage(inner, invocation, methodName, args);
+      }
+      return reflectGet(inner, prop, inner);
+    },
+  });
+}
+
+export function createAttributedGadgetClass(UserGadget) {
+  class AttributedGadget extends DurableObject {
+    #delegate;
+
+    constructor(ctx, env) {
+      super(ctx, env);
+      this.#delegate = new UserGadget(ctx, wrapEnv(env));
+      const invoke = (invocation, methodName, args) =>
+        invokeWithUsage(this.#delegate, invocation, methodName, args);
+      const restoreUserTarget = (params) => {
+        const restoreMethod = reflectGet(UserGadget.prototype, restore, this.#delegate);
+        if (typeof restoreMethod !== "function") {
+          throw new TypeError("This Gadget does not implement restore().");
+        }
+        return new RpcStub(wrapRestoredTarget(
+            reflectApply(restoreMethod, this.#delegate, [params])));
+      };
+      return new TrustedProxy(this, {
+        get: (target, prop) => {
+          if (prop === "__workshopInvoke") return invoke;
+          if (prop === restore) return restoreUserTarget;
+          const value = reflectGet(this.#delegate, prop, this.#delegate);
+          return typeof value === "function"
+            ? (...args) => reflectApply(value, this.#delegate, args)
+            : value;
+        },
+      });
+    }
+  }
+  return AttributedGadget;
+}
+`;
+
+const ATTRIBUTED_GADGET_WRAPPER_MODULE = String.raw`
+import { createAttributedGadgetClass } from "./__workshop_usage_context.js";
+import { Gadget as UserGadget } from "./__workshop_user_server.js";
+export * from "./__workshop_user_server.js";
+
+export const Gadget = createAttributedGadgetClass(UserGadget);
+`;
 
 let CODE_MODE_HARNESS =
 `import { WorkerEntrypoint, restore } from "cloudflare:workers";
@@ -228,7 +336,7 @@ type QueuedAgentCallback = {
   methodName: string;
   args: unknown[];            // original args (raw, with live transient stubs)
   argsSummary: string;        // depth-limited summary string
-  initiatorUserId: string;    // hex durable object ID of user DO
+  attribution: UsageAttribution;
   initiatorModelId: string;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
@@ -515,6 +623,7 @@ export type ActionRecord = {
   bindingName?: string;
 } & ({
   type: "action";
+  systemAssistanceId?: string;
   appliedAt?: Date;
   action: number;  // action key assigned by the gatekeeper, passed back on apply/reject/revert
   description: ActionDescription;
@@ -558,6 +667,7 @@ type BoundHookRecord = {
   callback: NativeRpcStub<RpcTarget>;
   description: HookDescription;
   enabled: boolean;
+  attribution: UsageAttribution;
 };
 
 type ChatDraftUpdateRecord = {
@@ -648,9 +758,8 @@ type ExternalChatRecord = {
 
 type ActiveAgentRecord = {
   chatId: number;
-  // Hex durable object ID of the initiator's user DO, used to re-resolve the model config and for
-  // billing.
-  initiatorUserId: string;
+  turnId: string;
+  attribution: UsageAttribution;
   // Model ID, used to re-resolve the model config (matches `chatMeta.activeAgent.id`).
   modelId: string;
   // Who initiated this turn (a user, or a gadget for spawner/callback turns).
@@ -658,6 +767,38 @@ type ActiveAgentRecord = {
   // Whether this turn was initiated by a gadget callback (vs. a chat message).
   callbackInitiated: boolean;
 };
+
+type PendingSystemAssistanceRecord = {
+  id: string;
+  turnId: string;
+  chatId: number;
+  modelId: string;
+  attribution: UsageAttribution;
+  state: "waiting" | "ready";
+  cause:
+    | {type: "action"; actionId: number}
+    | {type: "connectionRequest"; requestId: string};
+};
+
+type ActiveModelUsageOperationRecord = {
+  chatId: number;
+  turnId: string;
+  operationId: string;
+  chargeSnapshot: ModelChargeSnapshot;
+  reservationBound: ModelUsageReservationBound;
+};
+
+function sameUsageAttribution(left: UsageAttribution, right: UsageAttribution): boolean {
+  return left.principal.version === right.principal.version &&
+      left.principal.kind === right.principal.kind &&
+      left.principal.userId === right.principal.userId &&
+      left.source === right.source &&
+      left.workspaceId === right.workspaceId &&
+      left.chatId === right.chatId &&
+      left.gadgetId === right.gadgetId &&
+      left.automationId === right.automationId &&
+      left.automationRunId === right.automationRunId;
+}
 
 // One agent step's model-facing snapshot (see StoredAssistantMessage in agent.ts), keyed by the
 // chatId.sequence of the step's "message" record.
@@ -767,6 +908,9 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       //       binding-map seeds are derived), and agent-spawner configs hold the new
       //       `env: Record<name, WorkpieceId>` form (old `env?: string[]` allowlists rewritten,
       //       in both the creationSpec and the class stub's baked-in props).
+      //   2 = paid work carries a required host-attested Usage attribution. Active Agent records
+      //       are migrated when their legacy initiator User ID proves the Principal; bound hooks
+      //       carry the Workspace owner Principal. Ambiguous legacy Actions stay fail-closed.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -907,6 +1051,22 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       // `ActiveAgentRecord`.
       activeAgents: collection<ActiveAgentRecord>()({
         primaryKey: "chatId"
+      }),
+
+      // A delayed system-assistance turn, fixed before its causal Action or connection request is
+      // exposed. The visible Action/message deliberately omits this host-only authority.
+      pendingSystemAssistances: collection<PendingSystemAssistanceRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {
+          byTurnId(record: PendingSystemAssistanceRecord) { return record.turnId; },
+          byChatId(record: PendingSystemAssistanceRecord) { return record.chatId; },
+        },
+      }),
+
+      // The one provider inference that may be replayed if this Agent's DO is aborted. A completed
+      // inference deletes the row before the next inference in the same turn can start.
+      activeModelUsageOperations: collection<ActiveModelUsageOperationRecord>()({
+        primaryKey: "chatId",
       }),
 
       gadgetResponseDeliveries: collection<ExternalMessageRecord>()({
@@ -1106,6 +1266,218 @@ class OverseerImpl implements AgentHooks {
   ownerProfileId?: string;
 
   users: DurableObjectNamespace<UserDurableObject>;
+
+  usageAttribution(
+      userId: string,
+      source: UsageSource,
+      dimensions: Omit<UsageAttribution, "principal" | "source" | "workspaceId"> = {}):
+      UsageAttribution {
+    return normalizeUsageAttribution({
+      principal: {version: 1, kind: "user", userId},
+      source,
+      workspaceId: this.ctx.id.toString(),
+      ...dimensions,
+    });
+  }
+
+  activeAgentAttribution(chatId: number): UsageAttribution {
+    let record = this.storage.activeAgents.get(chatId);
+    if (!record) throw new Error("Active Agent Usage attribution is missing.");
+    return normalizeUsageAttribution(record.attribution);
+  }
+
+  createPendingSystemAssistance(
+      chatId: number, cause: PendingSystemAssistanceRecord["cause"]):
+      PendingSystemAssistanceRecord {
+    let active = this.storage.activeAgents.get(chatId);
+    if (!active) throw new Error("Active Agent Usage attribution is missing.");
+    let causal = normalizeUsageAttribution(active.attribution);
+    if (causal.workspaceId !== this.ctx.id.toString() || causal.chatId !== chatId) {
+      throw new Error("Active Agent Usage attribution does not match this Chat.");
+    }
+    let record: PendingSystemAssistanceRecord = {
+      id: `system-assistance:${crypto.randomUUID()}`,
+      turnId: active.turnId,
+      chatId,
+      modelId: active.modelId,
+      attribution: normalizeUsageAttribution({
+        ...causal,
+        source: "system-assistance",
+        chatId,
+      }),
+      state: "waiting",
+      cause,
+    };
+    this.storage.pendingSystemAssistances.put(record);
+    return record;
+  }
+
+  requireActionSystemAssistance(
+      action: ActionRecord & {type: "action"}): PendingSystemAssistanceRecord {
+    if (!action.systemAssistanceId) {
+      throw new Error("Usage Principal is missing for this pending Action.");
+    }
+    let task = this.storage.pendingSystemAssistances.get(action.systemAssistanceId);
+    if (!task || task.cause.type !== "action" || task.cause.actionId !== action.id ||
+        task.chatId !== ("chatId" in action.caller ? action.caller.chatId : undefined)) {
+      throw new Error("Usage Principal is missing for this pending Action.");
+    }
+    let attribution = normalizeUsageAttribution(task.attribution);
+    let caller = normalizeGatekeeperCaller(action.caller);
+    let expected = normalizeUsageAttribution({
+      ...caller.attribution,
+      source: "system-assistance",
+      chatId: task.chatId,
+    });
+    if (task.state !== "waiting" && task.state !== "ready" ||
+        task.modelId.length === 0 || task.turnId.length === 0 ||
+        !sameUsageAttribution(attribution, expected)) {
+      throw new Error("Usage Principal is invalid for this pending Action.");
+    }
+    return {...task, attribution};
+  }
+
+  prepareApprovedActionSystemAssistance(
+      decidedAction: ActionRecord & {type: "action"}):
+      {task: PendingSystemAssistanceRecord; actions: Array<ActionRecord & {type: "action"}>} |
+      undefined {
+    let decidedTask = this.requireActionSystemAssistance(decidedAction);
+    let tasks = [...this.storage.pendingSystemAssistances.byTurnId.get(decidedTask.turnId)]
+        .filter(task => task.cause.type === "action");
+    let actions = tasks.map(task => {
+      let action = this.storage.actions.get(
+          (task.cause as {type: "action"; actionId: number}).actionId);
+      if (!action || action.type !== "action") {
+        throw new Error("Pending system assistance has no causal Action.");
+      }
+      this.requireActionSystemAssistance(action);
+      return action;
+    }).toSorted((left, right) => left.id - right.id);
+
+    if (actions.some(action => action.state === "pending")) return undefined;
+    if (actions.some(action => action.state === "rejected")) {
+      this.ctx.storage.transactionSync(() => {
+        for (let task of tasks) this.storage.pendingSystemAssistances.delete(task.id);
+      });
+      return undefined;
+    }
+
+    let selected = this.storage.pendingSystemAssistances.get(
+        actions[0].systemAssistanceId!);
+    if (!selected) throw new Error("Usage Principal is missing for this pending Action.");
+    selected.state = "ready";
+    this.ctx.storage.transactionSync(() => {
+      this.storage.pendingSystemAssistances.put(selected);
+      for (let task of tasks) {
+        if (task.id !== selected!.id) this.storage.pendingSystemAssistances.delete(task.id);
+      }
+    });
+    return {task: selected, actions};
+  }
+
+  deleteActionSystemAssistance(action: ActionRecord & {type: "action"}): void {
+    let task = this.requireActionSystemAssistance(action);
+    this.ctx.storage.transactionSync(() => {
+      for (let sibling of this.storage.pendingSystemAssistances.byTurnId.get(task.turnId)) {
+        if (sibling.cause.type === "action") {
+          this.storage.pendingSystemAssistances.delete(sibling.id);
+        }
+      }
+    });
+  }
+
+  requireConnectionSystemAssistance(
+      requestId: string, chatId: number): PendingSystemAssistanceRecord {
+    let task = [...this.storage.pendingSystemAssistances.byChatId.get(chatId)].find(candidate =>
+      candidate.cause.type === "connectionRequest" && candidate.cause.requestId === requestId);
+    if (!task) throw new Error("Usage Principal is missing for this connection request.");
+    let attribution = normalizeUsageAttribution(task.attribution);
+    if (task.chatId !== chatId || task.state !== "waiting" && task.state !== "ready" ||
+        attribution.workspaceId !== this.ctx.id.toString() || attribution.chatId !== chatId ||
+        attribution.source !== "system-assistance" || task.modelId.length === 0 ||
+        task.turnId.length === 0) {
+      throw new Error("Usage Principal is invalid for this connection request.");
+    }
+    return {...task, attribution};
+  }
+
+  async resumePendingSystemAssistance(taskId: string): Promise<void> {
+    let task = this.storage.pendingSystemAssistances.get(taskId);
+    if (!task || task.state !== "ready") return;
+    let attribution = normalizeUsageAttribution(task.attribution);
+    if (attribution.workspaceId !== this.ctx.id.toString() ||
+        attribution.chatId !== task.chatId || attribution.source !== "system-assistance") {
+      throw new Error("Pending system assistance Usage attribution is invalid.");
+    }
+
+    await this.waitForChatMessagePreparation(task.chatId);
+    let meta = this.storage.chatMeta.get(task.chatId);
+    if (!meta) {
+      this.storage.pendingSystemAssistances.delete(task.id);
+      return;
+    }
+    if (meta.activeAgent) return;
+
+    let principalUser = this.users.get(this.users.idFromString(attribution.principal.userId));
+    let userMeta = await principalUser.getChatContext(task.modelId);
+    if (!userMeta.aiModel) {
+      this.storage.pendingSystemAssistances.delete(task.id);
+      return;
+    }
+
+    let freshTask = this.storage.pendingSystemAssistances.get(task.id);
+    let freshMeta = this.storage.chatMeta.get(task.chatId);
+    if (!freshTask || freshTask.state !== "ready" || !freshMeta || freshMeta.activeAgent) return;
+
+    freshMeta.activeAgent = userMeta.aiModel.profile;
+    freshMeta.lastActive = this.getChatTimestamp();
+    this.storage.chatMeta.put(freshMeta);
+    this.startAgent(task.chatId, userMeta.aiModel, userMeta.profile, attribution);
+    this.storage.pendingSystemAssistances.delete(task.id);
+  }
+
+  resumeReadySystemAssistanceForChat(chatId: number): void {
+    let task = [...this.storage.pendingSystemAssistances.byChatId.get(chatId)]
+        .find(candidate => candidate.state === "ready");
+    if (task) this.ctx.waitUntil(this.resumePendingSystemAssistance(task.id));
+  }
+
+  acquireModelUsageOperation(
+      chatId: number, input: Omit<ModelUsageOperation, "operationId">): ModelUsageOperation {
+    let activeAgent = this.storage.activeAgents.get(chatId);
+    if (!activeAgent) throw new Error("Active Agent record is missing for model Usage.");
+    let active = this.storage.activeModelUsageOperations.get(chatId);
+    if (active) {
+      if (active.turnId !== activeAgent.turnId) {
+        throw new Error("An unsettled model Usage operation blocks this Chat.");
+      }
+      return {
+        operationId: active.operationId,
+        chargeSnapshot: active.chargeSnapshot,
+        reservationBound: active.reservationBound,
+      };
+    }
+    let created: ActiveModelUsageOperationRecord = {
+      chatId,
+      turnId: activeAgent.turnId,
+      operationId: `model-inference:${crypto.randomUUID()}`,
+      chargeSnapshot: input.chargeSnapshot,
+      reservationBound: input.reservationBound,
+    };
+    this.storage.activeModelUsageOperations.put(created);
+    return {
+      operationId: created.operationId,
+      chargeSnapshot: created.chargeSnapshot,
+      reservationBound: created.reservationBound,
+    };
+  }
+
+  finishModelUsageOperation(chatId: number, operationId: string): void {
+    let active = this.storage.activeModelUsageOperations.get(chatId);
+    if (active?.operationId === operationId) {
+      this.storage.activeModelUsageOperations.delete(chatId);
+    }
+  }
 
   // Tracks the size of the most-recent snapshot, and the size of all incremental updates since,
   // in order to help decide when to make a new snapshot.
@@ -1356,7 +1728,8 @@ class OverseerImpl implements AgentHooks {
   async #resumeAgent(record: ActiveAgentRecord, liveChat: LiveChatContext) {
     let aiModel: DeploymentModelRecord | undefined;
     try {
-      let user = this.users.get(this.users.idFromString(record.initiatorUserId));
+      let attribution = normalizeUsageAttribution(record.attribution);
+      let user = this.users.get(this.users.idFromString(attribution.principal.userId));
       let userMeta = await user.getChatContext(record.modelId);
       aiModel = userMeta.aiModel;
     } catch (err) {
@@ -1388,10 +1761,40 @@ class OverseerImpl implements AgentHooks {
         record.chatId,
         aiModel,
         record.initiator,
-        record.initiatorUserId,
+        record.attribution,
         record.callbackInitiated,
         liveChat,
     );
+  }
+
+  #reconcilePendingSystemAssistances(): void {
+    let actionTurns = new Set<string>();
+    for (let task of Array.from(this.storage.pendingSystemAssistances.list())) {
+      if (task.cause.type === "action") {
+        if (actionTurns.has(task.turnId)) continue;
+        actionTurns.add(task.turnId);
+        let action = this.storage.actions.get(task.cause.actionId);
+        if (!action || action.type !== "action") {
+          this.storage.pendingSystemAssistances.delete(task.id);
+        } else if (action.state === "approved") {
+          this.prepareApprovedActionSystemAssistance(action);
+        } else if (action.state === "rejected") {
+          this.deleteActionSystemAssistance(action);
+        }
+        continue;
+      }
+
+      let requestId = task.cause.requestId;
+      let message = [...this.storage.chats.list({prefix: `${keyString(task.chatId)}.`})]
+          .find(candidate => candidate.type === "connectionRequest" &&
+              candidate.requestId === requestId);
+      if (!message || message.type !== "connectionRequest" || message.state === "denied") {
+        this.storage.pendingSystemAssistances.delete(task.id);
+      } else if (message.state === "accepted") {
+        task.state = "ready";
+        this.storage.pendingSystemAssistances.put(task);
+      }
+    }
   }
 
   constructor(public ctx: DurableObjectState, public env: Cloudflare.Env) {
@@ -1453,6 +1856,13 @@ class OverseerImpl implements AgentHooks {
         this.#deliverWaitingExternalMessageResponse(thread.id);
       }
     }
+
+    this.#reconcilePendingSystemAssistances();
+    for (let task of this.storage.pendingSystemAssistances.list()) {
+      if (task.state === "ready") {
+        this.ctx.waitUntil(this.resumePendingSystemAssistance(task.id));
+      }
+    }
   }
 
   // =======================================================================================
@@ -1461,7 +1871,7 @@ class OverseerImpl implements AgentHooks {
 
   // Migrate storage to the current schema version. Runs synchronously in the constructor.
   #migrateStorage(): void {
-    if (this.storage.version.get() !== 0) return;
+    if (this.storage.version.get() >= 2) return;
     if (this.ownerId === undefined) {
       // Brand-new (or never-initialized) DO: there is nothing to migrate. We deliberately avoid
       // writing anything here, so that probing a nonexistent DO leaves no storage behind; the
@@ -1473,7 +1883,7 @@ class OverseerImpl implements AgentHooks {
     // Run the whole migration in one transaction so that a mid-migration error can't leave the
     // workspace half-migrated.
     let startedAt = Date.now();
-    this.ctx.storage.transactionSync(() => {
+    if (this.storage.version.get() === 0) this.ctx.storage.transactionSync(() => {
       // Version 0 -> 1: the workspace predates multi-gadget support. If it has any gadget content
       // (code beyond the initial empty snapshot, or named bindings), register that content as the
       // workspace's single gadget and record it as the default gadget; binding names and blueprint
@@ -1521,9 +1931,7 @@ class OverseerImpl implements AgentHooks {
       // allowlist to the new `env: Record<name, WorkpieceId>` form (see AgentSpawnerConfig). The
       // config lives in two places and both must be updated: the record's `creationSpec`, and the
       // props baked into the record's `class` stub. Props can't be edited in place, so the stub
-      // is recreated the same way newAgentSpawnerGatekeeper() creates it -- except that
-      // `creatorUserId` isn't recoverable from the record, so it is omitted, relying on the
-      // documented legacy fallback to the workspace owner.
+      // is recreated the same way newAgentSpawnerGatekeeper() creates it.
       for (let gk of allGatekeepers) {
         if (gk.creationSpec?.type !== "agentSpawner") continue;
         // The stored (pre-migration) shape is derived from the real type, differing only in
@@ -1551,6 +1959,47 @@ class OverseerImpl implements AgentHooks {
       }
 
       this.storage.version.put(1);
+    });
+
+    if (this.storage.version.get() === 1) this.ctx.storage.transactionSync(() => {
+      for (let stored of Array.from(this.storage.activeAgents.list())) {
+        let legacy = stored as ActiveAgentRecord & {
+          attribution?: UsageAttribution;
+          initiatorUserId?: unknown;
+          turnId?: string;
+        };
+        if (typeof legacy.turnId !== "string" || legacy.turnId.length === 0) {
+          legacy.turnId = `agent-turn:${crypto.randomUUID()}`;
+        }
+        if (legacy.attribution !== undefined) {
+          try {
+            legacy.attribution = normalizeUsageAttribution(legacy.attribution);
+            this.storage.activeAgents.put(legacy);
+          } catch {
+            // Leave invalid records unchanged. Startup resumption rejects them before any paid
+            // provider call instead of assigning them to the owner.
+          }
+        } else if (typeof legacy.initiatorUserId === "string" &&
+                   /^[0-9a-f]{64}$/.test(legacy.initiatorUserId)) {
+          legacy.attribution = this.usageAttribution(
+              legacy.initiatorUserId, "agent", {chatId: legacy.chatId});
+          delete legacy.initiatorUserId;
+          this.storage.activeAgents.put(legacy);
+        }
+      }
+
+      for (let stored of Array.from(this.storage.boundHooks.list())) {
+        let legacy = stored as BoundHookRecord & {attribution?: UsageAttribution};
+        if (legacy.attribution === undefined) {
+          let vendorId = legacy.vendorId ??
+              gatekeeperVendorId(this.storage.gatekeepers.get(legacy.gatekeeperId));
+          legacy.attribution = this.usageAttribution(
+              this.ownerId!, vendorId === "scheduler" ? "scheduled" : "hook",
+              legacy.gadgetId !== undefined ? {gadgetId: legacy.gadgetId} : {});
+        }
+        this.storage.boundHooks.put(legacy);
+      }
+      this.storage.version.put(2);
     });
 
     this.logger.info("migrated workspace storage", {
@@ -1926,7 +2375,6 @@ class OverseerImpl implements AgentHooks {
       let props: AgentSpawnerBindingProps = {
         overseerId: this.ctx.id.toString(),
         config,
-        creatorUserId: clientUserId,
       };
       gatekeeper.creationSpec = {type: "agentSpawner", config};
       gatekeeper.class = this.ctx.exports.AgentSpawnerGatekeeper({props});
@@ -2213,12 +2661,84 @@ class OverseerImpl implements AgentHooks {
     return env;
   }
 
+  // Invoke one binding under a host-minted App invocation. The invocation capability fixes the
+  // Principal and gadget. Dynamic code can choose a visible method, but it cannot choose the User
+  // Usage Account that pays for the work.
+  async invokeAttributedGadgetBinding(
+      gadgetId: WorkpieceId, chatId: number | undefined, attributionValue: UsageAttribution,
+      target: BindingLoopbackTarget, methodName: string, args: unknown[]): Promise<unknown> {
+    let attribution = normalizeUsageAttribution(attributionValue);
+    if (attribution.workspaceId !== this.ctx.id.toString() ||
+        attribution.gadgetId !== gadgetId || attribution.chatId !== chatId ||
+        typeof methodName !== "string" || methodName === "__workshopInvoke" ||
+        !Array.isArray(args)) {
+      throw new Error("Usage invocation does not match this Gadget call.");
+    }
+
+    if (target.type === "gadget") {
+      if (target.id !== gadgetId) {
+        throw new Error("Usage invocation cannot call another Gadget.");
+      }
+    } else if (target.type === "gatekeeper") {
+      let gadget = this.getGadgetRecord(gadgetId);
+      if (!this.visibleBindings(gadget, chatId).some(([, edge]) => edge.target === target.id)) {
+        throw new Error("Usage invocation cannot call an unbound resource.");
+      }
+    } else {
+      target.type satisfies never;
+      throw new TypeError("Unknown binding target type.");
+    }
+
+    using session = await this.startGatekeeperSession(target, {
+      from: "gadget",
+      chatId,
+      gadgetId,
+      attribution,
+    });
+    let method = Reflect.get(session, methodName, session);
+    if (typeof method !== "function") {
+      throw new TypeError(`No such binding method: ${methodName}`);
+    }
+    return await Reflect.apply(method, session, args);
+  }
+
+  async invokeAttributedHookCallback(
+      hookId: number, attributionValue: UsageAttribution,
+      methodName: string, args: unknown[]): Promise<unknown> {
+    let record = this.storage.boundHooks.get(hookId);
+    if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
+    let base = normalizeUsageAttribution(record.attribution);
+    let attribution = normalizeUsageAttribution(attributionValue);
+    if (attribution.principal.userId !== base.principal.userId ||
+        attribution.workspaceId !== base.workspaceId ||
+        attribution.gadgetId !== base.gadgetId ||
+        attribution.source !== base.source ||
+        typeof methodName !== "string" || methodName === "__workshopInvoke" ||
+        !Array.isArray(args)) {
+      throw new Error("Usage invocation does not match this Hook callback.");
+    }
+
+    let gadgetId = attribution.gadgetId ?? this.resolveGadgetId(undefined);
+    let invocation = this.ctx.exports.UsageInvocationLoopback({props: {
+      overseerId: this.ctx.id.toString(),
+      gadgetId,
+      chatId: attribution.chatId,
+      attribution,
+    }});
+    let invoke = Reflect.get(record.callback, "__workshopInvoke", record.callback);
+    return Reflect.apply(invoke, record.callback, [invocation, methodName, args]);
+  }
+
   // Build the agent's executeCode env from the chat's binding map: each name resolves to a
   // gadget's RPC stub, a gatekeeper session stub, or an agent callback's stored arguments.
   // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
   // behavior elsewhere.
   getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>): object {
-    let caller: GatekeeperCaller = {from: "agent", chatId};
+    let caller: GatekeeperCaller = {
+      from: "agent",
+      chatId,
+      attribution: this.activeAgentAttribution(chatId),
+    };
     // This must be a *plain* object: it becomes the loaded worker's `env`, and the loader's
     // serializer rejects anything else (including a null-prototype object) with DataCloneError.
     // So prototype-pollution safety comes from validation instead: names from before name
@@ -2431,6 +2951,8 @@ class OverseerImpl implements AgentHooks {
   // If `chatId` is specified, load the worker including changes proposed in the given chat
   // thread. (The caller is presumed to have verified the chat exists and has proposed changes.)
   loadGadgetWorker(gadgetId: WorkpieceId, chatId?: number): WorkerStub {
+    let ownerId = this.ownerId;
+    if (!ownerId) throw new Error("Workspace owner is unavailable.");
     let codeVersion = `${this.storage.codeVersion.get()}`;
     let sequence: number | undefined;
     if (chatId !== undefined) {
@@ -2456,6 +2978,19 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
+      const userServerModule = "__workshop_user_server.js";
+      const usageContextModule = "__workshop_usage_context.js";
+      if (modules[userServerModule] !== undefined || modules[usageContextModule] !== undefined) {
+        throw new Error("Gadget code cannot define a reserved Workshop module.");
+      }
+      let serverModule = modules["server.js"];
+      if (serverModule === undefined) {
+        throw new Error("Gadget code must define server.js.");
+      }
+      modules[userServerModule] = serverModule;
+      modules[usageContextModule] = ATTRIBUTED_GADGET_CONTEXT_MODULE;
+      modules["server.js"] = ATTRIBUTED_GADGET_WRAPPER_MODULE;
+
       let tailProps: GadgetTailLoopbackProps = {
         chatId,
         gadgetId,
@@ -2468,10 +3003,18 @@ class OverseerImpl implements AgentHooks {
         compatibilityFlags: [
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
+          // Scope one explicit host-minted invocation capability to each concurrent App call.
+          "nodejs_als",
         ],
         mainModule: "server.js",
         modules,
-        env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
+        env: this.getEnvForLoader(gadgetId, {
+          from: "gadget",
+          chatId,
+          gadgetId,
+          attribution: this.usageAttribution(
+              ownerId, "gadget", {chatId, gadgetId}),
+        }, chatId),
         globalOutbound: null,
 
         // TODO: Switch to streaming tails when the workerd log spam issue is fixed.
@@ -2539,8 +3082,21 @@ class OverseerImpl implements AgentHooks {
   //
   // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
   // look like an RpcTarget instead.
-  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number): Promise<RpcStub<any>> {
+  async getGadgetFacet(
+      gadgetId: WorkpieceId, chatId: number | undefined,
+      attributionValue: UsageAttribution): Promise<RpcStub<any>> {
+    let attribution = normalizeUsageAttribution(attributionValue);
+    if (attribution.workspaceId !== this.ctx.id.toString() ||
+        attribution.gadgetId !== gadgetId || attribution.chatId !== chatId) {
+      throw new Error("Usage attribution does not match this Gadget connection.");
+    }
     let facet = this.getGadgetFacetFetcher(gadgetId, chatId);
+    let invocation = this.ctx.exports.UsageInvocationLoopback({props: {
+      overseerId: this.ctx.id.toString(),
+      gadgetId,
+      chatId,
+      attribution,
+    }});
 
     let self = this;
 
@@ -2564,7 +3120,9 @@ class OverseerImpl implements AgentHooks {
         //   possibly a runtime bug which needs investigation.
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
-          let result: Promise<any> = Reflect.apply(method, target, args);
+          let invoke = Reflect.get(target, "__workshopInvoke", target);
+          let result: Promise<any> = Reflect.apply(
+              invoke, target, [invocation, String(prop), args]);
           return result.catch((err: any) => {
             let msg = err;
             if (err instanceof Error) {
@@ -2645,6 +3203,11 @@ class OverseerImpl implements AgentHooks {
   // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
   async applyPendingAction(record: ActionRecord & {type: "action"},
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean): Promise<void> {
+    record.caller = normalizeGatekeeperCaller(record.caller);
+    if (!autoApproved && record.caller.from === "agent" &&
+        record.description.awaitDecision) {
+      this.requireActionSystemAssistance(record);
+    }
     let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
     await gatekeeper.applyAction(record.action);
     record.state = "approved";
@@ -2697,7 +3260,9 @@ class OverseerImpl implements AgentHooks {
     return this.#preparingChatMessages.get(chatId);
   }
 
-  async addGatekeeper(cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec)
+  async addGatekeeper(
+      cls: GatekeeperClass, creationSpec: GatekeeperCreationSpec | undefined,
+      caller: GatekeeperCaller)
       : Promise<GatekeeperClient<any>> {
     let id = this.allocateWorkpieceId();
     let gatekeeperRecord: GatekeeperRecord = {
@@ -2720,7 +3285,7 @@ class OverseerImpl implements AgentHooks {
       throw error;
     }
 
-    return new GatekeeperClientImpl<any>(this, id, facet);
+    return new GatekeeperClientImpl<any>(this, id, facet, caller);
   }
 
   // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
@@ -2746,13 +3311,18 @@ class OverseerImpl implements AgentHooks {
 
   // Open the session behind a binding loopback.
   startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
+    caller = normalizeGatekeeperCaller(caller);
     switch (target.type) {
       case "gadget": {
         if (caller.from === "agent") {
           this.#getOrCreateCapturedActions(caller.chatId).accessedGadget = true;
         }
         let chatId = "chatId" in caller ? caller.chatId : undefined;
-        return this.getGadgetFacet(target.id, chatId);
+        let attribution = normalizeUsageAttribution({
+          ...caller.attribution,
+          gadgetId: target.id,
+        });
+        return this.getGadgetFacet(target.id, chatId, attribution);
       }
 
       case "gatekeeper": {
@@ -2811,6 +3381,7 @@ class OverseerImpl implements AgentHooks {
 
   async authorizeObservation(gatekeeperId: number, description: ObservationDescription,
                              caller: GatekeeperCaller): Promise<void> {
+    caller = normalizeGatekeeperCaller(caller);
     if (description.prohibitAllSharing) {
       if ((await this.getSharingManager()).hasAnyShares()) {
         throw new Error(
@@ -3001,7 +3572,12 @@ class OverseerImpl implements AgentHooks {
       resourceTitle: string,
       resourceUrl: string | undefined,
       description: ObservationDescription): Promise<void> {
-    let caller: GatekeeperCaller = {from: "agent", chatId};
+    let caller: GatekeeperCaller = {
+      from: "agent",
+      chatId,
+      attribution: this.activeAgentAttribution(chatId),
+    };
+    caller = normalizeGatekeeperCaller(caller);
 
     let actionId = this.storage.nextActionId.get();
     this.storage.nextActionId.put(actionId + 1);
@@ -3025,6 +3601,7 @@ class OverseerImpl implements AgentHooks {
   async submitAction(gatekeeperId: number, action: number,
                      description: ActionDescription, caller: GatekeeperCaller)
       : Promise<void> {
+    caller = normalizeGatekeeperCaller(caller);
     if (this.storage.prohibitAllSharing.get()) {
       throw new Error(
           "This workspace has observed sensitive data. To prevent leaks, the workspace is prohibited " +
@@ -3036,6 +3613,15 @@ class OverseerImpl implements AgentHooks {
 
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
 
+    // Same auto-approval gate as before, named because awaitDecision uses it too. The drain is
+    // deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
+    let willAutoApprove = !!(description.autoApprovable && description.actionKind &&
+        this.storage.autoApproveTags.get(`${gatekeeperId}:${description.actionKind.tag}`) !== undefined);
+    let systemAssistance = caller.from === "agent" && description.awaitDecision &&
+        !willAutoApprove
+      ? this.createPendingSystemAssistance(caller.chatId, {type: "action", actionId})
+      : undefined;
+
     let record: ActionRecord = {
       id: actionId,
       gatekeeperId,
@@ -3046,16 +3632,12 @@ class OverseerImpl implements AgentHooks {
       createdAt: new Date(),
       state: "pending",
       type: "action",
+      ...(systemAssistance ? {systemAssistanceId: systemAssistance.id} : {}),
       description
     };
 
     this.storage.actions.put(record);
     this.#associateAction(caller, actionId);
-
-    // Same auto-approval gate as before, named because awaitDecision uses it too. The drain is
-    // deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
-    let willAutoApprove = !!(description.autoApprovable && description.actionKind &&
-        this.storage.autoApproveTags.get(`${gatekeeperId}:${description.actionKind.tag}`) !== undefined);
 
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending.
     // Auto-approved actions keep the seamless behavior the user opted into.
@@ -3072,6 +3654,7 @@ class OverseerImpl implements AgentHooks {
         gatekeeperId: number, controller: Fetcher<HookController<Hook>>,
         callback: NativeRpcStub<Hook>, description: HookDescription, caller: GatekeeperCaller)
         : Promise<void> {
+    caller = normalizeGatekeeperCaller(caller);
     let hookId = this.storage.nextHookId.get();
     this.storage.nextHookId.put(hookId + 1);
 
@@ -3098,17 +3681,23 @@ class OverseerImpl implements AgentHooks {
     }
 
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
+    let vendorId = gatekeeperVendorId(gatekeeper);
+    if (!this.ownerId) throw new Error("Workspace owner is unavailable.");
+    let attribution = this.usageAttribution(
+        this.ownerId, vendorId === "scheduler" ? "scheduled" : "hook",
+        gadgetId !== undefined ? {gadgetId} : {});
 
     this.storage.boundHooks.put({
       id: hookId,
       actionId,
       gatekeeperId,
       ...(gadgetId !== undefined ? {gadgetId} : {}),
-      vendorId: gatekeeperVendorId(gatekeeper),
+      vendorId,
       controller: controller as unknown as Fetcher<HookController<RpcTarget>>,
       callback: callback as unknown as NativeRpcStub<RpcTarget>,
       description,
       enabled,
+      attribution,
     });
 
     let record: ActionRecord = {
@@ -3474,7 +4063,8 @@ class OverseerImpl implements AgentHooks {
   // message. A result without a message suppresses only the generated message, not the invocation.
   async #prepareChatMessage(
       message: string | SlashCommandRequest,
-      hasAttachments: boolean): Promise<PreparedChatMessage> {
+      hasAttachments: boolean,
+      attribution: UsageAttribution): Promise<PreparedChatMessage> {
     if (typeof message !== "string") {
       // A built-in command is handled by the Workshop, not a Gatekeeper: there is nothing to invoke
       // here. Committing the event is what makes the turn a compaction turn (see isCompactionTurn).
@@ -3491,7 +4081,7 @@ class OverseerImpl implements AgentHooks {
       // Display-only, and from the browser, so a bad value is dropped rather than refused.
       message = {...message, commandPosition: sanitizeCommandPosition(message)};
       using authorizer = new NativeRpcStub<ObservationAuthorizer>(
-          new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user"}));
+          new SlashCommandAuthorizerImpl(this, gatekeeperId, {from: "user", attribution}));
       let result = await invokeSlashCommand(
           this.getGatekeeperFacet(gatekeeperId), message, authorizer);
       if (result.message === undefined) {
@@ -3606,7 +4196,8 @@ class OverseerImpl implements AgentHooks {
     let canonicalAttachments = this.canonicalizeChatAttachmentRefs(
         attachments, userMeta.aiModel?.config.provider);
     let prepared = await this.#prepareChatMessage(
-        initialMessage, (canonicalAttachments?.length ?? 0) > 0);
+        initialMessage, (canonicalAttachments?.length ?? 0) > 0,
+        this.usageAttribution(clientUser.id.toString(), "direct-user"));
 
     let chatId!: number;
     let timestamp = this.getChatTimestamp();
@@ -3644,7 +4235,8 @@ class OverseerImpl implements AgentHooks {
     if (prepared.message !== undefined && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;
       this.startAgent(chatId, userMeta.aiModel, userMeta.profile,
-                      clientUser.id.toString(), false, needsAgentTurnKeepAlive);
+          this.usageAttribution(clientUser.id.toString(), "agent", {chatId}),
+          false, needsAgentTurnKeepAlive);
     }
 
     if (userMeta.quickModel) {
@@ -3686,7 +4278,8 @@ class OverseerImpl implements AgentHooks {
     this.assertChatNotActive(chatId);
     using _chatMessageReservation = this.reserveChatMessagePreparation(chatId);
     let prepared = await this.#prepareChatMessage(
-        message, (canonicalAttachments?.length ?? 0) > 0);
+        message, (canonicalAttachments?.length ?? 0) > 0,
+        this.usageAttribution(clientUser.id.toString(), "direct-user", {chatId}));
 
     let meta = this.assertChatNotActive(chatId, true);
     let result = this.materializeChatDraft(chatId, meta);
@@ -3719,7 +4312,8 @@ class OverseerImpl implements AgentHooks {
     if (runsAgentTurn && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;
       this.startAgent(chatId, userMeta.aiModel, userMeta.profile,
-                      clientUser.id.toString(), false, needsAgentTurnKeepAlive);
+          this.usageAttribution(clientUser.id.toString(), "agent", {chatId}),
+          false, needsAgentTurnKeepAlive);
     }
     this.recordGadgetAnalytics({
       event_name: "gadget_interaction",
@@ -4002,18 +4596,20 @@ class OverseerImpl implements AgentHooks {
 
   // Start an agent turn for the given chat (fire-and-forget). Persists an `ActiveAgentRecord` so
   // the turn can be resumed after a server restart, and tracks the turn so the keep-alive alarm is
-  // held while it runs. `initiatorUserId` is the hex DO ID of the user whose model/account is used,
-  // needed to re-resolve the model config on resume.
+  // held while it runs. The attribution identifies the User Usage Account and lets resume resolve
+  // the same Deployment Model without consulting a later connection.
   startAgent(chatId: number, aiModel: DeploymentModelRecord,
-             initiator: AiChatAuthorInfo, initiatorUserId: string,
+             initiator: AiChatAuthorInfo, attribution: UsageAttribution,
              callbackInitiated: boolean = false,
              keepAlive: boolean = false): void {
     // Register before starting the turn so registration always precedes the turn's teardown
     // (`#unregisterRunningAgent`, in `#runAgentTurn`'s finally).
     this.#registerRunningAgent(chatId);
+    attribution = normalizeUsageAttribution(attribution);
     this.storage.activeAgents.put({
       chatId,
-      initiatorUserId,
+      turnId: `agent-turn:${crypto.randomUUID()}`,
+      attribution,
       modelId: aiModel.profile.id,
       initiator,
       callbackInitiated,
@@ -4024,7 +4620,7 @@ class OverseerImpl implements AgentHooks {
       chatId,
       aiModel,
       initiator,
-      initiatorUserId,
+      attribution,
       callbackInitiated,
       liveChat,
     );
@@ -4033,7 +4629,7 @@ class OverseerImpl implements AgentHooks {
 
   #runAgentTurn(chatId: number, aiModel: DeploymentModelRecord,
                 initiator: AiChatAuthorInfo,
-                initiatorUserId: string,
+                attribution: UsageAttribution,
                 callbackInitiated: boolean,
                 liveChat: LiveChatContext): Promise<void> {
     return obsContext.with({
@@ -4042,12 +4638,12 @@ class OverseerImpl implements AgentHooks {
       chatId,
       modelId: aiModel.profile.id,
     }, () => traced("agent.run", () => this.#runAgentTurnWithContext(
-        chatId, aiModel, initiator, initiatorUserId, callbackInitiated, liveChat)));
+        chatId, aiModel, initiator, attribution, callbackInitiated, liveChat)));
   }
 
   async #runAgentTurnWithContext(chatId: number, aiModel: DeploymentModelRecord,
                                  initiator: AiChatAuthorInfo,
-                                 initiatorUserId: string,
+                                 attribution: UsageAttribution,
                                  callbackInitiated: boolean,
                                  liveChat: LiveChatContext): Promise<void> {
     // When this turn is billed to the user's own Cloudflare account, we refresh their cached credit
@@ -4109,12 +4705,14 @@ class OverseerImpl implements AgentHooks {
       if (aiModel.config.provider === "deepseek") {
         chosenModel = meterAgentModelHandle(chosenModel, {
           usageRates: this.ctx.exports.AdminSettings.getByName(""),
-          user: this.users.get(this.users.idFromString(initiatorUserId)),
+          user: this.users.get(this.users.idFromString(attribution.principal.userId)),
           attribution: {
-            source: "agent",
-            workspaceId: this.ctx.id.toString(),
-            chatId,
+            ...attribution,
             deploymentModelId: aiModel.profile.id,
+          },
+          operations: {
+            acquire: input => this.acquireModelUsageOperation(chatId, input),
+            finish: operationId => this.finishModelUsageOperation(chatId, operationId),
           },
         });
       }
@@ -4279,6 +4877,7 @@ class OverseerImpl implements AgentHooks {
       if (liveChat.pendingAgentCallbacks.length > 0) {
         this.#startAgentForCallbacks(meta, liveChat);
       } else {
+        this.resumeReadySystemAssistanceForChat(chatId);
         this.#deliverWaitingExternalMessageResponse(chatId);
 
         // LiveChatContext is now empty.
@@ -4343,7 +4942,7 @@ class OverseerImpl implements AgentHooks {
   // Called by AgentSelfLoopback when any method is called on the `self` object.
   async deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
-      initiatorUserId: string, initiatorModelId: string): Promise<unknown> {
+      attribution: UsageAttribution, initiatorModelId: string): Promise<unknown> {
     if (!this.ownerId) throw new Error("Workspace has been deleted.");
 
     // Compute the summary eagerly (it only reads, doesn't mutate or need the sequence).
@@ -4356,7 +4955,8 @@ class OverseerImpl implements AgentHooks {
     let liveChat = this.#getLiveChat(chatId);
     let promise = new Promise<unknown>((resolve, reject) => {
       liveChat.pendingAgentCallbacks.push(
-          { methodName, args, argsSummary, initiatorUserId, initiatorModelId, resolve, reject });
+          {methodName, args, argsSummary, attribution: normalizeUsageAttribution(attribution),
+            initiatorModelId, resolve, reject});
     });
 
     // If there's no active agent right now, go ahead and start one.
@@ -4389,7 +4989,8 @@ class OverseerImpl implements AgentHooks {
       // Resolve the AI model based on the initiator of the first message. This means this
       // turn gets charged to the first initiator, even if it ends up handling multiple messages.
       // Oh well.
-      let user = this.users.get(this.users.idFromString(callbacks[0].initiatorUserId));
+      let user = this.users.get(
+          this.users.idFromString(callbacks[0].attribution.principal.userId));
 
       let userMeta = await user.getChatContext(callbacks[0].initiatorModelId);
 
@@ -4465,7 +5066,13 @@ class OverseerImpl implements AgentHooks {
       meta.activeAgent = userMeta.aiModel.profile;
       meta.lastActive = this.getChatTimestamp();
       this.storage.chatMeta.put(meta);
-      this.startAgent(chatId, userMeta.aiModel, author, callbacks[0].initiatorUserId,
+      let causalSource = callbacks[0].attribution.source;
+      this.startAgent(chatId, userMeta.aiModel, author, {
+        ...callbacks[0].attribution,
+        source: causalSource === "scheduled" || causalSource === "hook"
+          ? causalSource : "system-assistance",
+        chatId,
+      },
                       /* callbackInitiated */ true);
     } catch (err) {
       // Failure to set up the agent. Make sure to reject all callbacks.
@@ -4565,7 +5172,11 @@ class OverseerImpl implements AgentHooks {
         // seed time from the gatekeeper's suggested binding name), not as any gadget's binding.
         await this.addGatekeeper(
             cls,
-            {type: "ambient", vendorId: account.vendorId, accountId: account.accountId});
+            {type: "ambient", vendorId: account.vendorId, accountId: account.accountId},
+            {
+              from: "user",
+              attribution: this.usageAttribution(this.ownerId!, "system-assistance"),
+            });
       } catch (err) {
         this.logger.error("failed to provision ambient capsule", {
           event: "ambient.capsule.provision.failed",
@@ -4968,7 +5579,11 @@ class OverseerImpl implements AgentHooks {
           if (!record) return null;  // disconnected since the chat froze its set — no catalog.
           try {
             using authorizer = new RpcStub<ObservationAuthorizer>(new ApprovalQueueImpl(
-                this, gatekeeperId, {from: "agent", chatId}));
+                this, gatekeeperId, {
+                  from: "agent",
+                  chatId,
+                  attribution: this.activeAgentAttribution(chatId),
+                }));
             // The catalog comes from the installed gatekeeper facet (gadget-side), authorized as an
             // observation via the approval queue. getAgentCatalog is optional on Gatekeeper; ambient
             // resources always implement it (the agent relies on it for discovery), so we view the
@@ -5640,7 +6255,7 @@ class OverseerImpl implements AgentHooks {
       let selfStub = this.ctx.exports.AgentSelfLoopback({props: {
         overseerId: this.ctx.id.toString(),
         chatId,
-        initiatorUserId: this.users.idFromName(initiator.id).toString(),
+        attribution: this.activeAgentAttribution(chatId),
         initiatorModelId,
       }});
 
@@ -5821,6 +6436,8 @@ class OverseerImpl implements AgentHooks {
     }
 
     let requestId = `${chatId}:${crypto.randomUUID()}`;
+    this.createPendingSystemAssistance(
+        chatId, {type: "connectionRequest", requestId});
     let body: AiChatMessageBody = {
       type: "connectionRequest",
       requestId,
@@ -6505,6 +7122,71 @@ class OverseerImpl implements AgentHooks {
     return targets?.size === 1 ? targets.values().next().value : undefined;
   }
 
+  async spawnAgent(
+      title: string,
+      prompt: string,
+      config: AgentSpawnerConfig,
+      attribution: UsageAttribution,
+      callable: boolean): Promise<any> {
+    if (!this.ownerId) throw new Error("Workspace has been deleted.");
+    if (callable && !config.modelId) {
+      throw new Error("Cannot create a callable agent without a model.");
+    }
+    attribution = normalizeUsageAttribution(attribution);
+    if (attribution.workspaceId !== this.ctx.id.toString()) {
+      throw new Error("Usage attribution does not belong to this Workspace.");
+    }
+
+    let user = this.users.get(this.users.idFromString(attribution.principal.userId));
+    let userMeta = await user.getChatContext(config.modelId);
+    let chatId = this.nextChatId();
+    let childAttribution = normalizeUsageAttribution({...attribution, chatId});
+    let timestamp = this.getChatTimestamp();
+    let meta: AiChatMetadata = {
+      id: chatId,
+      title,
+      started: timestamp,
+      lastActive: timestamp,
+      spawnerName: config.displayName,
+    };
+    if (!callable && userMeta.aiModel) meta.activeAgent = userMeta.aiModel.profile;
+    this.storage.chatMeta.put(meta);
+
+    let bindings: Record<string, WorkpieceId> = Object.create(null);
+    for (let [name, target] of Object.entries(config.env)) {
+      if (this.storage.gadgets.get(target) || this.storage.gatekeepers.get(target)) {
+        bindings[name] = target;
+      }
+    }
+    this.storage.chatContext.put({chatId, spawnerConfig: config, bindings});
+
+    let author: AiChatAuthorInfo = {
+      type: "gadget",
+      id: userMeta.profile.id,
+      name: this.storage.title.get(),
+    };
+    this.storage.chats.put({
+      chatId,
+      sequence: this.nextChatSequence(chatId),
+      timestamp,
+      author,
+      type: "message",
+      message: prompt,
+    });
+
+    if (callable) {
+      return this.ctx.exports.AgentSelfLoopback({props: {
+        overseerId: this.ctx.id.toString(),
+        chatId,
+        attribution: childAttribution,
+        initiatorModelId: config.modelId!,
+      }}) as any;
+    }
+    if (userMeta.aiModel) {
+      this.startAgent(chatId, userMeta.aiModel, author, childAttribution);
+    }
+  }
+
   restore(params: OverseerRestoreParams): Fetcher<DurableObject> | Fetcher<RestoreForgerEntrypoint> {
     if (params.type !== "gadget") {
       throw new TypeError("Unknown restore params type: " + params.type);
@@ -6585,7 +7267,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // A workspace initialized by this version of the code is born at the current schema version;
     // there is nothing to migrate.
-    this.impl.storage.version.put(1);
+    this.impl.storage.version.put(2);
   }
 
   /**
@@ -6922,6 +7604,30 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.startGatekeeperSession(target, caller);
   }
 
+  /** Invoke one visible Gadget binding under a host-attested Usage invocation. */
+  async invokeAttributedGadgetBinding(
+      gadgetId: WorkpieceId, chatId: number | undefined, attribution: UsageAttribution,
+      target: BindingLoopbackTarget, methodName: string, args: unknown[]): Promise<unknown> {
+    return this.impl.invokeAttributedGadgetBinding(
+        gadgetId, chatId, attribution, target, methodName, args);
+  }
+
+  /** Invoke one persisted Hook callback under its host-attested Usage attribution. */
+  async invokeAttributedHookCallback(
+      hookId: number, attribution: UsageAttribution,
+      methodName: string, args: unknown[]): Promise<unknown> {
+    try {
+      return await this.impl.invokeAttributedHookCallback(hookId, attribution, methodName, args);
+    } catch (error) {
+      this.impl.logger.warn("hook callback delivery failed", {
+        event: "hook.callback.delivery.failed",
+        actionId: `hook:${hookId}`,
+        error,
+      });
+      throw error;
+    }
+  }
+
   startGatekeeperHook(id: number): NativeRpcStub<RpcTarget> {
     // TODO: There's a bug in workerd, if we return the RpcTarget directly here, because it is a
     //   Proxy, serializeJsValueWithPipeline() decides it is non-pipelineable, which is incorrect.
@@ -6929,7 +7635,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return new NativeRpcStub(this.impl.getGadgetHookEntrypoint(id));
   }
 
-  async startHook(hookId: number): Promise<{
+  async startHook(hookId: number, run?: HookRunMetadata): Promise<{
     callback: NativeRpcStub<RpcTarget>, approvalQueue: ApprovalQueue
   }> {
     let record = this.impl.storage.boundHooks.get(hookId);
@@ -6945,9 +7651,31 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error("Gatekeeper is disabled.");
     }
 
+    let attribution = normalizeUsageAttribution(record.attribution);
+    if (vendorId === "scheduler") {
+      if (!run) throw new Error("Scheduled run attribution is required.");
+      attribution = normalizeUsageAttribution({
+        ...attribution,
+        source: "scheduled",
+        automationId: run.automationId,
+        automationRunId: run.automationRunId,
+      });
+    } else if (run !== undefined) {
+      throw new Error("Automation dimensions are only valid for scheduled hooks.");
+    }
+
+    let callback = this.impl.ctx.exports.HookCallbackLoopback({props: {
+      overseerId: this.impl.ctx.id.toString(),
+      hookId,
+      attribution,
+    }});
+
     return {
-      callback: record.callback,
-      approvalQueue: new ApprovalQueueImpl(this.impl, record.gatekeeperId, {from: "hook"}),
+      callback: callback as unknown as NativeRpcStub<RpcTarget>,
+      approvalQueue: new ApprovalQueueImpl(this.impl, record.gatekeeperId, {
+        from: "hook",
+        attribution,
+      }),
     };
   }
 
@@ -6966,9 +7694,9 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   /** Called by AgentSelfLoopback when any method is called on the `self` object. */
   deliverAgentCallback(
       chatId: number, methodName: string, args: unknown[],
-      initiatorUserId: string, initiatorModelId: string): Promise<unknown> {
+      attribution: UsageAttribution, initiatorModelId: string): Promise<unknown> {
     return this.impl.deliverAgentCallback(
-        chatId, methodName, args, initiatorUserId, initiatorModelId);
+        chatId, methodName, args, attribution, initiatorModelId);
   }
 
   /** Called by TransientStubLoopback to retrieve a live transient RPC stub. */
@@ -6979,91 +7707,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     return this.impl.getTransientStub(chatId, sequence, stubIndex);
   }
 
-  async spawnAgent(
-      title: string, prompt: string, config: AgentSpawnerConfig,
-      creatorUserId?: string, callable?: boolean) {
-    if (!this.impl.ownerId) throw new Error("Workspace has been deleted.");
-    if (callable && !config.modelId) {
-      throw new Error("Cannot create a callable agent without a model.");
-    }
-
-    // Resolve the model from the creating user's account (falls back to owner for
-    // bindings created before collaborator support).
-    let resolveUserId = creatorUserId ?? this.impl.ownerId;
-    let user = this.impl.users.get(this.impl.users.idFromString(resolveUserId));
-    let userMeta = await user.getChatContext(config.modelId);
-
-    let chatId = this.impl.nextChatId();
-    let timestamp = this.impl.getChatTimestamp();
-    let meta: AiChatMetadata = {
-      id: chatId,
-      title,
-      started: timestamp,
-      lastActive: timestamp,
-      spawnerName: config.displayName,
-    };
-    if (!callable && userMeta.aiModel) {
-      meta.activeAgent = userMeta.aiModel.profile;
-    }
-    this.impl.storage.chatMeta.put(meta);
-
-    // Snapshot the spawner's configured bindings as the chat's seed binding layer -- the spawned
-    // agent sees only these, never the workspace default list. Entries whose targets no longer
-    // exist are dropped.
-    let bindings: Record<string, WorkpieceId> = Object.create(null);
-    for (let [name, target] of Object.entries(config.env)) {
-      if (this.impl.storage.gadgets.get(target) ||
-          this.impl.storage.gatekeepers.get(target)) {
-        bindings[name] = target;
-      }
-    }
-
-    this.impl.storage.chatContext.put({
-      chatId,
-      spawnerConfig: config,
-      bindings,
-    });
-
-    let author: AiChatAuthorInfo = {
-      type: "gadget",
-      id: userMeta.profile.id,
-      name: this.impl.storage.title.get(),
-    };
-
-    this.impl.storage.chats.put({
-      chatId,
-      sequence: this.impl.nextChatSequence(chatId),  // always 0 but need to initialize
-      timestamp,
-      author,
-
-      type: "message",
-      message: prompt,
-    });
-
-    if (callable) {
-      // Return a stub that delivers calls to the new chat thread, like the `self` magic object.
-      // The agent will be started on first callback via deliverAgentCallback().
-      return this.impl.ctx.exports.AgentSelfLoopback({props: {
-        overseerId: this.impl.ctx.id.toString(),
-        chatId,
-        initiatorUserId: this.impl.users.idFromString(resolveUserId).toString(),
-        initiatorModelId: config.modelId!,
-      }}) as any;
-    } else if (userMeta.aiModel) {
-      // Fire off the agent (asynchronously).
-      this.impl.startAgent(chatId, userMeta.aiModel, author,
-                           this.impl.users.idFromString(resolveUserId).toString());
-    } else {
-      // TODO: Flag as needing user attention.
-    }
-  }
-
   [restore](params: OverseerRestoreParams): any {
     return this.impl.restore(params);
   }
 }
 
-type GatekeeperCaller = {
+type GatekeeperCaller = ({
   from: "agent";
   chatId: number;
 } | {
@@ -7079,7 +7728,11 @@ type GatekeeperCaller = {
   chatId?: number;
 } | {
   from: "hook";
-};
+}) & {attribution: UsageAttribution};
+
+function normalizeGatekeeperCaller(caller: GatekeeperCaller): GatekeeperCaller {
+  return {...caller, attribution: normalizeUsageAttribution(caller.attribution)};
+}
 
 type GatekeeperLoopbackProps = {
   overseerId: string;
@@ -7089,10 +7742,79 @@ type GatekeeperLoopbackProps = {
   caller: GatekeeperCaller;
 };
 
+type UsageInvocationLoopbackProps = {
+  overseerId: string;
+  gadgetId: WorkpieceId;
+  chatId?: number;
+  attribution: UsageAttribution;
+};
+
+type HookCallbackLoopbackProps = {
+  overseerId: string;
+  hookId: number;
+  attribution: UsageAttribution;
+};
+
 type BindingLoopbackTarget = {
   type: "gadget" | "gatekeeper";
   id: WorkpieceId;
 };
+
+/** Host-minted capability that fixes the Usage Principal for one top-level App invocation. */
+export class UsageInvocationLoopback
+    extends WorkerEntrypoint<Cloudflare.Env, UsageInvocationLoopbackProps> {
+  async invokeBinding(
+      target: BindingLoopbackTarget, methodName: string, args: unknown[]): Promise<unknown> {
+    let ns = this.ctx.exports.OverseerDurableObject;
+    let overseer: DurableObjectStub<OverseerDurableObject> =
+        ns.get(ns.idFromString(this.ctx.props.overseerId));
+    return overseer.invokeAttributedGadgetBinding(
+        this.ctx.props.gadgetId, this.ctx.props.chatId, this.ctx.props.attribution,
+        target, methodName, args);
+  }
+}
+
+/** Host-minted callback capability for one admitted Hook or scheduled run. */
+export class HookCallbackLoopback
+    extends WorkerEntrypoint<Cloudflare.Env, HookCallbackLoopbackProps> {
+  constructor(ctx: ExecutionContext<HookCallbackLoopbackProps>, env: Cloudflare.Env) {
+    super(ctx, env);
+    let ns = ctx.exports.OverseerDurableObject;
+    let overseer: DurableObjectStub<OverseerDurableObject> =
+        ns.get(ns.idFromString(ctx.props.overseerId));
+    return new Proxy(this, {
+      get(target, prop) {
+        if (typeof prop === "symbol" || prop === "dummyMethodToWorkAroundValidatorBug") {
+          return Reflect.get(target, prop, target);
+        }
+        if (prop === "then") return undefined;
+        return (...args: unknown[]) => overseer.invokeAttributedHookCallback(
+            ctx.props.hookId, ctx.props.attribution, String(prop), args);
+      },
+      getPrototypeOf() {
+        return WorkerEntrypoint.prototype;
+      },
+    });
+  }
+
+  /** Deliver one Scheduled Tasks callback under this capability's fixed Usage attribution. */
+  onSchedule(firing: {
+    scheduleId: string;
+    runId: string;
+    scheduledTime: number;
+    actualTime: number;
+    timeZone: string;
+  }): Promise<unknown> {
+    let ns = this.ctx.exports.OverseerDurableObject;
+    let overseer: DurableObjectStub<OverseerDurableObject> =
+        ns.get(ns.idFromString(this.ctx.props.overseerId));
+    return overseer.invokeAttributedHookCallback(
+        this.ctx.props.hookId, this.ctx.props.attribution, "onSchedule", [firing]);
+  }
+
+  /** Ensure the Worker validator emits this entrypoint class. */
+  dummyMethodToWorkAroundValidatorBug() {}
+}
 
 /**
  * Horrible hack: At present the `env` of a dynamic isolate can contain ServiceStubs but cannot
@@ -7118,6 +7840,14 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 
     return new Proxy(session, {
       get(target, prop, receiver) {
+        if (prop === "__workshopInvoke") {
+          return (invocation: NativeRpcStub<RpcTarget & {
+                    invokeBinding(target: BindingLoopbackTarget, methodName: string,
+                                  args: unknown[]): Promise<unknown>;
+                  }>,
+                  methodName: string, args: unknown[]) =>
+            invocation.invokeBinding(ctx.props.target, methodName, args);
+        }
         // Note: We need `target` to be used as the receiver. If we use `receiver` as the receiver,
         //   we'll get an illegal invocation, as `receiver` points to our Proxy.
         return Reflect.get(target, prop, target);
@@ -7149,7 +7879,7 @@ type GatekeeperHookLoopbackProps = {
 export class GatekeeperHookLoopback
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperHookLoopbackProps>
     implements HookInitiator<RpcTarget> {
-  startHook(): Promise<
+  startHook(run?: HookRunMetadata): Promise<
       {callback: NativeRpcStub<RpcTarget>, approvalQueue: NativeRpcStub<ApprovalQueue>}> {
     let ns = this.ctx.exports.OverseerDurableObject;
     let overseer: DurableObjectStub<OverseerDurableObject> =
@@ -7157,14 +7887,14 @@ export class GatekeeperHookLoopback
 
     // Get an ApprovalQueue for this hook invocation from the overseer.
     // @ts-ignore seems the RPC types aren't working here
-    return overseer.startHook(this.ctx.props.hookId);
+    return overseer.startHook(this.ctx.props.hookId, run);
   }
 }
 
 type AgentSelfLoopbackProps = {
   overseerId: string;
   chatId: number;
-  initiatorUserId: string;
+  attribution: UsageAttribution;
   initiatorModelId: string;
 };
 
@@ -7185,14 +7915,14 @@ export class AgentSelfLoopback
     let ns = ctx.exports.OverseerDurableObject;
     let stub: DurableObjectStub<OverseerDurableObject> =
         ns.get(ns.idFromString(ctx.props.overseerId));
-    let { chatId, initiatorUserId, initiatorModelId } = ctx.props;
+    let {chatId, attribution, initiatorModelId} = ctx.props;
 
     return new Proxy<AgentSelfLoopback>(<any>this, {
       get(target, prop, receiver) {
         if (typeof prop === 'symbol') return Reflect.get(target, prop, target);
         return (...args: unknown[]) => {
           return stub.deliverAgentCallback(
-              chatId, String(prop), args, initiatorUserId, initiatorModelId);
+              chatId, String(prop), args, attribution, initiatorModelId);
         };
       },
       getPrototypeOf(target) {
@@ -7733,7 +8463,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (gatekeeper === undefined) {
       throw new Error(`No such gatekeeper id: ${id}`);
     }
-    return new GatekeeperClientImpl(this.impl, id, this.impl.getGatekeeperFacet(id));
+    return new GatekeeperClientImpl(this.impl, id, this.impl.getGatekeeperFacet(id), {
+      from: "user",
+      attribution: this.impl.usageAttribution(this.clientUserId, "direct-user"),
+    });
   }
 
   private async recordConnectionCreated(
@@ -7759,7 +8492,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       resourceUrl,
       typeUrlPattern,
     };
-    let result = await this.impl.addGatekeeper(cls, creationSpec);
+    let result = await this.impl.addGatekeeper(cls, creationSpec, {
+      from: "user",
+      attribution: this.impl.usageAttribution(this.clientUserId, "direct-user"),
+    });
     await this.recordConnectionCreated(result, "gatekeeper", vendorId);
     return result;
   }
@@ -7783,7 +8519,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec);
+        this.impl.ctx.exports.LanguageModelGatekeeper({props}), creationSpec, {
+          from: "user",
+          attribution: this.impl.usageAttribution(this.clientUserId, "direct-user"),
+        });
     await this.recordConnectionCreated(result, "ai_model");
     return result;
   }
@@ -7814,7 +8553,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let props: AgentSpawnerBindingProps = {
       overseerId: this.impl.ctx.id.toString(),
       config,
-      creatorUserId: this.#clientUser.id.toString(),
     };
 
     let creationSpec: GatekeeperCreationSpec = {
@@ -7823,7 +8561,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     };
 
     let result = await this.impl.addGatekeeper(
-        this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec);
+        this.impl.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec, {
+          from: "user",
+          attribution: this.impl.usageAttribution(this.clientUserId, "direct-user"),
+        });
     await this.recordConnectionCreated(result, "agent_spawner");
     return result;
   }
@@ -7861,7 +8602,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // If this was an awaited agent action, resume only after all awaited actions in the turn are
     // approved. If applyPendingAction throws, the action stays pending and the turn stays suspended.
     if (action.caller.from === "agent" && action.description.awaitDecision) {
-      await this.#maybeResumeAfterActionDecision(action.caller.chatId);
+      await this.#maybeResumeAfterActionDecision(action);
     }
 
     // Clearing this manual gate may unblock later auto-eligible pending actions on the same
@@ -7946,45 +8687,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return this.impl.deleteHook(id);
   }
 
-  // Resume a turn suspended on awaitDecision once all awaited actions from that turn are approved.
-  // Scoping to the current turn prevents older rejected actions from blocking future resumes.
-  async #maybeResumeAfterActionDecision(chatId: number): Promise<void> {
-    let awaited: (ActionRecord & {type: "action"})[] = [];
-    for (let msg of this.impl.storage.chats.list(
-        {prefix: `${keyString(chatId)}.`, reverse: true})) {
-      // Stop at whatever started the current turn: a user/gadget message or a gadget callback.
-      // (agentNudge is mid-turn, so it isn't a boundary.)
-      if (msg.type === "agentCallback") break;
-      if (msg.type === "message" &&
-          (msg.author.type === "user" || msg.author.type === "gadget")) {
-        break;
-      }
-      if (msg.type === "action") {
-        let record = this.impl.storage.actions.get(msg.actionId);
-        if (record && record.type === "action" &&
-            record.caller.from === "agent" && record.description.awaitDecision) {
-          awaited.push(record);
-        }
-      }
-    }
-    awaited.reverse();  // Present titles chronologically.
+  // Resume a turn suspended on awaitDecision once all Actions from its persisted Agent turn are
+  // approved. The durable task, not later Chat history, is the causal authority.
+  async #maybeResumeAfterActionDecision(
+      action: ActionRecord & {type: "action"}): Promise<void> {
+    let prepared = this.impl.prepareApprovedActionSystemAssistance(action);
+    if (!prepared) return;
 
-    // Only resume when every awaited action in the turn has been decided and all were approved.
-    if (awaited.length === 0) return;                       // No awaited action in current turn.
-    if (awaited.some(r => r.state === "pending")) return;   // Still waiting on a decision.
-    if (awaited.some(r => r.state === "rejected")) return;  // Denial leaves the turn ended.
-
-    // Persist one note for replay; raw action cards are not surfaced to the LLM. Concurrent
-    // approvals could both pass the gate above and append duplicate notes (the DO input gate is
-    // open across these awaits), but that's cosmetic — #resumeSuspendedAgent still starts one turn.
-    let titleList = awaited.map(r => `"${r.description.title}"`).join(", ");
+    let titleList = prepared.actions.map(record => `"${record.description.title}"`).join(", ");
     let summary =
         `The changes you submitted have been approved and applied: ${titleList}. ` +
         `Reads now reflect them.`;
     let author = await this.#getClientProfile();
-    this.impl.addChatMessages(chatId, author, [{type: "message", message: summary}]);
-
-    await this.#resumeSuspendedAgent(chatId);
+    this.impl.addChatMessages(prepared.task.chatId, author, [{type: "message", message: summary}]);
+    await this.impl.resumePendingSystemAssistance(prepared.task.id);
   }
 
   async rejectAction(id: number): Promise<void> {
@@ -8001,6 +8717,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       throw new Error(`Can't reject an observation: ${id}`);
     }
 
+    let deletesSystemAssistance = action.caller.from === "agent" &&
+        action.description.awaitDecision;
+    if (deletesSystemAssistance) this.impl.requireActionSystemAssistance(action);
+
     let gatekeeper = this.impl.getGatekeeperFacet(action.gatekeeperId);
 
     // Resolve the rejecter's identity before notifying the gatekeeper, so a failed profile fetch
@@ -8013,6 +8733,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     action.appliedAt = new Date();
     action.resolvedBy = profile;
     this.impl.storage.actions.put(action);
+    if (deletesSystemAssistance) this.impl.deleteActionSystemAssistance(action);
 
     // Deny leaves the turn ended, like denyConnectionRequest. The rejected record also prevents a
     // sibling approval from resuming this turn.
@@ -8105,52 +8826,13 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     throw new Error(`No such connection request: ${requestId}`);
   }
 
-  // Restart a suspended agent turn after its outcome is recorded in chat history (accepted
-  // connection, or all awaited actions approved). Denials intentionally don't call this.
-  async #resumeSuspendedAgent(chatId: number): Promise<void> {
-    await this.impl.waitForChatMessagePreparation(chatId);
-    let meta = this.impl.storage.chatMeta.get(chatId);
-    if (!meta) return;  // Chat deleted.
-    if (meta.activeAgent) return;  // Already running; it'll pick up the change on its next read.
-
-    // Recover the model this thread was using. getChatContext(null) does NOT resolve a model, so we
-    // find the id from the most recent agent-authored message (its author.id is the model id).
-    let modelId: string | null = null;
-    for (let msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`, reverse: true})) {
-      if (msg.author.type === "agent") {
-        modelId = msg.author.id;
-        break;
-      }
-    }
-
-    let userMeta = await this.#clientUser.getChatContext(modelId);
-    if (!userMeta.aiModel) return;  // No model resolved; nothing to resume.
-
-    let preparation = this.impl.waitForChatMessagePreparation(chatId);
-    if (preparation) {
-      await preparation;
-      return this.#resumeSuspendedAgent(chatId);
-    }
-
-    // Re-read after the await: another concurrent accept may have started the agent in the
-    // meantime. Avoid starting a second agent loop for the same chat.
-    let fresh = this.impl.storage.chatMeta.get(chatId);
-    if (!fresh || fresh.activeAgent) return;
-
-    fresh.activeAgent = userMeta.aiModel.profile;
-    fresh.lastActive = this.impl.getChatTimestamp();
-    this.impl.storage.chatMeta.put(fresh);
-
-    this.impl.startAgent(chatId, userMeta.aiModel, userMeta.profile,
-                         this.#clientUser.id.toString());
-  }
-
   async acceptConnectionRequest(
       requestId: string, result: {gatekeeperId: number}): Promise<void> {
     let msg = this.#findConnectionRequest(requestId);
     if (msg.state !== "pending") {
       throw new Error(`Connection request is not pending: ${requestId}`);
     }
+    let task = this.impl.requireConnectionSystemAssistance(requestId, msg.chatId);
 
     msg.state = "accepted";
     // The gatekeeper is surfaced to the agent as a named binding in the chat's env, under the
@@ -8159,9 +8841,12 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // Bump the timestamp so clients that were offline during the decision still receive the
     // mutated card on reconnect (the catch-up scan is ordered by timestamp).
     msg.timestamp = this.impl.getChatTimestamp();
-    this.impl.storage.chats.put(msg);  // fires the subscriber update() → re-delivers the card
-
-    await this.#resumeSuspendedAgent(msg.chatId);
+    task.state = "ready";
+    this.impl.ctx.storage.transactionSync(() => {
+      this.impl.storage.chats.put(msg);  // fires the subscriber update() → re-delivers the card
+      this.impl.storage.pendingSystemAssistances.put(task);
+    });
+    await this.impl.resumePendingSystemAssistance(task.id);
   }
 
   async denyConnectionRequest(requestId: string): Promise<void> {
@@ -8169,10 +8854,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (msg.state !== "pending") {
       throw new Error(`Connection request is not pending: ${requestId}`);
     }
+    let task = this.impl.requireConnectionSystemAssistance(requestId, msg.chatId);
 
     msg.state = "denied";
     msg.timestamp = this.impl.getChatTimestamp();
-    this.impl.storage.chats.put(msg);  // fires the subscriber update() → re-delivers the card
+    this.impl.ctx.storage.transactionSync(() => {
+      this.impl.storage.chats.put(msg);  // fires the subscriber update() → re-delivers the card
+      this.impl.storage.pendingSystemAssistances.delete(task.id);
+    });
 
     // Intentionally do NOT resume the agent on deny. The agent's turn already ended when it made the
     // request; leaving it ended lets the user say what they want done instead, rather than forcing
@@ -8745,6 +9434,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     this.impl.storage.chatMeta.delete(chatId);
     this.impl.storage.chatContext.delete(chatId);
+    for (let record of Array.from(
+        this.impl.storage.pendingSystemAssistances.byChatId.get(chatId))) {
+      this.impl.storage.pendingSystemAssistances.delete(record.id);
+    }
+    this.impl.storage.activeModelUsageOperations.delete(chatId);
     // Buffer the keys first: deleting invalidates the list cursor.
     let checkpoints = Array.from(
         this.impl.storage.chatCompactions.list({prefix: `${keyString(chatId)}.`}),
@@ -8815,7 +9509,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     this.impl.storage.chatMeta.put(meta);
 
     this.impl.startAgent(chatId, userMeta.aiModel, userMeta.profile,
-                         this.#clientUser.id.toString());
+        this.impl.usageAttribution(this.#clientUser.id.toString(), "agent", {chatId}));
   }
 
   async finalizeChatDraft(chatId: number): Promise<void> {
@@ -9401,7 +10095,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       chat_id: chatId,
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, chatId);
+    return this.impl.getGadgetFacet(
+        this.id, chatId,
+        this.impl.usageAttribution(
+            this.clientUserId, "gadget", {chatId, gadgetId: this.id}));
   }
 
   async exportPdf(chatId?: number): Promise<ReadableStream<Uint8Array>> {
@@ -9410,7 +10107,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     if (!browser) throw new Error("Gadget export is not configured for this deployment.");
     let bundle = await this.getUiBundle(chatId);
     if (!bundle) throw new Error("This Gadget does not have a UI to export.");
-    let gadget = await this.impl.getGadgetFacet(this.id, chatId);
+    let gadget = await this.impl.getGadgetFacet(
+        this.id, chatId,
+        this.impl.usageAttribution(
+            this.clientUserId, "gadget", {chatId, gadgetId: this.id}));
     let title = this.impl.getGadgetRecord(this.id).title;
     return renderGadgetPdf(browser, bundle.jsCode, title, gadget);
   }
@@ -9420,7 +10120,10 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     if (!browser) throw new Error("Gadget export is not configured for this deployment.");
     let bundle = await this.getUiBundle(chatId);
     if (!bundle) throw new Error("This Gadget does not have a UI to export.");
-    let gadget = await this.impl.getGadgetFacet(this.id, chatId);
+    let gadget = await this.impl.getGadgetFacet(
+        this.id, chatId,
+        this.impl.usageAttribution(
+            this.clientUserId, "gadget", {chatId, gadgetId: this.id}));
     let title = this.impl.getGadgetRecord(this.id).title;
     return renderGadgetDocx(browser, bundle.jsCode, title, gadget);
   }
@@ -9465,7 +10168,12 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     let edge = record.bindings[name];
     if (!edge || edge.pending || !this.impl.storage.gatekeepers.get(edge.target)) return null;
     return new GatekeeperClientImpl(
-        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target));
+        this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target), {
+          from: "user",
+          attribution: this.impl.usageAttribution(this.clientUserId, "direct-user", {
+            gadgetId: this.id,
+          }),
+        });
   }
 
   async bind(name: string, target: WorkpieceId, chatId?: number): Promise<void> {
@@ -9688,7 +10396,10 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       user_id: this.#clientUser.id.toString(),
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, undefined);
+    return this.impl.getGadgetFacet(
+        this.id, undefined,
+        this.impl.usageAttribution(
+            this.clientUserId, "gadget", {gadgetId: this.id}));
   }
 
   async exportPdf(chatId?: number): Promise<ReadableStream<Uint8Array>> {
@@ -9698,7 +10409,10 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
     if (!browser) throw new Error("Gadget export is not configured for this deployment.");
     let bundle = await this.getUiBundle();
     if (!bundle) throw new Error("This Gadget does not have a UI to export.");
-    let gadget = await this.impl.getGadgetFacet(this.id);
+    let gadget = await this.impl.getGadgetFacet(
+        this.id, undefined,
+        this.impl.usageAttribution(
+            this.clientUserId, "gadget", {gadgetId: this.id}));
     let title = this.impl.getGadgetRecord(this.id).title;
     return renderGadgetPdf(browser, bundle.jsCode, title, gadget);
   }
@@ -9709,7 +10423,10 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
     if (!browser) throw new Error("Gadget export is not configured for this deployment.");
     let bundle = await this.getUiBundle();
     if (!bundle) throw new Error("This Gadget does not have a UI to export.");
-    let gadget = await this.impl.getGadgetFacet(this.id);
+    let gadget = await this.impl.getGadgetFacet(
+        this.id, undefined,
+        this.impl.usageAttribution(
+            this.clientUserId, "gadget", {gadgetId: this.id}));
     let title = this.impl.getGadgetRecord(this.id).title;
     return renderGadgetDocx(browser, bundle.jsCode, title, gadget);
   }
@@ -9743,7 +10460,7 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     extends RpcTarget implements GatekeeperClient<Session> {
   constructor(private impl: OverseerImpl, private id: number,
       private facet: Fetcher<Gatekeeper<Session>>,
-      private caller: GatekeeperCaller = {from: "user"}) {
+      private caller: GatekeeperCaller) {
     super();
   }
 
@@ -9846,6 +10563,11 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
         description: HookDescription): Promise<void> {
     return this.impl.bindHook(this.gatekeeperId, controller, callback, description, this.caller);
   }
+
+  spawnAgent(
+      title: string, prompt: string, config: AgentSpawnerConfig, callable: boolean): Promise<any> {
+    return this.impl.spawnAgent(title, prompt, config, this.caller.attribution, callable);
+  }
 }
 
 // =======================================================================================
@@ -9855,11 +10577,6 @@ type AgentSpawnerBindingProps = {
   overseerId: string,
 
   config: AgentSpawnerConfig,
-
-  // DO ID of the user who created this binding. When agents are spawned, the model is
-  // resolved from this user's account. Falls back to the gadget owner for bindings
-  // created before collaborator support was added.
-  creatorUserId?: string,
 };
 
 import AGENT_SPAWNER_BINDING_TYPES from "./agent-spawner-binding.txt";
@@ -9891,7 +10608,8 @@ export class AgentSpawnerGatekeeper
 
   async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>)
       : Promise<AgentSpawnerBinding> {
-    return new AgentSpawnerBindingImpl(this.ctx);
+    return new AgentSpawnerBindingImpl(
+        this.ctx, approvalQueue.dup() as NativeRpcStub<ApprovalQueueImpl>);
   }
 
   applyAction(action: number): Promise<void> {
@@ -9917,26 +10635,23 @@ export class AgentSpawnerGatekeeper
 
 @validateRpc()
 class AgentSpawnerBindingImpl extends RpcTarget implements AgentSpawnerBinding {
-  constructor(private ctx: DurableObjectState<AgentSpawnerBindingProps>) {
+  constructor(private ctx: DurableObjectState<AgentSpawnerBindingProps>,
+              private approvalQueue: NativeRpcStub<ApprovalQueueImpl>) {
     super();
-  }
-
-  #getOverseer() {
-    let ns = this.ctx.exports.OverseerDurableObject;
-    let id = ns.idFromString(this.ctx.props.overseerId);
-    return ns.get(id);
   }
 
   async spawn(title: string, prompt: string): Promise<void> {
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs? But also, the agents show up in the chat history so
     //   maybe it's not really necessary to include them in the audit log too.
-    return this.#getOverseer().spawnAgent(
-        title, prompt, this.ctx.props.config, this.ctx.props.creatorUserId);
+    return this.approvalQueue.spawnAgent(title, prompt, this.ctx.props.config, false);
   }
 
   async spawnCallable(title: string, prompt: string): Promise<Fetcher<any>> {
-    return this.#getOverseer().spawnAgent(
-        title, prompt, this.ctx.props.config, this.ctx.props.creatorUserId, true);
+    return this.approvalQueue.spawnAgent(title, prompt, this.ctx.props.config, true);
+  }
+
+  [Symbol.dispose](): void {
+    this.approvalQueue[Symbol.dispose]();
   }
 }

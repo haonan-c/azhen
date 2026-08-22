@@ -1290,5 +1290,14 @@ export interface HookInitiator<Hook extends RpcTarget> extends WorkerEntrypoint 
    * observation. Some hooks may even pass callbacks or interpret the return value in a way that
    * causes side effects, which should be registered as actions.
    */
-  startHook(): Promise<{callback: RpcStub<Hook>, approvalQueue: RpcStub<ApprovalQueue>}>;
+  startHook(run?: HookRunMetadata):
+      Promise<{callback: RpcStub<Hook>, approvalQueue: RpcStub<ApprovalQueue>}>;
+}
+
+/** Content-free automation dimensions supplied by a trusted scheduled-event gatekeeper. */
+export interface HookRunMetadata {
+  /** Stable ID of the automation definition that caused this run. */
+  automationId: string;
+  /** Stable ID of this individual automation run. */
+  automationRunId: string;
 }

@@ -13,7 +13,7 @@ import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./a
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import {
   UsageAccount,
-  type AgentModelUsageAttribution,
+  type ModelUsageAttribution,
   type CreditReservation,
   type ModelMeteringAttempt,
   type ModelUsageCompletion,
@@ -521,9 +521,15 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Begin one trusted Agent model inference before any provider request can start. */
   async beginModelUsage(
       operationId: string,
-      attribution: AgentModelUsageAttribution,
+      attribution: ModelUsageAttribution,
       chargeSnapshot: ModelChargeSnapshot,
       reservationBound: ModelUsageReservationBound): Promise<ModelMeteringAttempt> {
+    if (attribution.principal === undefined) {
+      throw new Error("Usage Principal is required for paid work.");
+    }
+    if (attribution.principal.userId !== this.ctx.id.toString()) {
+      throw new Error("Usage Principal does not match this Usage Account.");
+    }
     await this.activateUsageAccount();
     return this.usageAccount.beginModelUsage(
       operationId,

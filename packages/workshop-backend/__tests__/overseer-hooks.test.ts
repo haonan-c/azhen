@@ -11,12 +11,31 @@ function makeOverseer(
         { enabled: true, vendorId: "email" },
     legacyVendorId?: string,
 ): OverseerDurableObject {
+  const userId = "a".repeat(64);
+  const workspaceId = "b".repeat(64);
   let overseer = Object.create(OverseerDurableObject.prototype) as OverseerDurableObject;
   Object.assign(overseer, {
     env: { BLUEPRINTS: { get: getConfig } },
     impl: {
+      ctx: {
+        id: {toString: () => workspaceId},
+        exports: {
+          UsageInvocationLoopback: ({props}: {props: object}) => ({props}),
+          HookCallbackLoopback: ({props}: {props: object}) => ({props}),
+        },
+      },
       storage: {
-        boundHooks: { get: () => hook && ({ ...hook, gatekeeperId: 1 }) },
+        boundHooks: { get: () => hook && ({
+          ...hook,
+          gatekeeperId: 1,
+          gadgetId: 7,
+          attribution: {
+            principal: {version: 1, kind: "user", userId},
+            source: hook.vendorId === "scheduler" ? "scheduled" : "hook",
+            workspaceId,
+            gadgetId: 7,
+          },
+        }) },
         gatekeepers: {
           get: () => legacyVendorId && {
             creationSpec: {
@@ -45,7 +64,32 @@ describe("OverseerDurableObject.startHook", () => {
     let overseer = makeOverseer(
         async () => serializeAdminConfig(config), { enabled: true, vendorId, callback });
 
-    await expect(overseer.startHook(1)).resolves.toMatchObject({ callback });
+    await expect(overseer.startHook(
+        1,
+        vendorId === "scheduler"
+          ? {automationId: "schedule-1", automationRunId: "run-1"}
+          : undefined,
+    )).resolves.toHaveProperty("callback");
+  });
+
+  it("runs a scheduled callback under the persisted owner Principal and run dimensions", async () => {
+    const callback = {};
+    let overseer = makeOverseer(
+        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
+        {enabled: true, vendorId: "scheduler", callback});
+
+    const result = await overseer.startHook(1, {
+      automationId: "schedule-1",
+      automationRunId: "run-1",
+    });
+    expect(result.callback).toEqual({props: expect.objectContaining({
+      hookId: 1,
+      attribution: expect.objectContaining({
+        source: "scheduled",
+        automationId: "schedule-1",
+        automationRunId: "run-1",
+      }),
+    })});
   });
 
   it("rejects delivery for an administratively disabled ordinary vendor", async () => {

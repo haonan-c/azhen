@@ -407,7 +407,10 @@ export class ScheduleDriver extends DurableObject {
     let hookResult: HookResult | undefined;
     try {
       // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
-      using hookCall = capabilities.initiator.startHook();
+      using hookCall = capabilities.initiator.startHook({
+        automationId: prepared.scheduleId,
+        automationRunId: prepared.runId,
+      });
       try {
         // Await admission rather than pipeline: its rejection must skip this occurrence before the
         // callback attempt is counted or either returned capability is used.

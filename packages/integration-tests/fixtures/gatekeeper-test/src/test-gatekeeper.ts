@@ -20,7 +20,7 @@
 // is one control knob here, `allow`, and the reason string is what carries the distinction to the
 // user. Tests exercise both narratives by choosing reason text.
 
-import { DurableObject, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
+import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import type {
   AccountDescription, ActionKind, ApprovalQueue, Gatekeeper, GatekeeperConnectCallback,
   GatekeeperUser, GatekeeperUserVerifier, ResourceDescription, ResourceConfiguratorFrame,
@@ -38,8 +38,10 @@ const SUPPORTED_RESOURCES: SupportedResource[] = [{
 }];
 
 const TYPES_CODE = `
-/** A stand-in resource. It has no operations; nothing here is ever called. */
-interface TestThing {}
+/** A stand-in resource used to trace delayed ApprovalQueue actions. */
+interface TestThing {
+  requestAction(label: string): Promise<void>;
+}
 `;
 
 // A 1x1 transparent GIF, so nothing here reaches for a network asset.
@@ -73,6 +75,15 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
 
   getAmbientVerificationCount(label: string): number {
     return this.ctx.storage.kv.get<number>(`ambient-verifications:${label}`) ?? 0;
+  }
+
+  recordAppliedAction(label: string): void {
+    const key = `applied-actions:${label}`;
+    this.ctx.storage.kv.put(key, (this.ctx.storage.kv.get<number>(key) ?? 0) + 1);
+  }
+
+  getAppliedActionCount(label: string): number {
+    return this.ctx.storage.kv.get<number>(`applied-actions:${label}`) ?? 0;
   }
 }
 
@@ -217,8 +228,28 @@ export class TestVerifier
 // ---------------------------------------------------------------------------
 // Gatekeeper (one per bound resource, running as a facet under the gadget's Overseer)
 
-/** No operations: these tests never open a gadget's session, only verify observers. */
-export type TestSession = Record<string, never>;
+export interface TestSession {
+  requestAction(label: string): Promise<void>;
+}
+
+class TestSessionImpl extends RpcTarget implements TestSession {
+  constructor(private state: DurableObjectState, private approvalQueue: RpcStub<ApprovalQueue>) {
+    super();
+  }
+
+  async requestAction(label: string): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(label)) throw new TypeError("Invalid test action label.");
+    const action = this.state.storage.kv.get<number>("next-action") ?? 1;
+    this.state.storage.kv.put("next-action", action + 1);
+    this.state.storage.kv.put(`action:${action}`, label);
+    await this.approvalQueue.submitAction(action, {
+      title: `Test action ${label}`,
+      description: "A delayed action used only by the Usage Principal integration tracer.",
+      implementsRevert: false,
+      awaitDecision: true,
+    });
+  }
+}
 
 export class TestGatekeeper
     extends DurableObject<Cloudflare.Env, BindingProps> implements Gatekeeper<TestSession> {
@@ -251,8 +282,8 @@ export class TestGatekeeper
     return [];
   }
 
-  async startSession(_approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return {};
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
+    return new TestSessionImpl(this.ctx, approvalQueue.dup());
   }
 
   /**
@@ -278,8 +309,10 @@ export class TestGatekeeper
     this.ctx.storage.kv.delete(`observer:${id}`);
   }
 
-  async applyAction(_action: number): Promise<void> {
-    throw new Error("The test gatekeeper submits no actions.");
+  async applyAction(action: number): Promise<void> {
+    const label = this.ctx.storage.kv.get<string>(`action:${action}`);
+    if (!label) throw new Error("No such test action.");
+    await control(this.ctx.exports).recordAppliedAction(label);
   }
 
   async rejectAction(_action: number): Promise<void> {}
@@ -346,6 +379,12 @@ export default {
       const { label } = body as Record<string, unknown>;
       if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
       return Response.json({ count: await control(ctx.exports).getAmbientVerificationCount(label) });
+    }
+
+    if (url.pathname === "/control/applied-action-count" && req.method === "POST") {
+      const { label } = body as Record<string, unknown>;
+      if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
+      return Response.json({ count: await control(ctx.exports).getAppliedActionCount(label) });
     }
 
     // Make this Worker issue a subrequest, so a test can prove that Worker-originated fetches really
