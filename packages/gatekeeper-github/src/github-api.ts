@@ -143,13 +143,25 @@ export class GitHubApiError extends Error {
   status: number;
   details?: unknown;
   isAuthError: boolean;
+  isRateLimit: boolean;
+  retryAfter?: string;
+  rateLimitRemaining?: string;
+  rateLimitReset?: string;
+  requestId?: string;
 
-  constructor(status: number, message: string, details?: unknown) {
+  constructor(status: number, message: string, details?: unknown, headers?: Headers) {
     super(message);
     this.name = "GitHubApiError";
     this.status = status;
     this.details = details;
     this.isAuthError = status === 401;
+    this.retryAfter = headers?.get("retry-after") ?? undefined;
+    this.rateLimitRemaining = headers?.get("x-ratelimit-remaining") ?? undefined;
+    this.rateLimitReset = headers?.get("x-ratelimit-reset") ?? undefined;
+    this.requestId = headers?.get("x-github-request-id") ?? undefined;
+    this.isRateLimit = status === 429 || (status === 403 && (
+      this.retryAfter !== undefined || this.rateLimitRemaining === "0"
+    ));
   }
 }
 
@@ -186,6 +198,25 @@ const API_VERSION = "2022-11-28";
 const DEFAULT_ACCEPT = "application/vnd.github+json";
 const USER_AGENT = "Cloudflare-Gadgets";
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_GET_RETRY_DELAY_MS = 30_000;
+
+export type GitHubApiActivity = {
+  requestDispatched(): void;
+  responseReceived(status: number): void;
+};
+
+function getRetryDelayMs(response: Response): number | undefined {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  }
+  if (response.headers.get("x-ratelimit-remaining") === "0") {
+    const reset = Number(response.headers.get("x-ratelimit-reset"));
+    if (Number.isFinite(reset)) return Math.max(0, reset * 1000 - Date.now());
+  }
+  return undefined;
+}
 
 function encodeBasicAuth(username: string, password: string): string {
   return btoa(`${username}:${password}`);
@@ -209,6 +240,7 @@ async function request<T>(
   path: string,
   options: RequestOptions = {},
   getToken?: () => Promise<string>,
+  activity?: GitHubApiActivity,
 ): Promise<RequestResult<T>> {
   const url = new URL(path, options.baseUrl ?? API_BASE_URL);
 
@@ -252,12 +284,24 @@ async function request<T>(
     body = JSON.stringify(options.body);
   }
 
-  const response = await fetch(url.toString(), {
-    method,
-    headers,
-    body,
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
+  let response: Response;
+  for (let attempt = 0;; attempt++) {
+    activity?.requestDispatched();
+    response = await fetch(url.toString(), {
+      method,
+      headers,
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    activity?.responseReceived(response.status);
+
+    const retryDelay = getRetryDelayMs(response);
+    if (method !== "GET" || attempt > 0 || retryDelay === undefined ||
+        retryDelay > MAX_GET_RETRY_DELAY_MS || (response.status !== 403 && response.status !== 429)) {
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, retryDelay));
+  }
 
   if (!response.ok && !(options.okStatuses ?? []).includes(response.status)) {
     const parsed = await parseBody(response);
@@ -271,7 +315,7 @@ async function request<T>(
         message = errorMessage;
       }
     }
-    throw new GitHubApiError(response.status, message, parsed);
+    throw new GitHubApiError(response.status, message, parsed, response.headers);
   }
 
   const parsed = await parseBody(response);
@@ -361,9 +405,16 @@ export async function revokeOAuthGrant(
 
 export class GitHubApi {
   #getToken: () => Promise<string>;
+  #activity?: GitHubApiActivity;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, activity?: GitHubApiActivity) {
     this.#getToken = getToken;
+    this.#activity = activity;
+  }
+
+  /** Return an API client that reports all attempts to one caller-owned billing operation. */
+  withActivity(activity: GitHubApiActivity): GitHubApi {
+    return new GitHubApi(this.#getToken, activity);
   }
 
   async #request<T>(
@@ -371,7 +422,7 @@ export class GitHubApi {
     path: string,
     options: RequestOptions = {},
   ): Promise<RequestResult<T>> {
-    return await request<T>(method, path, options, this.#getToken);
+    return await request<T>(method, path, options, this.#getToken, this.#activity);
   }
 
   async #conditionalGet<T>(
