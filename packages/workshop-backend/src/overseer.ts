@@ -1,7 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, ObserverBindingFailureCode, OpenGadgetObserverFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OBSERVER_BINDING_FAILURE_CODES, OPEN_GADGET_ERROR_CODES, resolveSiteName, type ModelChargeSnapshot } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind, type HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
+import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind, type BillableOperation, type BillableOperationOutcome, type HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -3425,6 +3425,37 @@ class OverseerImpl implements AgentHooks {
         event: "action.chat.message.post.failed", actionId, error: err,
       });
     }
+  }
+
+  /** Resolve the User Durable Object that owns one host-attested Usage Principal. */
+  userForPrincipal(userId: string): DurableObjectStub<UserDurableObject> {
+    return this.users.get(this.users.idFromString(userId));
+  }
+
+  /**
+   * Mint one trusted Billable API Operation for a Gatekeeper, before its first upstream call.
+   *
+   * The Usage Principal, Usage Source, and workspace dimensions come from the caller capability,
+   * never from the Gatekeeper. `externalAccountId` is a content-free attribution dimension the
+   * Gatekeeper reports; it carries no authority.
+   */
+  async beginBillableOperation(
+      gatekeeperId: number, billingMethodKey: string, externalAccountId: string,
+      caller: GatekeeperCaller): Promise<BillableOperation> {
+    caller = normalizeGatekeeperCaller(caller);
+    let vendorId = gatekeeperVendorId(this.storage.gatekeepers.get(gatekeeperId));
+    if (!vendorId) {
+      throw new Error("This gatekeeper has no vendor identity to bill against.");
+    }
+    let operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+    let chargeSnapshot = await this.ctx.exports.AdminSettings.getByName("")
+        .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
+    let principalUserId = caller.attribution.principal.userId;
+    await this.userForPrincipal(principalUserId).beginGatekeeperUsage(
+        operationId,
+        {...caller.attribution, vendorId, billingMethodKey, externalAccountId},
+        chargeSnapshot);
+    return new BillableOperationImpl(this, operationId, principalUserId);
   }
 
   async authorizeObservation(gatekeeperId: number, description: ObservationDescription,
@@ -10620,6 +10651,32 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
   }
 }
 
+// Host-minted capability for exactly one Gatekeeper Billable API Operation. Holding this stub is
+// the whole authority to meter that operation: the Workshop owns the operation ID and the Usage
+// Principal, so a Gatekeeper can neither forge an identity nor redirect a charge, and every retry
+// or paged request it makes while serving the operation reuses this one capability.
+@validateRpc()
+class BillableOperationImpl extends RpcTarget implements BillableOperation {
+  constructor(private impl: OverseerImpl, private operationId: string,
+              private principalUserId: string) {
+    super();
+  }
+
+  async getOperationId(): Promise<string> {
+    return this.operationId;
+  }
+
+  async markStarted(): Promise<void> {
+    await this.impl.userForPrincipal(this.principalUserId)
+        .markGatekeeperUsageStarted(this.operationId);
+  }
+
+  async complete(outcome: BillableOperationOutcome): Promise<void> {
+    await this.impl.userForPrincipal(this.principalUserId)
+        .completeGatekeeperUsage(this.operationId, outcome);
+  }
+}
+
 // ObservationAuthorizer handed to a slash-command provider. Scoped to one Gatekeeper; observations
 // only (no actions or hooks).
 @validateRpc()
@@ -10627,6 +10684,12 @@ class SlashCommandAuthorizerImpl extends NativeRpcTarget implements ObservationA
   constructor(private impl: OverseerImpl, private gatekeeperId: number,
               private caller: GatekeeperCaller) {
     super();
+  }
+
+  beginBillableOperation(
+      billingMethodKey: string, externalAccountId: string): Promise<BillableOperation> {
+    return this.impl.beginBillableOperation(
+        this.gatekeeperId, billingMethodKey, externalAccountId, this.caller);
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {
@@ -10639,6 +10702,12 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   constructor(private impl: OverseerImpl, private gatekeeperId: number,
               private caller: GatekeeperCaller) {
     super();
+  }
+
+  beginBillableOperation(
+      billingMethodKey: string, externalAccountId: string): Promise<BillableOperation> {
+    return this.impl.beginBillableOperation(
+        this.gatekeeperId, billingMethodKey, externalAccountId, this.caller);
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {

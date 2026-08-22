@@ -863,7 +863,70 @@ export interface Gatekeeper<Session> extends DurableObject {
       Promise<void | {message?: string, canRetry?: boolean, restart?: boolean}>;
 }
 
+/**
+ * Terminal execution signal for one Gatekeeper Billable API Operation.
+ *
+ * `executed` means the upstream business call was accepted or ran to completion. It settles the
+ * fixed API charge even when a later authorization step withholds the result from the caller,
+ * because the external quota was already consumed. `failed-before-execution` means the operation
+ * provably never reached the upstream service, and releases the held Credit. `unknown` means the
+ * Gatekeeper cannot tell, and holds the Credit Reservation for later reconciliation.
+ */
+export type BillableOperationOutcome = "executed" | "failed-before-execution" | "unknown";
+
+/**
+ * Host-minted capability that meters exactly one Gatekeeper Billable API Operation.
+ *
+ * The Workshop owns the operation ID and the Usage Principal, so a Gatekeeper can neither forge an
+ * identity nor redirect a charge. One capability covers one caller-visible business operation: the
+ * retries, pagination pages, and internal HTTP calls the Gatekeeper makes while serving it all
+ * belong to this single capability and are charged exactly once.
+ *
+ * Dispose the stub once the operation is complete.
+ */
+export interface BillableOperation extends RpcTarget {
+  /**
+   * Trusted Workshop-minted operation ID. Put it on the `ObservationDescription` or
+   * `ActionDescription` of the same business operation so the independent audit record links to
+   * this charge.
+   */
+  getOperationId(): Promise<string>;
+
+  /**
+   * Durably record that the upstream business call is about to be made. The Gatekeeper must await
+   * this immediately before its first upstream request, and must not call it again for retries
+   * within the same operation. `complete("executed")` is only accepted after this handoff.
+   */
+  markStarted(): Promise<void>;
+
+  /**
+   * Terminally settle, release, or hold the fixed API charge. Idempotent: repeating the same
+   * outcome returns normally, and a conflicting outcome throws.
+   */
+  complete(outcome: BillableOperationOutcome): Promise<void>;
+}
+
 export interface ObservationAuthorizer extends RpcTarget {
+  /**
+   * Begin metering one Gatekeeper Billable API Operation, before the first upstream business call.
+   *
+   * `billingMethodKey` is the stable caller-visible business-method key the deployment prices (for
+   * example `context.read.v1`); it must stay stable across releases, because the Usage Rate
+   * catalog is keyed on it. `externalAccountId` is the connected external account whose quota the
+   * call consumes — the external-account dimension retained for attribution.
+   *
+   * The Workshop supplies the Usage Principal, Usage Source, and workspace dimensions from the
+   * capability itself, never from the Gatekeeper. A priced method holds a Credit Reservation for
+   * the exact fixed charge; a method with no configured rate records an explicit zero-credit
+   * Metering Attempt instead, so Unpriced Use stays visible rather than silently free.
+   *
+   * Call this once per caller-visible business operation, not once per HTTP request.
+   */
+  beginBillableOperation(
+    billingMethodKey: string,
+    externalAccountId: string,
+  ): Promise<BillableOperation>;
+
   /**
    * Check whether the gadget should be permitted to make an observation (that is, to read some
    * data from an external service). The gatekeeper calls this on every read operation, and must
@@ -1062,6 +1125,13 @@ export type ObservationDescription = {
   title: string;
 
   /**
+   * Operation ID of the Billable API Operation this observation belongs to, from
+   * `BillableOperation.getOperationId()`. Audit and billing stay independent records; this only
+   * links them. Absent for observations that meter no upstream business call.
+   */
+  billingOperationId?: string;
+
+  /**
    * A complete description of the action to be taken, in Markdown-formatted natural language.
    * This will be displayed to the approver. It must include all details that might be relevant to
    * consider before approving.
@@ -1140,6 +1210,13 @@ export type ActionKind = {
 export type ActionDescription = {
   /** Brief one-line summary of the action, like an email subject line, to display in a list. */
   title: string;
+
+  /**
+   * Operation ID of the Billable API Operation this action belongs to, from
+   * `BillableOperation.getOperationId()`. Audit and billing stay independent records; this only
+   * links them. Absent for actions that meter no upstream business call.
+   */
+  billingOperationId?: string;
 
   /**
    * A complete description of the action to be taken, in Markdown-formatted natural language.
