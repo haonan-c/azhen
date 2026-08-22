@@ -1,4 +1,5 @@
 import "cloudflare:workers";
+import type { SpotifyOperationActivity } from "./billing.js";
 
 // ---------------------------------------------------------------------------
 // OAuth + HTTP wrapper around the Spotify Web API.
@@ -11,6 +12,7 @@ import "cloudflare:workers";
 const ACCOUNTS_BASE_URL = "https://accounts.spotify.com";
 const API_BASE_URL = "https://api.spotify.com";
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_RETRY_AFTER_MS = 30_000;
 // The generic /me/library endpoints accept fewer URIs per request than the old per-type endpoints,
 // so we chunk conservatively and stitch results back together.
 const LIBRARY_CHUNK = 20;
@@ -241,11 +243,30 @@ type RequestOptions = {
   okStatuses?: number[];
 };
 
+function retryAfterMs(response: Response): number | null {
+  const value = response.headers.get("Retry-After");
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+  const date = Date.parse(value);
+  if (!Number.isFinite(date)) return null;
+  return Math.min(Math.max(0, date - Date.now()), MAX_RETRY_AFTER_MS);
+}
+
 export class SpotifyApi {
   #getToken: () => Promise<string>;
+  #activity?: SpotifyOperationActivity;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, activity?: SpotifyOperationActivity) {
     this.#getToken = getToken;
+    this.#activity = activity;
+  }
+
+  /** Return an API view that reports every HTTP attempt to one caller-owned billing operation. */
+  withActivity(activity: SpotifyOperationActivity): SpotifyApi {
+    return new SpotifyApi(this.#getToken, activity);
   }
 
   async #request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
@@ -261,12 +282,26 @@ export class SpotifyApi {
       body = JSON.stringify(options.body);
     }
 
-    const response = await fetch(url.toString(), {
-      method,
-      headers,
-      body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response: Response;
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      this.#activity?.requestDispatched();
+      response = await fetch(url.toString(), {
+        method,
+        headers,
+        body,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      this.#activity?.responseReceived(response.status);
+
+      const delay = response.status === 429 && method === "GET" && attempt === 1
+        ? retryAfterMs(response)
+        : null;
+      if (delay === null) break;
+      await response.body?.cancel();
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
 
     if (!response.ok && !(options.okStatuses ?? []).includes(response.status)) {
       const parsed = await parseBody(response);

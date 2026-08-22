@@ -4,6 +4,9 @@ import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionExecution,
+  type ActionExecutionOutcome,
+  type ActionExecutionResult,
   type ActionDescription,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -11,11 +14,25 @@ import {
   type GatekeeperUser,
   type GatekeeperUserVerifier,
   type GatekeeperVendor as GatekeeperVendorIface,
+  type ObservationDescription,
   type ResourceConfiguratorFrame,
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  SPOTIFY_BILLING_METHODS,
+  spotifyActionBilling,
+  type SpotifyBillableReadMethod,
+  type SpotifyBillableWriteMethod,
+} from "./billing-methods.js";
+import {
+  runSpotifyRead,
+  spotifyActionRecoveryDisposition,
+  SpotifyOperationActivityTracker,
+  type SpotifyActionExecutionState,
+  type SpotifyOperationActivity,
+} from "./billing.js";
 import {
   SpotifyApi,
   SpotifyApiError,
@@ -758,11 +775,18 @@ export class SpotifyVerifier extends WorkerEntrypoint<Env> implements Gatekeeper
 // commands are the exception: they are gated like any action but, being live external state, are
 // never simulated.
 
-type WithApi = <T>(fn: (api: SpotifyApi) => Promise<T>) => Promise<T>;
+type WithApi = <T>(
+  fn: (api: SpotifyApi) => Promise<T>,
+  activity?: SpotifyOperationActivity,
+) => Promise<T>;
 
-type ActionState = "staged" | "pending" | "approved" | "rejected" | "failed";
+type ActionState = "staged" | "pending" | "approved" | "rejected" | "failed" | "unknown";
 
-type BaseAction = { approvalId: number; submittedAt: number };
+type BaseAction = {
+  approvalId: number;
+  submittedAt: number;
+  billingMethod: SpotifyBillableWriteMethod;
+};
 
 type SaveTracksAction = BaseAction & { type: "saveTracks"; trackIds: string[] };
 type RemoveSavedTracksAction = BaseAction & { type: "removeSavedTracks"; trackIds: string[] };
@@ -801,6 +825,19 @@ type PlayerCommand =
   | { op: "addToQueue"; uri: string; deviceId?: string };
 type PlayerAction = BaseAction & { type: "player"; command: PlayerCommand };
 
+const PLAYER_BILLING_METHODS = {
+  play: "SpotifyPlayer.play",
+  pause: "SpotifyPlayer.pause",
+  next: "SpotifyPlayer.next",
+  previous: "SpotifyPlayer.previous",
+  seek: "SpotifyPlayer.seek",
+  setVolume: "SpotifyPlayer.setVolume",
+  setShuffle: "SpotifyPlayer.setShuffle",
+  setRepeat: "SpotifyPlayer.setRepeat",
+  transfer: "SpotifyPlayer.transferTo",
+  addToQueue: "SpotifyPlayer.addToQueue",
+} as const satisfies Record<PlayerCommand["op"], SpotifyBillableWriteMethod>;
+
 type PlaylistTrackAction =
   PlaylistAddAction | PlaylistRemoveAction | PlaylistReorderAction | PlaylistReplaceAction;
 
@@ -822,6 +859,17 @@ type StoredActionRecord = {
   appliedAt?: number;
   rejectedAt?: number;
   revert?: RevertInfo;
+};
+
+type SpotifyActionExecutionRow = {
+  billingOperationId: string;
+  actionId: number;
+  providerIdempotencyKey?: string;
+  state: SpotifyActionExecutionState;
+};
+
+type PreparedSpotifyAction = {
+  execute(activity: SpotifyOperationActivity): Promise<void>;
 };
 
 // A track as it sits in a (possibly simulated) playlist.
@@ -980,13 +1028,19 @@ function applyPlaylistTrackOverlay(
 export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperImplProps>
   implements Gatekeeper<SpotifyAccountSession | SpotifyPlaylist> {
 
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+
   #userAccount(): DurableObjectStub<UserAccount> {
     return this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
   }
 
-  #withApi: WithApi = async <T>(fn: (api: SpotifyApi) => Promise<T>): Promise<T> => {
+  #withApi: WithApi = async <T>(
+    fn: (api: SpotifyApi) => Promise<T>,
+    activity?: SpotifyOperationActivity,
+  ): Promise<T> => {
     const account = this.#userAccount();
-    const api = new SpotifyApi(() => account.getAccessToken());
+    const baseApi = new SpotifyApi(() => account.getAccessToken());
+    const api = activity ? baseApi.withActivity(activity) : baseApi;
     try {
       return await fn(api);
     } catch (error) {
@@ -1034,9 +1088,14 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<SpotifyAccountSession | SpotifyPlaylist> {
     const queue = approvalQueue.dup();
     if (this.ctx.props.resourceKind === "playlist") {
-      return new SpotifyPlaylistImpl(this, queue, this.ctx.props.playlistId!);
+      return new SpotifyPlaylistImpl(
+        this,
+        queue,
+        this.ctx.props.playlistId!,
+        this.ctx.props.userObjectId,
+      );
     }
-    return new SpotifyAccountSessionImpl(this, queue);
+    return new SpotifyAccountSessionImpl(this, queue, this.ctx.props.userObjectId);
   }
 
   /**
@@ -1058,8 +1117,12 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return value;
   }
 
-  #newBase(): BaseAction {
-    return { approvalId: this.#counter("approval"), submittedAt: Date.now() };
+  #newBase(billingMethod: SpotifyBillableWriteMethod): BaseAction {
+    return {
+      approvalId: this.#counter("approval"),
+      submittedAt: Date.now(),
+      billingMethod,
+    };
   }
 
   #actionKey(id: number): string { return `action:${id}`; }
@@ -1138,7 +1201,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   #playlistDetailsKey(realId: string): string { return `pldetails:${realId}`; }
   #invalidatePlaylist(realId: string): void { this.ctx.storage.kv.delete(this.#playlistDetailsKey(realId)); }
 
-  async #getPlaylistSummary(realId: string): Promise<SpotifyPlaylistSummary> {
+  async #getPlaylistSummary(
+    realId: string,
+    activity?: SpotifyOperationActivity,
+  ): Promise<SpotifyPlaylistSummary> {
     const key = this.#playlistDetailsKey(realId);
     const cached = this.ctx.storage.kv.get<PlaylistDetailsCache>(key);
     if (cached && Date.now() - cached.fetchedAt < PLAYLIST_CACHE_TTL_MS) {
@@ -1146,7 +1212,9 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }
     let summary: SpotifyPlaylistSummary;
     try {
-      summary = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId)));
+      summary = normalizePlaylistSummary(
+        await this.#withApi(api => api.getPlaylist(realId), activity),
+      );
     } catch (error) {
       if (error instanceof SpotifyApiError && error.status === 404) {
         throw new Error(`No Spotify playlist found with id "${realId}".`, { cause: error });
@@ -1167,12 +1235,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async #materializePlaylistEntries(realId: string): Promise<PlaylistEntry[]> {
+  async #materializePlaylistEntries(
+    realId: string,
+    activity?: SpotifyOperationActivity,
+  ): Promise<PlaylistEntry[]> {
     // Fetch the first page to learn the total, then fetch the remaining pages with bounded
     // concurrency (rather than one-at-a-time) to cut latency on large playlists.
     let first;
     try {
-      first = await this.#withApi(api => api.listPlaylistItems(realId, 50, 0));
+      first = await this.#withApi(api => api.listPlaylistItems(realId, 50, 0), activity);
     } catch (error) {
       // Spotify withholds contents (403) for playlists the user doesn't own/collaborate on.
       if (error instanceof SpotifyApiError && error.status === 403) return [];
@@ -1187,7 +1258,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     for (let i = 0; i < offsets.length; i += PLAYLIST_FETCH_CONCURRENCY) {
       const batch = offsets.slice(i, i + PLAYLIST_FETCH_CONCURRENCY);
       const pages = await Promise.all(
-        batch.map(offset => this.#withApi(api => api.listPlaylistItems(realId, 50, offset))));
+        batch.map(offset => this.#withApi(
+          api => api.listPlaylistItems(realId, 50, offset),
+          activity,
+        )));
       for (const page of pages) {
         for (const item of page.items ?? []) entries.push(this.#toPlaylistEntry(item));
       }
@@ -1202,8 +1276,12 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
 
   // Full effective (overlaid) track list for a playlist. Only call when simulation is needed
   // (pending track edits exist, or the playlist is provisional).
-  async #effectivePlaylistEntries(logicalId: string, realId: string | undefined): Promise<PlaylistEntry[]> {
-    let entries = realId ? await this.#materializePlaylistEntries(realId) : [];
+  async #effectivePlaylistEntries(
+    logicalId: string,
+    realId: string | undefined,
+    activity?: SpotifyOperationActivity,
+  ): Promise<PlaylistEntry[]> {
+    let entries = realId ? await this.#materializePlaylistEntries(realId, activity) : [];
     const trackActions = this.#pendingPlaylistTrackActions(logicalId);
     if (trackActions.length > 0) {
       const uris = new Set<string>();
@@ -1212,7 +1290,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
           for (const uri of action.uris) uris.add(uri);
         }
       }
-      const meta = await this.#resolveTrackMetaByUri(uris);
+      const meta = await this.#resolveTrackMetaByUri(uris, activity);
       for (const action of trackActions) entries = applyPlaylistTrackOverlay(entries, action, meta);
     }
     return entries;
@@ -1242,7 +1320,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
 
   #playlistCountKey(realId: string): string { return `plcount:${realId}`; }
 
-  async #resolveTrackMetaByUri(uris: Iterable<string>): Promise<Map<string, SpotifyTrack>> {
+  async #resolveTrackMetaByUri(
+    uris: Iterable<string>,
+    activity?: SpotifyOperationActivity,
+  ): Promise<Map<string, SpotifyTrack>> {
     const meta = new Map<string, SpotifyTrack>();
     const ids: string[] = [];
     const seen = new Set<string>();
@@ -1251,25 +1332,40 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       if (id && !seen.has(id)) { seen.add(id); ids.push(id); }
     }
     for (let i = 0; i < ids.length; i += METADATA_CHUNK) {
-      const tracks = await this.#withApi(api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)));
+      const tracks = await this.#withApi(
+        api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)),
+        activity,
+      );
       for (const track of tracks) if (track) meta.set(track.uri, normalizeTrack(track));
     }
     return meta;
   }
 
-  async #resolveTracksById(ids: string[]): Promise<Map<string, SpotifyTrack>> {
+  async #resolveTracksById(
+    ids: string[],
+    activity?: SpotifyOperationActivity,
+  ): Promise<Map<string, SpotifyTrack>> {
     const meta = new Map<string, SpotifyTrack>();
     for (let i = 0; i < ids.length; i += METADATA_CHUNK) {
-      const tracks = await this.#withApi(api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)));
+      const tracks = await this.#withApi(
+        api => api.getTracks(ids.slice(i, i + METADATA_CHUNK)),
+        activity,
+      );
       for (const track of tracks) if (track) meta.set(track.id, normalizeTrack(track));
     }
     return meta;
   }
 
-  async #resolveAlbumsById(ids: string[]): Promise<Map<string, SpotifyAlbumRef>> {
+  async #resolveAlbumsById(
+    ids: string[],
+    activity?: SpotifyOperationActivity,
+  ): Promise<Map<string, SpotifyAlbumRef>> {
     const meta = new Map<string, SpotifyAlbumRef>();
     for (let i = 0; i < ids.length; i += METADATA_CHUNK) {
-      const albums = await this.#withApi(api => api.getAlbums(ids.slice(i, i + METADATA_CHUNK)));
+      const albums = await this.#withApi(
+        api => api.getAlbums(ids.slice(i, i + METADATA_CHUNK)),
+        activity,
+      );
       for (const album of albums) if (album) meta.set(album.id, normalizeAlbumRef(album));
     }
     return meta;
@@ -1279,24 +1375,36 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // Reads (with simulation overlay)
 
   #cachedUserRef?: SpotifyUserRef;
-  async #currentUserRef(): Promise<SpotifyUserRef> {
+  async #currentUserRef(activity?: SpotifyOperationActivity): Promise<SpotifyUserRef> {
     if (!this.#cachedUserRef) {
-      this.#cachedUserRef = normalizeUserRef(await this.#withApi(api => api.getCurrentUser()));
+      this.#cachedUserRef = normalizeUserRef(
+        await this.#withApi(api => api.getCurrentUser(), activity),
+      );
     }
     return this.#cachedUserRef;
   }
 
-  async getProfile(): Promise<SpotifyProfile> {
-    return normalizeProfile(await this.#withApi(api => api.getCurrentUser()));
+  @skipRpcValidation()
+  async getProfile(activity: SpotifyOperationActivity): Promise<SpotifyProfile> {
+    return normalizeProfile(await this.#withApi(api => api.getCurrentUser(), activity));
   }
 
-  async search(query: string, types: SpotifySearchType[], limit?: number): Promise<SpotifySearchResults> {
+  @skipRpcValidation()
+  async search(
+    query: string,
+    types: SpotifySearchType[],
+    limit: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifySearchResults> {
     // Feb 2026 reduced the search limit maximum from 50 to 10 for development-mode apps.
     const count = clampLimit(limit, 10, 10);
     // Spotify sprinkles `null` placeholders into playlist search results, which we drop — so a
     // small limit can filter down to fewer (even zero) items. Over-fetch to the API max and then
     // slice each category to the requested count to backfill those gaps.
-    const result = await this.#withApi(api => api.search(query, types, SEARCH_FETCH_MAX));
+    const result = await this.#withApi(
+      api => api.search(query, types, SEARCH_FETCH_MAX),
+      activity,
+    );
     return {
       tracks: (result.tracks?.items ?? []).filter(Boolean).map(normalizeTrack).slice(0, count),
       artists: (result.artists?.items ?? []).filter(Boolean).map(normalizeArtistRef).slice(0, count),
@@ -1305,9 +1413,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async getTrack(trackId: string): Promise<SpotifyTrack> {
+  @skipRpcValidation()
+  async getTrack(trackId: string, activity: SpotifyOperationActivity): Promise<SpotifyTrack> {
     try {
-      return normalizeTrack(await this.#withApi(api => api.getTrack(trackId)));
+      return normalizeTrack(await this.#withApi(api => api.getTrack(trackId), activity));
     } catch (error) {
       if (error instanceof SpotifyApiError && (error.status === 404 || error.status === 400)) {
         throw new Error(`No Spotify track found with id "${trackId}".`, { cause: error });
@@ -1316,13 +1425,29 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }
   }
 
-  async getTopTracks(timeRange: SpotifyTopTimeRange | undefined, limit?: number): Promise<SpotifyTrack[]> {
-    const result = await this.#withApi(api => api.getTopTracks(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)));
+  @skipRpcValidation()
+  async getTopTracks(
+    timeRange: SpotifyTopTimeRange | undefined,
+    limit: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyTrack[]> {
+    const result = await this.#withApi(
+      api => api.getTopTracks(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)),
+      activity,
+    );
     return (result.items ?? []).map(normalizeTrack);
   }
 
-  async getTopArtists(timeRange: SpotifyTopTimeRange | undefined, limit?: number): Promise<SpotifyArtistRef[]> {
-    const result = await this.#withApi(api => api.getTopArtists(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)));
+  @skipRpcValidation()
+  async getTopArtists(
+    timeRange: SpotifyTopTimeRange | undefined,
+    limit: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyArtistRef[]> {
+    const result = await this.#withApi(
+      api => api.getTopArtists(normalizeTimeRange(timeRange), clampLimit(limit, 20, 50)),
+      activity,
+    );
     return (result.items ?? []).map(normalizeArtistRef);
   }
 
@@ -1347,9 +1472,16 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return { added, removed };
   }
 
-  async areTracksSaved(trackIds: string[]): Promise<boolean[]> {
+  @skipRpcValidation()
+  async areTracksSaved(
+    trackIds: string[],
+    activity: SpotifyOperationActivity,
+  ): Promise<boolean[]> {
     if (trackIds.length === 0) return [];
-    const base = await this.#withApi(api => api.libraryContains(trackIds.map(trackUri)));
+    const base = await this.#withApi(
+      api => api.libraryContains(trackIds.map(trackUri)),
+      activity,
+    );
     const pending = this.#listPending();
     return trackIds.map((id, i) => {
       let saved = base[i] ?? false;
@@ -1361,9 +1493,16 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     });
   }
 
-  async areArtistsFollowed(artistIds: string[]): Promise<boolean[]> {
+  @skipRpcValidation()
+  async areArtistsFollowed(
+    artistIds: string[],
+    activity: SpotifyOperationActivity,
+  ): Promise<boolean[]> {
     if (artistIds.length === 0) return [];
-    const base = await this.#withApi(api => api.libraryContains(artistIds.map(artistUri)));
+    const base = await this.#withApi(
+      api => api.libraryContains(artistIds.map(artistUri)),
+      activity,
+    );
     const pending = this.#listPending();
     return artistIds.map((id, i) => {
       let following = base[i] ?? false;
@@ -1375,9 +1514,16 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     });
   }
 
-  async areAlbumsSaved(albumIds: string[]): Promise<boolean[]> {
+  @skipRpcValidation()
+  async areAlbumsSaved(
+    albumIds: string[],
+    activity: SpotifyOperationActivity,
+  ): Promise<boolean[]> {
     if (albumIds.length === 0) return [];
-    const base = await this.#withApi(api => api.libraryContains(albumIds.map(albumUri)));
+    const base = await this.#withApi(
+      api => api.libraryContains(albumIds.map(albumUri)),
+      activity,
+    );
     const pending = this.#listPending();
     return albumIds.map((id, i) => {
       let saved = base[i] ?? false;
@@ -1389,11 +1535,18 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     });
   }
 
-  async isFollowingPlaylist(logicalId: string): Promise<boolean> {
+  @skipRpcValidation()
+  async isFollowingPlaylist(
+    logicalId: string,
+    activity: SpotifyOperationActivity,
+  ): Promise<boolean> {
     const realId = this.#resolveRealPlaylistId(logicalId);
     // A provisional (pending-create) playlist will land in the user's library once approved.
     let following = realId
-      ? (await this.#withApi(api => api.libraryContains([playlistUri(realId)])))[0] ?? false
+      ? (await this.#withApi(
+          api => api.libraryContains([playlistUri(realId)]),
+          activity,
+        ))[0] ?? false
       : true;
     for (const action of this.#listPending()) {
       if (action.type === "playlistFollow" && action.playlistId === logicalId) following = true;
@@ -1402,15 +1555,20 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return following;
   }
 
-  async listSavedTracks(limit?: number, offset?: number): Promise<SpotifyTrack[]> {
+  @skipRpcValidation()
+  async listSavedTracks(
+    limit: number | undefined,
+    offset: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyTrack[]> {
     const lim = clampLimit(limit, 20, 50);
     const off = clampOffset(offset);
-    const base = await this.#withApi(api => api.listSavedTracks(lim, off));
+    const base = await this.#withApi(api => api.listSavedTracks(lim, off), activity);
     let tracks = (base.items ?? []).map(item => normalizeTrack(item.track));
     const { added, removed } = this.#pendingSavedDelta("track");
     if (removed.size > 0) tracks = tracks.filter(track => !removed.has(track.id));
     if (off === 0 && added.length > 0) {
-      const meta = await this.#resolveTracksById(added);
+      const meta = await this.#resolveTracksById(added, activity);
       const existing = new Set(tracks.map(track => track.id));
       const prepend = added.slice().toReversed()
         .map(id => meta.get(id))
@@ -1420,15 +1578,20 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return tracks.slice(0, lim);
   }
 
-  async listSavedAlbums(limit?: number, offset?: number): Promise<SpotifyAlbumRef[]> {
+  @skipRpcValidation()
+  async listSavedAlbums(
+    limit: number | undefined,
+    offset: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyAlbumRef[]> {
     const lim = clampLimit(limit, 20, 50);
     const off = clampOffset(offset);
-    const base = await this.#withApi(api => api.listSavedAlbums(lim, off));
+    const base = await this.#withApi(api => api.listSavedAlbums(lim, off), activity);
     let albums = (base.items ?? []).map(item => normalizeAlbumRef(item.album));
     const { added, removed } = this.#pendingSavedDelta("album");
     if (removed.size > 0) albums = albums.filter(album => !removed.has(album.id));
     if (off === 0 && added.length > 0) {
-      const meta = await this.#resolveAlbumsById(added);
+      const meta = await this.#resolveAlbumsById(added, activity);
       const existing = new Set(albums.map(album => album.id));
       const prepend = added.slice().toReversed()
         .map(id => meta.get(id))
@@ -1457,10 +1620,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async listPlaylists(limit?: number, offset?: number): Promise<SpotifyPlaylistSummary[]> {
+  @skipRpcValidation()
+  async listPlaylists(
+    limit: number | undefined,
+    offset: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyPlaylistSummary[]> {
     const lim = clampLimit(limit, 20, 50);
     const off = clampOffset(offset);
-    const base = await this.#withApi(api => api.listMyPlaylists(lim, off));
+    const base = await this.#withApi(api => api.listMyPlaylists(lim, off), activity);
     let summaries = (base.items ?? []).filter(Boolean).map(normalizePlaylistSummary);
     // Remember each playlist's real track count. GET /playlists/{id} withholds it for playlists the
     // user doesn't own, so getDetails() uses this as a fallback to stay consistent with listPlaylists.
@@ -1480,11 +1648,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     if (creates.length === 0) return summaries;
     // Surface pending (unapproved) creates at the top, with a simulated track count that reflects
     // all queued edits on the provisional playlist (not just the initial adds).
-    const owner = await this.#currentUserRef();
+    const owner = await this.#currentUserRef(activity);
     const synth: SpotifyPlaylistSummary[] = [];
     for (const create of creates) {
       const summary = this.#applyDetailsOverlay(create.provisionalId, this.#synthCreatedSummary(create));
-      const entries = await this.#effectivePlaylistEntries(create.provisionalId, undefined);
+      const entries = await this.#effectivePlaylistEntries(
+        create.provisionalId,
+        undefined,
+        activity,
+      );
       synth.push({ ...summary, owner, trackCount: entries.length });
     }
     synth.reverse();
@@ -1507,15 +1679,29 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return { ...summary, name, description, public: isPublic, collaborative };
   }
 
-  async playlistGetDetails(logicalId: string): Promise<SpotifyPlaylistSummary> {
+  @skipRpcValidation()
+  async playlistGetDetails(
+    logicalId: string,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyPlaylistSummary> {
     const realId = this.#resolveRealPlaylistId(logicalId);
     const hasTrackEdits = this.#pendingPlaylistTrackActions(logicalId).length > 0;
 
     let summary: SpotifyPlaylistSummary;
     if (realId) {
-      summary = this.#applyDetailsOverlay(logicalId, await this.#getPlaylistSummary(realId));
+      summary = this.#applyDetailsOverlay(
+        logicalId,
+        await this.#getPlaylistSummary(realId, activity),
+      );
       if (hasTrackEdits) {
-        summary = { ...summary, trackCount: (await this.#effectivePlaylistEntries(logicalId, realId)).length };
+        summary = {
+          ...summary,
+          trackCount: (await this.#effectivePlaylistEntries(
+            logicalId,
+            realId,
+            activity,
+          )).length,
+        };
       } else if (summary.trackCount === 0) {
         // Spotify withholds the count for non-owned playlists here; fall back to a count we saw via
         // listPlaylists so the two reads agree.
@@ -1529,14 +1715,24 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       summary = this.#applyDetailsOverlay(logicalId, this.#synthCreatedSummary(create));
       summary = {
         ...summary,
-        owner: await this.#currentUserRef(),
-        trackCount: (await this.#effectivePlaylistEntries(logicalId, undefined)).length,
+        owner: await this.#currentUserRef(activity),
+        trackCount: (await this.#effectivePlaylistEntries(
+          logicalId,
+          undefined,
+          activity,
+        )).length,
       };
     }
     return summary;
   }
 
-  async playlistListTracks(logicalId: string, limit?: number, offset?: number): Promise<SpotifyPlaylistTrack[]> {
+  @skipRpcValidation()
+  async playlistListTracks(
+    logicalId: string,
+    limit: number | undefined,
+    offset: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyPlaylistTrack[]> {
     const lim = clampLimit(limit, 50, 50);
     const off = clampOffset(offset);
     const realId = this.#resolveRealPlaylistId(logicalId);
@@ -1546,7 +1742,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     if (realId && this.#pendingPlaylistTrackActions(logicalId).length === 0) {
       let page;
       try {
-        page = await this.#withApi(api => api.listPlaylistItems(realId, lim, off));
+        page = await this.#withApi(
+          api => api.listPlaylistItems(realId, lim, off),
+          activity,
+        );
       } catch (error) {
         // Non-owned playlists: Spotify withholds contents (403). Match the documented empty result.
         if (error instanceof SpotifyApiError && error.status === 403) return [];
@@ -1569,7 +1768,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
       if (!create) throw new Error(`Spotify playlist ${logicalId} was not found.`);
     }
 
-    const entries = await this.#effectivePlaylistEntries(logicalId, realId);
+    const entries = await this.#effectivePlaylistEntries(logicalId, realId, activity);
     return entries.slice(off, off + lim).map((entry, index) => ({
       position: off + index,
       addedAt: entry.addedAt,
@@ -1578,16 +1777,23 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     }));
   }
 
-  async playerGetState(): Promise<SpotifyPlaybackState> {
-    return normalizePlaybackState(await this.#withApi(api => api.getPlaybackState()));
+  @skipRpcValidation()
+  async playerGetState(activity: SpotifyOperationActivity): Promise<SpotifyPlaybackState> {
+    return normalizePlaybackState(
+      await this.#withApi(api => api.getPlaybackState(), activity),
+    );
   }
 
-  async playerGetDevices(): Promise<SpotifyDevice[]> {
-    return (await this.#withApi(api => api.getDevices())).map(normalizeDevice);
+  @skipRpcValidation()
+  async playerGetDevices(activity: SpotifyOperationActivity): Promise<SpotifyDevice[]> {
+    return (await this.#withApi(api => api.getDevices(), activity)).map(normalizeDevice);
   }
 
-  async playerGetQueue(): Promise<{ currentlyPlaying: SpotifyTrack | null; queue: SpotifyTrack[] }> {
-    const result = await this.#withApi(api => api.getQueue());
+  @skipRpcValidation()
+  async playerGetQueue(
+    activity: SpotifyOperationActivity,
+  ): Promise<{ currentlyPlaying: SpotifyTrack | null; queue: SpotifyTrack[] }> {
+    const result = await this.#withApi(api => api.getQueue(), activity);
     if (!result) return { currentlyPlaying: null, queue: [] };
     return {
       currentlyPlaying: result.currently_playing ? normalizeTrack(result.currently_playing) : null,
@@ -1595,8 +1801,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     };
   }
 
-  async playerGetRecentlyPlayed(limit?: number): Promise<SpotifyPlayHistoryEntry[]> {
-    const result = await this.#withApi(api => api.getRecentlyPlayed(clampLimit(limit, 20, 50)));
+  @skipRpcValidation()
+  async playerGetRecentlyPlayed(
+    limit: number | undefined,
+    activity: SpotifyOperationActivity,
+  ): Promise<SpotifyPlayHistoryEntry[]> {
+    const result = await this.#withApi(
+      api => api.getRecentlyPlayed(clampLimit(limit, 20, 50)),
+      activity,
+    );
     return (result.items ?? []).map(item => ({
       track: normalizeTrack(item.track),
       playedAt: new Date(item.played_at),
@@ -1607,19 +1820,55 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // -------------------------------------------------------------------------
   // Action preparation + submission
 
-  prepareSaveTracks(trackIds: string[]): SaveTracksAction { return { ...this.#newBase(), type: "saveTracks", trackIds }; }
-  prepareRemoveSavedTracks(trackIds: string[]): RemoveSavedTracksAction { return { ...this.#newBase(), type: "removeSavedTracks", trackIds }; }
-  prepareSaveAlbums(albumIds: string[]): SaveAlbumsAction { return { ...this.#newBase(), type: "saveAlbums", albumIds }; }
-  prepareRemoveSavedAlbums(albumIds: string[]): RemoveSavedAlbumsAction { return { ...this.#newBase(), type: "removeSavedAlbums", albumIds }; }
-  prepareFollowArtists(artistIds: string[]): FollowArtistsAction { return { ...this.#newBase(), type: "followArtists", artistIds }; }
-  prepareUnfollowArtists(artistIds: string[]): UnfollowArtistsAction { return { ...this.#newBase(), type: "unfollowArtists", artistIds }; }
+  prepareSaveTracks(trackIds: string[]): SaveTracksAction {
+    return {
+      ...this.#newBase("SpotifyAccountSession.saveTracks"),
+      type: "saveTracks",
+      trackIds,
+    };
+  }
+  prepareRemoveSavedTracks(trackIds: string[]): RemoveSavedTracksAction {
+    return {
+      ...this.#newBase("SpotifyAccountSession.removeSavedTracks"),
+      type: "removeSavedTracks",
+      trackIds,
+    };
+  }
+  prepareSaveAlbums(albumIds: string[]): SaveAlbumsAction {
+    return {
+      ...this.#newBase("SpotifyAccountSession.saveAlbums"),
+      type: "saveAlbums",
+      albumIds,
+    };
+  }
+  prepareRemoveSavedAlbums(albumIds: string[]): RemoveSavedAlbumsAction {
+    return {
+      ...this.#newBase("SpotifyAccountSession.removeSavedAlbums"),
+      type: "removeSavedAlbums",
+      albumIds,
+    };
+  }
+  prepareFollowArtists(artistIds: string[]): FollowArtistsAction {
+    return {
+      ...this.#newBase("SpotifyAccountSession.followArtists"),
+      type: "followArtists",
+      artistIds,
+    };
+  }
+  prepareUnfollowArtists(artistIds: string[]): UnfollowArtistsAction {
+    return {
+      ...this.#newBase("SpotifyAccountSession.unfollowArtists"),
+      type: "unfollowArtists",
+      artistIds,
+    };
+  }
 
   preparePlaylistCreate(
     name: string,
     options?: { description?: string; public?: boolean; collaborative?: boolean },
   ): PlaylistCreateAction {
     return {
-      ...this.#newBase(),
+      ...this.#newBase("SpotifyAccountSession.createPlaylist"),
       type: "playlistCreate",
       provisionalId: `~${this.#counter("provisional")}`,
       name,
@@ -1630,28 +1879,68 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   }
 
   preparePlaylistAdd(playlistId: string, uris: string[], position?: number): PlaylistAddAction {
-    return { ...this.#newBase(), type: "playlistAdd", playlistId, uris, position };
+    return {
+      ...this.#newBase("SpotifyPlaylist.addTracks"),
+      type: "playlistAdd",
+      playlistId,
+      uris,
+      position,
+    };
   }
   preparePlaylistRemove(playlistId: string, uris: string[]): PlaylistRemoveAction {
-    return { ...this.#newBase(), type: "playlistRemove", playlistId, uris };
+    return {
+      ...this.#newBase("SpotifyPlaylist.removeTracks"),
+      type: "playlistRemove",
+      playlistId,
+      uris,
+    };
   }
   preparePlaylistReorder(playlistId: string, rangeStart: number, insertBefore: number, rangeLength: number): PlaylistReorderAction {
-    return { ...this.#newBase(), type: "playlistReorder", playlistId, rangeStart, insertBefore, rangeLength };
+    return {
+      ...this.#newBase("SpotifyPlaylist.reorderTracks"),
+      type: "playlistReorder",
+      playlistId,
+      rangeStart,
+      insertBefore,
+      rangeLength,
+    };
   }
   preparePlaylistReplace(playlistId: string, uris: string[]): PlaylistReplaceAction {
-    return { ...this.#newBase(), type: "playlistReplace", playlistId, uris };
+    return {
+      ...this.#newBase("SpotifyPlaylist.replaceTracks"),
+      type: "playlistReplace",
+      playlistId,
+      uris,
+    };
   }
   preparePlaylistDetails(playlistId: string, update: SpotifyPlaylistDetailsUpdate): PlaylistDetailsAction {
-    return { ...this.#newBase(), type: "playlistDetails", playlistId, update };
+    return {
+      ...this.#newBase("SpotifyPlaylist.changeDetails"),
+      type: "playlistDetails",
+      playlistId,
+      update,
+    };
   }
   preparePlaylistUnfollow(playlistId: string): PlaylistUnfollowAction {
-    return { ...this.#newBase(), type: "playlistUnfollow", playlistId };
+    return {
+      ...this.#newBase("SpotifyPlaylist.unfollow"),
+      type: "playlistUnfollow",
+      playlistId,
+    };
   }
   preparePlaylistFollow(playlistId: string): PlaylistFollowAction {
-    return { ...this.#newBase(), type: "playlistFollow", playlistId };
+    return {
+      ...this.#newBase("SpotifyPlaylist.follow"),
+      type: "playlistFollow",
+      playlistId,
+    };
   }
   preparePlayer(command: PlayerCommand): PlayerAction {
-    return { ...this.#newBase(), type: "player", command };
+    return {
+      ...this.#newBase(PLAYER_BILLING_METHODS[command.op]),
+      type: "player",
+      command,
+    };
   }
 
   async submitActionForApproval(
@@ -1661,7 +1950,10 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   ): Promise<void> {
     this.ctx.storage.kv.put<StoredActionRecord>(this.#actionKey(action.approvalId), { action, state: "staged" });
     try {
-      await queue.submitAction(action.approvalId, description);
+      await queue.submitAction(action.approvalId, {
+        ...description,
+        billing: spotifyActionBilling(action.billingMethod, this.ctx.props.userObjectId),
+      });
     } catch (error) {
       this.ctx.storage.kv.delete(this.#actionKey(action.approvalId));
       throw error;
@@ -1675,34 +1967,52 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   // -------------------------------------------------------------------------
   // Action lifecycle (apply / reject / revert)
 
-  async #applyAddTracks(realId: string, uris: string[], position?: number): Promise<void> {
+  async #applyAddTracks(
+    realId: string,
+    uris: string[],
+    position?: number,
+    activity?: SpotifyOperationActivity,
+  ): Promise<void> {
     let pos = position;
     for (let i = 0; i < uris.length; i += PLAYLIST_WRITE_CHUNK) {
       const chunk = uris.slice(i, i + PLAYLIST_WRITE_CHUNK);
-      await this.#withApi(api => api.addPlaylistItems(realId, chunk, pos));
+      await this.#withApi(api => api.addPlaylistItems(realId, chunk, pos), activity);
       if (pos !== undefined) pos += chunk.length;
     }
   }
 
-  async #setPlaylistTracks(realId: string, uris: string[]): Promise<void> {
-    await this.#withApi(api => api.replacePlaylistItems(realId, uris.slice(0, PLAYLIST_WRITE_CHUNK)));
+  async #setPlaylistTracks(
+    realId: string,
+    uris: string[],
+    activity?: SpotifyOperationActivity,
+  ): Promise<void> {
+    await this.#withApi(
+      api => api.replacePlaylistItems(realId, uris.slice(0, PLAYLIST_WRITE_CHUNK)),
+      activity,
+    );
     for (let i = PLAYLIST_WRITE_CHUNK; i < uris.length; i += PLAYLIST_WRITE_CHUNK) {
-      await this.#withApi(api => api.addPlaylistItems(realId, uris.slice(i, i + PLAYLIST_WRITE_CHUNK)));
+      await this.#withApi(
+        api => api.addPlaylistItems(realId, uris.slice(i, i + PLAYLIST_WRITE_CHUNK)),
+        activity,
+      );
     }
   }
 
-  async #applyPlayerCommand(command: PlayerCommand): Promise<void> {
+  async #applyPlayerCommand(
+    command: PlayerCommand,
+    activity: SpotifyOperationActivity,
+  ): Promise<void> {
     switch (command.op) {
-      case "play": await this.#withApi(api => api.play(command.deviceId, command.body)); return;
-      case "pause": await this.#withApi(api => api.pause(command.deviceId)); return;
-      case "next": await this.#withApi(api => api.next(command.deviceId)); return;
-      case "previous": await this.#withApi(api => api.previous(command.deviceId)); return;
-      case "seek": await this.#withApi(api => api.seek(command.positionMs, command.deviceId)); return;
-      case "setVolume": await this.#withApi(api => api.setVolume(command.volumePercent, command.deviceId)); return;
-      case "setShuffle": await this.#withApi(api => api.setShuffle(command.shuffle, command.deviceId)); return;
-      case "setRepeat": await this.#withApi(api => api.setRepeat(command.mode, command.deviceId)); return;
-      case "transfer": await this.#withApi(api => api.transfer(command.deviceId, command.play)); return;
-      case "addToQueue": await this.#withApi(api => api.addToQueue(command.uri, command.deviceId)); return;
+      case "play": await this.#withApi(api => api.play(command.deviceId, command.body), activity); return;
+      case "pause": await this.#withApi(api => api.pause(command.deviceId), activity); return;
+      case "next": await this.#withApi(api => api.next(command.deviceId), activity); return;
+      case "previous": await this.#withApi(api => api.previous(command.deviceId), activity); return;
+      case "seek": await this.#withApi(api => api.seek(command.positionMs, command.deviceId), activity); return;
+      case "setVolume": await this.#withApi(api => api.setVolume(command.volumePercent, command.deviceId), activity); return;
+      case "setShuffle": await this.#withApi(api => api.setShuffle(command.shuffle, command.deviceId), activity); return;
+      case "setRepeat": await this.#withApi(api => api.setRepeat(command.mode, command.deviceId), activity); return;
+      case "transfer": await this.#withApi(api => api.transfer(command.deviceId, command.play), activity); return;
+      case "addToQueue": await this.#withApi(api => api.addToQueue(command.uri, command.deviceId), activity); return;
     }
   }
 
@@ -1719,52 +2029,167 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     return realId;
   }
 
-  async applyAction(actionId: number): Promise<void> {
-    const record = this.#requireRecord(actionId);
-    // "failed" is retryable (a prior apply threw); the overseer may call applyAction again.
-    if (record.state !== "pending" && record.state !== "staged" && record.state !== "failed") {
-      throw new Error(`Spotify action ${actionId} is no longer pending.`);
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This Spotify Action predates billing. Reject it and submit the operation again.",
+      );
     }
-    const action = record.action;
-    try {
-      await this.#performAction(action, record);
-    } catch (error) {
-      // Apply failed (and won't take effect on Spotify). Mark it failed so its simulated effect
-      // stops masking real library/follow/playlist state, while keeping it retryable/discardable.
-      record.state = "failed";
-      this.ctx.storage.kv.put(this.#actionKey(actionId), record);
-      this.#invalidatePendingCache();
-      throw error;
-    }
-    record.state = "approved";
-    record.appliedAt = Date.now();
-    this.#retire(actionId, record);
+
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return await active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
+      }
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return await work;
   }
 
-  async #performAction(action: SpotifyAction, record: StoredActionRecord): Promise<void> {
+  async #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const key = `execution:${execution.billingOperationId}`;
+    let row = this.ctx.storage.kv.get<SpotifyActionExecutionRow>(key);
+    if (row) {
+      if (row.actionId !== actionId ||
+          row.providerIdempotencyKey !== execution.providerIdempotencyKey) {
+        throw new Error("Spotify Action execution identity conflicts with its durable claim.");
+      }
+      const disposition = spotifyActionRecoveryDisposition(row.state);
+      if (disposition.kind === "terminal") {
+        return { outcome: disposition.outcome };
+      }
+      if (disposition.kind === "unknown") {
+        return this.#finishBillableAction(key, row, "unknown", this.#getRecord(actionId));
+      }
+    } else {
+      row = {
+        billingOperationId: execution.billingOperationId,
+        actionId,
+        ...(execution.providerIdempotencyKey
+          ? { providerIdempotencyKey: execution.providerIdempotencyKey }
+          : {}),
+        state: execution.mode === "recover" ? "unknown" : "preparing",
+      };
+      this.ctx.storage.kv.put(key, row);
+      if (row.state === "unknown") {
+        return this.#finishBillableAction(key, row, "unknown", this.#getRecord(actionId));
+      }
+      await this.ctx.storage.sync();
+    }
+
+    const record = this.#getRecord(actionId);
+    if (!record || (record.state !== "pending" && record.state !== "staged")) {
+      return this.#finishBillableAction(key, row, "failed-before-execution", record);
+    }
+
+    if (row.state === "preparing") {
+      row = { ...row, state: "preflighting" };
+      this.ctx.storage.kv.put(key, row);
+      await this.ctx.storage.sync();
+    }
+
+    let prepared: PreparedSpotifyAction;
+    try {
+      prepared = await this.#prepareAction(record.action, record);
+    } catch {
+      return this.#finishBillableAction(key, row, "failed-before-execution", record);
+    }
+
+    row = { ...row, state: "applying" };
+    this.ctx.storage.kv.put(key, row);
+    await this.ctx.storage.sync();
+
+    const activity = new SpotifyOperationActivityTracker();
+    try {
+      await prepared.execute(activity);
+    } catch {
+      return this.#finishBillableAction(
+        key,
+        row,
+        activity.actionFailureOutcome(),
+        record,
+      );
+    }
+    return this.#finishBillableAction(key, row, "accepted", record);
+  }
+
+  #finishBillableAction(
+    key: string,
+    row: SpotifyActionExecutionRow,
+    outcome: ActionExecutionOutcome,
+    record?: StoredActionRecord,
+  ): ActionExecutionResult {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.put<SpotifyActionExecutionRow>(key, { ...row, state: outcome });
+      if (record) {
+        this.ctx.storage.kv.delete(this.#actionKey(row.actionId));
+        if (outcome === "accepted") {
+          record.state = "approved";
+          record.appliedAt = Date.now();
+        } else if (outcome === "unknown") {
+          record.state = "unknown";
+        } else {
+          record.state = "failed";
+        }
+        this.ctx.storage.kv.put(this.#retiredKey(row.actionId), record);
+      }
+    });
+    this.#invalidatePendingCache();
+    this.#maybePruneRetiredActions();
+    return { outcome };
+  }
+
+  async #prepareAction(
+    action: SpotifyAction,
+    record: StoredActionRecord,
+  ): Promise<PreparedSpotifyAction> {
     switch (action.type) {
-      case "saveTracks": await this.#withApi(api => api.saveToLibrary(action.trackIds.map(trackUri))); break;
-      case "removeSavedTracks": await this.#withApi(api => api.removeFromLibrary(action.trackIds.map(trackUri))); break;
-      case "saveAlbums": await this.#withApi(api => api.saveToLibrary(action.albumIds.map(albumUri))); break;
-      case "removeSavedAlbums": await this.#withApi(api => api.removeFromLibrary(action.albumIds.map(albumUri))); break;
-      case "followArtists": await this.#withApi(api => api.saveToLibrary(action.artistIds.map(artistUri))); break;
-      case "unfollowArtists": await this.#withApi(api => api.removeFromLibrary(action.artistIds.map(artistUri))); break;
+      case "saveTracks": return { execute: activity => this.#withApi(
+        api => api.saveToLibrary(action.trackIds.map(trackUri)), activity) };
+      case "removeSavedTracks": return { execute: activity => this.#withApi(
+        api => api.removeFromLibrary(action.trackIds.map(trackUri)), activity) };
+      case "saveAlbums": return { execute: activity => this.#withApi(
+        api => api.saveToLibrary(action.albumIds.map(albumUri)), activity) };
+      case "removeSavedAlbums": return { execute: activity => this.#withApi(
+        api => api.removeFromLibrary(action.albumIds.map(albumUri)), activity) };
+      case "followArtists": return { execute: activity => this.#withApi(
+        api => api.saveToLibrary(action.artistIds.map(artistUri)), activity) };
+      case "unfollowArtists": return { execute: activity => this.#withApi(
+        api => api.removeFromLibrary(action.artistIds.map(artistUri)), activity) };
       case "playlistCreate": {
-        const created = await this.#withApi(api => api.createPlaylist({
-          name: action.name,
-          description: action.description,
-          public: action.public,
-          collaborative: action.collaborative,
-        }));
-        this.ctx.storage.kv.put(this.#provisionalKey(action.provisionalId), { realId: created.id });
-        record.revert = { kind: "playlistCreate", realId: created.id };
-        break;
+        return { execute: async activity => {
+          const created = await this.#withApi(api => api.createPlaylist({
+            name: action.name,
+            description: action.description,
+            public: action.public,
+            collaborative: action.collaborative,
+          }), activity);
+          this.ctx.storage.kv.put(this.#provisionalKey(action.provisionalId), {
+            realId: created.id,
+          });
+          record.revert = { kind: "playlistCreate", realId: created.id };
+        } };
       }
       case "playlistAdd":
       case "playlistRemove":
       case "playlistReorder":
       case "playlistReplace": {
         const realId = this.#requireRealPlaylistId(action.playlistId);
+        const { trackCount } = await this.assertEditablePlaylist(action.playlistId);
+        if (action.type === "playlistReorder" &&
+            (action.rangeStart + action.rangeLength > trackCount ||
+             action.insertBefore > trackCount)) {
+          throw new Error(
+            `reorderTracks(): range is out of bounds for a playlist with ${trackCount} track(s).`,
+          );
+        }
         // Snapshot the pre-edit ordering so revert can restore it via replace, but only for
         // reasonably-sized playlists (keeps the stored value small). NOTE: revert is best-effort —
         // unavailable items (no uri) and local files are dropped, and the replace-based restore
@@ -1773,15 +2198,33 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
           const previous = await this.#materializePlaylistEntries(realId);
           record.revert = { kind: "playlistTracks", realId, previousUris: previous.map(e => e.uri).filter(Boolean) };
         }
-        if (action.type === "playlistAdd") await this.#applyAddTracks(realId, action.uris, action.position);
-        else if (action.type === "playlistRemove") await this.#withApi(api => api.removePlaylistItems(realId, action.uris));
-        else if (action.type === "playlistReplace") await this.#setPlaylistTracks(realId, action.uris);
-        else await this.#withApi(api => api.reorderPlaylistItems(realId, action.rangeStart, action.insertBefore, action.rangeLength));
-        this.#invalidatePlaylist(realId);
-        break;
+        return { execute: async activity => {
+          if (action.type === "playlistAdd") {
+            await this.#applyAddTracks(realId, action.uris, action.position, activity);
+          } else if (action.type === "playlistRemove") {
+            await this.#withApi(
+              api => api.removePlaylistItems(realId, action.uris),
+              activity,
+            );
+          } else if (action.type === "playlistReplace") {
+            await this.#setPlaylistTracks(realId, action.uris, activity);
+          } else {
+            await this.#withApi(
+              api => api.reorderPlaylistItems(
+                realId,
+                action.rangeStart,
+                action.insertBefore,
+                action.rangeLength,
+              ),
+              activity,
+            );
+          }
+          this.#invalidatePlaylist(realId);
+        } };
       }
       case "playlistDetails": {
         const realId = this.#requireRealPlaylistId(action.playlistId);
+        await this.assertEditablePlaylist(action.playlistId);
         const current = normalizePlaylistSummary(await this.#withApi(api => api.getPlaylist(realId)));
         record.revert = {
           kind: "playlistDetails",
@@ -1793,23 +2236,34 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
             collaborative: current.collaborative,
           },
         };
-        await this.#withApi(api => api.changePlaylistDetails(realId, action.update));
-        this.#invalidatePlaylist(realId);
-        break;
+        return { execute: async activity => {
+          await this.#withApi(api => api.changePlaylistDetails(realId, action.update), activity);
+          this.#invalidatePlaylist(realId);
+        } };
       }
       case "playlistUnfollow": {
         const realId = this.#requireRealPlaylistId(action.playlistId);
-        await this.#withApi(api => api.removeFromLibrary([playlistUri(realId)]));
-        this.#invalidatePlaylist(realId);
-        break;
+        return { execute: async activity => {
+          await this.#withApi(
+            api => api.removeFromLibrary([playlistUri(realId)]),
+            activity,
+          );
+          this.#invalidatePlaylist(realId);
+        } };
       }
       case "playlistFollow": {
         const realId = this.#requireRealPlaylistId(action.playlistId);
-        await this.#withApi(api => api.saveToLibrary([playlistUri(realId)]));
-        this.#invalidatePlaylist(realId);
-        break;
+        return { execute: async activity => {
+          await this.#withApi(
+            api => api.saveToLibrary([playlistUri(realId)]),
+            activity,
+          );
+          this.#invalidatePlaylist(realId);
+        } };
       }
-      case "player": await this.#applyPlayerCommand(action.command); break;
+      case "player": return {
+        execute: activity => this.#applyPlayerCommand(action.command, activity),
+      };
     }
   }
 
@@ -1915,15 +2369,37 @@ function disposeQueue(queue: RpcStub<ApprovalQueue>): void {
   (queue as RpcStub<ApprovalQueue> & { [Symbol.dispose](): void })[Symbol.dispose]();
 }
 
+function runSessionRead<T>(
+  queue: RpcStub<ApprovalQueue>,
+  externalAccountId: string,
+  method: SpotifyBillableReadMethod,
+  read: (activity: SpotifyOperationActivity) => Promise<T>,
+  describe: (result: T) => Omit<ObservationDescription, "billingOperationId">,
+): Promise<T> {
+  return runSpotifyRead(
+    queue,
+    externalAccountId,
+    SPOTIFY_BILLING_METHODS[method],
+    read,
+    describe,
+  );
+}
+
 @validateRpc()
 class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   #gk: SpotifyGatekeeperImpl;
   #queue: RpcStub<ApprovalQueue>;
+  #externalAccountId: string;
 
-  constructor(gk: SpotifyGatekeeperImpl, queue: RpcStub<ApprovalQueue>) {
+  constructor(
+    gk: SpotifyGatekeeperImpl,
+    queue: RpcStub<ApprovalQueue>,
+    externalAccountId: string,
+  ) {
     super();
     this.#gk = gk;
     this.#queue = queue;
+    this.#externalAccountId = externalAccountId;
   }
 
   [Symbol.dispose](): void {
@@ -1936,39 +2412,55 @@ class SpotifyPlayerImpl extends RpcTarget implements SpotifyPlayer {
   }
 
   async getState(): Promise<SpotifyPlaybackState> {
-    const state = await this.#gk.playerGetState();
-    await this.#queue.authorizeObservation({
-      title: "Read playback state",
-      description: "Read the current Spotify playback state and active device.",
-    });
-    return state;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlayer.getState",
+      activity => this.#gk.playerGetState(activity),
+      () => ({
+        title: "Read playback state",
+        description: "Read the current Spotify playback state and active device.",
+      }),
+    );
   }
 
   async getDevices(): Promise<SpotifyDevice[]> {
-    const devices = await this.#gk.playerGetDevices();
-    await this.#queue.authorizeObservation({
-      title: "List playback devices",
-      description: "List the available Spotify Connect devices.",
-    });
-    return devices;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlayer.getDevices",
+      activity => this.#gk.playerGetDevices(activity),
+      () => ({
+        title: "List playback devices",
+        description: "List the available Spotify Connect devices.",
+      }),
+    );
   }
 
   async getQueue(): Promise<{ currentlyPlaying: SpotifyTrack | null; queue: SpotifyTrack[] }> {
-    const result = await this.#gk.playerGetQueue();
-    await this.#queue.authorizeObservation({
-      title: "Read playback queue",
-      description: "Read the currently playing track and the upcoming playback queue.",
-    });
-    return result;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlayer.getQueue",
+      activity => this.#gk.playerGetQueue(activity),
+      () => ({
+        title: "Read playback queue",
+        description: "Read the currently playing track and the upcoming playback queue.",
+      }),
+    );
   }
 
   async getRecentlyPlayed(limit?: number): Promise<SpotifyPlayHistoryEntry[]> {
-    const result = await this.#gk.playerGetRecentlyPlayed(limit);
-    await this.#queue.authorizeObservation({
-      title: "Read recently played",
-      description: "Read recently played tracks from listening history.",
-    });
-    return result;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlayer.getRecentlyPlayed",
+      activity => this.#gk.playerGetRecentlyPlayed(limit, activity),
+      () => ({
+        title: "Read recently played",
+        description: "Read recently played tracks from listening history.",
+      }),
+    );
   }
 
   async play(options?: SpotifyPlayOptions): Promise<void> {
@@ -2055,12 +2547,19 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   #gk: SpotifyGatekeeperImpl;
   #queue: RpcStub<ApprovalQueue>;
   #logicalId: string;
+  #externalAccountId: string;
 
-  constructor(gk: SpotifyGatekeeperImpl, queue: RpcStub<ApprovalQueue>, logicalId: string) {
+  constructor(
+    gk: SpotifyGatekeeperImpl,
+    queue: RpcStub<ApprovalQueue>,
+    logicalId: string,
+    externalAccountId: string,
+  ) {
     super();
     this.#gk = gk;
     this.#queue = queue;
     this.#logicalId = logicalId;
+    this.#externalAccountId = externalAccountId;
   }
 
   [Symbol.dispose](): void {
@@ -2068,21 +2567,34 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async getDetails(): Promise<SpotifyPlaylistSummary> {
-    const summary = await this.#gk.playlistGetDetails(this.#logicalId);
-    await this.#queue.authorizeObservation({
-      title: `Read playlist "${summary.name}"`,
-      description: `Read details of the Spotify playlist "${summary.name}" (${summary.trackCount} tracks).`,
-    });
-    return summary;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlaylist.getDetails",
+      activity => this.#gk.playlistGetDetails(this.#logicalId, activity),
+      summary => ({
+        title: `Read playlist "${summary.name}"`,
+        description: `Read details of the Spotify playlist "${summary.name}" (${summary.trackCount} tracks).`,
+      }),
+    );
   }
 
   async listTracks(limit?: number, offset?: number): Promise<SpotifyPlaylistTrack[]> {
-    const tracks = await this.#gk.playlistListTracks(this.#logicalId, limit, offset);
-    await this.#queue.authorizeObservation({
-      title: "Read playlist tracks",
-      description: `Read ${tracks.length} track(s) from the playlist.`,
-    });
-    return tracks;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlaylist.listTracks",
+      activity => this.#gk.playlistListTracks(
+        this.#logicalId,
+        limit,
+        offset,
+        activity,
+      ),
+      tracks => ({
+        title: "Read playlist tracks",
+        description: `Read ${tracks.length} track(s) from the playlist.`,
+      }),
+    );
   }
 
   async addTracks(trackUris: string[], position?: number): Promise<void> {
@@ -2094,7 +2606,6 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
       throw new Error("addTracks(): position must be a non-negative integer.");
     }
     const uris = trackUris.map(toTrackUri);
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistAdd(this.#logicalId, uris, position);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: `Add ${uris.length} track(s) to playlist`,
@@ -2105,8 +2616,10 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
 
   async removeTracks(trackUris: string[]): Promise<void> {
     if (trackUris.length === 0) return;
+    if (trackUris.length > MAX_PLAYLIST_URIS_PER_CALL) {
+      throw new Error(`removeTracks(): at most ${MAX_PLAYLIST_URIS_PER_CALL} URIs per call.`);
+    }
     const uris = trackUris.map(toTrackUri);
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistRemove(this.#logicalId, uris);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: `Remove ${uris.length} track(s) from playlist`,
@@ -2122,10 +2635,6 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
         !Number.isInteger(length) || length < 1) {
       throw new Error("reorderTracks(): rangeStart/insertBefore must be >= 0 and rangeLength >= 1.");
     }
-    const { trackCount } = await this.#gk.assertEditablePlaylist(this.#logicalId);
-    if (rangeStart + length > trackCount || insertBefore > trackCount) {
-      throw new Error(`reorderTracks(): range is out of bounds for a playlist with ${trackCount} track(s).`);
-    }
     const action = this.#gk.preparePlaylistReorder(this.#logicalId, rangeStart, insertBefore, length);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: "Reorder playlist tracks",
@@ -2139,7 +2648,6 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
       throw new Error(`replaceTracks(): at most ${MAX_PLAYLIST_URIS_PER_CALL} URIs per call.`);
     }
     const uris = trackUris.map(toTrackUri);
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistReplace(this.#logicalId, uris);
     await this.#gk.submitActionForApproval(this.#queue, action, {
       title: "Replace playlist tracks",
@@ -2153,7 +2661,6 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
     if (update.public === true && update.collaborative === true) {
       throw new Error("changeDetails(): a collaborative playlist must be private (public and collaborative cannot both be true).");
     }
-    await this.#gk.assertEditablePlaylist(this.#logicalId);
     const action = this.#gk.preparePlaylistDetails(this.#logicalId, update);
     const fields = Object.keys(update).join(", ") || "details";
     await this.#gk.submitActionForApproval(this.#queue, action, {
@@ -2182,12 +2689,16 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
   }
 
   async isFollowing(): Promise<boolean> {
-    const result = await this.#gk.isFollowingPlaylist(this.#logicalId);
-    await this.#queue.authorizeObservation({
-      title: "Check playlist follow status",
-      description: "Check whether this playlist is in your library.",
-    });
-    return result;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyPlaylist.isFollowing",
+      activity => this.#gk.isFollowingPlaylist(this.#logicalId, activity),
+      () => ({
+        title: "Check playlist follow status",
+        description: "Check whether this playlist is in your library.",
+      }),
+    );
   }
 }
 
@@ -2195,11 +2706,17 @@ class SpotifyPlaylistImpl extends RpcTarget implements SpotifyPlaylist {
 class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSession {
   #gk: SpotifyGatekeeperImpl;
   #queue: RpcStub<ApprovalQueue>;
+  #externalAccountId: string;
 
-  constructor(gk: SpotifyGatekeeperImpl, queue: RpcStub<ApprovalQueue>) {
+  constructor(
+    gk: SpotifyGatekeeperImpl,
+    queue: RpcStub<ApprovalQueue>,
+    externalAccountId: string,
+  ) {
     super();
     this.#gk = gk;
     this.#queue = queue;
+    this.#externalAccountId = externalAccountId;
   }
 
   [Symbol.dispose](): void {
@@ -2207,12 +2724,16 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async getProfile(): Promise<SpotifyProfile> {
-    const profile = await this.#gk.getProfile();
-    await this.#queue.authorizeObservation({
-      title: "Read Spotify profile",
-      description: `Read the connected Spotify account's profile (${profile.displayName ?? profile.id}).`,
-    });
-    return profile;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.getProfile",
+      activity => this.#gk.getProfile(activity),
+      profile => ({
+        title: "Read Spotify profile",
+        description: `Read the connected Spotify account's profile (${profile.displayName ?? profile.id}).`,
+      }),
+    );
   }
 
   @skipRpcValidation()
@@ -2229,57 +2750,89 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
       }
     }
     assertOptionalLimit(limit);
-    const results = await this.#gk.search(query, types as SpotifySearchType[], limit);
-    await this.#queue.authorizeObservation({
-      title: `Search Spotify for "${query}"`,
-      description: `Search the Spotify catalog for "${query}" (${types.join(", ")}).`,
-    });
-    return results;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.search",
+      activity => this.#gk.search(
+        query,
+        types as SpotifySearchType[],
+        limit,
+        activity,
+      ),
+      () => ({
+        title: `Search Spotify for "${query}"`,
+        description: `Search the Spotify catalog for "${query}" (${types.join(", ")}).`,
+      }),
+    );
   }
 
   async getTrack(trackId: string): Promise<SpotifyTrack> {
-    const track = await this.#gk.getTrack(toBareId(trackId, "track"));
-    await this.#queue.authorizeObservation({
-      title: `Read track "${track.name}"`,
-      description: `Read catalog details for the track "${track.name}".`,
-    });
-    return track;
+    const id = toBareId(trackId, "track");
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.getTrack",
+      activity => this.#gk.getTrack(id, activity),
+      track => ({
+        title: `Read track "${track.name}"`,
+        description: `Read catalog details for the track "${track.name}".`,
+      }),
+    );
   }
 
   async listSavedTracks(limit?: number, offset?: number): Promise<SpotifyTrack[]> {
-    const tracks = await this.#gk.listSavedTracks(limit, offset);
-    await this.#queue.authorizeObservation({
-      title: "Read saved tracks",
-      description: `Read ${tracks.length} saved track(s) from the library.`,
-    });
-    return tracks;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.listSavedTracks",
+      activity => this.#gk.listSavedTracks(limit, offset, activity),
+      tracks => ({
+        title: "Read saved tracks",
+        description: `Read ${tracks.length} saved track(s) from the library.`,
+      }),
+    );
   }
 
   async listSavedAlbums(limit?: number, offset?: number): Promise<SpotifyAlbumRef[]> {
-    const albums = await this.#gk.listSavedAlbums(limit, offset);
-    await this.#queue.authorizeObservation({
-      title: "Read saved albums",
-      description: `Read ${albums.length} saved album(s) from the library.`,
-    });
-    return albums;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.listSavedAlbums",
+      activity => this.#gk.listSavedAlbums(limit, offset, activity),
+      albums => ({
+        title: "Read saved albums",
+        description: `Read ${albums.length} saved album(s) from the library.`,
+      }),
+    );
   }
 
   async areTracksSaved(trackIds: string[]): Promise<boolean[]> {
-    const result = await this.#gk.areTracksSaved(trackIds.map(id => toBareId(id, "track")));
-    await this.#queue.authorizeObservation({
-      title: "Check saved tracks",
-      description: `Check whether ${trackIds.length} track(s) are saved in the library.`,
-    });
-    return result;
+    const ids = trackIds.map(id => toBareId(id, "track"));
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.areTracksSaved",
+      activity => this.#gk.areTracksSaved(ids, activity),
+      () => ({
+        title: "Check saved tracks",
+        description: `Check whether ${trackIds.length} track(s) are saved in the library.`,
+      }),
+    );
   }
 
   async areAlbumsSaved(albumIds: string[]): Promise<boolean[]> {
-    const result = await this.#gk.areAlbumsSaved(albumIds.map(id => toBareId(id, "album")));
-    await this.#queue.authorizeObservation({
-      title: "Check saved albums",
-      description: `Check whether ${albumIds.length} album(s) are saved in the library.`,
-    });
-    return result;
+    const ids = albumIds.map(id => toBareId(id, "album"));
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.areAlbumsSaved",
+      activity => this.#gk.areAlbumsSaved(ids, activity),
+      () => ({
+        title: "Check saved albums",
+        description: `Check whether ${albumIds.length} album(s) are saved in the library.`,
+      }),
+    );
   }
 
   @skipRpcValidation()
@@ -2288,12 +2841,20 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
       throw new Error(`getTopTracks(): invalid timeRange "${timeRange}". Use short_term, medium_term, or long_term.`);
     }
     assertOptionalLimit(limit);
-    const tracks = await this.#gk.getTopTracks(timeRange as SpotifyTopTimeRange | undefined, limit);
-    await this.#queue.authorizeObservation({
-      title: "Read top tracks",
-      description: `Read the user's top ${tracks.length} track(s).`,
-    });
-    return tracks;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.getTopTracks",
+      activity => this.#gk.getTopTracks(
+        timeRange as SpotifyTopTimeRange | undefined,
+        limit,
+        activity,
+      ),
+      tracks => ({
+        title: "Read top tracks",
+        description: `Read the user's top ${tracks.length} track(s).`,
+      }),
+    );
   }
 
   @skipRpcValidation()
@@ -2302,12 +2863,20 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
       throw new Error(`getTopArtists(): invalid timeRange "${timeRange}". Use short_term, medium_term, or long_term.`);
     }
     assertOptionalLimit(limit);
-    const artists = await this.#gk.getTopArtists(timeRange as SpotifyTopTimeRange | undefined, limit);
-    await this.#queue.authorizeObservation({
-      title: "Read top artists",
-      description: `Read the user's top ${artists.length} artist(s).`,
-    });
-    return artists;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.getTopArtists",
+      activity => this.#gk.getTopArtists(
+        timeRange as SpotifyTopTimeRange | undefined,
+        limit,
+        activity,
+      ),
+      artists => ({
+        title: "Read top artists",
+        description: `Read the user's top ${artists.length} artist(s).`,
+      }),
+    );
   }
 
   async saveTracks(trackIds: string[]): Promise<void> {
@@ -2377,28 +2946,42 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
   }
 
   async isFollowingArtists(artistIds: string[]): Promise<boolean[]> {
-    const result = await this.#gk.areArtistsFollowed(artistIds.map(id => toBareId(id, "artist")));
-    await this.#queue.authorizeObservation({
-      title: "Check followed artists",
-      description: `Check whether ${artistIds.length} artist(s) are followed.`,
-    });
-    return result;
+    const ids = artistIds.map(id => toBareId(id, "artist"));
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.isFollowingArtists",
+      activity => this.#gk.areArtistsFollowed(ids, activity),
+      () => ({
+        title: "Check followed artists",
+        description: `Check whether ${artistIds.length} artist(s) are followed.`,
+      }),
+    );
   }
 
   async listPlaylists(limit?: number, offset?: number): Promise<SpotifyPlaylistSummary[]> {
-    const playlists = await this.#gk.listPlaylists(limit, offset);
-    await this.#queue.authorizeObservation({
-      title: "List playlists",
-      description: `List ${playlists.length} of the user's playlists.`,
-    });
-    return playlists;
+    return await runSessionRead(
+      this.#queue,
+      this.#externalAccountId,
+      "SpotifyAccountSession.listPlaylists",
+      activity => this.#gk.listPlaylists(limit, offset, activity),
+      playlists => ({
+        title: "List playlists",
+        description: `List ${playlists.length} of the user's playlists.`,
+      }),
+    );
   }
 
   getPlaylist(playlistId: string): SpotifyPlaylist {
     // Accept a bare id, an open.spotify.com URL, a spotify:playlist: URI, or a "~N" pending id;
     // reject anything malformed up front (rather than leaking a Spotify "Invalid base62 id").
     const logicalId = toPlaylistLogicalId(playlistId);
-    return new SpotifyPlaylistImpl(this.#gk, this.#queue.dup(), logicalId);
+    return new SpotifyPlaylistImpl(
+      this.#gk,
+      this.#queue.dup(),
+      logicalId,
+      this.#externalAccountId,
+    );
   }
 
   async createPlaylist(
@@ -2417,11 +3000,16 @@ class SpotifyAccountSessionImpl extends RpcTarget implements SpotifyAccountSessi
       description: `Create a new ${options?.public ? "public" : "private"} playlist named "${name}".`,
       implementsRevert: true,
     });
-    return new SpotifyPlaylistImpl(this.#gk, this.#queue.dup(), action.provisionalId);
+    return new SpotifyPlaylistImpl(
+      this.#gk,
+      this.#queue.dup(),
+      action.provisionalId,
+      this.#externalAccountId,
+    );
   }
 
   getPlayer(): SpotifyPlayer {
-    return new SpotifyPlayerImpl(this.#gk, this.#queue.dup());
+    return new SpotifyPlayerImpl(this.#gk, this.#queue.dup(), this.#externalAccountId);
   }
 }
 

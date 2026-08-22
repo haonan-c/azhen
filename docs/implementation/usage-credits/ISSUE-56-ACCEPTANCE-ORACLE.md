@@ -27,38 +27,38 @@
 
 ## 完整 caller-visible inventory 与 canonical stable keys
 
-统一 rate unit：`1 operation`，quantity=1。以下 key 应作为集中常量/registry，不能从函数反射、HTTP method/path、title、参数或资源 ID 动态生成。这里沿现有 #54 Oracle 的 `vendor.capability.method` 规范给出 canonical 值。
+统一 rate unit：`1 operation`，quantity=1。以下 key 应作为集中常量/registry，不能从函数反射、HTTP method/path、title、参数或资源 ID 动态生成。这里沿现有 #54 Oracle 的 `vendor.capability.method` 规范给出符合 Usage Rate Registry 小写标识符约束的 canonical 值。
 
 ### SpotifyAccountSession observations（11）
 
-- `getProfile` -> `spotify.account.getProfile`
+- `getProfile` -> `spotify.account.get-profile`
 - `search` -> `spotify.account.search`
-- `getTrack` -> `spotify.account.getTrack`
-- `listSavedTracks` -> `spotify.account.listSavedTracks`
-- `listSavedAlbums` -> `spotify.account.listSavedAlbums`
-- `areTracksSaved` -> `spotify.account.areTracksSaved`
-- `areAlbumsSaved` -> `spotify.account.areAlbumsSaved`
-- `getTopTracks` -> `spotify.account.getTopTracks`
-- `getTopArtists` -> `spotify.account.getTopArtists`
-- `isFollowingArtists` -> `spotify.account.isFollowingArtists`
-- `listPlaylists` -> `spotify.account.listPlaylists`
+- `getTrack` -> `spotify.account.get-track`
+- `listSavedTracks` -> `spotify.account.list-saved-tracks`
+- `listSavedAlbums` -> `spotify.account.list-saved-albums`
+- `areTracksSaved` -> `spotify.account.are-tracks-saved`
+- `areAlbumsSaved` -> `spotify.account.are-albums-saved`
+- `getTopTracks` -> `spotify.account.get-top-tracks`
+- `getTopArtists` -> `spotify.account.get-top-artists`
+- `isFollowingArtists` -> `spotify.account.is-following-artists`
+- `listPlaylists` -> `spotify.account.list-playlists`
 
 ### SpotifyAccountSession approved actions（7）
 
-- `saveTracks` -> `spotify.account.saveTracks`
-- `removeSavedTracks` -> `spotify.account.removeSavedTracks`
-- `saveAlbums` -> `spotify.account.saveAlbums`
-- `removeSavedAlbums` -> `spotify.account.removeSavedAlbums`
-- `followArtists` -> `spotify.account.followArtists`
-- `unfollowArtists` -> `spotify.account.unfollowArtists`
-- `createPlaylist` -> `spotify.account.createPlaylist`
+- `saveTracks` -> `spotify.account.save-tracks`
+- `removeSavedTracks` -> `spotify.account.remove-saved-tracks`
+- `saveAlbums` -> `spotify.account.save-albums`
+- `removeSavedAlbums` -> `spotify.account.remove-saved-albums`
+- `followArtists` -> `spotify.account.follow-artists`
+- `unfollowArtists` -> `spotify.account.unfollow-artists`
+- `createPlaylist` -> `spotify.account.create-playlist`
 
 ### SpotifyPlayer observations（4）
 
-- `getState` -> `spotify.player.getState`
-- `getDevices` -> `spotify.player.getDevices`
-- `getQueue` -> `spotify.player.getQueue`
-- `getRecentlyPlayed` -> `spotify.player.getRecentlyPlayed`
+- `getState` -> `spotify.player.get-state`
+- `getDevices` -> `spotify.player.get-devices`
+- `getQueue` -> `spotify.player.get-queue`
+- `getRecentlyPlayed` -> `spotify.player.get-recently-played`
 
 ### SpotifyPlayer approved actions（10）
 
@@ -67,25 +67,25 @@
 - `next` -> `spotify.player.next`
 - `previous` -> `spotify.player.previous`
 - `seek` -> `spotify.player.seek`
-- `setVolume` -> `spotify.player.setVolume`
-- `setShuffle` -> `spotify.player.setShuffle`
-- `setRepeat` -> `spotify.player.setRepeat`
-- `transferTo` -> `spotify.player.transferTo`
-- `addToQueue` -> `spotify.player.addToQueue`
+- `setVolume` -> `spotify.player.set-volume`
+- `setShuffle` -> `spotify.player.set-shuffle`
+- `setRepeat` -> `spotify.player.set-repeat`
+- `transferTo` -> `spotify.player.transfer-to`
+- `addToQueue` -> `spotify.player.add-to-queue`
 
 ### SpotifyPlaylist observations（3）
 
-- `getDetails` -> `spotify.playlist.getDetails`
-- `listTracks` -> `spotify.playlist.listTracks`
-- `isFollowing` -> `spotify.playlist.isFollowing`
+- `getDetails` -> `spotify.playlist.get-details`
+- `listTracks` -> `spotify.playlist.list-tracks`
+- `isFollowing` -> `spotify.playlist.is-following`
 
 ### SpotifyPlaylist approved actions（7）
 
-- `addTracks` -> `spotify.playlist.addTracks`
-- `removeTracks` -> `spotify.playlist.removeTracks`
-- `reorderTracks` -> `spotify.playlist.reorderTracks`
-- `replaceTracks` -> `spotify.playlist.replaceTracks`
-- `changeDetails` -> `spotify.playlist.changeDetails`
+- `addTracks` -> `spotify.playlist.add-tracks`
+- `removeTracks` -> `spotify.playlist.remove-tracks`
+- `reorderTracks` -> `spotify.playlist.reorder-tracks`
+- `replaceTracks` -> `spotify.playlist.replace-tracks`
+- `changeDetails` -> `spotify.playlist.change-details`
 - `unfollow` -> `spotify.playlist.unfollow`
 - `follow` -> `spotify.playlist.follow`
 
