@@ -64,6 +64,11 @@ export default defineConfig({
       if (error.message?.includes("abortAllDurableObjects")) return false;
       // Same, for the test that aborts only the user DO (state.abort with this reason).
       if (error.message?.includes("user-DO reset injected by test")) return false;
+      if (error.message?.includes("Action billing crash") ||
+          error.message?.includes("Action recovery Overseer reset injected by test")) return false;
+      // Cap'n Web also reports the deliberately invalid Gatekeeper response independently from
+      // the rejection that the Action recovery test awaits and checks exactly.
+      if (error.message === "Gatekeeper returned an invalid Action execution outcome.") return false;
     },
   },
 });

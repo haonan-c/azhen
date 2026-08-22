@@ -22,14 +22,16 @@
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import type {
-  AccountDescription, ActionKind, ApprovalQueue, Gatekeeper, GatekeeperConnectCallback,
-  GatekeeperUser, GatekeeperUserVerifier, ResourceDescription, ResourceConfiguratorFrame,
-  SupportedResource, VendorDescription,
+  AccountDescription, ActionExecution, ActionExecutionResult, ActionKind, ApprovalQueue, Gatekeeper,
+  GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, ResourceDescription,
+  ResourceConfiguratorFrame, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
 // Nothing but classes and the default handler may be exported from a Worker entry module: workerd
 // treats every named export as an entrypoint and rejects anything that isn't one.
 const VENDOR_HOST = "gadgets-test.example";
+const ACTION_METHOD_KEY = "test.action.apply.v1";
+const ACTION_PROVIDER_ORIGIN = "https://action-provider.gadgets-test.example";
 
 const SUPPORTED_RESOURCES: SupportedResource[] = [{
   urlPattern: `https://${VENDOR_HOST}/things/*`,
@@ -41,6 +43,7 @@ const TYPES_CODE = `
 /** A stand-in resource used to trace delayed ApprovalQueue actions. */
 interface TestThing {
   requestAction(label: string): Promise<void>;
+  requestBillableAction(label: string): Promise<void>;
 }
 `;
 
@@ -85,6 +88,8 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
   getAppliedActionCount(label: string): number {
     return this.ctx.storage.kv.get<number>(`applied-actions:${label}`) ?? 0;
   }
+
+
 }
 
 // ctx.exports is typed via the Cloudflare.GlobalProps declaration in env.d.ts, so loopback bindings
@@ -230,22 +235,69 @@ export class TestVerifier
 
 export interface TestSession {
   requestAction(label: string): Promise<void>;
+  requestBillableAction(label: string, providerIdempotency?: "supported"): Promise<void>;
+  requestAutoApprovableAction(label: string): Promise<void>;
+  requestUnpricedAction(label: string): Promise<void>;
 }
 
+type TestActionExecutionRecord = {
+  billingOperationId: string;
+  action: number;
+  providerIdempotencyKey?: string;
+  state: "applying" | "accepted" | "failed-before-execution" | "unknown";
+};
+
 class TestSessionImpl extends RpcTarget implements TestSession {
-  constructor(private state: DurableObjectState, private approvalQueue: RpcStub<ApprovalQueue>) {
+  constructor(
+      private state: DurableObjectState,
+      private accountLabel: string,
+      private approvalQueue: RpcStub<ApprovalQueue>) {
     super();
   }
 
   async requestAction(label: string): Promise<void> {
+    await this.#requestAction(label);
+  }
+
+  async requestBillableAction(
+      label: string, providerIdempotency?: "supported"): Promise<void> {
+    await this.#requestAction(label, ACTION_METHOD_KEY, providerIdempotency);
+  }
+
+  async requestAutoApprovableAction(label: string): Promise<void> {
+    await this.#requestAction(label, ACTION_METHOD_KEY, undefined, true);
+  }
+
+  async requestUnpricedAction(label: string): Promise<void> {
+    await this.#requestAction(label, "test.action.unpriced.v1");
+  }
+
+  async #requestAction(
+      label: string,
+      methodKey?: string,
+      providerIdempotency?: "supported",
+      autoApprovable = false,
+  ): Promise<void> {
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(label)) throw new TypeError("Invalid test action label.");
-    const action = this.state.storage.kv.get<number>("next-action") ?? 1;
-    this.state.storage.kv.put("next-action", action + 1);
-    this.state.storage.kv.put(`action:${action}`, label);
+    let action = this.state.storage.kv.get<number>(`action-label:${label}`);
+    if (action === undefined) {
+      action = this.state.storage.kv.get<number>("next-action") ?? 1;
+      this.state.storage.kv.put("next-action", action + 1);
+      this.state.storage.kv.put(`action-label:${label}`, action);
+      this.state.storage.kv.put(`action:${action}`, label);
+    }
     await this.approvalQueue.submitAction(action, {
       title: `Test action ${label}`,
+      ...(methodKey === undefined ? {} : {billing: {
+          methodKey,
+          externalAccountId: this.accountLabel,
+          providerIdempotency: providerIdempotency ?? "unsupported",
+        }}),
+      ...(autoApprovable
+        ? {actionKind: {tag: "test-write", label: "Test writes"}, autoApprovable: true}
+        : {}),
       description: "A delayed action used only by the Usage Principal integration tracer.",
-      implementsRevert: false,
+      implementsRevert: true,
       awaitDecision: true,
     });
   }
@@ -279,11 +331,11 @@ export class TestGatekeeper
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [];
+    return [{tag: "test-write", label: "Test writes"}];
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return new TestSessionImpl(this.ctx, approvalQueue.dup());
+    return new TestSessionImpl(this.ctx, this.ctx.props.label, approvalQueue.dup());
   }
 
   /**
@@ -309,16 +361,110 @@ export class TestGatekeeper
     this.ctx.storage.kv.delete(`observer:${id}`);
   }
 
-  async applyAction(action: number): Promise<void> {
+  async applyAction(
+      action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
     const label = this.ctx.storage.kv.get<string>(`action:${action}`);
     if (!label) throw new Error("No such test action.");
+    if (!execution) {
+      await control(this.ctx.exports).recordAppliedAction(label);
+      return {outcome: "accepted"};
+    }
+    const key = `execution:${execution.billingOperationId}`;
+    let record = this.ctx.storage.kv.get<TestActionExecutionRecord>(key);
+    if (record) {
+      if (record.action !== action ||
+          record.providerIdempotencyKey !== execution.providerIdempotencyKey) {
+        throw new Error("Test Action execution identity conflicts with its durable claim.");
+      }
+      if (record.state !== "applying") return {outcome: record.state};
+      if (execution.mode === "recover" && !record.providerIdempotencyKey) {
+        record = {...record, state: "unknown"};
+        this.ctx.storage.kv.put(key, record);
+        return {outcome: "unknown"};
+      }
+    } else {
+      if (execution.mode === "recover") {
+        this.ctx.storage.kv.put<TestActionExecutionRecord>(key, {
+          billingOperationId: execution.billingOperationId,
+          action,
+          ...(execution.providerIdempotencyKey
+            ? {providerIdempotencyKey: execution.providerIdempotencyKey}
+            : {}),
+          state: "unknown",
+        });
+        return {outcome: "unknown"};
+      }
+      record = {
+        billingOperationId: execution.billingOperationId,
+        action,
+        ...(execution.providerIdempotencyKey
+          ? {providerIdempotencyKey: execution.providerIdempotencyKey}
+          : {}),
+        state: "applying",
+      };
+      this.ctx.storage.kv.put(key, record);
+    }
+
+    if (label.startsWith("preflight-")) {
+      this.ctx.storage.kv.put<TestActionExecutionRecord>(
+        key,
+        {...record, state: "failed-before-execution"},
+      );
+      return {outcome: "failed-before-execution"};
+    }
+
+    if (label.startsWith("crash-before-dispatch-")) {
+      this.ctx.abort("Test crash after the durable execution claim and before provider dispatch.");
+    }
+
+    try {
+      const response = await fetch(`${ACTION_PROVIDER_ORIGIN}/effects/${label}`, {
+        method: "POST",
+        ...(record.providerIdempotencyKey
+          ? {headers: {"idempotency-key": record.providerIdempotencyKey}}
+          : {}),
+      });
+      if (!response.ok) throw new Error("The test Action provider returned an indeterminate error.");
+    } catch (error) {
+      if (record.providerIdempotencyKey) throw error;
+      this.ctx.storage.kv.put<TestActionExecutionRecord>(key, {...record, state: "unknown"});
+      return {outcome: "unknown"};
+    }
+
+    if (label.startsWith("crash-after-provider-")) {
+      this.ctx.abort("Test crash after provider dispatch and before outcome persistence.");
+    }
+
+    this.ctx.storage.kv.put<TestActionExecutionRecord>(key, {...record, state: "accepted"});
+    if (label.startsWith("invalid-outcome-once-")) {
+      // Leave the Gatekeeper's accepted outcome durable while making the first Overseer call fail
+      // validation. The integration test can then restart the Workshop and prove the new Overseer
+      // resumes the persisted applying Action without dispatching the provider effect again.
+      return {outcome: "invalid-test-outcome" as never};
+    }
+    if (label.startsWith("crash-after-outcome-")) {
+      await this.ctx.storage.sync();
+      throw new Error("Test lost the acknowledgement after durable outcome persistence.");
+    }
     await control(this.ctx.exports).recordAppliedAction(label);
+    return {outcome: "accepted"};
   }
 
   async rejectAction(_action: number): Promise<void> {}
 
-  async revertAction(_action: number): Promise<void> {
-    throw new Error("The test gatekeeper submits no actions.");
+  async revertAction(action: number): Promise<void | {message?: string; canRetry?: boolean}> {
+    const label = this.ctx.storage.kv.get<string>(`action:${action}`);
+    if (!label) throw new Error("No such test action.");
+    const key = `revert:${action}`;
+    const state = this.ctx.storage.kv.get<"applying" | "reverted">(key);
+    if (state === "reverted") return;
+    if (state === "applying") {
+      return {message: "The test Action revert outcome is unknown.", canRetry: false};
+    }
+    this.ctx.storage.kv.put(key, "applying");
+    const response = await fetch(`${ACTION_PROVIDER_ORIGIN}/reverts/${label}`, {method: "POST"});
+    if (!response.ok) throw new Error("The test Action provider did not confirm revert.");
+    this.ctx.storage.kv.put(key, "reverted");
   }
 }
 

@@ -33,6 +33,8 @@ import * as Y from "yjs";
 
 const PROVIDER_ORIGIN = "https://deepseek-billing.test";
 const TITLE_PROVIDER_ORIGIN = "https://title-model.test";
+const ACTION_PROVIDER_ORIGIN = "https://action-provider.gadgets-test.example";
+const ACTION_METHOD_KEY = "test.action.apply.v1";
 const AGENT_PROMPT = "DEEPSEEK_AGENT_E2E_PROMPT";
 const SCHEDULER_DIR = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -341,6 +343,12 @@ beforeAll(async () => {
     apiToken: "fake-deepseek-integration-token",
     apiUrl: `${PROVIDER_ORIGIN}/v1`,
   });
+  await admin.updateUsageRates([{
+    kind: "gatekeeper-operation-rate",
+    vendorId: TEST_VENDOR_ID,
+    billingMethodKey: ACTION_METHOD_KEY,
+    amountSubunits: 25n,
+  }], "Price delayed Actions used by the integration tracer");
   const catalog = await admin.getDeploymentModelCatalog();
   const selectedModelId = catalog.models.find(
     model => model.name === "DeepSeek billing integration",
@@ -752,7 +760,7 @@ describe("DeepSeek Agent billing", () => {
     })]);
   });
 
-  it("keeps delayed approval assistance on the disconnected submitting User", async () => {
+  it("resumes delayed assistance after an administrator settles unknown Action Usage", async () => {
     const ownerPublicApi = connect(harness.url);
     const submitterPublicApi = connect(harness.url);
     const [ownerName, submitterName] = nextUsernames("actionowner", "actionsubmitter");
@@ -766,12 +774,17 @@ describe("DeepSeek Agent billing", () => {
     const submitterWorkspace = await submitter.openGadget(workspaceId);
     const ownerBefore = await owner.getUsageCreditBalance();
     const submitterBefore = await submitter.getUsageCreditBalance();
-    const actionLabel = `delayed-${crypto.randomUUID()}`;
+    const actionLabel = `unknown-delayed-${crypto.randomUUID()}`;
     let agentProviderCalls = 0;
+    let actionProviderCalls = 0;
     let signalAssistanceCall!: () => void;
     const assistanceCall = new Promise<void>(resolve => { signalAssistanceCall = resolve; });
     providerHandler = async (url, _method, _headers, request) => {
       if (url.origin === TITLE_PROVIDER_ORIGIN) return deepSeekSse();
+      if (url.origin === ACTION_PROVIDER_ORIGIN) {
+        actionProviderCalls += 1;
+        throw new Error("The Action provider response was lost after dispatch.");
+      }
       if (url.origin !== PROVIDER_ORIGIN) return null;
       const payload = JSON.parse(await request.text()) as {tools?: unknown};
       if (!Array.isArray(payload.tools) || payload.tools.length === 0) return deepSeekSse();
@@ -781,7 +794,7 @@ describe("DeepSeek Agent billing", () => {
         return deepSeekNamedToolCallSse("executeCode", {
           code: `
             export default async function(self, env) {
-              await env.TEST_AMBIENT.requestAction(${JSON.stringify(actionLabel)});
+              await env.TEST_AMBIENT.requestBillableAction(${JSON.stringify(actionLabel)});
             }
           `,
         });
@@ -804,7 +817,21 @@ describe("DeepSeek Agent billing", () => {
     submitter[Symbol.dispose]();
     submitterPublicApi[Symbol.dispose]();
 
-    await ownerWorkspace.approveAction(pending.id);
+    expect(await ownerWorkspace.approveAction(pending.id)).toBe("unknown");
+    using adminPublicApi = connect(harness.url);
+    using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected the deployment administrator capability.");
+    using usageAdmin = await admin.getUsageApi();
+    const reconciliationRequest = {
+      workspaceId,
+      actionId: pending.id,
+      operationId: `admin-action-settle:${crypto.randomUUID()}`,
+      decision: "settle" as const,
+      reason: "Provider confirmed that the delayed Action executed",
+    };
+    const reconciliation = await usageAdmin.reconcileAction(reconciliationRequest);
+    expect(await usageAdmin.reconcileAction(reconciliationRequest)).toEqual(reconciliation);
     await Promise.race([
       assistanceCall,
       new Promise<never>((_resolve, reject) =>
@@ -821,7 +848,9 @@ describe("DeepSeek Agent billing", () => {
     const ownerAfter = await owner.getUsageCreditBalance();
     const submitterAfter = await reopenedSubmitter.getUsageCreditBalance();
 
-    expect(await appliedActionCount(actionLabel)).toBe(1);
+    expect(actionProviderCalls).toBe(1);
+    expect((await ownerWorkspace.listActions()).find(action => action.id === pending.id)?.state)
+      .toBe("accepted");
     expect(ownerAfter).toEqual(ownerBefore);
     expect(ownerRecords).toEqual([]);
     expect(submitterAfter.availableSubunits).toBeLessThan(submitterBefore.availableSubunits);
@@ -829,6 +858,11 @@ describe("DeepSeek Agent billing", () => {
       expect.objectContaining({source: "agent", workspaceId, chatId}),
       expect.objectContaining({source: "system-assistance", workspaceId, chatId}),
     ]));
+    const history = await ownerWorkspace.getChatHistory(chatId);
+    expect(history.messages.filter(message =>
+      message.type === "message" &&
+      message.message.startsWith("The changes you submitted have been approved and applied:"),
+    )).toHaveLength(1);
 
     ownerWorkspace[Symbol.dispose]();
     owner[Symbol.dispose]();

@@ -286,7 +286,7 @@ describe("Gatekeeper billing tracer: priced two-stage lifecycle", () => {
     const second = await user.stub.completeGatekeeperUsage(operationId, "executed");
     expect(second).toEqual(first);
     expect(await user.stub.markGatekeeperUsageStarted(operationId))
-      .toMatchObject({ state: "settled" });
+      .toMatchObject({attempt: {state: "settled"}, startedNow: false});
 
     // Exactly one fixed API charge for the whole business operation.
     expect((await user.stub.getUsageCreditBalance()).availableSubunits)

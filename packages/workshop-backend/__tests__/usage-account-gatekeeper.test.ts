@@ -89,7 +89,10 @@ describe("Gatekeeper two-stage billing state machine", () => {
         reservedSubunits: CHARGE,
       });
 
-      expect(account.markGatekeeperUsageStarted("op-settle").state).toBe("started");
+      expect(account.markGatekeeperUsageStarted("op-settle")).toMatchObject({
+        attempt: {state: "started"},
+        startedNow: true,
+      });
 
       const record = account.completeGatekeeperUsage("op-settle", "executed");
       expect(record.outcome).toBe("settled");
@@ -174,8 +177,8 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(third).toEqual(first);
       expect(account.getBalance().reservedSubunits).toBe(CHARGE);
 
-      account.markGatekeeperUsageStarted("op-retry");
-      account.markGatekeeperUsageStarted("op-retry");
+      expect(account.markGatekeeperUsageStarted("op-retry").startedNow).toBe(true);
+      expect(account.markGatekeeperUsageStarted("op-retry").startedNow).toBe(false);
 
       const record = account.completeGatekeeperUsage("op-retry", "executed");
       expect(account.completeGatekeeperUsage("op-retry", "executed")).toEqual(record);
