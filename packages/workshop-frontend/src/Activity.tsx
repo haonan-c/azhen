@@ -112,7 +112,19 @@ function activityStatus(
   if (record.state === 'rejected') {
     return { label: messages.activity_status_denied(), dotClass: 'bg-kumo-danger', textClass: 'text-kumo-danger' }
   }
-  return { label: messages.activity_status_approved(), dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
+  if (record.state === 'accepted') {
+    return { label: messages.activity_status_accepted(), dotClass: 'bg-kumo-success', textClass: 'text-kumo-subtle' }
+  }
+  if (record.state === 'applying') {
+    return { label: messages.activity_status_applying(), dotClass: 'bg-kumo-brand', textClass: 'text-kumo-strong' }
+  }
+  if (record.state === 'failed-before-execution') {
+    return { label: messages.activity_status_failed_before_execution(), dotClass: 'bg-kumo-danger', textClass: 'text-kumo-danger' }
+  }
+  if (record.state === 'unknown') {
+    return { label: messages.activity_status_unknown(), dotClass: 'bg-kumo-danger', textClass: 'text-kumo-danger' }
+  }
+  return { label: messages.activity_status_reverted(), dotClass: 'bg-kumo-inactive', textClass: 'text-kumo-subtle' }
 }
 
 function TypeIcon({ record, className }: { record: ActionLogEntry; className?: string }) {

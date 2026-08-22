@@ -113,7 +113,7 @@ describe('localized activity', () => {
         subscriber.entry({
           id: 1,
           type: 'observation',
-          state: 'approved',
+          state: 'accepted',
           createdAt: at,
           appliedAt: at,
           resourceTitle: 'OBSERVATION RESOURCE VERBATIM',

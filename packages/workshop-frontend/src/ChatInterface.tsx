@@ -71,6 +71,7 @@ import {
   AiChatMessage,
   AiChatSubscriber,
   ActionLogEntry,
+  ActionState,
   AiChatAuthorInfo,
   CapsuleSpecifier,
   AiChatStreamEvent,
@@ -6049,7 +6050,10 @@ function ChatInterface({
     return changed;
   };
 
-  const applyOptimisticActionState = (actionId: number, state: "approved" | "rejected"): boolean => {
+  const applyResolvedActionState = (
+    actionId: number,
+    state: Exclude<ActionState, "pending" | "applying">,
+  ): boolean => {
     let changed = false;
     const locations = cacheRef.current.actionMessages.get(actionId);
     if (!locations) return false;
@@ -6122,12 +6126,12 @@ function ChatInterface({
 
   // Enable auto-approval of an action tag on its connection (gated by the confirm dialog). The
   // server applies the now-eligible pending action(s) via its drain, and the action state flips to
-  // "approved" through the actions subscription -- so we don't optimistically mutate it here.
+  // "accepted" through the actions subscription -- so we don't optimistically mutate it here.
   const { alwaysApproveTag, isTagAutoApproved } =
     useAlwaysApproveTag(overseer, setProcessingActions, onAutoApproveChange);
 
   const resolveAction = useResolveAction(overseer, setProcessingActions, (actionId, state) => {
-    if (applyOptimisticActionState(actionId, state)) forceUpdate();
+    if (applyResolvedActionState(actionId, state)) forceUpdate();
   });
 
   // Handle enabling/disabling a bound hook from the chat thread.
@@ -6691,7 +6695,7 @@ function ChatInterface({
     }
 
     const isPending = state === "pending";
-    const isApproved = state === "approved";
+    const isApproved = state === "accepted";
     const isRejected = state === "rejected";
     // A blocking (awaitDecision) pending action suspends the agent turn and blocks the composer, so
     // present it as a prominent callout with its details expanded by default.
@@ -6705,7 +6709,15 @@ function ChatInterface({
       ? uiMessages.approval_approved()
       : isRejected
         ? uiMessages.approval_denied()
-        : null;
+        : state === "applying"
+          ? uiMessages.approval_applying()
+          : state === "failed-before-execution"
+            ? uiMessages.approval_failed_before_execution()
+            : state === "unknown"
+              ? uiMessages.approval_unknown()
+              : state === "reverted"
+                ? uiMessages.approval_reverted()
+                : null;
     const stateLabelCls = isRejected
       ? "text-kumo-danger"
       : "text-kumo-inactive";
