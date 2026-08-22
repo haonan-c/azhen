@@ -568,6 +568,41 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
       });
   });
 
+  it("lets an administrator page one registered User's content-free Usage Records", async () => {
+    const user = await createDormantUser("adminusagerecords", "Admin Usage Records");
+    await user.stub.activateUsageAccount();
+    const target = await findRegistered(user.identity);
+    const operationId = "gatekeeper-operation:admin-visible";
+    await user.stub.beginGatekeeperUsage(operationId, {
+      principal: {version: 1, kind: "user", userId: user.id.toString()},
+      source: "direct-user",
+      workspaceId: "b".repeat(64),
+      vendorId: TEST_CHARGE_SNAPSHOT.vendorId,
+      billingMethodKey: TEST_CHARGE_SNAPSHOT.billingMethodKey,
+      externalAccountId: "opaque-account-sentinel",
+    }, TEST_CHARGE_SNAPSHOT);
+    await user.stub.markGatekeeperUsageStarted(operationId);
+    await user.stub.completeGatekeeperUsage(operationId, "executed");
+
+    expect(await adminUsage().listUsageRecords({
+      registeredUserRef: target.registeredUserRef,
+      limit: 1,
+    })).toMatchObject({
+      records: [{
+        kind: "gatekeeper",
+        id: "usage-record:gatekeeper-operation:admin-visible",
+        source: "direct-user",
+        vendorId: TEST_CHARGE_SNAPSHOT.vendorId,
+        billingMethodKey: TEST_CHARGE_SNAPSHOT.billingMethodKey,
+        externalAccountId: "opaque-account-sentinel",
+        pricing: "priced",
+        outcome: "settled",
+        chargeSubunits: TEST_CHARGE_SNAPSHOT.chargeSubunits,
+      }],
+      nextCursor: null,
+    });
+  });
+
   it("preserves a consumed original, permits the exact negative balance, and blocks paid work",
       async () => {
     const user = await createDormantUser("negativebalance", "Negative Balance");

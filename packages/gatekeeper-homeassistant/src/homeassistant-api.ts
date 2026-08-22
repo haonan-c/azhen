@@ -12,6 +12,8 @@
 // ---------------------------------------------------------------------------
 // Errors
 
+import type { HomeAssistantReadActivity } from "./billing";
+
 export class HomeAssistantError extends Error {
   readonly status?: number;
   /** When true, this error indicates the LLAT is invalid or revoked. */
@@ -32,6 +34,8 @@ export interface HomeAssistantCredentials {
   baseUrl: string;
   /** A long-lived access token. */
   token: string;
+  /** Optional Worker service transport for a bound Home Assistant upstream. */
+  fetcher?: Fetcher;
 }
 
 function joinUrl(baseUrl: string, path: string): string {
@@ -71,6 +75,7 @@ async function fetchJson<T>(
   creds: HomeAssistantCredentials,
   path: string,
   init: RequestInit = {},
+  activity?: HomeAssistantReadActivity,
 ): Promise<T> {
   const url = joinUrl(creds.baseUrl, path);
   const headers = new Headers(init.headers ?? {});
@@ -91,7 +96,13 @@ async function fetchJson<T>(
 
   let response: Response;
   try {
-    response = await fetch(url, { ...init, headers, signal: controller.signal });
+    activity?.requestDispatched();
+    response = await (creds.fetcher?.fetch(url, {
+      ...init,
+      headers,
+      signal: controller.signal,
+    }) ?? fetch(url, { ...init, headers, signal: controller.signal }));
+    activity?.responseReceived();
   } catch (e: any) {
     if (controller.signal.aborted && e?.name === "AbortError") {
       throw new HomeAssistantError(
@@ -129,18 +140,26 @@ async function fetchJson<T>(
 }
 
 export class HomeAssistantRest {
-  constructor(private readonly creds: HomeAssistantCredentials) {}
+  constructor(
+    private readonly creds: HomeAssistantCredentials,
+    private readonly activity?: HomeAssistantReadActivity,
+  ) {}
 
   async getConfig(): Promise<any> {
-    return await fetchJson(this.creds, "api/config");
+    return await fetchJson(this.creds, "api/config", {}, this.activity);
   }
 
   async getStates(): Promise<any[]> {
-    return await fetchJson(this.creds, "api/states");
+    return await fetchJson(this.creds, "api/states", {}, this.activity);
   }
 
   async getState(entityId: string): Promise<any> {
-    return await fetchJson(this.creds, `api/states/${encodeURIComponent(entityId)}`);
+    return await fetchJson(
+      this.creds,
+      `api/states/${encodeURIComponent(entityId)}`,
+      {},
+      this.activity,
+    );
   }
 
   // NOTE: Service calls and event firing go through the WebSocket API instead of REST. See
@@ -153,7 +172,7 @@ export class HomeAssistantRest {
     return await fetchJson(this.creds, "api/template", {
       method: "POST",
       body: JSON.stringify({ template, variables }),
-    });
+    }, this.activity);
   }
 
   async getHistory(
@@ -167,7 +186,7 @@ export class HomeAssistantRest {
     if (end) params.set("end_time", end.toISOString());
     if (minimal) params.set("minimal_response", "true");
     const path = `api/history/period/${start.toISOString()}?${params.toString()}`;
-    return await fetchJson(this.creds, path);
+    return await fetchJson(this.creds, path, {}, this.activity);
   }
 
   async getLogbook(start: Date, end?: Date, entityId?: string): Promise<any[]> {
@@ -175,16 +194,16 @@ export class HomeAssistantRest {
     if (end) params.set("end_time", end.toISOString());
     if (entityId) params.set("entity", entityId);
     const path = `api/logbook/${start.toISOString()}?${params.toString()}`;
-    return await fetchJson(this.creds, path);
+    return await fetchJson(this.creds, path, {}, this.activity);
   }
 
   async getServices(): Promise<any[]> {
-    return await fetchJson(this.creds, "api/services");
+    return await fetchJson(this.creds, "api/services", {}, this.activity);
   }
 
   /** Quick check that the API is reachable and credentials are valid. */
   async ping(): Promise<{ message: string }> {
-    return await fetchJson(this.creds, "api/");
+    return await fetchJson(this.creds, "api/", {}, this.activity);
   }
 }
 
@@ -234,9 +253,11 @@ export class HomeAssistantWebSocket {
   #pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
   #closed = false;
   #closePromise: Promise<void>;
+  #activity?: HomeAssistantReadActivity;
 
-  private constructor(ws: WebSocket) {
+  private constructor(ws: WebSocket, activity?: HomeAssistantReadActivity) {
     this.#ws = ws;
+    this.#activity = activity;
     this.#closePromise = new Promise<void>((resolve) => {
       ws.addEventListener("close", () => {
         this.#closed = true;
@@ -266,6 +287,7 @@ export class HomeAssistantWebSocket {
       const pending = this.#pending.get(msg.id);
       if (!pending) return;
       this.#pending.delete(msg.id);
+      this.#activity?.responseReceived();
       if (msg.success) {
         pending.resolve(msg.result);
       } else {
@@ -279,12 +301,30 @@ export class HomeAssistantWebSocket {
   }
 
   /** Open a new authenticated WebSocket connection. */
-  static async connect(creds: HomeAssistantCredentials): Promise<HomeAssistantWebSocket> {
+  static async connect(
+    creds: HomeAssistantCredentials,
+    activity?: HomeAssistantReadActivity,
+  ): Promise<HomeAssistantWebSocket> {
     const wsUrl = websocketUrl(creds.baseUrl);
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl);
+      if (creds.fetcher) {
+        const fetchUrl = new URL(wsUrl);
+        fetchUrl.protocol = fetchUrl.protocol === "wss:" ? "https:" : "http:";
+        const response = await creds.fetcher.fetch(fetchUrl, {
+          headers: { Upgrade: "websocket" },
+        });
+        const responseSocket = response.webSocket;
+        if (response.status !== 101 || responseSocket === null) {
+          throw new Error(`unexpected HTTP status ${response.status}`);
+        }
+        ws = responseSocket;
+        ws.accept();
+      } else {
+        ws = new WebSocket(wsUrl);
+      }
     } catch (e: any) {
+      activity?.upstreamFailedBeforeDispatch();
       throw new HomeAssistantError(
         `Failed to open WebSocket to ${wsUrl}: ${e?.message ?? e}`,
       );
@@ -342,11 +382,15 @@ export class HomeAssistantWebSocket {
         };
         ws.addEventListener("message", onMessage);
       });
+    } catch (error) {
+      activity?.upstreamFailedBeforeDispatch();
+      try { ws.close(); } catch { /* ignore */ }
+      throw error;
     } finally {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     }
 
-    return new HomeAssistantWebSocket(ws);
+    return new HomeAssistantWebSocket(ws, activity);
   }
 
   /** Send a command and wait for the result. */
@@ -358,6 +402,7 @@ export class HomeAssistantWebSocket {
     const promise = new Promise<T>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
     });
+    this.#activity?.requestDispatched();
     this.#ws.send(JSON.stringify({ ...command, id }));
     return promise;
   }
@@ -414,8 +459,9 @@ export class HomeAssistantWebSocket {
 export async function withWebSocket<T>(
   creds: HomeAssistantCredentials,
   fn: (ws: HomeAssistantWebSocket) => Promise<T>,
+  activity?: HomeAssistantReadActivity,
 ): Promise<T> {
-  const ws = await HomeAssistantWebSocket.connect(creds);
+  const ws = await HomeAssistantWebSocket.connect(creds, activity);
   try {
     return await fn(ws);
   } finally {
@@ -438,8 +484,9 @@ export interface RegistrySnapshot {
 
 export async function fetchRegistrySnapshot(
   creds: HomeAssistantCredentials,
+  activity?: HomeAssistantReadActivity,
 ): Promise<RegistrySnapshot> {
-  const states = await new HomeAssistantRest(creds).getStates();
+  const states = await new HomeAssistantRest(creds, activity).getStates();
   const stateMap = new Map<string, any>();
   for (const s of states) {
     stateMap.set(s.entity_id, s);
@@ -454,5 +501,5 @@ export async function fetchRegistrySnapshot(
       ws.send<any[]>({ type: "config/entity_registry/list" }),
     ]);
     return { areas, floors, labels, devices, entities, states: stateMap };
-  });
+  }, activity);
 }

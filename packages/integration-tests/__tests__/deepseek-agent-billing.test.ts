@@ -10,6 +10,7 @@ import {
   type ExactRatio,
   type ModelUsageRateCatalogEntry,
   type UserModelUsageRecord,
+  type UserUsageRecord,
 } from "@gadgets/workshop-shared/api";
 import {
   ADMIN_USERNAME,
@@ -53,8 +54,9 @@ let deploymentModelId: string;
 let rateEntry: ModelUsageRateCatalogEntry;
 let creditConversion: ExactRatio;
 
-function recordsForDeploymentModel(records: UserModelUsageRecord[]): UserModelUsageRecord[] {
-  return records.filter(record => record.deploymentModelId === deploymentModelId);
+function recordsForDeploymentModel(records: UserUsageRecord[]): UserModelUsageRecord[] {
+  return records.filter((record): record is UserModelUsageRecord =>
+    record.kind === "model" && record.deploymentModelId === deploymentModelId);
 }
 
 async function signInWhenAvailable(username: string): Promise<{

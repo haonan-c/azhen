@@ -151,9 +151,11 @@ describe("Deployment Model invocation metering", () => {
     expect(origins).toHaveLength(2);
     expect(new Set(origins)).toEqual(new Set([AGENT_ORIGIN, QUICK_ORIGIN]));
     // One Metering Attempt per provider inference, each naming the model that actually ran it.
-    expect(new Set(records.map(record => `${record.source}:${record.deploymentModelId}`)))
+    const modelRecords = records.filter(record => record.kind === "model");
+    expect(modelRecords).toHaveLength(records.length);
+    expect(new Set(modelRecords.map(record => `${record.source}:${record.deploymentModelId}`)))
         .toEqual(new Set([`agent:${agentModelId}`, `system-assistance:${quickModelId}`]));
-    for (const record of records) {
+    for (const record of modelRecords) {
       expect(record).toMatchObject({
         kind: "model",
         outcome: "settled",

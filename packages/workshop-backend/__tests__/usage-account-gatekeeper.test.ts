@@ -60,7 +60,8 @@ const ATTRIBUTION: GatekeeperUsageAttribution = {
  * The account and its storage must never escape this callback: Workers forbids touching one
  * Durable Object's I/O objects from another.
  */
-async function withAccount<T>(body: (account: UsageAccount) => T): Promise<T> {
+async function withAccount<T>(
+    body: (account: UsageAccount, storage: DurableObjectStorage) => T): Promise<T> {
   const username = `gk-usage-${crypto.randomUUID()}`;
   const stub = users.get(users.idFromName(username));
   const token = await stub.createAccount(username, username, new Uint8Array([2, 4, 6, 8]));
@@ -73,7 +74,7 @@ async function withAccount<T>(body: (account: UsageAccount) => T): Promise<T> {
     }));
     // Materialize the initial grant so later calls need no snapshot argument.
     account.getBalance(GRANT);
-    return body(account);
+    return body(account, state.storage);
   });
 }
 
@@ -110,7 +111,8 @@ describe("Gatekeeper two-stage billing state machine", () => {
 
   it("records an explicit zero-credit Attempt for Unpriced Use and charges nothing", async () => {
     await withAccount(account => {
-      const attempt = account.beginGatekeeperUsage("op-unpriced", ATTRIBUTION, UNPRICED);
+      const operationId = "gatekeeper-operation:unpriced-test";
+      const attempt = account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
       expect(attempt.reservationId).toBeNull();
       expect(attempt.reservationAmountSubunits).toBe(0n);
       expect(account.getBalance()).toEqual({
@@ -118,8 +120,8 @@ describe("Gatekeeper two-stage billing state machine", () => {
         reservedSubunits: 0n,
       });
 
-      account.markGatekeeperUsageStarted("op-unpriced");
-      const record = account.completeGatekeeperUsage("op-unpriced", "executed");
+      account.markGatekeeperUsageStarted(operationId);
+      const record = account.completeGatekeeperUsage(operationId, "executed");
       expect(record.outcome).toBe("settled");
       expect(record.chargeSubunits).toBe(0n);
       expect(record.ledgerEntryId).toBeNull();
@@ -132,6 +134,97 @@ describe("Gatekeeper two-stage billing state machine", () => {
       const snapshot = account.getSnapshot();
       expect(snapshot.unpricedUsageDecisions).toHaveLength(1);
       expect(snapshot.unpricedUsageDecisions[0]!.chargeSnapshot.pricing).toBe("unpriced");
+      expect(account.listUserUsageRecords({limit: 10}).records).toEqual([{
+        kind: "gatekeeper",
+        id: "usage-record:gatekeeper-operation:unpriced-test",
+        source: ATTRIBUTION.source,
+        workspaceId: ATTRIBUTION.workspaceId,
+        chatId: ATTRIBUTION.chatId,
+        vendorId: ATTRIBUTION.vendorId,
+        billingMethodKey: ATTRIBUTION.billingMethodKey,
+        externalAccountId: ATTRIBUTION.externalAccountId,
+        pricing: "unpriced",
+        outcome: "settled",
+        chargeSubunits: 0n,
+        createdAt: record.createdAt,
+      }]);
+    });
+  });
+
+  it("paginates user-visible Gatekeeper Usage Records", async () => {
+    await withAccount(account => {
+      for (const suffix of ["page-a", "page-b"]) {
+        const operationId = `gatekeeper-operation:${suffix}`;
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+
+      const first = account.listUserUsageRecords({limit: 1});
+      expect(first.records).toHaveLength(1);
+      expect(first.nextCursor).not.toBeNull();
+      const second = account.listUserUsageRecords({limit: 1, cursor: first.nextCursor!});
+      expect(second.records).toHaveLength(1);
+      expect(second.nextCursor).toBeNull();
+      expect(new Set([...first.records, ...second.records].map(record => record.id))).toEqual(
+        new Set([
+          "usage-record:gatekeeper-operation:page-a",
+          "usage-record:gatekeeper-operation:page-b",
+        ]),
+      );
+    });
+  });
+
+  it("lists Action and Observation Usage Records together", async () => {
+    await withAccount(account => {
+      for (const operationId of [
+        "gatekeeper-operation:mixed-read",
+        "gatekeeper-action:mixed-action",
+      ]) {
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+
+      const records = account.listUserUsageRecords({limit: 10}).records;
+      expect(new Set(records.map(record => record.id))).toEqual(new Set([
+        "usage-record:gatekeeper-operation:mixed-read",
+        "usage-record:gatekeeper-action:mixed-action",
+      ]));
+    });
+  });
+
+  it("lazily indexes old Usage Records in bounded resumable batches", async () => {
+    await withAccount((account, storage) => {
+      for (let index = 0; index < 101; ++index) {
+        const operationId = `gatekeeper-operation:legacy-unindexed-${index}`;
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+      for (const [key] of storage.kv.list({
+        prefix: "usageAccount:gatekeeperUsageTimeIndex:",
+      })) {
+        storage.kv.delete(key);
+      }
+
+      expect(() => account.listUserUsageRecords({limit: 100})).toThrow(
+        "Usage Records are being prepared. Retry the request.",
+      );
+      expect(Array.from(storage.kv.list({
+        prefix: "usageAccount:gatekeeperUsageTimeIndex:",
+      }))).toHaveLength(100);
+      expect(storage.kv.get("usageAccount:gatekeeperUsageTimeIndexMigrationCursor:v1"))
+        .toBeTypeOf("string");
+
+      const page = account.listUserUsageRecords({limit: 100});
+      expect(page.records).toHaveLength(100);
+      expect(page.nextCursor).not.toBeNull();
+      expect(Array.from(storage.kv.list({
+        prefix: "usageAccount:gatekeeperUsageTimeIndex:",
+      }))).toHaveLength(101);
+      expect(storage.kv.get("usageAccount:gatekeeperUsageTimeIndexMigrationCursor:v1"))
+        .toBeUndefined();
     });
   });
 

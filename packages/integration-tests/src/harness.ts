@@ -61,6 +61,14 @@ export type GatekeeperSpec = {
   patch?: (config: WorkerConfig) => void;
 };
 
+/** A real auxiliary Worker booted in the harness without binding it as a Gatekeeper vendor. */
+export type AuxiliaryWorkerSpec = {
+  /** Worker package or fixture directory containing wrangler.jsonc. */
+  dir: string;
+  /** Optional test-only configuration adjustment. */
+  patch?: (config: WorkerConfig) => void;
+};
+
 // Read a checked-in wrangler.jsonc and make it usable as an *inline* harness config.
 //
 // A worker whose `main` is generated (capnweb-validate) needs `build.cwd` pinned to its own directory
@@ -123,6 +131,8 @@ export type Harness = {
 
 export async function startHarness(opts: {
   gatekeepers: GatekeeperSpec[];
+  /** Additional Workers, such as a protocol-faithful mock upstream. */
+  auxiliaryWorkers?: AuxiliaryWorkerSpec[];
   patchWorkshop?: (config: WorkerConfig) => void;
   /** Defaults to this repo's root. Override when a gatekeeper lives outside it. */
   root?: string;
@@ -134,13 +144,18 @@ export async function startHarness(opts: {
     gk.patch?.(config);
     return { binding: gk.binding, name: config.name, config };
   });
-
+  const auxiliaryWorkers = (opts.auxiliaryWorkers ?? []).map(worker => {
+    const config = readWorkerConfig(worker.dir);
+    worker.patch?.(config);
+    return config;
+  });
   const server = createTestHarness({
     root: opts.root ?? REPO_ROOT,
     // workshop-backend is primary, so unrouted requests (e.g. /api) go to it.
     workers: [
       { config: workshopConfig(gatekeepers, opts.patchWorkshop) },
       ...gatekeepers.map(({ config }) => ({ config })),
+      ...auxiliaryWorkers.map(config => ({ config })),
     ],
   });
 

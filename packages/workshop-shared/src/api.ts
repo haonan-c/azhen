@@ -515,10 +515,47 @@ export type UserModelUsageRecord = {
   createdAt: string;
 };
 
+/** User-safe, content-free projection of one Gatekeeper API Usage Record. */
+export type UserGatekeeperUsageRecord = {
+  /** Usage Record discriminator. */
+  kind: "gatekeeper";
+  /** Opaque stable identifier safe to use as a UI list key. */
+  id: string;
+  /** Origin of this Gatekeeper operation. */
+  source: UsageSource;
+  /** Workspace that ran the operation. */
+  workspaceId: string;
+  /** Conversation that ran the operation, when applicable. */
+  chatId?: number;
+  /** App that ran the operation, when applicable. */
+  gadgetId?: WorkpieceId;
+  /** Stable unattended automation identifier, when applicable. */
+  automationId?: string;
+  /** Stable identifier for one unattended automation run, when applicable. */
+  automationRunId?: string;
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Stable caller-visible business-method key. */
+  billingMethodKey: string;
+  /** Opaque connected external-account dimension supplied by the Gatekeeper. */
+  externalAccountId: string;
+  /** Whether the immutable Charge Snapshot had a configured rate. */
+  pricing: "priced" | "unpriced";
+  /** Durable terminal outcome of the Metering Attempt. */
+  outcome: "settled" | "failed-before-execution" | "usage-unknown";
+  /** Exact Usage Credit charged, zero for priced-zero or Unpriced Use, or null when unresolved. */
+  chargeSubunits: bigint | null;
+  /** Canonical UTC completion time. */
+  createdAt: string;
+};
+
+/** User-safe projection of one model or Gatekeeper Usage Record. */
+export type UserUsageRecord = UserModelUsageRecord | UserGatekeeperUsageRecord;
+
 /** One bounded page of the authenticated User's own Usage Records. */
 export type UserUsageRecordPage = {
   /** Records in descending completion order. */
-  records: UserModelUsageRecord[];
+  records: UserUsageRecord[];
   /** Opaque cursor for the next page, or null when this page is complete. */
   nextCursor: string | null;
 };
@@ -853,6 +890,12 @@ export type AdminUsageUserSearchResult = {
   nextCursor: string | null;
 };
 
+/** Administrator request for one registered User's content-free Usage Records. */
+export type AdminUsageRecordPageRequest = UserUsageRecordPageRequest & {
+  /** Opaque target returned by Registry search. */
+  registeredUserRef: string;
+};
+
 /** Exact authoritative balance components captured around one administrator correction. */
 export type AdminUsageBalanceState = {
   /** Sum of every immutable Credit Ledger Entry delta. */
@@ -988,6 +1031,9 @@ export type AdminActionReconciliationResult = {
 export interface AdminUsageApi {
   /** Search only the authoritative Registry without waking or fabricating User Durable Objects. */
   searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult>;
+
+  /** Return one bounded page of a registered User's content-free Usage Records. */
+  listUsageRecords(request: AdminUsageRecordPageRequest): Promise<UserUsageRecordPage>;
 
   /** Append one exact positive administrator grant to a registered User. */
   grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult>;

@@ -475,7 +475,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.getBalance();
   }
 
-  /** Return one bounded page of this User's content-free model Usage Records. */
+  /** Return one bounded page of this User's content-free Usage Records. */
   async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
     await this.activateUsageAccount();
     return this.usageAccount.listUserUsageRecords(request);

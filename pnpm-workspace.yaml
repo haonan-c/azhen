@@ -46,6 +46,7 @@ allowBuilds:
   '@google/genai': true
   core-js-pure: true
   esbuild: true
+  msw: false
   protobufjs: true
   sharp: true
   workerd: true

@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageRecordPageRequest, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -840,6 +840,16 @@ function normalizeAdminUsageSearchRequest(
   };
 }
 
+function normalizeAdminUsageRecordPageRequest(
+    request: AdminUsageRecordPageRequest): AdminUsageRecordPageRequest {
+  assertExactRpcObject(request, ["registeredUserRef"], ["cursor", "limit"]);
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    ...(request.cursor === undefined ? {} : {cursor: request.cursor}),
+    ...(request.limit === undefined ? {} : {limit: request.limit}),
+  };
+}
+
 function normalizeAdminUsageGrantRequest(request: AdminUsageGrantRequest): AdminUsageGrantRequest {
   assertExactRpcObject(
     request,
@@ -944,6 +954,15 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
 
   searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
     return this.admin.searchRegisteredUsageUsers(normalizeAdminUsageSearchRequest(request));
+  }
+
+  async listUsageRecords(request: AdminUsageRecordPageRequest): Promise<UserUsageRecordPage> {
+    const normalized = normalizeAdminUsageRecordPageRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    return user.listUsageRecords({
+      ...(normalized.cursor === undefined ? {} : {cursor: normalized.cursor}),
+      ...(normalized.limit === undefined ? {} : {limit: normalized.limit}),
+    });
   }
 
   async grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult> {

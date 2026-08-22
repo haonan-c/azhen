@@ -1,0 +1,6 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "homeassistant-upstream",
+  "main": "src/homeassistant-upstream.ts",
+  "compatibility_date": "2026-02-02"
+}

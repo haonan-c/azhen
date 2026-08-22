@@ -8,6 +8,7 @@ import {
   type ModelChargeSnapshot,
   type PricedChargeSnapshot,
   type UsageCreditBalance,
+  type UserGatekeeperUsageRecord,
   type UserModelUsageRecord,
   type UserUsageRecordPage,
   type UserUsageRecordPageRequest,
@@ -37,12 +38,18 @@ const MODEL_USAGE_RECORD_PREFIX = "usageAccount:modelUsageRecord:";
 const MODEL_USAGE_TIME_INDEX_PREFIX = "usageAccount:modelUsageTimeIndex:";
 const GATEKEEPER_ATTEMPT_PREFIX = "usageAccount:gatekeeperAttempt:";
 const GATEKEEPER_USAGE_RECORD_PREFIX = "usageAccount:gatekeeperUsageRecord:";
+const GATEKEEPER_USAGE_TIME_INDEX_PREFIX = "usageAccount:gatekeeperUsageTimeIndex:";
+const GATEKEEPER_USAGE_TIME_INDEX_VERSION_KEY =
+  "usageAccount:gatekeeperUsageTimeIndexVersion:v1";
+const GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_CURSOR_KEY =
+  "usageAccount:gatekeeperUsageTimeIndexMigrationCursor:v1";
 const GATEKEEPER_RECONCILIATION_PREFIX = "usageAccount:gatekeeperReconciliation:";
 const GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX =
   "usageAccount:gatekeeperReconciliationByUsage:";
 const BILLING_BLOCK_KEY = "usageAccount:billingBlock:v1";
 const DEFAULT_USER_USAGE_PAGE_LIMIT = 50;
 const MAX_USER_USAGE_PAGE_LIMIT = 100;
+const GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH = 100;
 
 type TransactionResult<T> = { value: T } | { error: Error };
 
@@ -364,35 +371,97 @@ export class UsageAccount {
     });
   }
 
-  /** Return one bounded, content-free page of this User's model Usage Records. */
+  /** Return one bounded, content-free page of this User's Usage Records. */
   listUserUsageRecords(request: UserUsageRecordPageRequest): UserUsageRecordPage {
     const {cursor, limit} = normalizeUserUsageRecordPageRequest(request);
+    const indexReady = this.storage.transactionSync(() =>
+      this.migrateGatekeeperUsageTimeIndexBatch());
+    if (!indexReady) {
+      throw new Error("Usage Records are being prepared. Retry the request.");
+    }
     return this.storage.transactionSync(() => {
-      const entries = Array.from(this.storage.kv.list<string>({
+      const modelEntries = Array.from(this.storage.kv.list<string>({
         prefix: MODEL_USAGE_TIME_INDEX_PREFIX,
         reverse: true,
         limit: limit + 1,
         ...(cursor === undefined
           ? {} : {end: MODEL_USAGE_TIME_INDEX_PREFIX + cursor}),
+      })).map(([indexKey, operationId]) => ({
+        kind: "model" as const,
+        indexKey,
+        operationId,
+        cursor: indexKey.slice(MODEL_USAGE_TIME_INDEX_PREFIX.length),
       }));
+      const gatekeeperEntries = Array.from(this.storage.kv.list<string>({
+        prefix: GATEKEEPER_USAGE_TIME_INDEX_PREFIX,
+        reverse: true,
+        limit: limit + 1,
+        ...(cursor === undefined
+          ? {} : {end: GATEKEEPER_USAGE_TIME_INDEX_PREFIX + cursor}),
+      })).map(([indexKey, operationId]) => ({
+        kind: "gatekeeper" as const,
+        indexKey,
+        operationId,
+        cursor: indexKey.slice(GATEKEEPER_USAGE_TIME_INDEX_PREFIX.length),
+      }));
+      const entries = [...modelEntries, ...gatekeeperEntries]
+        .toSorted((left, right) => right.cursor.localeCompare(left.cursor));
       const visible = entries.slice(0, limit);
-      const records = visible.map(([indexKey, operationId]) => {
-        const record = this.storage.kv.get<ModelUsageRecord>(
-          MODEL_USAGE_RECORD_PREFIX + operationId,
-        );
-        if (!record || indexKey !== modelUsageTimeIndexKey(record)) {
-          throw new Error("Model Usage Record index does not reconcile.");
+      const records = visible.map(entry => {
+        if (entry.kind === "model") {
+          const record = this.storage.kv.get<ModelUsageRecord>(
+            MODEL_USAGE_RECORD_PREFIX + entry.operationId,
+          );
+          if (!record || entry.indexKey !== modelUsageTimeIndexKey(record)) {
+            throw new Error("Model Usage Record index does not reconcile.");
+          }
+          assertModelUsageRecord(record, entry.operationId);
+          return userModelUsageRecord(record);
         }
-        assertModelUsageRecord(record, operationId);
-        return userModelUsageRecord(record);
+        const record = this.storage.kv.get<GatekeeperUsageRecord>(
+          GATEKEEPER_USAGE_RECORD_PREFIX + entry.operationId,
+        );
+        if (!record || entry.indexKey !== gatekeeperUsageTimeIndexKey(record)) {
+          throw new Error("Gatekeeper Usage Record index does not reconcile.");
+        }
+        assertGatekeeperUsageRecord(record, entry.operationId);
+        return userGatekeeperUsageRecord(record);
       });
       return {
         records,
         nextCursor: entries.length > limit
-          ? visible.at(-1)![0].slice(MODEL_USAGE_TIME_INDEX_PREFIX.length)
+          ? visible.at(-1)!.cursor
           : null,
       };
     });
+  }
+
+  private migrateGatekeeperUsageTimeIndexBatch(): boolean {
+    if (this.storage.kv.get<boolean>(GATEKEEPER_USAGE_TIME_INDEX_VERSION_KEY) === true) return true;
+    const startAfter = this.storage.kv.get<string>(
+      GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_CURSOR_KEY,
+    );
+    const entries = Array.from(this.storage.kv.list<GatekeeperUsageRecord>({
+      prefix: GATEKEEPER_USAGE_RECORD_PREFIX,
+      ...(startAfter === undefined ? {} : {startAfter}),
+      limit: GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH + 1,
+    }));
+    const batch = entries.slice(0, GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH);
+    for (const [recordKey, record] of batch) {
+      const operationId = recordKey.slice(GATEKEEPER_USAGE_RECORD_PREFIX.length);
+      assertGatekeeperUsageRecord(record, operationId);
+      this.storage.kv.put(gatekeeperUsageTimeIndexKey(record), operationId);
+    }
+    if (entries.length > GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH) {
+      this.storage.kv.put(
+        GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_CURSOR_KEY,
+        batch.at(-1)![0],
+      );
+      return false;
+    }
+    this.storage.kv.delete(GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_CURSOR_KEY);
+    this.storage.kv.put(GATEKEEPER_USAGE_TIME_INDEX_VERSION_KEY, true);
+    return true;
   }
 
   /** Atomically reserve positive Credit for one stable operation ID. */
@@ -1159,6 +1228,7 @@ export class UsageAccount {
         createdAt: completedAt,
       };
       this.storage.kv.put(recordKey, record);
+      this.storage.kv.put(gatekeeperUsageTimeIndexKey(record), operationId);
       this.storage.kv.put<GatekeeperMeteringAttempt>(attemptKey, {
         ...attempt,
         state: outcome,
@@ -2043,6 +2113,10 @@ function modelUsageTimeIndexKey(record: ModelUsageRecord): string {
   return `${MODEL_USAGE_TIME_INDEX_PREFIX}${record.createdAt}:${record.operationId}`;
 }
 
+function gatekeeperUsageTimeIndexKey(record: GatekeeperUsageRecord): string {
+  return `${GATEKEEPER_USAGE_TIME_INDEX_PREFIX}${record.createdAt}:${record.operationId}`;
+}
+
 function normalizeUserUsageRecordPageRequest(
     value: UserUsageRecordPageRequest): {cursor?: string; limit: number} {
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
@@ -2094,6 +2168,39 @@ function userModelUsageRecord(record: ModelUsageRecord): UserModelUsageRecord {
       outputTokens: record.usage.outputTokens,
       reasoningTokens: record.usage.reasoningTokens,
     },
+    chargeSubunits: record.chargeSubunits,
+    createdAt: record.createdAt,
+  };
+}
+
+function userGatekeeperUsageRecord(
+    record: GatekeeperUsageRecord): UserGatekeeperUsageRecord {
+  if (!record.operationId.startsWith("gatekeeper-operation:") &&
+      !record.operationId.startsWith("gatekeeper-action:")) {
+    throw new Error("Gatekeeper Usage Record public identity is invalid.");
+  }
+  return {
+    kind: "gatekeeper",
+    id: `usage-record:${record.operationId}`,
+    source: record.attribution.source,
+    workspaceId: record.attribution.workspaceId,
+    ...(record.attribution.chatId !== undefined
+      ? {chatId: record.attribution.chatId}
+      : {}),
+    ...(record.attribution.gadgetId !== undefined
+      ? {gadgetId: record.attribution.gadgetId}
+      : {}),
+    ...(record.attribution.automationId !== undefined
+      ? {automationId: record.attribution.automationId}
+      : {}),
+    ...(record.attribution.automationRunId !== undefined
+      ? {automationRunId: record.attribution.automationRunId}
+      : {}),
+    vendorId: record.attribution.vendorId,
+    billingMethodKey: record.attribution.billingMethodKey,
+    externalAccountId: record.attribution.externalAccountId,
+    pricing: record.chargeSnapshot.pricing,
+    outcome: record.outcome,
     chargeSubunits: record.chargeSubunits,
     createdAt: record.createdAt,
   };
