@@ -13,6 +13,10 @@ import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./a
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import {
   UsageAccount,
+  type GatekeeperMeteringAttempt,
+  type GatekeeperUsageAttribution,
+  type GatekeeperUsageCompletion,
+  type GatekeeperUsageRecord,
   type ModelUsageAttribution,
   type CreditReservation,
   type ModelMeteringAttempt,
@@ -24,6 +28,7 @@ import {
 import type {
   AdminUsageOperationResult,
   ChargeSnapshot,
+  GatekeeperChargeSnapshot,
   ModelChargeSnapshot,
   PricedChargeSnapshot,
   UsageCreditBalance,
@@ -557,6 +562,35 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       usage: ModelUsageCompletion): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
     return this.usageAccount.completeModelUsage(operationId, usage);
+  }
+
+  /** Begin one trusted Gatekeeper Billable API Operation before its first upstream call. */
+  async beginGatekeeperUsage(
+      operationId: string,
+      attribution: GatekeeperUsageAttribution,
+      chargeSnapshot: GatekeeperChargeSnapshot): Promise<GatekeeperMeteringAttempt> {
+    if (attribution.principal === undefined) {
+      throw new Error("Usage Principal is required for paid work.");
+    }
+    if (attribution.principal.userId !== this.ctx.id.toString()) {
+      throw new Error("Usage Principal does not match this Usage Account.");
+    }
+    await this.activateUsageAccount();
+    return this.usageAccount.beginGatekeeperUsage(operationId, attribution, chargeSnapshot);
+  }
+
+  /** Persist the durable upstream-start handoff for one trusted Gatekeeper operation. */
+  async markGatekeeperUsageStarted(operationId: string): Promise<GatekeeperMeteringAttempt> {
+    await this.activateUsageAccount();
+    return this.usageAccount.markGatekeeperUsageStarted(operationId);
+  }
+
+  /** Settle, release, or hold one trusted Gatekeeper Billable API Operation. */
+  async completeGatekeeperUsage(
+      operationId: string,
+      completion: GatekeeperUsageCompletion): Promise<GatekeeperUsageRecord> {
+    await this.activateUsageAccount();
+    return this.usageAccount.completeGatekeeperUsage(operationId, completion);
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */

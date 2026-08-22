@@ -5,7 +5,7 @@ import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type {
-  ObservationAuthorizer, ObservationDescription,
+  BillableOperation, BillableOperationOutcome, ObservationAuthorizer, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ContextSearchResult, ContextListing, ContextListingEntry, ContextReadResult,
@@ -22,6 +22,12 @@ const logger = obsContext.createLogger({
 
 // Fanout cap for whole-library search/list.
 const MAX_COLLECTION_FANOUT = 8;
+
+/**
+ * Stable priced business-method key for one Context Library document read. The deployment Usage
+ * Rate catalog is keyed on it, so it must never change once a deployment has priced it.
+ */
+export const CONTEXT_READ_BILLING_METHOD_KEY = "context.read.v1";
 
 type ObserveCollections = (collectionIds: string[]) => Promise<{
   excludeObservers?: string[];
@@ -161,11 +167,17 @@ export class LibraryReadSession extends RpcTarget {
     let enabled = await this.#enabled();
     if (!enabled.has(collectionId)) return null;
 
-    let doc = await this.#collection(collectionId).getContextDocument(path);
+    // One Billable API Operation covers this whole read. Nothing above this line reaches the
+    // document store, so a rejected id or a disabled collection is never charged.
+    using operation = await this.authorizer.beginBillableOperation(
+      CONTEXT_READ_BILLING_METHOD_KEY, this.accountId);
+    let doc = await this.#readDocument(operation, collectionId, path);
     // No document found (missing or inaccessible) → nothing was observed, so don't record one.
+    // The store was still asked, so the fixed API charge stands.
     if (!doc) return null;
 
     await this.#authorize([collectionId], {
+      billingOperationId: await operation.getOperationId(),
       title: `Context read: ${doc.name}`,
       description: `Read Context Library document \`${docId}\`.`,
     });
@@ -180,6 +192,44 @@ export class LibraryReadSession extends RpcTarget {
       description: doc.description,
       content,
     };
+  }
+
+  // Two-stage billing around the single upstream document fetch. The attempt is marked started
+  // durably immediately before the store is asked, and the charge is completed as soon as the
+  // store answers -- before the observation is authorized, so a withheld result stays charged.
+  async #readDocument(
+      operation: NativeRpcStub<BillableOperation>, collectionId: string, path: string) {
+    try {
+      await operation.markStarted();
+    } catch (error) {
+      // The store was never asked, so the held Credit is released rather than charged.
+      await this.#completeQuietly(operation, "failed-before-execution");
+      throw error;
+    }
+    let doc: Awaited<ReturnType<ContextCollectionDurableObject["getContextDocument"]>>;
+    try {
+      doc = await this.#collection(collectionId).getContextDocument(path);
+    } catch (error) {
+      // The store may already have served the read, so the charge is held, not released.
+      await this.#completeQuietly(operation, "unknown");
+      throw error;
+    }
+    // A failure to settle an executed read must surface: the quota was already consumed.
+    await operation.complete("executed");
+    return doc;
+  }
+
+  // Complete a failed operation without masking the failure that caused it. The Metering Attempt
+  // stays non-terminal and is reconciled from its own durable state.
+  async #completeQuietly(
+      operation: NativeRpcStub<BillableOperation>, outcome: BillableOperationOutcome) {
+    try {
+      await operation.complete(outcome);
+    } catch (error) {
+      logger.error("failed to complete Gatekeeper billing", {
+        event: "billing.complete.failed", operation: outcome, error,
+      });
+    }
   }
 
   // Fetch without recording; list() authorizes.

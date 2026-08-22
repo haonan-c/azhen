@@ -3,6 +3,7 @@ import {
   type AdminUsageOperationKind,
   type AdminUsageOperationResult,
   type ChargeSnapshot,
+  type GatekeeperChargeSnapshot,
   type InitialGrantSnapshot,
   type ModelChargeSnapshot,
   type PricedChargeSnapshot,
@@ -34,6 +35,8 @@ const REVERSAL_PREFIX = "usageAccount:reversal:";
 const MODEL_ATTEMPT_PREFIX = "usageAccount:modelAttempt:";
 const MODEL_USAGE_RECORD_PREFIX = "usageAccount:modelUsageRecord:";
 const MODEL_USAGE_TIME_INDEX_PREFIX = "usageAccount:modelUsageTimeIndex:";
+const GATEKEEPER_ATTEMPT_PREFIX = "usageAccount:gatekeeperAttempt:";
+const GATEKEEPER_USAGE_RECORD_PREFIX = "usageAccount:gatekeeperUsageRecord:";
 const BILLING_BLOCK_KEY = "usageAccount:billingBlock:v1";
 const DEFAULT_USER_USAGE_PAGE_LIMIT = 50;
 const MAX_USER_USAGE_PAGE_LIMIT = 100;
@@ -100,6 +103,51 @@ export type ModelUsageRecord = {
     "reconciliation-required";
   usageStatus: "reported" | "not-reported" | "invalid-report";
   usage: ReportedModelUsage | null;
+  chargeSubunits: bigint | null;
+  createdAt: string;
+};
+
+/** Content-free, host-attested dimensions for one Gatekeeper Billable API Operation. */
+export type GatekeeperUsageAttribution = UsageAttribution & {
+  /** Stable Gatekeeper vendor identifier that owns the upstream business call. */
+  vendorId: string;
+  /** Stable caller-visible business-method key priced by the Usage Rate version. */
+  billingMethodKey: string;
+  /** Connected external account the upstream business call consumes quota from. */
+  externalAccountId: string;
+};
+
+/**
+ * Terminal execution signal a Gatekeeper reports for one Billable API Operation.
+ *
+ * `executed` means the upstream business call was accepted or ran, and the fixed API charge is
+ * owed even when a later authorization step withholds the result from the caller.
+ */
+export type GatekeeperUsageCompletion = "executed" | "failed-before-execution" | "unknown";
+
+/** Durable lifecycle state for one Gatekeeper Billable API Operation. */
+export type GatekeeperMeteringAttempt = {
+  operationId: string;
+  attribution: GatekeeperUsageAttribution;
+  chargeSnapshot: GatekeeperChargeSnapshot;
+  reservationAmountSubunits: bigint;
+  reservationId: string | null;
+  state: "ready" | "started" | "settled" | "failed-before-execution" | "usage-unknown";
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  usageRecordId?: string;
+};
+
+/** Immutable result of one completed Gatekeeper Billable API Operation. */
+export type GatekeeperUsageRecord = {
+  id: string;
+  operationId: string;
+  attribution: GatekeeperUsageAttribution;
+  chargeSnapshot: GatekeeperChargeSnapshot;
+  reservationId: string | null;
+  ledgerEntryId: string | null;
+  outcome: "settled" | "failed-before-execution" | "usage-unknown";
   chargeSubunits: bigint | null;
   createdAt: string;
 };
@@ -206,6 +254,8 @@ export type UsageAccountSnapshot = UsageCreditBalance & {
   adminOperations: AdminUsageOperationResult[];
   modelMeteringAttempts: ModelMeteringAttempt[];
   modelUsageRecords: ModelUsageRecord[];
+  gatekeeperMeteringAttempts: GatekeeperMeteringAttempt[];
+  gatekeeperUsageRecords: GatekeeperUsageRecord[];
   billingBlock: UsageBillingBlock | null;
 };
 
@@ -855,6 +905,293 @@ export class UsageAccount {
     return record;
   }
 
+  /**
+   * Atomically create one Gatekeeper Metering Attempt and its immutable pricing decision.
+   *
+   * A priced snapshot with a positive charge holds that exact fixed amount as a Credit
+   * Reservation. A priced-zero or Unpriced snapshot holds nothing and records an explicit
+   * zero-credit Attempt instead. Repeating the same operation ID with the same inputs returns the
+   * stored Attempt unchanged, so retries, pagination, and internal HTTP calls that belong to one
+   * business operation never create a second charge.
+   */
+  beginGatekeeperUsage(
+      operationId: string,
+      attribution: GatekeeperUsageAttribution,
+      chargeSnapshot: GatekeeperChargeSnapshot,
+      initialGrantSnapshot?: InitialGrantSnapshot): GatekeeperMeteringAttempt {
+    const result =
+        this.storage.transactionSync<TransactionResult<GatekeeperMeteringAttempt>>(() => {
+      const totals = this.ensureInitialGrant(initialGrantSnapshot);
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+
+      let normalizedAttribution: GatekeeperUsageAttribution;
+      let normalizedSnapshot: GatekeeperChargeSnapshot;
+      try {
+        normalizedAttribution = normalizeGatekeeperUsageAttribution(attribution);
+        const snapshot = normalizeChargeSnapshot(chargeSnapshot);
+        if (snapshot.kind !== "gatekeeper") {
+          throw new TypeError("Gatekeeper metering requires a Gatekeeper Charge Snapshot.");
+        }
+        if (snapshot.vendorId !== normalizedAttribution.vendorId ||
+            snapshot.billingMethodKey !== normalizedAttribution.billingMethodKey) {
+          throw new TypeError("Gatekeeper Charge Snapshot does not match its Metered operation.");
+        }
+        normalizedSnapshot = snapshot;
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      const attemptKey = GATEKEEPER_ATTEMPT_PREFIX + operationId;
+      const existing = this.storage.kv.get<GatekeeperMeteringAttempt>(attemptKey);
+      if (existing !== undefined) {
+        try {
+          assertGatekeeperMeteringAttempt(existing, operationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        if (!gatekeeperAttemptInputsEqual(existing, normalizedAttribution, normalizedSnapshot)) {
+          return {
+            error: new Error("Gatekeeper Metering operation ID conflicts with its stored input."),
+          };
+        }
+        return {value: existing};
+      }
+      if (this.storage.kv.get(ADMIN_OPERATION_PREFIX + operationId) !== undefined ||
+          this.storage.kv.get(GATEKEEPER_USAGE_RECORD_PREFIX + operationId) !== undefined ||
+          this.storage.kv.get(MODEL_ATTEMPT_PREFIX + operationId) !== undefined ||
+          this.storage.kv.get(MODEL_USAGE_RECORD_PREFIX + operationId) !== undefined) {
+        return {error: new Error("Operation ID already records a different Usage operation.")};
+      }
+      if (this.storage.kv.get(RESERVATION_PREFIX + operationId) !== undefined ||
+          this.storage.kv.get(UNPRICED_DECISION_PREFIX + operationId) !== undefined) {
+        return {error: new Error("Operation ID already records a pricing decision.")};
+      }
+
+      const createdAt = new Date().toISOString();
+      const reservationAmountSubunits = normalizedSnapshot.chargeSubunits;
+      let reservationId: string | null = null;
+      if (normalizedSnapshot.pricing === "priced") {
+        if (reservationAmountSubunits > 0n) {
+          if (totals.ledgerBalanceSubunits - totals.reservedSubunits < reservationAmountSubunits) {
+            return {error: new Error("Insufficient Usage Credit.")};
+          }
+          this.storage.kv.put<CreditReservation>(RESERVATION_PREFIX + operationId, {
+            operationId,
+            amountSubunits: reservationAmountSubunits,
+            chargeSnapshot: normalizedSnapshot,
+            state: "reserved",
+            createdAt,
+          });
+          this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+            ...totals,
+            reservedSubunits: totals.reservedSubunits + reservationAmountSubunits,
+          });
+          reservationId = operationId;
+        }
+      } else {
+        this.storage.kv.put<UnpricedUsageDecision>(UNPRICED_DECISION_PREFIX + operationId, {
+          operationId,
+          chargeSnapshot: normalizedSnapshot,
+          createdAt,
+        });
+      }
+
+      const attempt: GatekeeperMeteringAttempt = {
+        operationId,
+        attribution: normalizedAttribution,
+        chargeSnapshot: normalizedSnapshot,
+        reservationAmountSubunits,
+        reservationId,
+        state: "ready",
+        createdAt,
+      };
+      this.storage.kv.put(attemptKey, attempt);
+      return {value: attempt};
+    });
+    return unwrapTransactionResult(result);
+  }
+
+  /** Persist that one Gatekeeper business operation is about to cross the upstream boundary. */
+  markGatekeeperUsageStarted(operationId: string): GatekeeperMeteringAttempt {
+    const result =
+        this.storage.transactionSync<TransactionResult<GatekeeperMeteringAttempt>>(() => {
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+      const key = GATEKEEPER_ATTEMPT_PREFIX + operationId;
+      const attempt = this.storage.kv.get<GatekeeperMeteringAttempt>(key);
+      if (!attempt) return {error: new Error("Gatekeeper Metering Attempt does not exist.")};
+      try {
+        assertGatekeeperMeteringAttempt(attempt, operationId);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+      if (attempt.state !== "ready") return {value: attempt};
+      const started: GatekeeperMeteringAttempt = {
+        ...attempt,
+        state: "started",
+        startedAt: new Date().toISOString(),
+      };
+      this.storage.kv.put(key, started);
+      return {value: started};
+    });
+    return unwrapTransactionResult(result);
+  }
+
+  /**
+   * Atomically settle, release, or hold one Gatekeeper Billable API Operation.
+   *
+   * `executed` settles the fixed API charge, `failed-before-execution` releases it, and `unknown`
+   * holds the Credit Reservation for later reconciliation. Repeating the same terminal completion
+   * returns the stored Usage Record unchanged.
+   */
+  completeGatekeeperUsage(
+      operationId: string,
+      completion: GatekeeperUsageCompletion): GatekeeperUsageRecord {
+    const result = this.storage.transactionSync<TransactionResult<GatekeeperUsageRecord>>(() => {
+      const operationIdError = operationIdValidationError(operationId);
+      if (operationIdError) return {error: operationIdError};
+      if (completion !== "executed" && completion !== "failed-before-execution" &&
+          completion !== "unknown") {
+        return {error: new TypeError("Gatekeeper Metering completion is invalid.")};
+      }
+      const attemptKey = GATEKEEPER_ATTEMPT_PREFIX + operationId;
+      const attempt = this.storage.kv.get<GatekeeperMeteringAttempt>(attemptKey);
+      if (!attempt) return {error: new Error("Gatekeeper Metering Attempt does not exist.")};
+      try {
+        assertGatekeeperMeteringAttempt(attempt, operationId);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      const outcome: GatekeeperUsageRecord["outcome"] = completion === "executed"
+        ? "settled" : completion === "unknown" ? "usage-unknown" : "failed-before-execution";
+      const recordKey = GATEKEEPER_USAGE_RECORD_PREFIX + operationId;
+      const existingRecord = this.storage.kv.get<GatekeeperUsageRecord>(recordKey);
+      if (existingRecord !== undefined) {
+        try {
+          assertGatekeeperUsageRecord(existingRecord, operationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        if (existingRecord.outcome !== outcome) {
+          return {
+            error: new Error("Gatekeeper Metering completion conflicts with its Usage Record."),
+          };
+        }
+        return {value: existingRecord};
+      }
+      if (attempt.state !== "ready" && attempt.state !== "started") {
+        return {error: new Error("Gatekeeper Metering Attempt is already terminal.")};
+      }
+      // Only a released charge may skip the durable start handoff. Both a settled charge and a
+      // held unknown outcome imply the upstream call may have run, so the account always retains
+      // proof that it was about to be made.
+      if (completion !== "failed-before-execution" && attempt.state !== "started") {
+        return {error: new Error("Gatekeeper Metering Attempt has not started.")};
+      }
+
+      const totals = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+      if (!totals) return {error: new Error("Usage Credit totals are missing.")};
+      try {
+        assertUsageAccountTotals(totals);
+      } catch (error) {
+        return {error: error instanceof Error ? error : new Error(String(error))};
+      }
+
+      const completedAt = new Date().toISOString();
+      const reservationKey = RESERVATION_PREFIX + operationId;
+      let chargeSubunits: bigint | null = null;
+      let ledgerEntryId: string | null = null;
+
+      if (outcome === "settled") {
+        chargeSubunits = attempt.chargeSnapshot.chargeSubunits;
+        if (attempt.reservationId !== null) {
+          const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+          if (!reservation) return {error: new Error("Credit Reservation does not exist.")};
+          try {
+            this.assertStoredReservationConsistency(reservation, operationId);
+          } catch (error) {
+            return {error: error instanceof Error ? error : new Error(String(error))};
+          }
+          if (reservation.state !== "reserved" ||
+              chargeSubunits !== reservation.amountSubunits ||
+              totals.reservedSubunits < reservation.amountSubunits) {
+            return {error: new Error("Gatekeeper Metering reservation cannot be settled.")};
+          }
+          ledgerEntryId = chargeLedgerEntryId(operationId);
+          if (this.storage.kv.get(LEDGER_PREFIX + ledgerEntryId) !== undefined) {
+            return {error: new Error(
+              "Usage Credit Ledger entry already exists without a Usage Record.",
+            )};
+          }
+          this.storage.kv.put<CreditLedgerEntry>(LEDGER_PREFIX + ledgerEntryId, {
+            id: ledgerEntryId,
+            operationId,
+            kind: "usage-charge",
+            deltaSubunits: -chargeSubunits,
+            createdAt: completedAt,
+          });
+          this.storage.kv.put<CreditReservation>(reservationKey, {
+            ...reservation,
+            state: "settled",
+            settledAmountSubunits: chargeSubunits,
+            ledgerEntryId,
+            settledAt: completedAt,
+          });
+          this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+            ledgerBalanceSubunits: totals.ledgerBalanceSubunits - chargeSubunits,
+            reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+          });
+        }
+      } else if (outcome === "failed-before-execution" && attempt.reservationId !== null) {
+        const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+        if (!reservation) return {error: new Error("Credit Reservation does not exist.")};
+        try {
+          this.assertStoredReservationConsistency(reservation, operationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+        if (reservation.state !== "reserved" ||
+            totals.reservedSubunits < reservation.amountSubunits) {
+          return {error: new Error("Gatekeeper Metering reservation cannot be released.")};
+        }
+        this.storage.kv.put<CreditReservation>(reservationKey, {
+          ...reservation,
+          state: "released",
+          releasedAt: completedAt,
+        });
+        this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+          ...totals,
+          reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+        });
+      }
+      // `usage-unknown` deliberately leaves the Credit Reservation held.
+
+      const recordId = gatekeeperUsageRecordId(operationId);
+      const record: GatekeeperUsageRecord = {
+        id: recordId,
+        operationId,
+        attribution: attempt.attribution,
+        chargeSnapshot: attempt.chargeSnapshot,
+        reservationId: attempt.reservationId,
+        ledgerEntryId,
+        outcome,
+        chargeSubunits,
+        createdAt: completedAt,
+      };
+      this.storage.kv.put(recordKey, record);
+      this.storage.kv.put<GatekeeperMeteringAttempt>(attemptKey, {
+        ...attempt,
+        state: outcome,
+        completedAt,
+        usageRecordId: recordId,
+      });
+      return {value: record};
+    });
+    return unwrapTransactionResult(result);
+  }
+
   /** Atomically settle a reservation and append its immutable Usage Charge entry. */
   settle(
       operationId: string,
@@ -1247,6 +1584,12 @@ export class UsageAccount {
     const modelUsageRecordRecords = Array.from(
       this.storage.kv.list<ModelUsageRecord>({prefix: MODEL_USAGE_RECORD_PREFIX}),
     );
+    const gatekeeperAttemptRecords = Array.from(
+      this.storage.kv.list<GatekeeperMeteringAttempt>({prefix: GATEKEEPER_ATTEMPT_PREFIX}),
+    );
+    const gatekeeperUsageRecordRecords = Array.from(
+      this.storage.kv.list<GatekeeperUsageRecord>({prefix: GATEKEEPER_USAGE_RECORD_PREFIX}),
+    );
     const billingBlock = this.storage.kv.get<UsageBillingBlock>(BILLING_BLOCK_KEY) ?? null;
     const registrationOutbox = this.storage.kv.get<UsageUserRegistrationOutbox>(
       REGISTRATION_OUTBOX_KEY,
@@ -1267,6 +1610,10 @@ export class UsageAccount {
       unpricedDecisionRecords,
       ledgerRecords,
       billingBlock,
+    );
+    assertGatekeeperUsageRecordsReconcile(
+      gatekeeperAttemptRecords,
+      gatekeeperUsageRecordRecords,
     );
     const reconciledLedgerBalanceSubunits = ledgerEntries.reduce(
       (total, entry) => total + entry.deltaSubunits,
@@ -1294,6 +1641,8 @@ export class UsageAccount {
       adminOperations: adminOperationRecords.map(([, operation]) => operation.result),
       modelMeteringAttempts: modelMeteringAttemptRecords.map(([, attempt]) => attempt),
       modelUsageRecords: modelUsageRecordRecords.map(([, record]) => record),
+      gatekeeperMeteringAttempts: gatekeeperAttemptRecords.map(([, attempt]) => attempt),
+      gatekeeperUsageRecords: gatekeeperUsageRecordRecords.map(([, record]) => record),
       billingBlock,
     };
   }
@@ -1787,6 +2136,203 @@ function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: s
     normalizeCanonicalUtcTimestamp(record.createdAt, "Model Usage Record time");
   } catch {
     throw new Error("Model Usage Record does not reconcile.");
+  }
+}
+
+function gatekeeperUsageRecordId(operationId: string): string {
+  return `gatekeeper-usage:${operationId}`;
+}
+
+function assertGatekeeperUsageRecordsReconcile(
+  attemptRecords: [string, GatekeeperMeteringAttempt][],
+  usageRecords: [string, GatekeeperUsageRecord][],
+): void {
+  const attempts = new Map<string, GatekeeperMeteringAttempt>();
+  for (const [key, attempt] of attemptRecords) {
+    if (key !== GATEKEEPER_ATTEMPT_PREFIX + attempt.operationId ||
+        attempts.has(attempt.operationId)) {
+      throw new Error("Gatekeeper Metering Attempt identity does not reconcile.");
+    }
+    assertGatekeeperMeteringAttempt(attempt, attempt.operationId);
+    attempts.set(attempt.operationId, attempt);
+  }
+  const linkedAttempts = new Set<string>();
+  for (const [key, record] of usageRecords) {
+    if (key !== GATEKEEPER_USAGE_RECORD_PREFIX + record.operationId) {
+      throw new Error("Gatekeeper Usage Record identity does not reconcile.");
+    }
+    assertGatekeeperUsageRecord(record, record.operationId);
+    const attempt = attempts.get(record.operationId);
+    if (!attempt || linkedAttempts.has(record.operationId) ||
+        attempt.usageRecordId !== record.id || attempt.completedAt !== record.createdAt ||
+        attempt.state !== record.outcome ||
+        attempt.reservationId !== record.reservationId ||
+        !gatekeeperAttemptInputsEqual(attempt, record.attribution, record.chargeSnapshot)) {
+      throw new Error("Gatekeeper Usage Record does not reconcile with its Metering Attempt.");
+    }
+    linkedAttempts.add(record.operationId);
+  }
+  for (const attempt of attempts.values()) {
+    if (attempt.state !== "ready" && attempt.state !== "started" &&
+        !linkedAttempts.has(attempt.operationId)) {
+      throw new Error("Terminal Gatekeeper Metering Attempt has no Usage Record.");
+    }
+  }
+}
+
+function normalizeGatekeeperUsageAttribution(
+    value: GatekeeperUsageAttribution): GatekeeperUsageAttribution {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).some(key => key !== "vendorId" && key !== "billingMethodKey" &&
+        key !== "externalAccountId" && key !== "principal" && key !== "source" &&
+        key !== "workspaceId" && key !== "chatId" && key !== "gadgetId" &&
+        key !== "automationId" && key !== "automationRunId") ||
+      !isStableUsageDimension(value.vendorId) ||
+      !isStableUsageDimension(value.billingMethodKey) ||
+      !isStableUsageDimension(value.externalAccountId)) {
+    throw new TypeError("Gatekeeper Usage attribution is invalid.");
+  }
+  const {vendorId, billingMethodKey, externalAccountId, ...attribution} = value;
+  return {
+    ...normalizeUsageAttribution(attribution),
+    vendorId,
+    billingMethodKey,
+    externalAccountId,
+  };
+}
+
+function isStableUsageDimension(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,199}$/.test(value);
+}
+
+function gatekeeperAttemptInputsEqual(
+  attempt: GatekeeperMeteringAttempt,
+  attribution: GatekeeperUsageAttribution,
+  snapshot: GatekeeperChargeSnapshot,
+): boolean {
+  return attempt.attribution.principal.version === attribution.principal.version &&
+    attempt.attribution.principal.kind === attribution.principal.kind &&
+    attempt.attribution.principal.userId === attribution.principal.userId &&
+    attempt.attribution.source === attribution.source &&
+    attempt.attribution.workspaceId === attribution.workspaceId &&
+    attempt.attribution.chatId === attribution.chatId &&
+    attempt.attribution.gadgetId === attribution.gadgetId &&
+    attempt.attribution.automationId === attribution.automationId &&
+    attempt.attribution.automationRunId === attribution.automationRunId &&
+    attempt.attribution.vendorId === attribution.vendorId &&
+    attempt.attribution.billingMethodKey === attribution.billingMethodKey &&
+    attempt.attribution.externalAccountId === attribution.externalAccountId &&
+    chargeSnapshotsEqual(attempt.chargeSnapshot, snapshot);
+}
+
+function assertGatekeeperMeteringAttempt(
+    attempt: GatekeeperMeteringAttempt, expectedOperationId: string): void {
+  const baseKeys = [
+    "operationId",
+    "attribution",
+    "chargeSnapshot",
+    "reservationAmountSubunits",
+    "reservationId",
+    "state",
+    "createdAt",
+  ];
+  if (typeof attempt !== "object" || attempt === null || Array.isArray(attempt) ||
+      attempt.operationId !== expectedOperationId ||
+      operationIdValidationError(expectedOperationId) !== undefined ||
+      typeof attempt.reservationAmountSubunits !== "bigint" ||
+      attempt.reservationAmountSubunits < 0n ||
+      typeof attempt.createdAt !== "string" ||
+      (attempt.state !== "ready" && attempt.state !== "started" &&
+       attempt.state !== "settled" && attempt.state !== "failed-before-execution" &&
+       attempt.state !== "usage-unknown")) {
+    throw new Error("Gatekeeper Metering Attempt does not reconcile.");
+  }
+  try {
+    normalizeGatekeeperUsageAttribution(attempt.attribution);
+    const snapshot = normalizeChargeSnapshot(attempt.chargeSnapshot);
+    if (snapshot.kind !== "gatekeeper") throw new TypeError("Expected a Gatekeeper snapshot.");
+    if (attempt.reservationAmountSubunits !== snapshot.chargeSubunits) {
+      throw new TypeError("Reservation amount does not match its Charge Snapshot.");
+    }
+    normalizeCanonicalUtcTimestamp(
+      attempt.createdAt, "Gatekeeper Metering Attempt creation time");
+    if (attempt.startedAt !== undefined) {
+      normalizeCanonicalUtcTimestamp(
+        attempt.startedAt, "Gatekeeper Metering Attempt start time");
+    }
+    if (attempt.completedAt !== undefined) {
+      normalizeCanonicalUtcTimestamp(
+        attempt.completedAt, "Gatekeeper Metering Attempt completion time");
+    }
+  } catch {
+    throw new Error("Gatekeeper Metering Attempt does not reconcile.");
+  }
+  // Only a positive priced charge holds Credit; priced-zero and Unpriced Use hold nothing.
+  if ((attempt.chargeSnapshot.pricing === "priced" &&
+       attempt.chargeSnapshot.chargeSubunits > 0n) !==
+      (attempt.reservationId === expectedOperationId)) {
+    throw new Error("Gatekeeper Metering Attempt pricing decision does not reconcile.");
+  }
+  if (attempt.state === "ready") {
+    if (!hasExactKeys(attempt, baseKeys)) {
+      throw new Error("Ready Gatekeeper Metering Attempt has terminal fields.");
+    }
+    return;
+  }
+  if (attempt.state === "started") {
+    if (!hasExactKeys(attempt, [...baseKeys, "startedAt"]) || attempt.startedAt === undefined) {
+      throw new Error("Started Gatekeeper Metering Attempt has terminal fields.");
+    }
+    return;
+  }
+  // Only a released charge may lack the start handoff; a settled or held one always retains it.
+  const startedKeys = attempt.state === "failed-before-execution" && attempt.startedAt === undefined
+    ? [] : ["startedAt"];
+  if (!hasExactKeys(attempt, [...baseKeys, ...startedKeys, "completedAt", "usageRecordId"]) ||
+      !attempt.completedAt || !attempt.usageRecordId ||
+      (attempt.state !== "failed-before-execution" && attempt.startedAt === undefined)) {
+    throw new Error("Terminal Gatekeeper Metering Attempt is incomplete.");
+  }
+}
+
+function assertGatekeeperUsageRecord(
+    record: GatekeeperUsageRecord, expectedOperationId: string): void {
+  if (typeof record !== "object" || record === null || Array.isArray(record) ||
+      !hasExactKeys(record, [
+        "id",
+        "operationId",
+        "attribution",
+        "chargeSnapshot",
+        "reservationId",
+        "ledgerEntryId",
+        "outcome",
+        "chargeSubunits",
+        "createdAt",
+      ]) ||
+      record.id !== gatekeeperUsageRecordId(expectedOperationId) ||
+      record.operationId !== expectedOperationId ||
+      operationIdValidationError(expectedOperationId) !== undefined ||
+      typeof record.createdAt !== "string" ||
+      (record.outcome !== "settled" && record.outcome !== "failed-before-execution" &&
+       record.outcome !== "usage-unknown") ||
+      (record.chargeSubunits !== null &&
+       (typeof record.chargeSubunits !== "bigint" || record.chargeSubunits < 0n))) {
+    throw new Error("Gatekeeper Usage Record does not reconcile.");
+  }
+  if ((record.outcome === "settled") !== (record.chargeSubunits !== null) ||
+      (record.outcome !== "settled" && record.ledgerEntryId !== null)) {
+    throw new Error("Gatekeeper Usage Record terminal state does not reconcile.");
+  }
+  try {
+    normalizeGatekeeperUsageAttribution(record.attribution);
+    const snapshot = normalizeChargeSnapshot(record.chargeSnapshot);
+    if (snapshot.kind !== "gatekeeper") throw new TypeError("Expected a Gatekeeper snapshot.");
+    if (record.outcome === "settled" && record.chargeSubunits !== snapshot.chargeSubunits) {
+      throw new TypeError("Settled charge does not match its Charge Snapshot.");
+    }
+    normalizeCanonicalUtcTimestamp(record.createdAt, "Gatekeeper Usage Record time");
+  } catch {
+    throw new Error("Gatekeeper Usage Record does not reconcile.");
   }
 }
 
