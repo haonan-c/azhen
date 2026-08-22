@@ -87,6 +87,8 @@ export class GitHubOperationActivityTracker implements GitHubOperationActivity {
 
 /** Durable Action states that control whether GitHub work may be dispatched on recovery. */
 export type GitHubActionExecutionState =
+  | "applying"
+  // Legacy name written before the durable schema documented the applying handoff.
   | "preparing"
   | "preflighting"
   | "provider-dispatching"
@@ -99,7 +101,9 @@ export function githubActionRecoveryDisposition(
   | { kind: "resume" }
   | { kind: "unknown" }
   | { kind: "terminal"; outcome: ActionExecutionOutcome } {
-  if (state === "preparing" || state === "preflighting") return { kind: "resume" };
+  if (state === "applying" || state === "preparing" || state === "preflighting") {
+    return { kind: "resume" };
+  }
   if (state === "provider-dispatching") return { kind: "unknown" };
   return { kind: "terminal", outcome: state };
 }
@@ -122,10 +126,13 @@ async function completeQuietly(
 /** Billing state retained by one paged GitHub read until its cursor is exhausted or disposed. */
 export class GitHubCursorBilling implements Disposable {
   readonly #authorizer: GitHubReadAuthorizer;
-  readonly #operation: DisposableBillableOperation;
-  readonly #operationId: string;
+  readonly #externalAccountId: string;
+  readonly #method: GitHubBillingMethod;
   readonly #description: Omit<ObservationDescription, "billingOperationId">;
+  readonly #ownedAuthorizer?: Disposable;
   readonly #activity = new GitHubOperationActivityTracker();
+  #operation?: DisposableBillableOperation;
+  #operationId?: string;
   #started = false;
   #settled = false;
   #disposed = false;
@@ -133,46 +140,68 @@ export class GitHubCursorBilling implements Disposable {
 
   private constructor(
     authorizer: GitHubReadAuthorizer,
-    operation: DisposableBillableOperation,
-    operationId: string,
+    externalAccountId: string,
+    method: GitHubBillingMethod,
     description: Omit<ObservationDescription, "billingOperationId">,
+    ownedAuthorizer?: Disposable,
   ) {
     this.#authorizer = authorizer;
-    this.#operation = operation;
-    this.#operationId = operationId;
+    this.#externalAccountId = externalAccountId;
+    this.#method = method;
     this.#description = description;
+    this.#ownedAuthorizer = ownedAuthorizer;
   }
 
-  /** Begin one logical cursor operation without starting provider work. */
-  static async begin(
+  /** Create one logical cursor operation without reserving Credit or starting provider work. */
+  static create(
     authorizer: GitHubReadAuthorizer,
     externalAccountId: string,
     method: GitHubBillingMethod,
     description: Omit<ObservationDescription, "billingOperationId">,
-  ): Promise<GitHubCursorBilling> {
-    const operation = await authorizer.beginBillableOperation(
-      method.methodKey,
+    ownedAuthorizer?: Disposable,
+  ): GitHubCursorBilling {
+    return new GitHubCursorBilling(
+      authorizer,
       externalAccountId,
+      method,
+      description,
+      ownedAuthorizer,
     );
+  }
+
+  async #begin(): Promise<void> {
+    let operation: DisposableBillableOperation | undefined;
     try {
+      operation = await this.#authorizer.beginBillableOperation(
+        this.#method.methodKey,
+        this.#externalAccountId,
+      );
       const operationId = await operation.getOperationId();
-      return new GitHubCursorBilling(authorizer, operation, operationId, description);
+      this.#operation = operation;
+      this.#operationId = operationId;
     } catch (error) {
-      await completeQuietly(operation, "failed-before-execution");
-      operation[Symbol.dispose]();
+      if (operation) {
+        await completeQuietly(operation, "failed-before-execution");
+        operation[Symbol.dispose]();
+      }
+      this.#disposed = true;
+      this.#ownedAuthorizer?.[Symbol.dispose]();
       throw error;
     }
   }
 
   /** Run the next page inside this cursor's original operation identity. */
   async next<T>(read: () => Promise<T>): Promise<T> {
+    if (this.#disposed) throw new Error("This GitHub cursor has been disposed.");
     if (this.#authorizationError !== undefined) throw this.#authorizationError;
+    if (!this.#operation) await this.#begin();
+    const operation = this.#operation!;
     if (!this.#started) {
       try {
-        await this.#operation.markStarted();
+        await operation.markStarted();
         this.#started = true;
       } catch (error) {
-        await completeQuietly(this.#operation, "failed-before-execution");
+        await completeQuietly(operation, "failed-before-execution");
         this[Symbol.dispose]();
         throw error;
       }
@@ -183,7 +212,7 @@ export class GitHubCursorBilling implements Disposable {
       result = await withGitHubOperationActivity(this.#activity, read);
     } catch (error) {
       if (!this.#settled) {
-        await completeQuietly(this.#operation, this.#activity.failureOutcome());
+        await completeQuietly(operation, this.#activity.failureOutcome());
         this.#settled = true;
         this[Symbol.dispose]();
       }
@@ -191,12 +220,17 @@ export class GitHubCursorBilling implements Disposable {
     }
 
     if (!this.#settled) {
-      await this.#operation.complete("executed");
+      try {
+        await operation.complete("executed");
+      } catch (error) {
+        this[Symbol.dispose]();
+        throw error;
+      }
       this.#settled = true;
       try {
         await this.#authorizer.authorizeObservation({
           ...this.#description,
-          billingOperationId: this.#operationId,
+          billingOperationId: this.#operationId!,
         });
       } catch (error) {
         this.#authorizationError = error;
@@ -210,7 +244,8 @@ export class GitHubCursorBilling implements Disposable {
   [Symbol.dispose](): void {
     if (this.#disposed) return;
     this.#disposed = true;
-    this.#operation[Symbol.dispose]();
+    this.#operation?.[Symbol.dispose]();
+    this.#ownedAuthorizer?.[Symbol.dispose]();
   }
 }
 

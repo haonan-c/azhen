@@ -16,7 +16,11 @@ const METHOD = {
   quantity: 1,
 } as const;
 
-function makeAuthorizer(options: { trace: string[]; authorizeError?: Error }) {
+function makeAuthorizer(options: {
+  trace: string[];
+  authorizeError?: Error;
+  completeError?: Error;
+}) {
   const operation = {
     async getOperationId() {
       options.trace.push("operation-id");
@@ -27,6 +31,7 @@ function makeAuthorizer(options: { trace: string[]; authorizeError?: Error }) {
     },
     async complete(outcome: BillableOperationOutcome) {
       options.trace.push(`complete:${outcome}`);
+      if (options.completeError) throw options.completeError;
     },
     [Symbol.dispose]() {
       options.trace.push("dispose");
@@ -47,17 +52,14 @@ function makeAuthorizer(options: { trace: string[]; authorizeError?: Error }) {
 describe("GitHub read billing coordinator", () => {
   it("keeps one operation across lazy cursor pages", async () => {
     const trace: string[] = [];
-    const billing = await GitHubCursorBilling.begin(
+    const billing = GitHubCursorBilling.create(
       makeAuthorizer({ trace }),
       "opaque-github-account",
       METHOD,
       { title: "List GitHub issues", description: "List GitHub issues" },
     );
 
-    expect(trace).toEqual([
-      `begin:${METHOD.methodKey}:opaque-github-account`,
-      "operation-id",
-    ]);
+    expect(trace).toEqual([]);
 
     expect(await billing.next(async () => {
       trace.push("upstream:page-1");
@@ -79,6 +81,34 @@ describe("GitHub read billing coordinator", () => {
       "upstream:page-2",
       "dispose",
     ]);
+  });
+
+  it("does not reserve Credit for a cursor that is never consumed", () => {
+    const trace: string[] = [];
+    const billing = GitHubCursorBilling.create(
+      makeAuthorizer({ trace }),
+      "opaque-github-account",
+      METHOD,
+      { title: "List GitHub issues", description: "List GitHub issues" },
+    );
+
+    billing[Symbol.dispose]();
+
+    expect(trace).toEqual([]);
+  });
+
+  it("disposes a cursor operation when settlement fails", async () => {
+    const trace: string[] = [];
+    const billing = GitHubCursorBilling.create(
+      makeAuthorizer({ trace, completeError: new Error("settlement unavailable") }),
+      "opaque-github-account",
+      METHOD,
+      { title: "List GitHub issues", description: "List GitHub issues" },
+    );
+
+    await expect(billing.next(async () => ["one"]))
+      .rejects.toThrow("settlement unavailable");
+    expect(trace.at(-1)).toBe("dispose");
   });
 
   it("settles one multi-request operation before authorization", async () => {
@@ -158,6 +188,7 @@ describe("GitHub read billing coordinator", () => {
 
 describe("GitHub Action recovery phase", () => {
   it("replays only phases that prove no mutation dispatch", () => {
+    expect(githubActionRecoveryDisposition("applying")).toEqual({ kind: "resume" });
     expect(githubActionRecoveryDisposition("preparing")).toEqual({ kind: "resume" });
     expect(githubActionRecoveryDisposition("preflighting")).toEqual({ kind: "resume" });
     expect(githubActionRecoveryDisposition("provider-dispatching")).toEqual({ kind: "unknown" });

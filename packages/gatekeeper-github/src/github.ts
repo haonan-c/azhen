@@ -277,8 +277,14 @@ type GitHubAction =
   | ReplyToDiffCommentAction
   | MergePullRequestAction;
 
+type GitHubActionClaim = {
+  argumentsHash: string;
+  targetCategory: "repository" | "issue" | "pull-request" | "missing";
+};
+
 type StoredActionRecord = {
   action: GitHubAction;
+  claim?: GitHubActionClaim;
   state: StoredActionState;
   appliedAt?: number;
   rejectedAt?: number;
@@ -290,6 +296,8 @@ type GitHubActionExecutionRow = {
   actionId: number;
   providerIdempotencyKey?: string;
   state: GitHubActionExecutionState;
+  argumentsHash: string;
+  targetCategory: GitHubActionClaim["targetCategory"];
   providerResultId?: number;
   enrichmentPending?: true;
 };
@@ -386,6 +394,22 @@ const NOT_CONFIGURED_HTML = `<!DOCTYPE html>
 
 function hexEncode(bytes: Uint8Array): string {
   return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function createGitHubActionClaim(action: GitHubAction): Promise<GitHubActionClaim> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(action)),
+  );
+  const targetCategory = action.type === "createIssue" || action.type === "createPullRequest"
+    ? "repository"
+    : "targetKind" in action
+      ? action.targetKind === "issue" ? "issue" : "pull-request"
+      : "pull-request";
+  return {
+    argumentsHash: hexEncode(new Uint8Array(digest)),
+    targetCategory,
+  };
 }
 
 function generateNonce(): string {
@@ -1987,9 +2011,10 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     this.#putRetiredActionRecord(approvalId, record);
   }
 
-  #stageAction(action: GitHubAction): void {
+  #stageAction(action: GitHubAction, claim: GitHubActionClaim): void {
     this.#putActionRecord(action.approvalId, {
       action,
+      claim,
       state: "staged",
     });
     this.#pendingActionsCache = undefined;
@@ -3246,7 +3271,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     action: GitHubAction,
     description: ActionDescription,
   ): Promise<void> {
-    this.#stageAction(action);
+    const claim = await createGitHubActionClaim(action);
+    this.#stageAction(action, claim);
     try {
       await approvalQueue.submitAction(action.approvalId, {
         ...description,
@@ -3307,6 +3333,17 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           row.providerIdempotencyKey !== execution.providerIdempotencyKey) {
         throw new Error("GitHub Action execution identity conflicts with its durable claim.");
       }
+      const storedClaim = this.#getActionRecord(actionId)?.claim;
+      if (storedClaim) {
+        if (row.argumentsHash === undefined || row.targetCategory === undefined) {
+          row = { ...row, ...storedClaim };
+          this.ctx.storage.kv.put(key, row);
+          await this.ctx.storage.sync();
+        } else if (row.argumentsHash !== storedClaim.argumentsHash ||
+            row.targetCategory !== storedClaim.targetCategory) {
+          throw new Error("GitHub Action arguments conflict with its durable execution claim.");
+        }
+      }
       const disposition = githubActionRecoveryDisposition(row.state);
       if (disposition.kind === "terminal") {
         await this.#resumeAcceptedEnrichment(key);
@@ -3316,13 +3353,30 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         return this.#finishBillableAction(key, row, "unknown", this.#getActionRecord(actionId));
       }
     } else {
+      const record = this.#getActionRecord(actionId);
+      const claim = record?.claim ?? (record
+        ? await createGitHubActionClaim(record.action)
+        : {
+            argumentsHash: hexEncode(new Uint8Array(await crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode(`missing:${actionId}`),
+            ))),
+            targetCategory: "missing" as const,
+          });
+      if (record && !record.claim) {
+        record.claim = claim;
+        if (record.state === "staged" || record.state === "pending") {
+          this.#putActionRecord(actionId, record);
+        }
+      }
       row = {
         billingOperationId: execution.billingOperationId,
         actionId,
+        ...claim,
         ...(execution.providerIdempotencyKey
           ? { providerIdempotencyKey: execution.providerIdempotencyKey }
           : {}),
-        state: execution.mode === "recover" ? "unknown" : "preparing",
+        state: execution.mode === "recover" ? "unknown" : "applying",
       };
       this.ctx.storage.kv.put(key, row);
       if (row.state === "unknown") {
@@ -4000,11 +4054,13 @@ async function runSessionCursorRead<T>(
   create: () => Promise<Cursor<T>>,
   description: Omit<ObservationDescription, "billingOperationId">,
 ): Promise<Cursor<T>> {
-  const billing = await GitHubCursorBilling.begin(
-    queue,
+  const ownedQueue = queue.dup();
+  const billing = GitHubCursorBilling.create(
+    ownedQueue,
     externalAccountId,
     GITHUB_READ_BILLING_METHODS[method],
     description,
+    ownedQueue,
   );
   return new BillableCursor(create, billing);
 }
@@ -4284,14 +4340,16 @@ class GitHubPullRequestImpl extends GitHubIssueImpl implements GitHubPullRequest
   }
 
   async readDiff(options?: GitHubPageOptions): Promise<GitHubPullRequestDiff> {
-    const billing = await GitHubCursorBilling.begin(
-      this.approvalQueue,
+    const ownedQueue = this.approvalQueue.dup();
+    const billing = GitHubCursorBilling.create(
+      ownedQueue,
       this.externalAccountId,
       GITHUB_READ_BILLING_METHODS["GitHubPullRequest.readDiff"],
       {
         title: `Read diff for #${this.logicalId}`,
         description: `Read the diff for pull request #${this.logicalId}.`,
       },
+      ownedQueue,
     );
     const diff = await billing.next(
       () => this.gatekeeper.pullDiff(this.logicalId, options?.resultsPerPage ?? 20),

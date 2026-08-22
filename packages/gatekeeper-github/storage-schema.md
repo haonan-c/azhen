@@ -34,9 +34,19 @@ No per-user SQL tables are used.
 - `counter:diff` -> next numeric suffix for provisional diff comments created by pending reviews.
 - `counter:reply` -> next numeric suffix for provisional diff replies.
 
-### Pending action log
+### Action log and execution claims
 
-- `pendingAction:<localId>` -> serialized `GitHubAction` union.
+- `action:<approvalId>` -> a live staged or pending `StoredActionRecord`.
+- `retiredAction:<approvalId>` -> the final approved, rejected, failed, or unknown record.
+- `execution:<billingOperationId>` -> the durable provider execution claim. It stores the Action ID,
+  SHA-256 parameter hash, target category, provider idempotency key when present, execution phase,
+  provider result ID when known, and whether accepted review-comment alias enrichment is pending.
+
+The parameter hash is only recovery evidence. It is not a Usage dimension and is not copied into
+financial records. Provider execution phases are `applying`, `preflighting`,
+`provider-dispatching`, `accepted`, `failed-before-execution`, and `unknown`. Only the first two
+phases can resume provider work. A recovered `provider-dispatching` write becomes `unknown` and is
+not replayed.
 
 Stored action variants:
 
@@ -52,7 +62,8 @@ Stored action variants:
 - `replyToDiffComment`
 - `mergePullRequest`
 
-These records are the source of truth for simulation.
+Live `action:*` records are the source of truth for simulation. Final records move atomically to
+`retiredAction:*` when their provider outcome is persisted.
 
 ### Provisional resource mapping
 
@@ -153,7 +164,7 @@ Cache invalidation strategy:
 ## Simulation model
 
 - Reads fetch cached or remote GitHub state.
-- Pending actions from `pendingAction:*` are overlaid on that state at read time.
+- Pending actions from `action:*` are overlaid on that state at read time.
 - Provisional creates synthesize issue/PR objects locally until GitHub assigns a real ID.
 - Rejecting a provisional create deletes dependent pending actions and returns `restart: true`.
 - Review-thread simulation supports pending review comments and pending replies to real GitHub diff comments.

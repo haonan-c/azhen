@@ -76,9 +76,9 @@ export class GitHubBillingTestParent extends DurableObject {
 
   async listIssues(name: string) {
     const { queue, session } = await this.#session(name, "repo");
-    using _session = session;
     if (!("listIssues" in session)) throw new Error("Expected repository Session.");
     using cursor = await session.listIssues({ resultsPerPage: 50 });
+    session[Symbol.dispose]();
     let count = 0;
     for (;;) {
       const page = await cursor.next();

@@ -13,6 +13,7 @@ import {
 } from "../../gatekeeper-github/src/billing-methods.js";
 import type {
   GitHubIssue,
+  GitHubPullRequest,
   GitHubRepo,
 } from "../../gatekeeper-github/src/types.js";
 import { ADMIN_USERNAME, startHarness, type Harness } from "../src/harness.js";
@@ -20,8 +21,12 @@ import { NetworkInterceptor, type Handler } from "../src/network-interceptor.js"
 import {
   connect,
   listConnectedAccounts,
+  MAX_OBSERVER_PROMPTS,
   nextUsernames,
+  ObserverConfigRecorder,
+  signIn,
   signUp,
+  stubFor,
   waitFor,
   type ConnectedAccount,
 } from "../src/rpc-client.js";
@@ -37,10 +42,24 @@ const WRITE_CHARGE = 43n;
 let harness: Harness;
 let interceptor: NetworkInterceptor;
 let issuePages = 0;
+let retryIssueList = false;
+let issueListRetryReturned = false;
 let issueCreates = 0;
+let loseCreateResponse = false;
 let issueReads = 0;
 let issueUpdates = 0;
 let rejectUpdateWithRateLimit = false;
+let mergeMode: "success" | "declined" | "conflict" | "loss" = "success";
+let mergeCalls = 0;
+let lastMergeBody: unknown;
+let loseCommentResponse = false;
+let loseReviewResponse = false;
+let loseReplyResponse = false;
+let commentCalls = 0;
+let reviewCalls = 0;
+let replyCalls = 0;
+let replyPreflightReads = 0;
+let commentDeletes = 0;
 
 function owner() {
   return {
@@ -79,7 +98,23 @@ function issue(number: number, title = `Fixture issue ${number}`) {
   };
 }
 
-const githubHandler: Handler = async (url, method) => {
+function pullRequest(number: number) {
+  return {
+    ...issue(number, `Fixture pull request ${number}`),
+    html_url: `https://github.com/fixture-owner/private-repo-marker/pull/${number}`,
+    draft: false,
+    requested_reviewers: [],
+    commits: 1,
+    additions: 2,
+    deletions: 1,
+    changed_files: 1,
+    mergeable: true,
+    head: { ref: "private-feature-branch", sha: "private-head-sha", repo: repository() },
+    base: { ref: "main", sha: "private-base-sha", repo: repository() },
+  };
+}
+
+const githubHandler: Handler = async (url, method, _headers, request) => {
   if (url.hostname === "github.com" &&
       url.pathname === "/login/oauth/access_token" && method === "POST") {
     return Response.json({
@@ -99,10 +134,18 @@ const githubHandler: Handler = async (url, method) => {
   if (url.pathname === "/repos/fixture-owner/private-repo-marker/issues") {
     if (method === "POST") {
       issueCreates++;
+      if (loseCreateResponse) throw new Error("GitHub create response lost after effect");
       return Response.json(issue(700, "Created fixture"));
     }
     if (method === "GET") {
       issuePages++;
+      if (retryIssueList) {
+        if (!issueListRetryReturned) {
+          issueListRetryReturned = true;
+          return new Response(null, { status: 429, headers: { "Retry-After": "0" } });
+        }
+        return Response.json([]);
+      }
       const page = Number(url.searchParams.get("page") ?? 1);
       const count = page < 3 ? 100 : page === 3 ? 1 : 0;
       return Response.json(Array.from(
@@ -130,6 +173,68 @@ const githubHandler: Handler = async (url, method) => {
       }
       return Response.json(issue(1, "New title"));
     }
+  }
+  if (method === "POST" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/issues/1/comments") {
+    commentCalls++;
+    if (loseCommentResponse) throw new Error("GitHub comment response lost after effect");
+    return Response.json({
+      id: 51,
+      html_url: "https://github.com/fixture-owner/private-repo-marker/issues/1#issuecomment-51",
+      body: "Fixture comment",
+      user: owner(),
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    });
+  }
+  if (method === "DELETE" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/issues/comments/51") {
+    commentDeletes++;
+    return new Response(null, { status: 204 });
+  }
+  if (method === "GET" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/pulls/1") {
+    return Response.json(pullRequest(1));
+  }
+  if (method === "PUT" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/pulls/1/merge") {
+    mergeCalls++;
+    lastMergeBody = await request.json();
+    if (mergeMode === "loss") throw new Error("GitHub merge response lost after effect");
+    if (mergeMode === "conflict") return new Response(null, { status: 409 });
+    return Response.json({
+      sha: mergeMode === "success" ? "merge-sha" : "",
+      merged: mergeMode === "success",
+      message: mergeMode === "success" ? "merged" : "declined",
+    });
+  }
+  if (method === "POST" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/pulls/1/reviews") {
+    reviewCalls++;
+    if (loseReviewResponse) throw new Error("GitHub review response lost after effect");
+    return Response.json({ id: 52 });
+  }
+  if (method === "GET" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/pulls/comments/55") {
+    replyPreflightReads++;
+    return Response.json({
+      id: 55,
+      html_url: "https://github.com/fixture-owner/private-repo-marker/pull/1#discussion_r55",
+      body: "Root comment",
+      user: owner(),
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      path: "src/file.ts",
+      line: 1,
+      side: "RIGHT",
+      subject_type: "line",
+    });
+  }
+  if (method === "POST" &&
+      url.pathname === "/repos/fixture-owner/private-repo-marker/pulls/1/comments/55/replies") {
+    replyCalls++;
+    if (loseReplyResponse) throw new Error("GitHub reply response lost after effect");
+    return Response.json({ id: 56 });
   }
   return null;
 };
@@ -184,9 +289,23 @@ async function newGitHubUser(prefix: string): Promise<{
   const account = await connectGitHub(user);
   const workspace = await user.newGadget();
   issuePages = 0;
+  retryIssueList = false;
+  issueListRetryReturned = false;
   issueCreates = 0;
+  loseCreateResponse = false;
   issueReads = 0;
   issueUpdates = 0;
+  mergeMode = "success";
+  mergeCalls = 0;
+  lastMergeBody = undefined;
+  loseCommentResponse = false;
+  loseReviewResponse = false;
+  loseReplyResponse = false;
+  commentCalls = 0;
+  reviewCalls = 0;
+  replyCalls = 0;
+  replyPreflightReads = 0;
+  commentDeletes = 0;
   return { publicApi, user, account, workspace };
 }
 
@@ -234,6 +353,18 @@ beforeAll(async () => {
     {
       kind: "gatekeeper-operation-rate",
       vendorId: VENDOR_ID,
+      billingMethodKey: GITHUB_READ_BILLING_METHODS["GitHubIssue.getDetails"].methodKey,
+      amountSubunits: READ_CHARGE,
+    },
+    {
+      kind: "gatekeeper-operation-rate",
+      vendorId: VENDOR_ID,
+      billingMethodKey: GITHUB_READ_BILLING_METHODS["GitHubPullRequest.getDetails"].methodKey,
+      amountSubunits: READ_CHARGE,
+    },
+    {
+      kind: "gatekeeper-operation-rate",
+      vendorId: VENDOR_ID,
       billingMethodKey: GITHUB_WRITE_BILLING_METHODS["GitHubRepo.createIssue"].methodKey,
       amountSubunits: WRITE_CHARGE,
     },
@@ -241,6 +372,31 @@ beforeAll(async () => {
       kind: "gatekeeper-operation-rate",
       vendorId: VENDOR_ID,
       billingMethodKey: GITHUB_WRITE_BILLING_METHODS["GitHubIssue.setTitle"].methodKey,
+      amountSubunits: WRITE_CHARGE,
+    },
+    {
+      kind: "gatekeeper-operation-rate",
+      vendorId: VENDOR_ID,
+      billingMethodKey: GITHUB_WRITE_BILLING_METHODS["GitHubPullRequest.merge"].methodKey,
+      amountSubunits: WRITE_CHARGE,
+    },
+    {
+      kind: "gatekeeper-operation-rate",
+      vendorId: VENDOR_ID,
+      billingMethodKey: GITHUB_WRITE_BILLING_METHODS["GitHubIssue.postComment"].methodKey,
+      amountSubunits: WRITE_CHARGE,
+    },
+    {
+      kind: "gatekeeper-operation-rate",
+      vendorId: VENDOR_ID,
+      billingMethodKey: GITHUB_WRITE_BILLING_METHODS["GitHubPullRequest.postReview"].methodKey,
+      amountSubunits: WRITE_CHARGE,
+    },
+    {
+      kind: "gatekeeper-operation-rate",
+      vendorId: VENDOR_ID,
+      billingMethodKey:
+        GITHUB_WRITE_BILLING_METHODS["GitHubPullRequest.replyToDiffComment"].methodKey,
       amountSubunits: WRITE_CHARGE,
     },
   ], "Price representative GitHub operations");
@@ -299,6 +455,11 @@ describe.sequential("GitHub billing production Worker contract", () => {
       if (!gatekeeper) throw new Error("Failed to create the GitHub repository resource.");
       using session = await gatekeeper.openSession() as RpcStub<GitHubRepo>;
       const before = await context.user.getUsageCreditBalance();
+      {
+        using _unusedCursor = await session.listIssues({ resultsPerPage: 50 });
+        expect(issuePages).toBe(0);
+        expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      }
       using cursor = await session.listIssues({ resultsPerPage: 50 });
       expect(issuePages).toBe(0);
 
@@ -320,6 +481,72 @@ describe.sequential("GitHub billing production Worker contract", () => {
           record.billingMethodKey === "github.repository.issues.list.v1");
       expect(records).toHaveLength(1);
     } finally {
+      disposeUser(context);
+    }
+  });
+
+  it("charges representative issue and pull-request reads to the caller", async () => {
+    const context = await newGitHubUser("githubresources");
+    try {
+      using issueGatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/issues/1",
+      );
+      using pullGatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/pull/1",
+      );
+      if (!issueGatekeeper || !pullGatekeeper) {
+        throw new Error("Failed to create representative GitHub resources.");
+      }
+      using issueSession = await issueGatekeeper.openSession() as RpcStub<GitHubIssue>;
+      using pullSession = await pullGatekeeper.openSession() as RpcStub<GitHubPullRequest>;
+      const before = await context.user.getUsageCreditBalance();
+
+      expect((await issueSession.getDetails()).title).toBe("Old title");
+      expect((await pullSession.getDetails()).title).toBe("Fixture pull request 1");
+
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - 2n * READ_CHARGE,
+      });
+      const methodKeys = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper")
+        .map(record => record.billingMethodKey);
+      expect(methodKeys).toEqual(expect.arrayContaining([
+        "github.issue.details.read.v1",
+        "github.pull.details.read.v1",
+      ]));
+    } finally {
+      disposeUser(context);
+    }
+  });
+
+  it("keeps a safe GET retry in one billed cursor operation", async () => {
+    const context = await newGitHubUser("githubretry");
+    try {
+      using gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub repository resource.");
+      using session = await gatekeeper.openSession() as RpcStub<GitHubRepo>;
+      const before = await context.user.getUsageCreditBalance();
+      retryIssueList = true;
+      using cursor = await session.listIssues();
+
+      expect(await cursor.next()).toBeNull();
+      expect(issuePages).toBe(2);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - READ_CHARGE,
+      });
+      const records = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper" &&
+          record.billingMethodKey === "github.repository.issues.list.v1");
+      expect(records).toHaveLength(1);
+    } finally {
+      retryIssueList = false;
       disposeUser(context);
     }
   });
@@ -391,5 +618,269 @@ describe.sequential("GitHub billing production Worker contract", () => {
       rejectUpdateWithRateLimit = false;
       disposeUser(context);
     }
+  });
+
+  it("holds an ambiguous create and never replays its provider effect", async () => {
+    const context = await newGitHubUser("githubcreateunknown");
+    try {
+      using gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub repository resource.");
+      using session = await gatekeeper.openSession() as RpcStub<GitHubRepo>;
+      const before = await context.user.getUsageCreditBalance();
+      using _issue = await session.createIssue({ title: "Ambiguous private title" });
+      const action = await latestPendingAction(context.workspace);
+      loseCreateResponse = true;
+
+      expect(await context.workspace.approveAction(action.id)).toBe("unknown");
+      expect(await context.workspace.approveAction(action.id)).toBe("unknown");
+      expect(issueCreates).toBe(1);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: WRITE_CHARGE,
+        availableSubunits: before.availableSubunits - WRITE_CHARGE,
+      });
+      expect(await latestUsage(context.user)).toMatchObject({
+        billingMethodKey: "github.repository.issue.create.v1",
+        outcome: "usage-unknown",
+        chargeSubunits: null,
+      });
+    } finally {
+      loseCreateResponse = false;
+      disposeUser(context);
+    }
+  });
+
+  it("persists merge SHA and classifies success, refusal, conflict, and response loss", async () => {
+    const context = await newGitHubUser("githubmerge");
+    try {
+      using gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/pull/1",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub pull request resource.");
+      using session = await gatekeeper.openSession() as RpcStub<GitHubPullRequest>;
+      const before = await context.user.getUsageCreditBalance();
+
+      await session.merge();
+      const accepted = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(accepted.id)).toBe("accepted");
+      expect(await context.workspace.approveAction(accepted.id)).toBe("accepted");
+      expect(lastMergeBody).toMatchObject({ sha: "private-head-sha" });
+
+      mergeMode = "declined";
+      await session.merge();
+      const declined = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(declined.id)).toBe("failed-before-execution");
+
+      mergeMode = "conflict";
+      await session.merge();
+      const conflict = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(conflict.id)).toBe("failed-before-execution");
+
+      mergeMode = "loss";
+      await session.merge();
+      const unknown = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(unknown.id)).toBe("unknown");
+      expect(await context.workspace.approveAction(unknown.id)).toBe("unknown");
+
+      expect(mergeCalls).toBe(4);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: WRITE_CHARGE,
+        availableSubunits: before.availableSubunits - 2n * WRITE_CHARGE,
+      });
+      const outcomes = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper" &&
+          record.billingMethodKey === "github.pull.merge.v1")
+        .map(record => record.outcome);
+      expect(outcomes).toEqual(expect.arrayContaining([
+        "settled",
+        "failed-before-execution",
+        "usage-unknown",
+      ]));
+    } finally {
+      mergeMode = "success";
+      disposeUser(context);
+    }
+  });
+
+  it("does not replay ambiguous comment, review, or diff-reply writes", async () => {
+    const context = await newGitHubUser("githubwriteunknown");
+    try {
+      using issueGatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/issues/1",
+      );
+      using pullGatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/pull/1",
+      );
+      if (!issueGatekeeper || !pullGatekeeper) {
+        throw new Error("Failed to create representative GitHub resources.");
+      }
+      using issueSession = await issueGatekeeper.openSession() as RpcStub<GitHubIssue>;
+      using pullSession = await pullGatekeeper.openSession() as RpcStub<GitHubPullRequest>;
+      const before = await context.user.getUsageCreditBalance();
+
+      loseCommentResponse = true;
+      await issueSession.postComment("Private comment marker");
+      const comment = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(comment.id)).toBe("unknown");
+      expect(await context.workspace.approveAction(comment.id)).toBe("unknown");
+
+      loseReviewResponse = true;
+      await pullSession.postReview({
+        revision: { baseSha: "private-base-sha", headSha: "private-head-sha" },
+        decision: "comment",
+      });
+      const review = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(review.id)).toBe("unknown");
+      expect(await context.workspace.approveAction(review.id)).toBe("unknown");
+
+      loseReplyResponse = true;
+      await pullSession.replyToDiffComment("55", "Private reply marker");
+      const reply = await latestPendingAction(context.workspace);
+      expect(await context.workspace.approveAction(reply.id)).toBe("unknown");
+      expect(await context.workspace.approveAction(reply.id)).toBe("unknown");
+
+      expect(commentCalls).toBe(1);
+      expect(reviewCalls).toBe(1);
+      expect(replyPreflightReads).toBe(1);
+      expect(replyCalls).toBe(1);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 3n * WRITE_CHARGE,
+        availableSubunits: before.availableSubunits - 3n * WRITE_CHARGE,
+      });
+      const records = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter((record): record is UserGatekeeperUsageRecord =>
+          record.kind === "gatekeeper" && record.outcome === "usage-unknown");
+      expect(records.map(record => record.billingMethodKey)).toEqual(expect.arrayContaining([
+        "github.issue.comment.create.v1",
+        "github.pull.review.create.v1",
+        "github.pull.review_comment.reply.v1",
+      ]));
+    } finally {
+      loseCommentResponse = false;
+      loseReviewResponse = false;
+      loseReplyResponse = false;
+      disposeUser(context);
+    }
+  });
+
+  it("reverts an accepted comment without a second billed operation or refund", async () => {
+    const context = await newGitHubUser("githubrevert");
+    try {
+      using gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/issues/1",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub issue resource.");
+      using session = await gatekeeper.openSession() as RpcStub<GitHubIssue>;
+      const before = await context.user.getUsageCreditBalance();
+      await session.postComment("Revertable private comment");
+      const action = await latestPendingAction(context.workspace);
+
+      expect(await context.workspace.approveAction(action.id)).toBe("accepted");
+      await context.workspace.revertAction(action.id);
+
+      expect(commentCalls).toBe(1);
+      expect(commentDeletes).toBe(1);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - WRITE_CHARGE,
+      });
+      const records = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper" &&
+          record.billingMethodKey === "github.issue.comment.create.v1");
+      expect(records).toHaveLength(1);
+    } finally {
+      disposeUser(context);
+    }
+  });
+
+  it("splits shared-resource usage and keeps delayed approval on its initiator", async () => {
+    using ownerPublicApi = connect(harness.url);
+    using secondPublicApi = connect(harness.url);
+    const [ownerName, firstName, secondName] = nextUsernames(
+      "githubowner",
+      "githubfirst",
+      "githubsecond",
+    );
+    using ownerUser = await signUp(ownerPublicApi, ownerName);
+    using secondUser = await signUp(secondPublicApi, secondName);
+    const ownerAccount = await connectGitHub(ownerUser);
+    const secondObserverAccount = await connectGitHub(secondUser);
+    using ownerWorkspace = await ownerUser.newGadget();
+    const workspaceId = (await ownerWorkspace.getMetadata()).id;
+    expect(await ownerWorkspace.addCollaborator(secondName, "build")).not.toBeNull();
+    using ownerGatekeeper = await ownerWorkspace.newGatekeeper(
+      ownerAccount.id,
+      "https://github.com/fixture-owner/private-repo-marker/issues/1",
+    );
+    if (!ownerGatekeeper) throw new Error("Failed to create the shared GitHub issue resource.");
+    const gatekeeperId = await ownerGatekeeper.getId();
+    using secondObserverConfig = stubFor(
+      new ObserverConfigRecorder().alwaysChoose(secondObserverAccount.id, MAX_OBSERVER_PROMPTS),
+    );
+    using secondWorkspace = await secondUser.openGadget(
+      workspaceId,
+      undefined,
+      secondObserverConfig,
+    );
+    using secondGatekeeper = await secondWorkspace.getGatekeeperById(gatekeeperId);
+    using secondSession = await secondGatekeeper.openSession() as RpcStub<GitHubIssue>;
+    const ownerBefore = await ownerUser.getUsageCreditBalance();
+    const secondBefore = await secondUser.getUsageCreditBalance();
+    let firstAvailableBefore = 0n;
+    let pendingActionId = 0;
+
+    {
+      using firstPublicApi = connect(harness.url);
+      using firstUser = await signUp(firstPublicApi, firstName);
+      const firstObserverAccount = await connectGitHub(firstUser);
+      expect(await ownerWorkspace.addCollaborator(firstName, "build")).not.toBeNull();
+      using firstObserverConfig = stubFor(
+        new ObserverConfigRecorder().alwaysChoose(firstObserverAccount.id, MAX_OBSERVER_PROMPTS),
+      );
+      using firstWorkspace = await firstUser.openGadget(
+        workspaceId,
+        undefined,
+        firstObserverConfig,
+      );
+      using firstGatekeeper = await firstWorkspace.getGatekeeperById(gatekeeperId);
+      using firstSession = await firstGatekeeper.openSession() as RpcStub<GitHubIssue>;
+      firstAvailableBefore = (await firstUser.getUsageCreditBalance()).availableSubunits;
+
+      await Promise.all([firstSession.getDetails(), secondSession.getDetails()]);
+      await firstSession.setTitle("Delayed private title");
+      pendingActionId = (await latestPendingAction(ownerWorkspace)).id;
+    }
+
+    expect(await ownerWorkspace.approveAction(pendingActionId)).toBe("accepted");
+    using reopenedPublicApi = connect(harness.url);
+    using reopenedFirst = await signIn(reopenedPublicApi, firstName);
+    const firstRecords = (await reopenedFirst.listOwnUsageRecords({ limit: 10 })).records
+      .filter((record): record is UserGatekeeperUsageRecord => record.kind === "gatekeeper");
+    const secondRecords = (await secondUser.listOwnUsageRecords({ limit: 10 })).records
+      .filter((record): record is UserGatekeeperUsageRecord => record.kind === "gatekeeper");
+
+    expect(await ownerUser.getUsageCreditBalance()).toEqual(ownerBefore);
+    expect(await reopenedFirst.getUsageCreditBalance()).toEqual({
+      reservedSubunits: 0n,
+      availableSubunits: firstAvailableBefore - READ_CHARGE - WRITE_CHARGE,
+    });
+    expect(await secondUser.getUsageCreditBalance()).toEqual({
+      reservedSubunits: 0n,
+      availableSubunits: secondBefore.availableSubunits - READ_CHARGE,
+    });
+    expect(firstRecords.map(record => record.billingMethodKey)).toEqual(expect.arrayContaining([
+      "github.issue.details.read.v1",
+      "github.issue.title.set.v1",
+    ]));
+    expect(secondRecords.map(record => record.billingMethodKey))
+      .toContain("github.issue.details.read.v1");
+    expect(new Set([...firstRecords, ...secondRecords].map(record => record.externalAccountId)).size)
+      .toBe(1);
   });
 });
