@@ -8,6 +8,7 @@ import {
   GitHubOperationActivityTracker,
   githubActionRecoveryDisposition,
   runGitHubRead,
+  validateGitHubActionClaim,
 } from "../src/billing.js";
 
 const METHOD = {
@@ -187,6 +188,21 @@ describe("GitHub read billing coordinator", () => {
 });
 
 describe("GitHub Action recovery phase", () => {
+  it("backfills legacy claims and rejects hash or category conflicts", () => {
+    const expected = { argumentsHash: "sha256:expected", targetCategory: "issue" };
+
+    expect(validateGitHubActionClaim({}, expected)).toEqual(expected);
+    expect(validateGitHubActionClaim(expected, expected)).toEqual(expected);
+    expect(() => validateGitHubActionClaim(
+      { ...expected, argumentsHash: "sha256:other" },
+      expected,
+    )).toThrow("arguments conflict");
+    expect(() => validateGitHubActionClaim(
+      { ...expected, targetCategory: "pull-request" },
+      expected,
+    )).toThrow("arguments conflict");
+  });
+
   it("replays only phases that prove no mutation dispatch", () => {
     expect(githubActionRecoveryDisposition("applying")).toEqual({ kind: "resume" });
     expect(githubActionRecoveryDisposition("preparing")).toEqual({ kind: "resume" });

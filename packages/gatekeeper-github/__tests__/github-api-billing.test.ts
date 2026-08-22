@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { GitHubApi, GitHubApiError } from "../src/github-api.js";
+import { GitHubApi, GitHubApiError, githubErrorForLogging } from "../src/github-api.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -15,6 +15,17 @@ function activityTrace() {
 }
 
 describe("GitHub API billing activity", () => {
+  it("removes provider response content from logged errors", () => {
+    const safe = githubErrorForLogging(new GitHubApiError(
+      500,
+      "private-provider-message",
+      { body: "private-provider-body" },
+    ));
+
+    expect(safe.message).toBe("GitHub operation failed with status 500.");
+    expect(`${safe.name}:${safe.message}:${safe.stack}`).not.toContain("private-provider");
+  });
+
   it("retries one rate-limited GET inside the caller-owned operation", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(null, {

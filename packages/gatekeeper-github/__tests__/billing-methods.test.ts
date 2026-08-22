@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  GITHUB_BILLING_METHODS,
   GITHUB_READ_BILLING_METHODS,
   GITHUB_WRITE_BILLING_METHODS,
   githubActionBilling,
@@ -44,6 +45,10 @@ const EXPECTED_WRITE_KEYS = [
 ] as const;
 
 describe("GitHub Billable Method inventory", () => {
+  it("covers the public RPC surface with 32 billing policies", () => {
+    expect(Object.keys(GITHUB_BILLING_METHODS)).toHaveLength(32);
+  });
+
   it("fixes the complete 13-read registry", () => {
     const entries = Object.values(GITHUB_READ_BILLING_METHODS);
 

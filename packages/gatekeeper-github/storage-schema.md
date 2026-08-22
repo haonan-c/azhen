@@ -46,7 +46,8 @@ The parameter hash is only recovery evidence. It is not a Usage dimension and is
 financial records. Provider execution phases are `applying`, `preflighting`,
 `provider-dispatching`, `accepted`, `failed-before-execution`, and `unknown`. Only the first two
 phases can resume provider work. A recovered `provider-dispatching` write becomes `unknown` and is
-not replayed.
+not replayed. Rows written by the earlier schema may contain `preparing`; recovery treats this
+legacy value as `applying` and does not repeat a provider effect.
 
 Stored action variants:
 

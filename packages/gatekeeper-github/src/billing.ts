@@ -94,6 +94,27 @@ export type GitHubActionExecutionState =
   | "provider-dispatching"
   | ActionExecutionOutcome;
 
+/** Content-free identity fields persisted on a GitHub Action provider claim. */
+export type GitHubDurableActionClaim<TargetCategory extends string = string> = {
+  argumentsHash: string;
+  targetCategory: TargetCategory;
+};
+
+/** Backfill a legacy claim or reject a conflicting Action identity. */
+export function validateGitHubActionClaim<TargetCategory extends string>(
+  current: Partial<GitHubDurableActionClaim<TargetCategory>>,
+  expected: GitHubDurableActionClaim<TargetCategory>,
+): GitHubDurableActionClaim<TargetCategory> {
+  if (current.argumentsHash === undefined && current.targetCategory === undefined) {
+    return expected;
+  }
+  if (current.argumentsHash !== expected.argumentsHash ||
+      current.targetCategory !== expected.targetCategory) {
+    throw new Error("GitHub Action arguments conflict with its durable execution claim.");
+  }
+  return expected;
+}
+
 /** Classify a recovered Action without replaying a possibly dispatched GitHub mutation. */
 export function githubActionRecoveryDisposition(
   state: GitHubActionExecutionState,

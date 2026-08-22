@@ -24,6 +24,7 @@ import {
 import {
   GitHubApi,
   GitHubApiError,
+  githubErrorForLogging,
   exchangeAuthCode,
   revokeOAuthGrant,
   type ConditionalRequestResult,
@@ -45,6 +46,7 @@ import {
   GitHubCursorBilling,
   githubActionRecoveryDisposition,
   runGitHubRead,
+  validateGitHubActionClaim,
   withGitHubOperationActivity,
   GitHubOperationActivityTracker,
   type GitHubActionExecutionState,
@@ -1273,7 +1275,7 @@ export class UserAccount extends DurableObject<Env> {
         await revokeOAuthGrant(accessToken, this.env.CLIENT_ID, this.env.CLIENT_SECRET);
       } catch (error) {
         logger.error("failed to revoke GitHub OAuth grant", {
-          event: "oauth.grant.revoke.failed", error,
+          event: "oauth.grant.revoke.failed", error: githubErrorForLogging(error),
         });
       }
     }
@@ -2415,7 +2417,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       changedFiles = comparison.files?.length ?? 0;
     } catch (error) {
       logger.warn("failed to compute provisional pull request comparison", {
-        event: "pull.request.provisional.comparison.compute.failed", error,
+        event: "pull.request.provisional.comparison.compute.failed",
+        error: githubErrorForLogging(error),
       });
     }
 
@@ -2612,7 +2615,8 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         assertIssueSearchResultsInRepo(owner, repo, results);
       } catch (error) {
         logger.warn("GitHub issue search scope validation failed", {
-          event: "issue.search.scope.validation.failed", error,
+          event: "issue.search.scope.validation.failed",
+          error: githubErrorForLogging(error),
         });
         throw error;
       }
@@ -3289,6 +3293,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GitHubRepoSession | GitHubIssue | GitHubPullRequest> {
+    await this.#resumeAcceptedEnrichments();
     const queue = approvalQueue.dup();
     const externalAccountId = this.ctx.props.userObjectId;
     switch (this.ctx.props.resourceKind) {
@@ -3335,13 +3340,11 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
       const storedClaim = this.#getActionRecord(actionId)?.claim;
       if (storedClaim) {
-        if (row.argumentsHash === undefined || row.targetCategory === undefined) {
-          row = { ...row, ...storedClaim };
+        const validatedClaim = validateGitHubActionClaim(row, storedClaim);
+        if (row.argumentsHash === undefined && row.targetCategory === undefined) {
+          row = { ...row, ...validatedClaim };
           this.ctx.storage.kv.put(key, row);
           await this.ctx.storage.sync();
-        } else if (row.argumentsHash !== storedClaim.argumentsHash ||
-            row.targetCategory !== storedClaim.targetCategory) {
-          throw new Error("GitHub Action arguments conflict with its durable execution claim.");
         }
       }
       const disposition = githubActionRecoveryDisposition(row.state);
@@ -3384,6 +3387,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       }
       await this.ctx.storage.sync();
     }
+    if (!row) throw new Error("GitHub Action execution claim was not persisted.");
 
     const record = this.#getLiveActionRecord(actionId);
     if (!record || (record.state !== "pending" && record.state !== "staged")) {
@@ -3469,8 +3473,18 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     } catch (error) {
       logger.warn("failed to enrich an accepted GitHub Action", {
         event: "action.accepted.enrichment.failed",
-        error,
+        error: githubErrorForLogging(error),
       });
+    }
+  }
+
+  async #resumeAcceptedEnrichments(): Promise<void> {
+    for (const [key, row] of this.ctx.storage.kv.list<GitHubActionExecutionRow>({
+      prefix: "execution:",
+    })) {
+      if (row.state === "accepted" && row.enrichmentPending) {
+        await this.#resumeAcceptedEnrichment(key);
+      }
     }
   }
 

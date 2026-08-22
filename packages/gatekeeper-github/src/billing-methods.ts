@@ -1,4 +1,15 @@
 import type { ActionBilling } from "@gadgets/workshop-shared/gatekeeper";
+import type { GitHubIssue, GitHubPullRequest, GitHubRepo } from "./types.js";
+
+type RpcMethodName<T> = {
+  [Key in keyof T]: T[Key] extends (...args: never[]) => unknown ? Key : never;
+}[keyof T] & string;
+
+/** Every caller-visible GitHub RPC method, derived from the public session interfaces. */
+export type GitHubCallerVisibleMethod =
+  | `GitHubRepo.${RpcMethodName<GitHubRepo>}`
+  | `GitHubIssue.${RpcMethodName<GitHubIssue>}`
+  | `GitHubPullRequest.${RpcMethodName<GitHubPullRequest>}`;
 
 /** One fixed-rate GitHub caller-visible business operation. */
 export type GitHubBillingMethod = {
@@ -53,6 +64,12 @@ export const GITHUB_WRITE_BILLING_METHODS = {
   "GitHubPullRequest.replyToDiffComment": operation("github.pull.review_comment.reply.v1"),
   "GitHubPullRequest.merge": operation("github.pull.merge.v1"),
 } as const satisfies Record<string, GitHubBillingMethod>;
+
+/** Compile-time coverage guard against adding a public GitHub method without billing policy. */
+export const GITHUB_BILLING_METHODS = {
+  ...GITHUB_READ_BILLING_METHODS,
+  ...GITHUB_WRITE_BILLING_METHODS,
+} as const satisfies Record<GitHubCallerVisibleMethod, GitHubBillingMethod>;
 
 /** A public GitHub read that performs a Billable API Operation. */
 export type GitHubBillableReadMethod = keyof typeof GITHUB_READ_BILLING_METHODS;

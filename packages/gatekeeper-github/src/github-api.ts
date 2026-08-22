@@ -165,6 +165,12 @@ export class GitHubApiError extends Error {
   }
 }
 
+/** Convert a caught GitHub failure to content-free log evidence. */
+export function githubErrorForLogging(caught: unknown): Error {
+  const status = caught instanceof GitHubApiError ? ` with status ${caught.status}` : "";
+  return new Error(`GitHub operation failed${status}.`);
+}
+
 type RequestOptions = {
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;

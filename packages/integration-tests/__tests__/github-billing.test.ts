@@ -57,6 +57,8 @@ let loseReviewResponse = false;
 let loseReplyResponse = false;
 let commentCalls = 0;
 let reviewCalls = 0;
+let failNextReviewEnrichment = false;
+let reviewEnrichmentReads = 0;
 let replyCalls = 0;
 let replyPreflightReads = 0;
 let commentDeletes = 0;
@@ -215,6 +217,28 @@ const githubHandler: Handler = async (url, method, _headers, request) => {
     return Response.json({ id: 52 });
   }
   if (method === "GET" &&
+      url.pathname ===
+        "/repos/fixture-owner/private-repo-marker/pulls/1/reviews/52/comments") {
+    reviewEnrichmentReads++;
+    if (failNextReviewEnrichment) {
+      failNextReviewEnrichment = false;
+      return Response.json({ message: "private-provider-response-marker" }, { status: 500 });
+    }
+    return Response.json([{
+      id: 53,
+      pull_request_review_id: 52,
+      html_url: "https://github.com/fixture-owner/private-repo-marker/pull/1#discussion_r53",
+      body: "Review comment",
+      user: owner(),
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      path: "src/file.ts",
+      line: 1,
+      side: "RIGHT",
+      subject_type: "line",
+    }]);
+  }
+  if (method === "GET" &&
       url.pathname === "/repos/fixture-owner/private-repo-marker/pulls/comments/55") {
     replyPreflightReads++;
     return Response.json({
@@ -278,6 +302,7 @@ async function connectGitHub(api: RpcStub<AuthenticatedApi>): Promise<ConnectedA
 }
 
 async function newGitHubUser(prefix: string): Promise<{
+  username: string;
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
   account: ConnectedAccount;
@@ -303,10 +328,12 @@ async function newGitHubUser(prefix: string): Promise<{
   loseReplyResponse = false;
   commentCalls = 0;
   reviewCalls = 0;
+  failNextReviewEnrichment = false;
+  reviewEnrichmentReads = 0;
   replyCalls = 0;
   replyPreflightReads = 0;
   commentDeletes = 0;
-  return { publicApi, user, account, workspace };
+  return { username, publicApi, user, account, workspace };
 }
 
 function disposeUser(context: Awaited<ReturnType<typeof newGitHubUser>>): void {
@@ -440,6 +467,24 @@ describe.sequential("GitHub billing production Worker contract", () => {
       );
       expect(usageJson).not.toContain("private-repo-marker");
       expect(usageJson).not.toContain("private-description-marker");
+
+      using adminPublicApi = connect(harness.url);
+      using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
+      using admin = await authenticatedAdmin.getAdminApi();
+      if (!admin) throw new Error("Expected the deployment administrator capability.");
+      using usageApi = await admin.getUsageApi();
+      const registeredUsers = await usageApi.searchUsers({ query: context.username, limit: 10 });
+      const registeredUser = registeredUsers.users.find(user => user.identity === context.username);
+      if (!registeredUser) throw new Error("Expected the billed GitHub User in the Registry.");
+      const adminUsageJson = JSON.stringify(
+        (await usageApi.listUsageRecords({
+          registeredUserRef: registeredUser.registeredUserRef,
+          limit: 100,
+        })).records,
+        (_key, value) => typeof value === "bigint" ? value.toString() : value,
+      );
+      expect(adminUsageJson).not.toContain("private-repo-marker");
+      expect(adminUsageJson).not.toContain("private-description-marker");
     } finally {
       disposeUser(context);
     }
@@ -795,6 +840,48 @@ describe.sequential("GitHub billing production Worker contract", () => {
           record.billingMethodKey === "github.issue.comment.create.v1");
       expect(records).toHaveLength(1);
     } finally {
+      disposeUser(context);
+    }
+  });
+
+  it("recovers accepted review enrichment without replaying the review", async () => {
+    const context = await newGitHubUser("githubreviewenrichment");
+    try {
+      using gatekeeper = await context.workspace.newGatekeeper(
+        context.account.id,
+        "https://github.com/fixture-owner/private-repo-marker/pull/1",
+      );
+      if (!gatekeeper) throw new Error("Failed to create the GitHub pull request resource.");
+      const gatekeeperId = await gatekeeper.getId();
+      const session = await gatekeeper.openSession() as RpcStub<GitHubPullRequest>;
+      const before = await context.user.getUsageCreditBalance();
+      failNextReviewEnrichment = true;
+      await session.postReview({
+        revision: { baseSha: "private-base-sha", headSha: "private-head-sha" },
+        decision: "comment",
+        diffComments: [{
+          target: { path: "src/file.ts", subjectType: "line", line: 1, side: "new" },
+          bodyMarkdown: "Review comment",
+        }],
+      });
+      const action = await latestPendingAction(context.workspace);
+
+      expect(await context.workspace.approveAction(action.id)).toBe("accepted");
+      session[Symbol.dispose]();
+      using reopenedGatekeeper = await context.workspace.getGatekeeperById(gatekeeperId);
+      using _reopenedSession = await reopenedGatekeeper.openSession() as RpcStub<GitHubPullRequest>;
+      expect(reviewCalls).toBe(1);
+      expect(reviewEnrichmentReads).toBe(2);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - WRITE_CHARGE,
+      });
+      const records = (await context.user.listOwnUsageRecords({ limit: 100 })).records
+        .filter(record => record.kind === "gatekeeper" &&
+          record.billingMethodKey === "github.pull.review.create.v1");
+      expect(records).toHaveLength(1);
+    } finally {
+      failNextReviewEnrichment = false;
       disposeUser(context);
     }
   });
