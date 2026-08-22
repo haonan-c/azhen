@@ -1,6 +1,6 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, stripTrailingSlashes, type ActionExecution, type ActionExecutionResult } from '@gadgets/workshop-shared/gatekeeper';
 import { exchangeAuthCode, getAccessToken, getGoogleAccountDescription, getGoogleVerifiedEmail, GmailApi, GmailMessageRaw, GmailOutboundMessage, GoogleAccessToken, normalizeEmailRecipients, revokeGoogleToken } from "./google-api";
 import {
   GmailSession, GmailThread, GmailMessage,
@@ -47,6 +47,17 @@ import GOOGLE_SHEETS_CONFIGURATOR_HTML from "./generated/google-sheets-configura
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
+import { runGoogleRead, type GoogleOperationActivity } from "./billing.js";
+import {
+  GOOGLE_BILLING_METHODS,
+  googleActionBilling,
+  type GoogleBillableReadMethod,
+  type GoogleBillableWriteMethod,
+} from "./billing-methods.js";
+import {
+  durableGoogleActionExecutionStorage,
+  runGoogleBillableAction,
+} from "./action-billing.js";
 
 // Vendor id = GATEKEEPER_<NAME> binding suffix (lowercased).
 const VENDOR_ID = "google";
@@ -1257,14 +1268,30 @@ type GmailAction =
 type GmailSessionContext = {
   gmailApi: GmailApi;
   approvalQueue: RpcStub<ApprovalQueue>;
+  externalAccountId: string;
   pendingActions: PendingActionStore<GmailAction>;
   // SESSION PATH: the raw search query passed to the Gmail API for listThreads/search.
   // This handles historical + new messages. See GmailGatekeeperImplProps.searchQuery.
   searchQuery: string | undefined;
   labelId: string | undefined;
   labelName: string | undefined;
-  resolveLabels: (labelIds: string[]) => Promise<GmailLabel[]>;
+  resolveLabels: (labelIds: string[], gmailApi?: GmailApi) => Promise<GmailLabel[]>;
 };
+
+function runGmailRead<T>(
+  ctx: GmailSessionContext,
+  method: GoogleBillableReadMethod,
+  read: (gmailApi: GmailApi) => Promise<T>,
+  describe: (result: T) => Omit<ObservationDescription, "billingOperationId">,
+): Promise<T> {
+  return runGoogleRead(
+    ctx.approvalQueue,
+    ctx.externalAccountId,
+    GOOGLE_BILLING_METHODS[method],
+    activity => read(ctx.gmailApi.withActivity(activity)),
+    describe,
+  );
+}
 
 // ── GmailSessionImpl ────────────────────────────────────────────────
 
@@ -1371,6 +1398,7 @@ class GmailSessionImpl extends RpcTarget implements GmailSession {
     const message = this.#ctx.gmailApi.buildSendRaw(to, subject, body);
     await submitGmailAction(
       this.#ctx,
+      "GmailSession.send",
       { type: "send", to: message.to, subject: message.subject, body: message.body },
       {
         title: sanitizeApprovalTitle(`Send email: ${message.subject}`),
@@ -1407,6 +1435,7 @@ function describeOutboundMessage(intro: string, message: GmailOutboundMessage): 
 
 async function submitGmailAction(
     ctx: GmailSessionContext,
+    method: GoogleBillableWriteMethod,
     action: GmailAction,
     desc: { title: string; description: string }): Promise<void> {
   if (ctx.pendingActions.list().length >= 100) {
@@ -1414,7 +1443,11 @@ async function submitGmailAction(
   }
   let actionId = ctx.pendingActions.submit(action);
   try {
-    await ctx.approvalQueue.submitAction(actionId, { ...desc, implementsRevert: false });
+    await ctx.approvalQueue.submitAction(actionId, {
+      ...desc,
+      implementsRevert: false,
+      billing: googleActionBilling(method, ctx.externalAccountId),
+    });
   } catch (err) {
     ctx.pendingActions.remove(actionId);
     throw err;
@@ -1454,13 +1487,29 @@ class GmailThreadCursorImpl extends RpcTarget implements Cursor<GmailThreadEntry
   async #nextPage(): Promise<GmailThreadEntry[] | null> {
     if (this.#exhausted) return null;
 
+    return runGmailRead(
+      this.#ctx,
+      "GmailThreadCursor.next",
+      gmailApi => this.#fetchNextPage(gmailApi),
+      entries => ({
+        title: `Read ${entries?.length ?? 0} Gmail threads`,
+        description: entries === null
+          ? "Reach the end of the Gmail thread cursor."
+          : `Fetch the next page of Gmail threads.\n\n` +
+            formatApprovalField("Subjects", entries.map(entry => entry.info.subject).join("\n")),
+      }),
+    );
+  }
+
+  async #fetchNextPage(gmailApi: GmailApi): Promise<GmailThreadEntry[] | null> {
+
     let result: {threads: Array<{id: string; snippet?: string}>; nextPageToken?: string};
     let pageToken = this.#pageToken;
     let exhausted = false;
     let skippedPages = 0;
     do {
       const previousToken = pageToken;
-      result = await this.#ctx.gmailApi.listThreads(
+      result = await gmailApi.listThreads(
         20, this.#query, pageToken, this.#labelIds);
       pageToken = result.nextPageToken;
       exhausted = !result.nextPageToken;
@@ -1482,7 +1531,7 @@ class GmailThreadCursorImpl extends RpcTarget implements Cursor<GmailThreadEntry
     const entries: GmailThreadEntry[] = [];
     for (let i = 0; i < result.threads.length; i += 5) {
       const batch = await Promise.all(result.threads.slice(i, i + 5).map(async thread => {
-        const metadata = await this.#ctx.gmailApi.getThreadInfo(thread.id);
+        const metadata = await gmailApi.getThreadInfo(thread.id);
         const info: GmailThreadInfo = {
           ...metadata,
           ...(thread.snippet !== undefined ? {snippet: thread.snippet} : {}),
@@ -1492,13 +1541,6 @@ class GmailThreadCursorImpl extends RpcTarget implements Cursor<GmailThreadEntry
       }));
       entries.push(...batch);
     }
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: `Read ${entries.length} Gmail threads`,
-      description:
-        `Fetch the next page of Gmail threads.\n\n` +
-        formatApprovalField("Subjects", entries.map(entry => entry.info.subject).join("\n")),
-    });
 
     this.#pageToken = pageToken;
     this.#exhausted = exhausted;
@@ -1521,35 +1563,43 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
     this.#cachedInfo = cachedInfo;
   }
 
-  async #ensureInfo(): Promise<GmailThreadInfo> {
+  async #ensureInfo(gmailApi: GmailApi = this.#ctx.gmailApi): Promise<GmailThreadInfo> {
     if (!this.#cachedInfo) {
-      this.#cachedInfo = await this.#ctx.gmailApi.getThreadInfo(this.#threadId);
+      this.#cachedInfo = await gmailApi.getThreadInfo(this.#threadId);
     }
     return this.#cachedInfo;
   }
 
   async getMetadata(): Promise<GmailThreadInfo> {
-    const info = await this.#ensureInfo();
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: sanitizeApprovalTitle(`Thread info: ${info.subject}`),
-      description: `Get metadata for thread ${this.#threadId}.`,
-    });
-
-    return info;
+    return runGmailRead(
+      this.#ctx,
+      "GmailThread.getMetadata",
+      gmailApi => this.#ensureInfo(gmailApi),
+      info => ({
+        title: sanitizeApprovalTitle(`Thread info: ${info.subject}`),
+        description: `Get metadata for thread ${this.#threadId}.`,
+      }),
+    );
   }
 
   async messages(): Promise<GmailMessage[]> {
-    const thread = await this.#ctx.gmailApi.getThread(this.#threadId);
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: sanitizeApprovalTitle(`Get messages: ${thread.snippet || "(no snippet)"}`),
-      description: `Get all messages in thread ${this.#threadId}.`,
-    });
-
-    return thread.messages.map(message =>
-      new GmailMessageStub(this.#ctx, message.id, this.#threadId)
+    const result = await runGmailRead(
+      this.#ctx,
+      "GmailThread.messages",
+      async gmailApi => {
+        const thread = await gmailApi.getThread(this.#threadId);
+        return {
+          thread,
+          messages: thread.messages.map(message =>
+            new GmailMessageStub(this.#ctx, message.id, this.#threadId)),
+        };
+      },
+      ({ thread }) => ({
+        title: sanitizeApprovalTitle(`Get messages: ${thread.snippet || "(no snippet)"}`),
+        description: `Get all messages in thread ${this.#threadId}.`,
+      }),
     );
+    return result.messages;
   }
 
   async messagesVisibleTo(address: string): Promise<GmailMessage[]> {
@@ -1557,46 +1607,52 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
       throw new Error(`Email address must be at most ${MAX_GMAIL_ADDRESS_BYTES} bytes.`);
     }
     const [normalizedAddress] = normalizeEmailRecipients([address]);
-    const thread = await this.#ctx.gmailApi.getThread(this.#threadId);
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: sanitizeApprovalTitle(`Messages involving ${normalizedAddress}`),
-      description:
-        "List messages in this thread involving the requested address.\n\n" +
-        formatApprovalField("Address", normalizedAddress) + "\n\n" +
-        formatApprovalField("Thread snippet", thread.snippet || "(no snippet)"),
-    });
-
-    if (thread.messages.length > MAX_GMAIL_VISIBLE_THREAD_MESSAGES) {
-      throw new Error(
-        `Thread has ${thread.messages.length} messages; messagesVisibleTo() supports at most ` +
-        `${MAX_GMAIL_VISIBLE_THREAD_MESSAGES}.`);
-    }
-
-    const target = normalizedAddress.toLowerCase();
-    const visible: GmailMessage[] = [];
-    // Fetch only participant metadata, at most five messages at once.
-    for (let i = 0; i < thread.messages.length; i += 5) {
-      const batch = thread.messages.slice(i, i + 5);
-      const participantSets = await Promise.all(batch.map(message =>
-        this.#ctx.gmailApi.getMessageParticipants(message.id).catch(err => {
-          logger.warn("getMessageParticipants failed", {
-            event: "gmail.message.participants.get.failed",
-            messageId: message.id, error: err,
-          });
-          return null;
-        })));
-      for (let j = 0; j < batch.length; j++) {
-        if (participantSets[j]?.has(target)) {
-          visible.push(new GmailMessageStub(this.#ctx, batch[j].id, this.#threadId));
+    const result = await runGmailRead(
+      this.#ctx,
+      "GmailThread.messagesVisibleTo",
+      async gmailApi => {
+        const thread = await gmailApi.getThread(this.#threadId);
+        if (thread.messages.length > MAX_GMAIL_VISIBLE_THREAD_MESSAGES) {
+          throw new Error(
+            `Thread has ${thread.messages.length} messages; messagesVisibleTo() supports at most ` +
+            `${MAX_GMAIL_VISIBLE_THREAD_MESSAGES}.`);
         }
-      }
-    }
-    return visible;
+
+        const target = normalizedAddress.toLowerCase();
+        const visible: GmailMessage[] = [];
+        // Fetch only participant metadata, at most five messages at once.
+        for (let i = 0; i < thread.messages.length; i += 5) {
+          const batch = thread.messages.slice(i, i + 5);
+          const participantSets = await Promise.all(batch.map(message =>
+            gmailApi.getMessageParticipants(message.id).catch(err => {
+              logger.warn("getMessageParticipants failed", {
+                event: "gmail.message.participants.get.failed",
+                messageId: message.id, error: err,
+              });
+              return null;
+            })));
+          for (let j = 0; j < batch.length; j++) {
+            if (participantSets[j]?.has(target)) {
+              visible.push(new GmailMessageStub(this.#ctx, batch[j].id, this.#threadId));
+            }
+          }
+        }
+        return { thread, visible };
+      },
+      ({ thread }) => ({
+        title: sanitizeApprovalTitle(`Messages involving ${normalizedAddress}`),
+        description:
+          "List messages in this thread involving the requested address.\n\n" +
+          formatApprovalField("Address", normalizedAddress) + "\n\n" +
+          formatApprovalField("Thread snippet", thread.snippet || "(no snippet)"),
+      }),
+    );
+    return result.visible;
   }
 
   async #submitThreadAction(
       type: "archive" | "trash" | "markRead" | "markUnread",
+      method: GoogleBillableWriteMethod,
       titlePrefix: string,
       intro: string): Promise<void> {
     const info = await this.#ensureInfo();
@@ -1607,6 +1663,7 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
     });
     await submitGmailAction(
       this.#ctx,
+      method,
       { type, threadId: this.#threadId },
       {
         title: sanitizeApprovalTitle(`${titlePrefix}: ${subject}`),
@@ -1620,19 +1677,31 @@ class GmailThreadStub extends RpcTarget implements GmailThread {
   }
 
   async archive(): Promise<void> {
-    await this.#submitThreadAction("archive", "Archive", "Remove this thread from the inbox.");
+    await this.#submitThreadAction(
+      "archive", "GmailThread.archive", "Archive", "Remove this thread from the inbox.");
   }
 
   async trash(): Promise<void> {
-    await this.#submitThreadAction("trash", "Trash", "Move this thread to trash.");
+    await this.#submitThreadAction(
+      "trash", "GmailThread.trash", "Trash", "Move this thread to trash.");
   }
 
   async markRead(): Promise<void> {
-    await this.#submitThreadAction("markRead", "Mark read", "Mark every message in this thread as read.");
+    await this.#submitThreadAction(
+      "markRead",
+      "GmailThread.markRead",
+      "Mark read",
+      "Mark every message in this thread as read.",
+    );
   }
 
   async markUnread(): Promise<void> {
-    await this.#submitThreadAction("markUnread", "Mark unread", "Mark every message in this thread as unread.");
+    await this.#submitThreadAction(
+      "markUnread",
+      "GmailThread.markUnread",
+      "Mark unread",
+      "Mark every message in this thread as unread.",
+    );
   }
 }
 
@@ -1653,33 +1722,36 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
     this.#cachedRaw = cachedRaw;
   }
 
-  async #getRaw(): Promise<GmailMessageRaw> {
+  async #getRaw(gmailApi: GmailApi = this.#ctx.gmailApi): Promise<GmailMessageRaw> {
     if (!this.#cachedRaw) {
-      this.#cachedRaw = await this.#ctx.gmailApi.getMessage(this.#messageId);
+      this.#cachedRaw = await gmailApi.getMessage(this.#messageId);
     }
     return this.#cachedRaw;
   }
 
   async getMetadata(): Promise<GmailMessageInfo> {
-    const raw = await this.#getRaw();
-    const rawInfo = await this.#ctx.gmailApi.parseMessageInfo(raw);
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: sanitizeApprovalTitle(`Message info: ${rawInfo.subject}`),
-      description: `Get metadata for message ${this.#messageId}.`,
-    });
-
-    // Resolve raw label IDs to GmailLabel objects.
-    const labels = await this.#ctx.resolveLabels(rawInfo.labelIds);
-    return {
-      id: this.#messageId,
-      from: rawInfo.from,
-      to: rawInfo.to,
-      cc: rawInfo.cc,
-      subject: rawInfo.subject,
-      timestamp: rawInfo.timestamp,
-      labels,
-    };
+    return runGmailRead(
+      this.#ctx,
+      "GmailMessage.getMetadata",
+      async gmailApi => {
+        const raw = await this.#getRaw(gmailApi);
+        const rawInfo = await gmailApi.parseMessageInfo(raw);
+        const labels = await this.#ctx.resolveLabels(rawInfo.labelIds, gmailApi);
+        return {
+          id: this.#messageId,
+          from: rawInfo.from,
+          to: rawInfo.to,
+          cc: rawInfo.cc,
+          subject: rawInfo.subject,
+          timestamp: rawInfo.timestamp,
+          labels,
+        };
+      },
+      info => ({
+        title: sanitizeApprovalTitle(`Message info: ${info.subject}`),
+        description: `Get metadata for message ${this.#messageId}.`,
+      }),
+    );
   }
 
   async thread(): Promise<GmailThread> {
@@ -1691,15 +1763,19 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
   }
 
   async getContent(): Promise<EmailContent> {
-    const raw = await this.#getRaw();
-    const { info, content } = await this.#ctx.gmailApi.parseMessage(raw);
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: sanitizeApprovalTitle(`Read message: ${info.subject}`),
-      description: `Get body content of message ${this.#messageId}.`,
-    });
-
-    return content;
+    const result = await runGmailRead(
+      this.#ctx,
+      "GmailMessage.getContent",
+      async gmailApi => {
+        const raw = await this.#getRaw(gmailApi);
+        return gmailApi.parseMessage(raw);
+      },
+      ({ info }) => ({
+        title: sanitizeApprovalTitle(`Read message: ${info.subject}`),
+        description: `Get body content of message ${this.#messageId}.`,
+      }),
+    );
+    return result.content;
   }
 
   async reply(body: string): Promise<void> {
@@ -1715,6 +1791,7 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
     validateOutboundInput([...message.to, ...message.cc], message.subject, message.body);
     await submitGmailAction(
       this.#ctx,
+      "GmailMessage.reply",
       {
         type: "reply",
         sourceMessageId: this.#messageId,
@@ -1742,6 +1819,7 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
     validateOutboundInput([...message.to, ...message.cc], message.subject, message.body);
     await submitGmailAction(
       this.#ctx,
+      "GmailMessage.replyAll",
       {
         type: "reply",
         sourceMessageId: this.#messageId,
@@ -1773,6 +1851,7 @@ class GmailMessageStub extends RpcTarget implements GmailMessage {
     validateOutboundInput(message.to, message.subject, message.body);
     await submitGmailAction(
       this.#ctx,
+      "GmailMessage.forward",
       { type: "forward", sourceMessageId: this.#messageId, to: normalizedTo, body },
       {
         title: sanitizeApprovalTitle(`Forward: ${message.subject}`),
@@ -1799,6 +1878,7 @@ type GmailGatekeeperImplProps = {
 @validateRpc()
 export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplProps>
     implements Gatekeeper<GmailSession> {
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
   #tokens = new AccessTokenCache(opts => {
     let stub = this.ctx.exports.UserAccount.get(
         this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
@@ -1870,8 +1950,8 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     // In-memory label map cache for the session lifetime. Fetched once on
     // first label resolution, shared across all stubs in this session.
     let labelMapCache: Map<string, string> | undefined;
-    const getLabelMap = async () => {
-      if (!labelMapCache) labelMapCache = await gmailApi.listLabels();
+    const getLabelMap = async (api: GmailApi = gmailApi) => {
+      if (!labelMapCache) labelMapCache = await api.listLabels();
       return labelMapCache;
     };
     let labelId: string | undefined;
@@ -1886,63 +1966,96 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
     const ctx: GmailSessionContext = {
       gmailApi,
       approvalQueue: approvalQueue.dup(),
+      externalAccountId: this.ctx.props.userObjectId,
       pendingActions: new PendingActionStore<GmailAction>(this.ctx.storage.kv),
       searchQuery: this.ctx.props.searchQuery,
       labelId,
       labelName: this.ctx.props.labelName,
-      resolveLabels: async (labelIds: string[]): Promise<GmailLabel[]> =>
-        toLabelObjects(labelIds, await getLabelMap()),
+      resolveLabels: async (labelIds: string[], api?: GmailApi): Promise<GmailLabel[]> =>
+        toLabelObjects(labelIds, await getLabelMap(api)),
     };
 
     return new GmailSessionImpl(ctx);
   }
 
   /** --------------------------------------------------------------------------- */
-  async applyAction(actionId: number): Promise<void> {
-    const pendingActions = new PendingActionStore<GmailAction>(this.ctx.storage.kv);
-    const action = pendingActions.get(actionId);
-    if (!action) throw new Error(`Unknown pending Gmail action: ${actionId}`);
-
-    const selfEmail = await this.#getSelfEmail();
-    const gmailApi = new GmailApi(selfEmail, opts => this.#getAccessToken(opts));
-
-    switch (action.type) {
-      case "archive":
-        await gmailApi.modifyThread(action.threadId, [], ["INBOX"]);
-        break;
-      case "trash":
-        await gmailApi.trashThread(action.threadId);
-        break;
-      case "markRead":
-        await gmailApi.modifyThread(action.threadId, [], ["UNREAD"]);
-        break;
-      case "markUnread":
-        await gmailApi.modifyThread(action.threadId, ["UNREAD"], []);
-        break;
-      case "send": {
-        const message = gmailApi.buildSendRaw(action.to, action.subject, action.body);
-        await gmailApi.sendRawMessage(message.raw);
-        break;
-      }
-      case "reply": {
-        const original = await gmailApi.getMessage(action.sourceMessageId);
-        const message = await gmailApi.buildReplyRaw(
-          original, action.body, action.replyAll, action.sourceWasSent);
-        await gmailApi.sendRawMessage(message.raw, action.threadId);
-        break;
-      }
-      case "forward": {
-        const original = await gmailApi.getMessage(action.sourceMessageId);
-        const message = await gmailApi.buildForwardRaw(original, action.to, action.body);
-        await gmailApi.sendRawMessage(message.raw);
-        break;
-      }
-      default:
-        action satisfies never;
-        throw new Error(`unknown action type: ${(action as {type: string}).type}`);
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This Gmail Action predates billing. Reject it and submit the operation again.",
+      );
     }
 
-    pendingActions.remove(actionId);
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
+      }
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return work;
+  }
+
+  #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const pendingActions = new PendingActionStore<GmailAction>(this.ctx.storage.kv);
+    return runGoogleBillableAction({
+      storage: durableGoogleActionExecutionStorage(this.ctx.storage),
+      actionId,
+      execution,
+      getPending: () => pendingActions.get(actionId),
+      removePending: () => pendingActions.remove(actionId),
+      prepare: async action => {
+        const selfEmail = await this.#getSelfEmail();
+        const gmailApi = new GmailApi(selfEmail, opts => this.#getAccessToken(opts));
+        switch (action.type) {
+          case "archive":
+            return (activity: GoogleOperationActivity) =>
+              gmailApi.withActivity(activity).modifyThread(action.threadId, [], ["INBOX"]);
+          case "trash":
+            return (activity: GoogleOperationActivity) =>
+              gmailApi.withActivity(activity).trashThread(action.threadId);
+          case "markRead":
+            return (activity: GoogleOperationActivity) =>
+              gmailApi.withActivity(activity).modifyThread(action.threadId, [], ["UNREAD"]);
+          case "markUnread":
+            return (activity: GoogleOperationActivity) =>
+              gmailApi.withActivity(activity).modifyThread(action.threadId, ["UNREAD"], []);
+          case "send": {
+            const message = gmailApi.buildSendRaw(action.to, action.subject, action.body);
+            return async (activity: GoogleOperationActivity) => {
+              await gmailApi.withActivity(activity).sendRawMessage(message.raw);
+            };
+          }
+          case "reply": {
+            const original = await gmailApi.getMessage(action.sourceMessageId);
+            const message = await gmailApi.buildReplyRaw(
+              original,
+              action.body,
+              action.replyAll,
+              action.sourceWasSent,
+            );
+            return async (activity: GoogleOperationActivity) => {
+              await gmailApi.withActivity(activity).sendRawMessage(message.raw, action.threadId);
+            };
+          }
+          case "forward": {
+            const original = await gmailApi.getMessage(action.sourceMessageId);
+            const message = await gmailApi.buildForwardRaw(original, action.to, action.body);
+            return async (activity: GoogleOperationActivity) => {
+              await gmailApi.withActivity(activity).sendRawMessage(message.raw);
+            };
+          }
+        }
+      },
+      execute: (write, activity) => write(activity),
+    });
   }
 
   async rejectAction(actionId: number): Promise<void | {restart?: boolean}> {
@@ -1998,6 +2111,13 @@ type GoogleDocAppendAction = GoogleDocActionBase & {
 }
 
 type GoogleDocAction = GoogleDocReplaceAction | GoogleDocAppendAction;
+
+type PreparedGoogleDocAction = {
+  action: GoogleDocAction;
+  snapshot: DocSnapshot;
+  requests: any[];
+  laterPending: GoogleDocPendingAction[];
+};
 
 type GoogleDocPendingAction = {id: number, action: GoogleDocAction};
 
@@ -2181,6 +2301,7 @@ const EDIT_DOCUMENT_ACTION: ActionKind = {
 export class GoogleDocGatekeeperImpl
     extends DurableObject<Env, GoogleDocGatekeeperImplProps>
     implements Gatekeeper<GoogleDocSession> {
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
   #simulationCache: GoogleDocSimulationCacheHolder = {};
   #tokens = new AccessTokenCache(opts => {
     let stub: DurableObjectStub<UserAccount> = this.ctx.exports.UserAccount.get(
@@ -2219,79 +2340,120 @@ export class GoogleDocGatekeeperImpl
     return new GoogleDocSessionImpl(
         api,
         this.ctx.props.documentId,
+        this.ctx.props.userObjectId,
         approvalQueue.dup(),
         pendingActions,
         this.ctx.storage,
         this.#simulationCache);
   }
 
-  async applyAction(actionId: number): Promise<void> {
-    let pendingActions = new PendingActionStore<GoogleDocAction>(this.ctx.storage.kv);
-    let pending = pendingActions.list();
-    let pendingIndex = pending.findIndex(({id}) => id === actionId);
-    if (pendingIndex === -1) {
-      throw new Error(`Unknown pending Google Doc action: ${actionId}`);
-    }
-    let pendingRecord = pending[pendingIndex];
-
-    let action = pendingRecord.action;
-    if (action.invalidatedReason) {
-      pendingActions.remove(actionId);
-      this.#simulationCache.current = undefined;
-      return;
-    }
-
-    let firstPending = pending.find(({action}) => !action.invalidatedReason);
-    if (firstPending?.id !== actionId) {
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
       throw new Error(
-        `Google Doc edits must be approved in order. Approve earlier edit ` +
-        `${firstPending?.id} before edit ${actionId}.`);
+        "This Google Doc Action predates billing. Reject it and submit the edit again.",
+      );
     }
 
-    let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
-    let doc = await api.getDocument(action.documentId);
-    let snapshot = docToMarkdown(doc);
-    let requests: any[];
-    try {
-      requests = materializeGoogleDocAction(snapshot, action);
-    } catch (error) {
-      logger.error("dropping stale Google Doc action during apply", {
-        event: "google.doc.action.apply.stale.dropped",
-        actionId, error,
-      });
-      pendingActions.remove(actionId);
-      this.#simulationCache.current = undefined;
-      await this.ctx.storage.put("docSnapshot", snapshot);
-      invalidateUnreplayableGoogleDocActions(
-          pendingActions,
-          snapshot.markdown,
-          pending.slice(pendingIndex + 1),
-          `Pending Google Doc edits could not be replayed after edit ${actionId} was dropped`);
-      return;
-    }
-    if (requests.length > 0) {
-      await api.batchUpdate(action.documentId, requests, snapshot.revisionId);
-    }
-    pendingActions.remove(actionId);
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
+      }
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return work;
+  }
+
+  async #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const pendingActions = new PendingActionStore<GoogleDocAction>(this.ctx.storage.kv);
+    let preparedAction: PreparedGoogleDocAction | undefined;
+    const result = await runGoogleBillableAction({
+      storage: durableGoogleActionExecutionStorage(this.ctx.storage),
+      actionId,
+      execution,
+      getPending: () => pendingActions.get(actionId),
+      removePending: () => pendingActions.remove(actionId),
+      prepare: async action => {
+        if (action.invalidatedReason) throw new Error(action.invalidatedReason);
+
+        const pending = pendingActions.list();
+        const pendingIndex = pending.findIndex(record => record.id === actionId);
+        const firstPending = pending.find(record => !record.action.invalidatedReason);
+        if (firstPending?.id !== actionId) {
+          throw new Error(
+            `Google Doc edits must be approved in order. Approve earlier edit ` +
+            `${firstPending?.id} before edit ${actionId}.`,
+          );
+        }
+
+        const api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+        const snapshot = docToMarkdown(await api.getDocument(action.documentId));
+        let requests: any[];
+        try {
+          requests = materializeGoogleDocAction(snapshot, action);
+        } catch (error) {
+          logger.error("dropping stale Google Doc action during apply", {
+            event: "google.doc.action.apply.stale.dropped",
+            actionId,
+            error,
+          });
+          throw error;
+        }
+        preparedAction = {
+          action,
+          snapshot,
+          requests,
+          laterPending: pending.slice(pendingIndex + 1),
+        };
+        return { api, preparedAction };
+      },
+      execute: async ({ api, preparedAction: prepared }, activity) => {
+        if (prepared.requests.length > 0) {
+          await api.withActivity(activity).batchUpdate(
+            prepared.action.documentId,
+            prepared.requests,
+            prepared.snapshot.revisionId,
+          );
+        }
+      },
+    });
+
     this.#simulationCache.current = undefined;
+    if (result.outcome !== "accepted" || !preparedAction) {
+      await this.ctx.storage.delete("docSnapshot");
+      return result;
+    }
 
     try {
-      let refreshedSnapshot = snapshot;
-      if (requests.length > 0) {
-        refreshedSnapshot = docToMarkdown(await api.getDocument(action.documentId));
+      let refreshedSnapshot = preparedAction.snapshot;
+      if (preparedAction.requests.length > 0) {
+        const api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
+        refreshedSnapshot = docToMarkdown(
+          await api.getDocument(preparedAction.action.documentId),
+        );
       }
       await this.ctx.storage.put("docSnapshot", refreshedSnapshot);
       invalidateUnreplayableGoogleDocActions(
-          pendingActions,
-          refreshedSnapshot.markdown,
-          pending.slice(pendingIndex + 1),
-          `Pending Google Doc edits could not be replayed after edit ${actionId} was applied`);
+        pendingActions,
+        refreshedSnapshot.markdown,
+        preparedAction.laterPending,
+        `Pending Google Doc edits could not be replayed after edit ${actionId} was applied`,
+      );
     } catch (error) {
       logger.warn("failed to refresh Google Doc simulation after applying action", {
-        event: "google.doc.simulation.refresh.failed", error,
+        event: "google.doc.simulation.refresh.failed",
+        error,
       });
       await this.ctx.storage.delete("docSnapshot");
     }
+    return result;
   }
 
   async rejectAction(actionId: number): Promise<void | {restart?: boolean}> {
@@ -2341,6 +2503,7 @@ export class GoogleDocGatekeeperImpl
 class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   #docsApi: GoogleDocsApi;
   #documentId: string;
+  #externalAccountId: string;
   #approvalQueue: RpcStub<ApprovalQueue>;
   #pendingActions: PendingActionStore<GoogleDocAction>;
   #storage: DurableObjectStorage;
@@ -2349,6 +2512,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   constructor(
     docsApi: GoogleDocsApi,
     documentId: string,
+    externalAccountId: string,
     approvalQueue: RpcStub<ApprovalQueue>,
     pendingActions: PendingActionStore<GoogleDocAction>,
     storage: DurableObjectStorage,
@@ -2357,13 +2521,17 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     super();
     this.#docsApi = docsApi;
     this.#documentId = documentId;
+    this.#externalAccountId = externalAccountId;
     this.#approvalQueue = approvalQueue;
     this.#pendingActions = pendingActions;
     this.#storage = storage;
     this.#simulationCache = simulationCache;
   }
 
-  async #getSnapshot(forceRefresh?: boolean): Promise<DocSnapshot> {
+  async #getSnapshot(
+    forceRefresh?: boolean,
+    docsApi: GoogleDocsApi = this.#docsApi,
+  ): Promise<DocSnapshot> {
     if (!forceRefresh) {
       let cached = await this.#storage.get<DocSnapshot>("docSnapshot");
       if (cached) {
@@ -2372,7 +2540,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
           return cached;
         }
         // TTL expired — check if document has changed.
-        let currentRevisionId = await this.#docsApi.getRevisionId(this.#documentId);
+        let currentRevisionId = await docsApi.getRevisionId(this.#documentId);
         if (currentRevisionId === cached.revisionId) {
           cached.fetchedAt = Date.now();
           await this.#storage.put("docSnapshot", cached);
@@ -2382,18 +2550,18 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     }
 
     // Fetch full document and build snapshot.
-    let doc = await this.#docsApi.getDocument(this.#documentId);
+    let doc = await docsApi.getDocument(this.#documentId);
     let snapshot = docToMarkdown(doc);
     await this.#storage.put("docSnapshot", snapshot);
     return snapshot;
   }
 
-  async #getSimulatedContent(): Promise<{
+  async #getSimulatedContent(docsApi: GoogleDocsApi = this.#docsApi): Promise<{
     snapshot: DocSnapshot,
     markdown: string,
     pendingActions: GoogleDocAction[],
   }> {
-    let snapshot = await this.#getSnapshot();
+    let snapshot = await this.#getSnapshot(false, docsApi);
     let pending = this.#pendingActions.list();
     let pendingFingerprint = googleDocPendingFingerprint(pending);
     let cached = this.#simulationCache.current;
@@ -2422,33 +2590,49 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   async getMetadata(): Promise<DocMetadata> {
-    let {snapshot, pendingActions} = await this.#getSimulatedContent();
-
-    await this.#approvalQueue.authorizeObservation({
-      title: "Read Google Doc metadata",
-      description: "Read the title and modification time of the document.",
-    });
-
-    // The Docs API doesn't return lastModified directly (that's a Drive API field).
-    // For now, use the fetch timestamp as an approximation.
-    // TODO: Use Drive API files.get for actual modifiedTime.
-    let lastModified = pendingActions.reduce(
-        (latest, action) => Math.max(latest, action.submittedAt), snapshot.fetchedAt);
-    return {
-      title: snapshot.title ?? "Untitled document",
-      lastModified: new Date(lastModified),
-    };
+    return runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS["GoogleDocSession.getMetadata"],
+      async activity => {
+        const {snapshot, pendingActions} = await this.#getSimulatedContent(
+          this.#docsApi.withActivity(activity),
+        );
+        // The Docs API doesn't return lastModified directly (that's a Drive API field).
+        // For now, use the fetch timestamp as an approximation.
+        // TODO: Use Drive API files.get for actual modifiedTime.
+        const lastModified = pendingActions.reduce(
+          (latest, action) => Math.max(latest, action.submittedAt),
+          snapshot.fetchedAt,
+        );
+        return {
+          title: snapshot.title ?? "Untitled document",
+          lastModified: new Date(lastModified),
+        };
+      },
+      () => ({
+        title: "Read Google Doc metadata",
+        description: "Read the title and modification time of the document.",
+      }),
+    );
   }
 
   async getContent(): Promise<string> {
-    let {markdown} = await this.#getSimulatedContent();
-
-    await this.#approvalQueue.authorizeObservation({
-      title: "Read Google Doc content",
-      description: "Read the full simulated content of the document as Markdown.",
-    });
-
-    return markdown;
+    return runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS["GoogleDocSession.getContent"],
+      async activity => {
+        const {markdown} = await this.#getSimulatedContent(
+          this.#docsApi.withActivity(activity),
+        );
+        return markdown;
+      },
+      () => ({
+        title: "Read Google Doc content",
+        description: "Read the full simulated content of the document as Markdown.",
+      }),
+    );
   }
 
   async replaceText(oldMarkdown: string, newMarkdown: string): Promise<void> {
@@ -2481,6 +2665,10 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
           `**Old:** ${oldPreview}\n\n` +
           `**New:** ${newPreview}`,
         implementsRevert: false,
+        billing: googleActionBilling(
+          "GoogleDocSession.replaceText",
+          this.#externalAccountId,
+        ),
         // Group all document edits under one tag
         actionKind: EDIT_DOCUMENT_ACTION,
         autoApprovable: true,
@@ -2512,6 +2700,10 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
         title: "Append to Google Doc",
         description: `Append content to the end of the document:\n\n${preview}`,
         implementsRevert: false,
+        billing: googleActionBilling(
+          "GoogleDocSession.appendText",
+          this.#externalAccountId,
+        ),
         // Same "editDocument" tag as replaceText
         actionKind: EDIT_DOCUMENT_ACTION,
         autoApprovable: true,
@@ -2571,7 +2763,10 @@ export class GoogleSheetsGatekeeperImpl
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleSpreadsheetSession> {
     let api = new GoogleSheetsApi(opts => this.#getAccessToken(opts));
     return new GoogleSpreadsheetSessionImpl(
-      api, this.ctx.props.spreadsheetId, approvalQueue.dup(),
+      api,
+      this.ctx.props.spreadsheetId,
+      this.ctx.props.userObjectId,
+      approvalQueue.dup(),
     );
   }
 
@@ -2608,16 +2803,19 @@ export class GoogleSheetsGatekeeperImpl
 class GoogleSpreadsheetSessionImpl extends RpcTarget implements GoogleSpreadsheetSession {
   #api: GoogleSheetsApi;
   #spreadsheetId: string;
+  #externalAccountId: string;
   #approvalQueue: RpcStub<ApprovalQueue>;
 
   constructor(
     api: GoogleSheetsApi,
     spreadsheetId: string,
+    externalAccountId: string,
     approvalQueue: RpcStub<ApprovalQueue>,
   ) {
     super();
     this.#api = api;
     this.#spreadsheetId = spreadsheetId;
+    this.#externalAccountId = externalAccountId;
     this.#approvalQueue = approvalQueue;
   }
 
@@ -2626,50 +2824,63 @@ class GoogleSpreadsheetSessionImpl extends RpcTarget implements GoogleSpreadshee
   }
 
   async getSpreadsheet(): Promise<SpreadsheetInfo> {
-    let spreadsheet = await this.#api.getSpreadsheet(this.#spreadsheetId);
-    await this.#approvalQueue.authorizeObservation({
-      title: "Read Google spreadsheet metadata",
-      description:
-        `Read metadata for "${spreadsheet.title}", including its ${spreadsheet.sheets.length} ` +
-        "worksheet(s).",
-    });
-    return spreadsheet;
+    return runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS["GoogleSpreadsheetSession.getSpreadsheet"],
+      activity => this.#api.withActivity(activity).getSpreadsheet(this.#spreadsheetId),
+      spreadsheet => ({
+        title: "Read Google spreadsheet metadata",
+        description:
+          `Read metadata for "${spreadsheet.title}", including its ` +
+          `${spreadsheet.sheets.length} worksheet(s).`,
+      }),
+    );
   }
 
   async readRange(
     range: string,
     options?: { valueMode?: SpreadsheetValueMode },
   ): Promise<SpreadsheetRange> {
-    return (await this.#readRanges([range], options))[0];
+    return (await this.#readRanges("GoogleSpreadsheetSession.readRange", [range], options))[0];
   }
 
   async readRanges(
     ranges: string[],
     options?: { valueMode?: SpreadsheetValueMode },
   ): Promise<SpreadsheetRange[]> {
-    return this.#readRanges(ranges, options);
+    return this.#readRanges("GoogleSpreadsheetSession.readRanges", ranges, options);
   }
 
   async #readRanges(
+    method: "GoogleSpreadsheetSession.readRange" | "GoogleSpreadsheetSession.readRanges",
     ranges: string[],
     options?: { valueMode?: SpreadsheetValueMode },
   ): Promise<SpreadsheetRange[]> {
-    let result = await this.#api.readRanges(
-      this.#spreadsheetId, ranges, options?.valueMode,
+    return runGoogleRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      GOOGLE_BILLING_METHODS[method],
+      activity => this.#api.withActivity(activity).readRanges(
+        this.#spreadsheetId,
+        ranges,
+        options?.valueMode,
+      ),
+      result => {
+        const cellCount = result.reduce(
+          (total, item) => total + item.values.reduce((sum, row) => sum + row.length, 0),
+          0,
+        );
+        return {
+          title: result.length === 1
+            ? `Read Google Sheets range ${result[0].range}`
+            : `Read ${result.length} Google Sheets ranges`,
+          description:
+            `Read ${cellCount.toLocaleString()} cell(s) from ${result.length} bounded range(s) ` +
+            "in the connected spreadsheet.",
+        };
+      },
     );
-    let cellCount = result.reduce(
-      (total, range) => total + range.values.reduce((sum, row) => sum + row.length, 0),
-      0,
-    );
-    await this.#approvalQueue.authorizeObservation({
-      title: result.length === 1
-        ? `Read Google Sheets range ${result[0].range}`
-        : `Read ${result.length} Google Sheets ranges`,
-      description:
-        `Read ${cellCount.toLocaleString()} cell(s) from ${result.length} bounded range(s) in ` +
-        "the connected spreadsheet.",
-    });
-    return result;
   }
 }
 

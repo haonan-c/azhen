@@ -4,6 +4,7 @@
 // It follows the same pattern as google-api.ts (which wraps the Gmail API).
 
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperationActivity } from "./billing.js";
 
 // ---------------------------------------------------------------------------
 // Types modeling the Google Docs API response.
@@ -89,7 +90,15 @@ export type TextStyle = {
 const DOCS_API_BASE = "https://docs.googleapis.com/v1/documents";
 
 export class GoogleDocsApi {
-  constructor(private getAccessToken: AccessTokenProvider) {}
+  constructor(
+    private getAccessToken: AccessTokenProvider,
+    private activity?: GoogleOperationActivity,
+  ) {}
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: GoogleOperationActivity): GoogleDocsApi {
+    return new GoogleDocsApi(this.getAccessToken, activity);
+  }
 
   /** Fetch the full document. */
   async getDocument(documentId: string): Promise<GoogleDocsDocument> {
@@ -97,6 +106,7 @@ export class GoogleDocsApi {
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}`,
       {},
       this.getAccessToken,
+      { activity: this.activity },
     );
 
     if (!response.ok) {
@@ -119,6 +129,7 @@ export class GoogleDocsApi {
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}?fields=revisionId`,
       {},
       this.getAccessToken,
+      { activity: this.activity },
     );
 
     if (!response.ok) {
@@ -160,6 +171,7 @@ export class GoogleDocsApi {
         body: JSON.stringify(body),
       },
       this.getAccessToken,
+      { activity: this.activity },
     );
 
     if (!response.ok) {

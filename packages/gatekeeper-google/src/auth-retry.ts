@@ -20,6 +20,8 @@
 // Both concerns share a single attempt counter, so the worst case is a predictable `retries + 1`
 // requests: `retries` transient attempts plus at most one extra for the one-shot 401 refresh.
 
+import type { GoogleOperationActivity } from "./billing.js";
+
 /**
  * Options for requesting an access token.
  *
@@ -42,6 +44,8 @@ export type FetchWithAuthRetryOptions = {
   retries?: number;
   /** Per-attempt abort timeout in milliseconds. Omitted means no timeout is imposed. */
   timeoutMs?: number;
+  /** Caller-owned activity for one Billable API Operation across all internal attempts. */
+  activity?: GoogleOperationActivity;
 };
 
 const BASE_DELAY_MS = 500;
@@ -108,11 +112,13 @@ export async function fetchWithAuthRetry(
 
     let response: Response;
     try {
+      opts.activity?.requestDispatched();
       response = await fetch(url, {
         ...init,
         headers,
         ...(signal ? { signal } : {}),
       });
+      opts.activity?.responseReceived(response.status);
     } catch (error) {
       // Network error or timeout: ambiguous, so retry idempotent GETs only.
       if (replayable && method === "GET" && attempt < retries - 1) {

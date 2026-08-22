@@ -8,7 +8,8 @@
     "build:configurator": "node ../../scripts/build-gatekeeper-configurator.mjs .",
     "deploy": "pnpm run build:configurator && wrangler deploy",
     "build": "pnpm run build:configurator && tsc",
-    "clean": "rm -rf dist src/generated"
+    "clean": "rm -rf dist src/generated",
+    "test": "pnpm run build:configurator && vitest run"
   },
   "dependencies": {
     "@gadgets/backend-utils": "workspace:*",
@@ -20,7 +21,9 @@
     "postal-mime": "^2.7.5"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "catalog:",
     "typescript": "catalog:",
+    "vitest": "catalog:",
     "wrangler": "catalog:"
   }
 }

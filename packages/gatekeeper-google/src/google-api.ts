@@ -7,6 +7,7 @@ import { GmailThreadInfo, EmailAddress } from "./types";
 import { createMimeMessage } from "mimetext/browser";
 import PostalMime, { addressParser } from "postal-mime";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperationActivity } from "./billing.js";
 
 /**
  * Internal type for parsed message info with raw label IDs (not yet resolved
@@ -531,15 +532,29 @@ async function readErrorText(response: Response, maxBytes = 4096): Promise<strin
 export class GmailApi {
   private selfEmail: string;
 
-  constructor(selfEmail: string, private getAccessToken: AccessTokenProvider) {
+  constructor(
+    selfEmail: string,
+    private getAccessToken: AccessTokenProvider,
+    private activity?: GoogleOperationActivity,
+  ) {
     this.selfEmail = selfEmail;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: GoogleOperationActivity): GmailApi {
+    return new GmailApi(this.selfEmail, this.getAccessToken, activity);
   }
 
   // All Gmail API calls go through this for auth + retry: it injects the Bearer token, retries
   // once on a 401 with a force-refreshed token, and retries transient failures (429 / 5xx) with
   // backoff on GETs only. Callers must not set the Authorization header themselves.
   private authedFetch(url: string, init?: RequestInit): Promise<Response> {
-    return fetchWithAuthRetry(url, init ?? {}, this.getAccessToken);
+    return fetchWithAuthRetry(
+      url,
+      init ?? {},
+      this.getAccessToken,
+      { activity: this.activity },
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import type {
   SpreadsheetCellValue, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperationActivity } from "./billing.js";
 
 const API_BASE = "https://sheets.googleapis.com/v4/spreadsheets";
 const MAX_RANGES = 20;
@@ -162,11 +163,22 @@ async function readResponseText(response: Response, maxBytes: number): Promise<s
 }
 
 export class GoogleSheetsApi {
-  constructor(private getAccessToken: AccessTokenProvider) {}
+  constructor(
+    private getAccessToken: AccessTokenProvider,
+    private activity?: GoogleOperationActivity,
+  ) {}
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: GoogleOperationActivity): GoogleSheetsApi {
+    return new GoogleSheetsApi(this.getAccessToken, activity);
+  }
 
   async #request<T>(url: URL): Promise<T> {
     let response = await fetchWithAuthRetry(
-      url.toString(), {}, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      url.toString(), {}, this.getAccessToken, {
+        timeoutMs: REQUEST_TIMEOUT_MS,
+        activity: this.activity,
+      },
     );
 
     let text: string;
