@@ -13,7 +13,6 @@ import Header from '../components/Header'
 import AppShell from '../components/AppShell/AppShell'
 import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
-import AccountSelectionModal from '../components/billing/AccountSelectionModal'
 import { m as messages } from '../paraglide/messages.js'
 
 export const Route = createRootRoute({
@@ -176,7 +175,6 @@ function AuthenticatedShell({
   const fullscreen = isWorkspaceEditor
   return (
     <>
-      <AccountSelectionModal />
       {fullscreen ? (
         <main>
           <Outlet />

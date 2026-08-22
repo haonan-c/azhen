@@ -8,22 +8,8 @@ const CF_OAUTH_AUTH_URL = "https://dash.cloudflare.com/oauth2/auth";
 const CF_OAUTH_TOKEN_URL = "https://dash.cloudflare.com/oauth2/token";
 
 /**
- * Scopes for sign-in + the AI Gateway billing/BYOK flow: read account details and route inference
- * through the user's own AI Gateway. We deliberately do NOT request "openid" — the dashboard OAuth
- * client isn't permitted it; identity comes from user-details.read (the /user API). offline_access
- * yields a refresh token; account-settings.read is required to enumerate the user's account(s).
- */
-export const FULL_SCOPES = [
-  "offline_access",
-  "aig.read",
-  "aig.run",
-  "user-details.read",
-  "account-settings.read",
-];
-
-/**
- * Minimal scopes for sign-in only: a refresh token + the /user identity read. Used in "auth" mode
- * (the resulting grant is transient).
+ * Minimal scopes for sign-in: a refresh token and the `/user` identity read. The dashboard OAuth
+ * client does not permit `openid`, so identity comes from `user-details.read`.
  */
 export const AUTH_SCOPES = [
   "offline_access",

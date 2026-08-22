@@ -1,12 +1,11 @@
 import { WorkerEntrypoint, DurableObject } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
-  GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, GatekeeperUserVerifier, VendorDescription,
+  GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, VendorDescription,
   GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription,
   SupportedResource, ResourceConfiguratorFrame, stripTrailingSlashes,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
-import { getOAuthConfig, buildAuthorizeUrl, generatePkce, exchangeCode, refreshTokens, AUTH_SCOPES, FULL_SCOPES } from "./oauth";
+import { getOAuthConfig, buildAuthorizeUrl, generatePkce, exchangeCode, refreshTokens, AUTH_SCOPES } from "./oauth";
 import { fetchIdentity } from "./cloudflare-api";
 import { VENDOR_ID } from "./vendor.js";
 import TYPES_CODE from "./types.txt";
@@ -23,7 +22,6 @@ type StoredNonce = {
   expiresAt: number;
   stage: "initiation" | "oauth";
   verifier?: string;
-  scopes?: string[];
 };
 
 // A cached access token plus its absolute expiry (unix ms).
@@ -155,21 +153,17 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       logo: { url: CLOUDFLARE_LOGO_URL },
       color: "#fbece0",
       tagline: "Sign in with Cloudflare",
-      description:
-          "Sign in with your Cloudflare account. Usage beyond the free tier can be billed to your " +
-          "own Cloudflare AI Gateway credits.",
+      description: "Use your Cloudflare identity to sign in.",
       providesAuth: true,
     };
   }
 
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,
-                       options?: GatekeeperConnectOptions): Promise<{ url: string }> {
+                       _options?: GatekeeperConnectOptions): Promise<{ url: string }> {
     const userObjectId = this.ctx.exports.UserAccount.newUniqueId();
     const initiationNonce = generateNonce();
-    const authOnly = options?.scopes === "auth";
-    const scopes = authOnly ? AUTH_SCOPES : FULL_SCOPES;
     await this.ctx.exports.UserAccount.get(userObjectId)
-        .setCallback(callback, initiationNonce, scopes, authOnly);
+        .setCallback(callback, initiationNonce);
     return { url: `${getBaseUrl(this.env)}/${userObjectId.toString()}/${initiationNonce}` };
   }
 
@@ -190,16 +184,13 @@ export class UserAccount extends DurableObject<Env> {
     return config;
   }
 
-  async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string,
-                    scopes?: string[], ephemeral?: boolean) {
+  async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string) {
     if (!this.ctx.storage.kv.get<string>("refreshToken")) {
       this.ctx.storage.setAlarm(Date.now() + 3600 * 1000);
     }
     this.ctx.storage.kv.put("callback", callback);
-    // Scopes to request (auth-only for sign-in, or the full capability set). Reused on reconnect.
-    if (scopes) this.ctx.storage.kv.put<string[]>("scopes", scopes);
-    // Auth-only sign-in grants are transient: dropped shortly after the email is read.
-    this.ctx.storage.kv.put<boolean>("ephemeral", ephemeral ?? false);
+    // Identity-only sign-in grants are transient: drop them shortly after the email is read.
+    this.ctx.storage.kv.put<boolean>("ephemeral", true);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
@@ -209,6 +200,9 @@ export class UserAccount extends DurableObject<Env> {
 
   async prepareReconnect(initiationNonce: string) {
     this.ctx.storage.kv.put<boolean>("reconnecting", true);
+    // A legacy connected account can contain the retired broader scope list. Reconnect always uses
+    // the current identity-only scopes and removes the old list before creating an authorization URL.
+    this.ctx.storage.kv.delete("scopes");
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
@@ -234,8 +228,7 @@ export class UserAccount extends DurableObject<Env> {
       stage: "oauth",
       verifier,
     });
-    const scopes = this.ctx.storage.kv.get<string[]>("scopes") ?? FULL_SCOPES;
-    return { oauthNonce, challenge, scopes };
+    return { oauthNonce, challenge, scopes: AUTH_SCOPES };
   }
 
   async acceptAuthCode(code: string, oauthNonce: string): Promise<boolean> {
@@ -338,7 +331,7 @@ type GatekeeperUserImplProps = { userObjectId: string };
 
 @validateRpc()
 export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImplProps>
-                                implements CloudflareGatekeeperUser {
+                                implements GatekeeperUser {
   #account() {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     return this.ctx.exports.UserAccount.get(id);
@@ -363,10 +356,6 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async ensureResources(_resourceUrlPatterns: string[]): Promise<{url?: string}> {
     return {};
-  }
-
-  async getUsableAccessToken(): Promise<string | null> {
-    return this.#account().getAccessToken();
   }
 
   async getSupportedResources(): Promise<SupportedResource[]> {

@@ -207,58 +207,31 @@ describe("getModel AI Gateway routing", () => {
         "CF_AI_GATEWAY_WAI and CF_AI_GATEWAY_WAI_DIRECT cannot be configured together.");
   });
 
-  it("prioritizes a connected user's Gateway over platform routing", async () => {
-    const handle = routeModel(env(), WORKERS_AI_CONFIG, INITIATOR, {
-      userGateway: { accountId: "user-account-id", apiKey: "user-token" },
+  it("ignores legacy personal Gateway data injected at runtime", async () => {
+    const workerEnv = {
+      ...env(),
+      ENABLE_CLOUDFLARE_LIMITS: "true",
+      DAILY_LLM_CALL_LIMIT: "1",
+      MINIMUM_CLOUDFLARE_BALANCE: "1000",
+    } as unknown as Cloudflare.Env;
+    const options = {
+      userGateway: { accountId: "legacy-user-account-id", apiKey: "legacy-user-token" },
       metadata: { source: "chat", gadgetId: "gadget-789", chatId: 9 },
-    });
+    } as unknown as Omit<Parameters<typeof getModel>[3], "metering">;
+    const handle = routeModel(workerEnv, WORKERS_AI_CONFIG, INITIATOR, options);
 
-    // BYOK rides the user's default gateway's provider-native routes (unified *billing* has no
-    // API requirements), regardless of the platform gateway configuration. For Workers AI that
-    // is its own OpenAI-compatible endpoint under workers-ai/v1.
-    expect(handle.model.api).toBe("openai-completions");
-    expect(handle.model.id).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
     expect(handle.model.baseUrl).toBe(
-        "https://gateway.ai.cloudflare.com/v1/user-account-id/default/workers-ai/v1");
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/workers-ai/v1");
     expect(handle.aiGatewayLogRoute).toEqual({
-      gateway: "default",
-      accountId: "user-account-id",
-      apiToken: "user-token",
+      gateway: "platform-gateway",
+      accountId: "gateway-account-id",
+      apiToken: "gateway-token",
     });
 
     const request = await captureRequest(handle);
-    expect(request.url).toBe(
-        "https://gateway.ai.cloudflare.com/v1/user-account-id/default/workers-ai/v1/" +
-        "chat/completions");
-    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer user-token");
-    expect(JSON.parse(request.headers.get("cf-aig-metadata")!)).toEqual({
-      user: "user-123",
-      source: "chat",
-      gadgetId: "gadget-789",
-      chatId: 9,
-    });
-  }, 15000);
-
-  it("speaks the provider's native API on a connected user's Gateway", async () => {
-    const handle = routeModel(env(), ANTHROPIC_CONFIG, INITIATOR, {
-      userGateway: { accountId: "user-account-id", apiKey: "user-token" },
-    });
-
-    // Never the gateway's unified OpenAI-compat translation layer: it drops provider features
-    // (extended thinking, cache_control prompt caching, the Responses API).
-    expect(handle.model.api).toBe("anthropic-messages");
-    expect(handle.model.id).toBe("claude-sonnet-4-5");
-    expect(handle.model.baseUrl).toBe(
-        "https://gateway.ai.cloudflare.com/v1/user-account-id/default/anthropic");
-
-    const request = await captureRequest(handle);
-    expect(request.url).toBe(
-        "https://gateway.ai.cloudflare.com/v1/user-account-id/default/anthropic/v1/messages");
-    // The user's token authorizes the gateway; the SDK's own auth headers are suppressed so the
-    // gateway's unified-billing provider keys apply.
-    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer user-token");
-    expect(request.headers.get("x-api-key")).toBeNull();
-    expect(request.headers.get("authorization")).toBeNull();
+    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+    expect(request.url).not.toContain("legacy-user-account-id");
+    expect([...request.headers.values()].join("\n")).not.toContain("legacy-user-token");
   }, 15000);
 
   it("routes Workers AI to its REST endpoint when explicitly configured direct", async () => {
@@ -335,8 +308,8 @@ describe("getModel direct routing", () => {
   }, 15000);
 
   it("uses the config's own account and token for direct Workers AI", async () => {
-    // Outside gateway mode, Workers AI is BYOK like any other provider: credentials come from
-    // the model config (never from env, which only configures gateway mode).
+    // Outside gateway mode, Workers AI credentials come from the administrator-controlled
+    // Deployment Model config (never from env, which only configures gateway mode).
     const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), {
       ...WORKERS_AI_CONFIG,
       accountId: "user-account-id",
@@ -358,10 +331,10 @@ describe("getModel direct routing", () => {
     { accountId: undefined, apiToken: "user-token" },
     { accountId: "user-account-id", apiToken: "" },
   ])("requires config credentials for direct Workers AI", (overrides) => {
-    // Pre-BYOK configs (saved when Workers AI needed no credentials) fail with a clear message.
+    // Legacy configs saved without Workers AI credentials fail with a clear message.
     expect(() => routeModel(env({ CF_AI_GATEWAY: undefined }),
         { ...WORKERS_AI_CONFIG, ...overrides }, INITIATOR))
-        .toThrow("This Workers AI model has no Cloudflare credentials.");
+        .toThrow("This Workers AI Deployment Model has no Cloudflare credentials.");
   });
 
   it("appends /v1 to an Ollama server base URL", () => {
@@ -423,9 +396,7 @@ describe("getModel direct routing", () => {
       provider: "deepseek",
       model: "deepseek-v4-flash",
       apiToken: "deepseek-token",
-    }, INITIATOR, {
-      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
-    });
+    }, INITIATOR);
 
     expect(handle.model.api).toBe("openai-completions");
     expect(handle.model.baseUrl).toBe("https://api.deepseek.com");
@@ -443,7 +414,7 @@ describe("getModel direct routing", () => {
     expect(body.thinking).toEqual({ type: "disabled" });
   }, 15000);
 
-  it("keeps Ollama direct when platform and user gateways are configured", async () => {
+  it("keeps Ollama direct when the platform gateway is configured", async () => {
     const handle = routeModel(env({
       CF_AI_GATEWAY_PROVIDERS: "anthropic,ollama",
     }), {
@@ -451,9 +422,7 @@ describe("getModel direct routing", () => {
       model: "qwen3:8b",
       apiToken: "ollama-token",
       apiUrl: "http://my-ollama:11434",
-    }, INITIATOR, {
-      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
-    });
+    }, INITIATOR);
 
     expect(handle.model.baseUrl).toBe("http://my-ollama:11434/v1");
     expect(handle.aiGatewayLogRoute).toBeUndefined();
@@ -566,23 +535,68 @@ describe("getModel Usage metering chokepoint", () => {
     expect(meteringCalls.filter(call => call === "begin")).toHaveLength(2);
   }, 15000);
 
-  it("passes a provider it cannot meter through without an Attempt", async () => {
+  it("records an Unpriced Use Attempt for a provider without a Usage parser", async () => {
     const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), ANTHROPIC_CONFIG, INITIATOR);
 
     await captureRequest(handle);
-    expect(meteringCalls).toEqual([]);
+    expect(meteringCalls).toEqual([
+      "issue:anthropic:claude-sonnet-4-5", "begin", "start", "complete",
+    ]);
   }, 15000);
 
-  it("names exactly the providers whose own Usage report it can read", () => {
-    expect(isMeteredModelProvider("deepseek")).toBe(true);
-    for (const provider of ["anthropic", "openai", "google", "cloudflare", "ollama"]) {
+  it("does not call an unpriced provider when Attempt persistence fails", async () => {
+    const baseMetering = stubMetering();
+    const metering = {
+      ...baseMetering,
+      user: {
+        ...baseMetering.user,
+        async beginModelUsage() {
+          meteringCalls.push("begin");
+          throw new Error("stubbed Attempt persistence failure");
+        },
+      },
+    } as unknown as ModelMeteringOptions;
+    const handle = getModel(
+      env({CF_AI_GATEWAY: undefined}),
+      ANTHROPIC_CONFIG,
+      INITIATOR,
+      {metering},
+    );
+    let providerCalls = 0;
+
+    const result = await handle.stream(handle.model, {
+      messages: [{role: "user", content: "hello", timestamp: 0}],
+    }, {
+      maxRetries: 0,
+      fetch: (async () => {
+        providerCalls += 1;
+        return Response.json({error: {message: "must not run"}}, {status: 400});
+      }) as typeof fetch,
+    }).result();
+
+    expect(result.stopReason).toBe("error");
+    expect(providerCalls).toBe(0);
+    expect(meteringCalls).toEqual(["issue:anthropic:claude-sonnet-4-5", "begin"]);
+  }, 15000);
+
+  it("recognizes every resolved provider that must create an Attempt", () => {
+    for (const provider of [
+      "anthropic", "openai", "google", "cloudflare-workers-ai", "deepseek", "ollama",
+    ]) {
+      expect(isMeteredModelProvider(provider)).toBe(true);
+    }
+    for (const provider of ["cloudflare", "unknown-provider"]) {
       expect(isMeteredModelProvider(provider)).toBe(false);
     }
   });
 
-  it("refuses to wrap a handle whose provider it cannot meter", () => {
+  it("refuses to wrap a handle whose provider is unsupported", () => {
     const handle = routeModel(env({ CF_AI_GATEWAY: undefined }), ANTHROPIC_CONFIG, INITIATOR);
-    expect(() => meterModelHandle(handle, stubMetering()))
-        .toThrow(/only a metered provider/);
+    const unsupported = {
+      ...handle,
+      model: {...handle.model, provider: "unknown-provider"},
+    } as ModelHandle;
+    expect(() => meterModelHandle(unsupported, stubMetering()))
+        .toThrow(/only a supported provider/);
   });
 });

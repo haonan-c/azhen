@@ -2,11 +2,9 @@ import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
-import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
-import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings, DeploymentModelRecord } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
@@ -83,12 +81,6 @@ function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   return true;
 }
 
-/**
- * Vendor id of the Cloudflare gatekeeper (the suffix of GATEKEEPER_CLOUDFLARE, lowercased). The AI
- * Gateway billing flow is Cloudflare-specific, so several places key off this literal.
- */
-export const CLOUDFLARE_VENDOR_ID = "cloudflare";
-
 export type UserChatContext = {
   profile: AiChatAuthorInfo;
   aiModel?: DeploymentModelRecord;
@@ -151,18 +143,6 @@ type OutputRecord = WorkspaceOutputEntry & {
   workspaceId: string;
 };
 
-// AI Gateway billing state for the optional top-up flow: which Cloudflare account to bill and a
-// cached credit balance. The OAuth tokens themselves live in the connected Cloudflare *gatekeeper*
-// account (vendorId "cloudflare"); billing reads a usable token from there via getUsableAccessToken.
-type CloudflareBilling = {
-  // Selected account, once chosen (auto-selected when the grant sees exactly one).
-  accountId?: string;
-  accountName?: string;
-  // Cached credit balance (USD) and when it was last fetched (unix ms).
-  creditsRemaining?: number | null;
-  creditsUpdatedAt?: number;
-};
-
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length != b.length) {
     return false;
@@ -206,10 +186,6 @@ function makeUserStorage(storage: DurableObjectStorage) {
       }),
     },
     singletons: {
-      // AI Gateway billing state (selected account + cached balance) for the optional top-up flow;
-      // null until a Cloudflare account is connected and resolved.
-      cloudflareBilling: <CloudflareBilling | null>null,
-
       created: false,
       profile: <AiChatAuthorInfo>{
         type: "user",
@@ -229,11 +205,6 @@ function makeUserStorage(storage: DurableObjectStorage) {
 
       nextAccountId: 0,
       pinnedBlueprints: <string[]>[],
-
-      // Per-user free-tier daily LLM-call counter (only used when ENABLE_CLOUDFLARE_LIMITS is on).
-      // Stores the current UTC day and the calls made that day; a stale `day` implicitly resets the
-      // count. Folds the former standalone RateLimitDO into the user object.
-      dailyLlmCount: <{ day: string; count: number } | null>null,
 
       // `passwordHash` value as passed to `login()`, but with an extra round of SHA-256 applied.
       //
@@ -755,89 +726,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async completeOnboarding(): Promise<void> {
     this.storage.onboardingCompleted.put(true);
-  }
-
-  // ---------------------------------------------------------------------------------------------
-  // Cloudflare account connection (optional top-up flow).
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * Return the connected Cloudflare *gatekeeper* account stub, if any. The AI Gateway billing flow
-   * narrows it to CloudflareGatekeeperUser to obtain a usable access token. Null if the user hasn't
-   * connected (or signed in with) Cloudflare.
-   */
-  async getCloudflareGatekeeperAccount(): Promise<Fetcher<CloudflareGatekeeperUser> | null> {
-    let nextAccountId = this.storage.nextAccountId.get();
-    for (let id = 0; id < nextAccountId; id++) {
-      let rec: ConnectedAccountRecord | undefined;
-      try { rec = this.storage.connectedAccounts.get(id); } catch { continue; }
-      if (rec && rec.vendorId === CLOUDFLARE_VENDOR_ID) {
-        return rec.account as unknown as Fetcher<CloudflareGatekeeperUser>;
-      }
-    }
-    return null;
-  }
-
-  /** The AI Gateway billing state (selected account + cached balance), or null if unset. */
-  async getCloudflareBilling(): Promise<CloudflareBilling | null> {
-    return this.storage.cloudflareBilling.get();
-  }
-
-  /** Update the cached credit balance for the billed account. */
-  async updateCloudflareCredits(creditsRemaining: number | null): Promise<void> {
-    let record = this.storage.cloudflareBilling.get() ?? {};
-    record.creditsRemaining = creditsRemaining;
-    record.creditsUpdatedAt = Date.now();
-    this.storage.cloudflareBilling.put(record);
-  }
-
-  /**
-   * Persist which Cloudflare account to bill. Clears the cached credit balance (it belonged to the
-   * old account).
-   */
-  async setCloudflareAccountSelection(accountId: string, accountName?: string): Promise<void> {
-    let record = this.storage.cloudflareBilling.get() ?? {};
-    record.accountId = accountId;
-    record.accountName = accountName;
-    record.creditsRemaining = undefined;
-    record.creditsUpdatedAt = undefined;
-    this.storage.cloudflareBilling.put(record);
-  }
-
-  // ---------------------------------------------------------------------------------------------
-  // Free-tier daily LLM-call counter (folded in from the former standalone RateLimitDO). Only used
-  // when ENABLE_CLOUDFLARE_LIMITS is on. Single-threaded DO execution makes the read-modify-write
-  // race-free; the window resets at UTC midnight when the stored day no longer matches.
-  // ---------------------------------------------------------------------------------------------
-
-  #dailyUsed(day: string): number {
-    let record = this.storage.dailyLlmCount.get();
-    return record && record.day === day ? record.count : 0;
-  }
-
-  /** Read the current daily quota state without counting a call. */
-  async checkDailyLlmCount(limit: number): Promise<DailyQuotaResult> {
-    let day = utcDayKey();
-    let used = this.#dailyUsed(day);
-    return { withinLimits: used < limit, remaining: Math.max(0, limit - used), limit, used,
-             resetAt: nextUtcMidnightIso() };
-  }
-
-  /**
-   * Atomically check the daily limit and, if within it, count one call. `withinLimits` is the
-   * pre-count decision; `used`/`remaining` reflect the state AFTER counting. No-ops once exhausted,
-   * so a blocked request never counts.
-   */
-  async consumeDailyLlmCall(limit: number): Promise<DailyQuotaResult> {
-    let day = utcDayKey();
-    let used = this.#dailyUsed(day);
-    if (used >= limit) {
-      return { withinLimits: false, remaining: 0, limit, used, resetAt: nextUtcMidnightIso() };
-    }
-    let newUsed = used + 1;
-    this.storage.dailyLlmCount.put({ day, count: newUsed });
-    return { withinLimits: true, remaining: Math.max(0, limit - newUsed), limit, used: newUsed,
-             resetAt: nextUtcMidnightIso() };
   }
 
   /** DO NOT MAKE PUBLIC -- returns API keys. */
@@ -1665,11 +1553,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
       await account.account.revoke();
       this.storage.connectedAccounts.delete(accountId);
-      // Disconnecting the Cloudflare account also clears the AI Gateway billing state (selected
-      // account + cached balance), which is meaningless without the underlying grant.
-      if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
-        this.storage.cloudflareBilling.put(null);
-      }
       logger.info("account disconnected", {
         event: "account.disconnected",
         vendorId: account.vendorId, accountId, autoProvisioned: false,
@@ -1689,55 +1572,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
     return record.account.startResourceConfigurator(resourceUrlPattern);
-  }
-
-  /**
-   * Persist a connected gatekeeper account that was established during sign-in (rather than via the
-   * usual logged-in connectAccount flow). Used for providers like Cloudflare where signing in also
-   * links the account for AI Gateway billing: the login callback resolves this user by verified
-   * email, then calls here to store the full-scope grant.
-   */
-  async linkConnectedAccountFromLogin(
-      account: Fetcher<GatekeeperUser>, vendorId: string, expiresAt?: Date): Promise<void> {
-    let description = await account.describe();
-    let uniqueName = description.uniqueName;
-
-    // A repeated sign-in is a re-authorization, so the *fresh* grant is the one we want. If this
-    // identity is already connected for this vendor, refresh that record in place rather than letting
-    // putConnectedAccount's dedup discard the new grant: keeping the stale record would leave billing
-    // broken whenever the old token had expired or was rotated out by this very re-auth — the
-    // opposite of what signing in again should accomplish.
-    if (uniqueName) {
-      let existing = this.#findConnectedAccountByIdentity(vendorId, uniqueName);
-      if (existing) {
-        // Drop the now-stale grant (a separate gatekeeper-side object from the fresh one), then point
-        // the existing record — keeping its id, so UI references stay stable — at the fresh grant.
-        try {
-          await existing.account.revoke();
-        } catch (err) {
-          logger.error("failed to revoke stale grant; replacing anyway", {
-            event: "account.stale.grant.revoke.failed",
-            accountId: existing.id, vendorId, error: err,
-          });
-        }
-        existing.account = account;
-        existing.description = description;
-        existing.credentialExpiresAt = expiresAt;
-        existing.credentialsExpired = false;
-        this.storage.connectedAccounts.put(existing);
-        return;
-      }
-    }
-
-    let id = this.storage.nextAccountId.get();
-    this.storage.nextAccountId.put(id + 1);
-    this.storage.connectedAccounts.put({
-      id,
-      account,
-      description,
-      vendorId,
-      credentialExpiresAt: expiresAt,
-    });
   }
 
   // Find an existing connected account for the given vendor + identity (uniqueName), excluding

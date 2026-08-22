@@ -462,12 +462,12 @@ describe("Deployment Model RPC", () => {
     });
   });
 
-  it("keeps legacy personal model settings inert across every model resolution path", async () => {
+  it("keeps legacy personal model and billing settings inert across model resolution", async () => {
     using publicApi = await connect();
     const account = await createAccount(publicApi, "legacymodel");
     const legacyModelId = "legacy-personal-model";
     const legacyToken = "legacy-personal-secret";
-    const user = exports.UserDurableObject.get(
+    let user = exports.UserDurableObject.get(
       exports.UserDurableObject.idFromName(account.username),
     );
     await runInDurableObject(user, (_instance, state) => {
@@ -480,7 +480,20 @@ describe("Deployment Model RPC", () => {
         },
       });
       state.storage.kv.put("quickModel", legacyModelId);
+      state.storage.kv.put("dailyLlmCount", {day: "2099-12-31", count: 99_999});
+      state.storage.kv.put("cloudflareBilling", {
+        accountId: "legacy-user-cloudflare-account",
+        accountName: "Legacy personal billing",
+        creditsRemaining: 99_999,
+        creditsUpdatedAt: 1,
+      });
     });
+    await expect(rejection(runInDurableObject(user, (_instance, state) => {
+      state.abort(USER_DO_ABORT_REASON);
+    }))).resolves.toMatchObject({message: USER_DO_ABORT_REASON});
+    user = exports.UserDurableObject.get(
+      exports.UserDurableObject.idFromName(account.username),
+    );
 
     const adminToken = await getDeploymentAdminToken(publicApi);
     using authenticatedAdmin = await publicApi.authenticate(adminToken);
@@ -525,6 +538,39 @@ describe("Deployment Model RPC", () => {
     });
 
     using workspace = await ordinary.newGadget();
+    const requests: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push([
+        request.url,
+        JSON.stringify([...request.headers.entries()]),
+        await request.text(),
+      ].join("\n"));
+      return openAiTextResponse("Platform-funded reply.");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const chatId = await workspace.newChat("Use the Deployment Model.", deploymentModelId);
+      await vi.waitFor(async () => {
+        const chat = (await workspace.listChats()).find(candidate => candidate.id === chatId);
+        expect(chat?.activeAgent).toBeUndefined();
+        expect(requests.length).toBeGreaterThan(0);
+        const records = (await ordinary.listOwnUsageRecords({limit: 10})).records;
+        expect(records.length).toBeGreaterThan(0);
+        expect(records).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            deploymentModelId,
+            pricing: "unpriced",
+            outcome: "usage-unknown",
+          }),
+        ]));
+      }, {timeout: 10_000});
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(requests.join("\n")).not.toContain(legacyToken);
+    expect(requests.join("\n")).not.toContain("legacy-user-cloudflare-account");
+
     await expect(rejection(workspace.newChat("Do not run.", legacyModelId)))
         .resolves.toMatchObject({
           message: `No such model: ${legacyModelId}`,
@@ -549,11 +595,20 @@ describe("Deployment Model RPC", () => {
     expect(await runInDurableObject(user, (_instance, state) => ({
       model: state.storage.kv.get(`aiModels:${legacyModelId}`),
       quickModel: state.storage.kv.get("quickModel"),
+      legacyQuota: state.storage.kv.get("dailyLlmCount"),
+      legacyBilling: state.storage.kv.get("cloudflareBilling"),
     }))).toEqual({
       model: expect.objectContaining({
         config: expect.objectContaining({apiToken: legacyToken}),
       }),
       quickModel: legacyModelId,
+      legacyQuota: {day: "2099-12-31", count: 99_999},
+      legacyBilling: {
+        accountId: "legacy-user-cloudflare-account",
+        accountName: "Legacy personal billing",
+        creditsRemaining: 99_999,
+        creditsUpdatedAt: 1,
+      },
     });
   });
 
@@ -784,12 +839,13 @@ describe("active Agent Usage Principal across a real DO abort", () => {
       using resumedPrincipal = await resumedPrincipalPublicApi.authenticate(principalAccount.token);
       await vi.waitFor(async () => {
         const records = await resumedPrincipal.listOwnUsageRecords({limit: 10});
+        const agentRecords = records.records.filter(record => record.source === "agent");
         const balance = await resumedPrincipal.getUsageCreditBalance();
         const ownerBalance = await resumedOwner.getUsageCreditBalance();
         const chats = await resumedWorkspace.listChats();
         expect(agentRequests).toBe(2);
-        expect(records.records).toHaveLength(1);
-        expect(records.records[0]).toMatchObject({
+        expect(agentRecords).toHaveLength(1);
+        expect(agentRecords[0]).toMatchObject({
           source: "agent",
           outcome: "settled",
           workspaceId,

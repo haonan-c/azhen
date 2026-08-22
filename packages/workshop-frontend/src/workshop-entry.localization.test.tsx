@@ -37,7 +37,6 @@ vi.mock('./components/AppShell/AppShell', () => ({
 }))
 vi.mock('./components/Header', () => ({ default: () => null }))
 vi.mock('./AddModelModal', () => ({ default: () => null }))
-vi.mock('./components/billing/AccountSelectionModal', () => ({ default: () => null }))
 vi.mock('./components/MeshBackground', () => ({ default: () => null }))
 vi.mock('./ThemeContext', () => ({
   useTheme: () => ({ resolvedThemeMode: 'light' }),
@@ -58,7 +57,6 @@ const serverConfig = {
   authVendors: [],
   banner: '',
   bannerColor: 'neutral',
-  cloudflareLimitsEnabled: false,
   passwordAuthEnabled: true,
   signupsEnabled: true,
   siteName: '',

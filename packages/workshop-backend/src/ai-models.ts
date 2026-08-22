@@ -28,19 +28,9 @@ import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./a
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 import {
-  isMeteredModelProvider, meterModelHandle, type ModelMeteringOptions,
+  meterModelHandle, type ModelMeteringOptions,
 } from "./metered-model.js";
 import type { UsageAttribution } from "./usage-attribution.js";
-
- /**
-  * Routing to bill a user's own Cloudflare account for inference (BYOK path once the free tier is
-  * exhausted). Defined here to avoid a backend->ai-gateway-billing type import cycle at runtime.
-  * Inference is routed through the account's "default" AI Gateway.
-  */
- export interface UserGatewayRouting {
-   accountId: string;
-   apiKey: string;
- }
 
 // Gadgets-owned attribution schema attached to AI Gateway requests.
 type GatewayMetadata = {
@@ -63,7 +53,6 @@ export type GatewayMetadataContext = {
 
 type ModelRoutingOptions = {
   sessionAffinity?: string;
-  userGateway?: UserGatewayRouting;
   metadata?: GatewayMetadataContext;
   /**
    * Usage metering for every stream the returned handle runs. Required: `getModel()` is the one
@@ -183,15 +172,14 @@ function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsComp
   };
 }
 
-// Build the pi model descriptor for reaching a provider's own native API through an AI Gateway
-// (the platform's or a user's). `gatewayUrl` is a gateway root
+// Build the pi model descriptor for reaching a provider's own native API through the Workshop
+// Deployment's AI Gateway. `gatewayUrl` is a gateway root
 // (https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}); each provider's native API is
 // exposed under a per-provider path on it. AI Gateway also offers a unified OpenAI-compat
 // translation layer (/compat), which we deliberately never use: we already speak every
 // provider's native API, and the translation drops provider features pi relies on (extended
-// thinking, Anthropic cache_control prompt caching, the OpenAI Responses API). Billing --
-// including unified billing on a user's own gateway -- is orthogonal to which API a request
-// speaks. Returns undefined for providers AI Gateway cannot serve (ollama).
+// thinking, Anthropic cache_control prompt caching, the OpenAI Responses API). Returns undefined
+// for providers AI Gateway cannot serve (ollama).
 function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Api> | undefined {
   const catalog = catalogModel(config.provider, config.model);
   const window = modelTokenWindow(config, catalog);
@@ -363,10 +351,9 @@ function makeHandle(args: HandleArgs): ModelHandle {
 }
 
 /**
- * Resolve an AiModelConfig to a metered ModelHandle, choosing among three routing modes: the user's
- * own AI Gateway (BYOK unified billing), the platform's AI Gateway (free tier), or direct provider
- * access with the config's own credentials. The handle carries the matching AI Gateway log route
- * for cost accounting, when there is one.
+ * Resolve an AiModelConfig to a metered ModelHandle, using either the Workshop Deployment's AI
+ * Gateway or direct provider access with administrator-controlled Deployment Model credentials.
+ * The handle carries the matching AI Gateway log route for cost accounting, when there is one.
  *
  * This is the single seam between an invocation source and a provider, so metering is applied here
  * for every source -- Agent steps, compaction, titles, binding naming, Gadget model bindings and
@@ -376,11 +363,7 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions): ModelHandle {
   let handle = routeModel(env, config, initiator, options);
-  // A provider whose Usage report this deployment cannot parse is reported rather than charged
-  // from an estimate; see isMeteredModelProvider.
-  return isMeteredModelProvider(handle.model.provider)
-      ? meterModelHandle(handle, options.metering)
-      : handle;
+  return meterModelHandle(handle, options.metering);
 }
 
 // Choose the routing for one model call. Callers get the metered handle from getModel(); nothing
@@ -388,23 +371,13 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
 function routeModel(env: Cloudflare.Env, config: AiModelConfig,
                     initiator: AiChatAuthorInfo,
                     options: ModelRoutingOptions): ModelHandle {
-  // These providers have no AI Gateway route. Existing BYOK models remain usable when either a
-  // platform or user Gateway is active, and always retain their own credentials.
+  // These providers have no AI Gateway route and always retain their Deployment Model credentials.
   if (DIRECT_ONLY_AI_PROVIDERS.has(config.provider)) {
     return getModelDirect(config, options.sessionAffinity);
   }
 
-  // BYOK: a connected user's own Cloudflare account pays for every Gateway-capable provider,
-  // including Workers AI, through unified billing. Honored regardless of whether a platform AI
-  // Gateway is configured, so connected users are always billed correctly for those providers.
-  if (options.userGateway) {
-    return getModelViaUserGateway(
-        config, buildMetadata(initiator, options.metadata), options.userGateway,
-        options.sessionAffinity);
-  }
-
-  // Otherwise: when a platform AI Gateway is configured, route through it (platform-funded free
-  // tier). The config's apiToken/apiUrl are ignored in that mode.
+  // When the Workshop Deployment has an AI Gateway, its credentials and provider keys fund the
+  // request. The Deployment Model's apiToken/apiUrl are ignored in that mode.
   let gwConfig = getAiGatewayConfig(env);
   if (gwConfig) {
     return getModelViaGateway(gwConfig, config, initiator, options);
@@ -413,48 +386,7 @@ function routeModel(env: Cloudflare.Env, config: AiModelConfig,
   return getModelDirect(config, options.sessionAffinity);
 }
 
-// Route inference through the user's own account (unified billing) via their account's default AI
-// Gateway. Supports every provider AI Gateway serves, including Workers AI. Billed to the
-// user's Cloudflare credits; no provider API key required.
-function getModelViaUserGateway(
-  config: AiModelConfig,
-  metadata: GatewayMetadata,
-  userGateway: UserGatewayRouting,
-  sessionAffinity?: string,
-): ModelHandle {
-  // Route through the user's AI Gateway data plane, speaking each provider's native API (see
-  // gatewayNativeModel; unified *billing* has no API requirements). Auth is the connected user's
-  // Cloudflare token via `cf-aig-authorization` (authorized by its `aig.run` scope); the
-  // account-level `/ai/v1` REST endpoint rejects that token. We always use the account's
-  // auto-created "default" gateway.
-  const model = gatewayNativeModel(
-      config, `https://gateway.ai.cloudflare.com/v1/${userGateway.accountId}/default`);
-  if (!model) {
-    throw new Error(`Provider "${config.provider}" is not supported via unified billing.`);
-  }
-  return makeHandle({
-    model,
-    // The Google SDK requires an API key and sends it as `x-goog-api-key`, which the gateway
-    // forwards verbatim unless it recognizes the token as gateway auth -- same stored-key flow
-    // as the platform path (see getModelViaGateway).
-    ...(config.provider === "google" ? { apiKey: userGateway.apiKey } : {}),
-    headers: {
-      "cf-aig-authorization": `Bearer ${userGateway.apiKey}`,
-      Authorization: null,
-      "x-api-key": null,
-    },
-    gatewayMetadata: metadata,
-    sessionAffinity,
-    aiGatewayLogRoute: {
-      gateway: "default",
-      accountId: userGateway.accountId,
-      apiToken: userGateway.apiKey,
-    },
-  });
-}
-
-// Platform free-tier path: route through the deployment's configured AI Gateway (platform-funded).
-// Used only for requests that are NOT billed to a connected user's account.
+// Route through the Workshop Deployment's configured, platform-funded AI Gateway.
 function getModelViaGateway(
   gwConfig: AiGatewayConfig,
   config: AiModelConfig,
@@ -553,12 +485,12 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       });
     case "cloudflare": {
       // Workers AI is fetch-only (no Workers-binding transport), so outside AI Gateway mode it's
-      // BYOK like every other provider: the user's own account ID and API token come from the
-      // model config. (The REST endpoint is account-scoped, hence the extra accountId field.)
+      // reached with the administrator-controlled account ID and API token in the Deployment Model
+      // config. (The REST endpoint is account-scoped, hence the extra accountId field.)
       if (!config.accountId || !config.apiToken) {
         throw new Error(
-            "This Workers AI model has no Cloudflare credentials. Re-add it with your " +
-            "Cloudflare account ID and an API token that permits Workers AI.");
+            "This Workers AI Deployment Model has no Cloudflare credentials. Ask an " +
+            "administrator to add its account ID and Workers AI API token.");
       }
       return makeHandle({
         model: {
@@ -646,8 +578,8 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
       });
     case "deepseek":
       // DeepSeek's official API is OpenAI Chat-Completions compatible; pi's catalog carries the
-      // model metadata (1M window, cost, thinking format). BYOK: the user's DeepSeek key -- and
-      // optionally a proxy URL -- come from the model config.
+      // model metadata (1M window, cost, thinking format). Its administrator-controlled key and
+      // optional proxy URL come from the Deployment Model config.
       //
       // Reasoning is intentionally left OFF by default: it keeps requests cheaper and faster and
       // stops reasoning_content from ballooning the context (which would trigger compaction far

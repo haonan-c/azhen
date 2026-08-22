@@ -19,7 +19,9 @@ Roles are totally ordered: `build` > `use`.
 `build` collaborators differ from the owner in a few ways:
 
 - **Cannot delete the gadget.** Only the owner can do this.
-- **Use their own AI models.** When a collaborator engages AI chat, the model is resolved from their own account (BYOK billing goes to whoever prompted the AI, not the gadget owner).
+- **Use their own Model Selection and Usage Credits.** When a collaborator starts AI chat, the
+  collaborator's Model Selection chooses a Deployment Model, and the collaborator is the Usage
+  Principal instead of the Gadget owner.
 - **Use their own connected accounts for bindings.** When a collaborator adds a gatekeeper binding, it connects through that collaborator's third-party accounts, not the owner's. This prevents collaborators from gaining access to the owner's accounts beyond what the gadget's existing bindings already expose.
 - **Limited revocation authority.** A collaborator can only remove users that they themselves added (see "Permission graph" below).
 
@@ -139,7 +141,10 @@ A non-owner can only sever their own `user` edge to the target (and only if such
 
 Collaborators share the gadget's code, storage, and AI chat history, but certain resources are scoped to individual users:
 
-- **AI model bindings** resolve from the account of whoever created the binding. This is baked in at binding creation time for AI model gatekeepers (the full `AiModelConfig` including API key is stored in the binding props). For agent spawners, the creating user's DO ID is stored in `AgentSpawnerBindingProps.creatorUserId` so the model can be resolved at trigger time from the correct account.
+- **AI model bindings** use the Deployment Model configuration captured when the binding was
+  created. The configuration remains administrator-controlled, and each invocation is charged to
+  the persisted Usage Principal. For agent spawners, the creating User's DO ID is stored in
+  `AgentSpawnerBindingProps.creatorUserId` so unattended use keeps the correct principal.
 - **Gatekeeper bindings** connect through the third-party accounts of whoever created them (`OverseerClientInterface.newGatekeeper()` calls `clientUser.getGatekeeperClassFor()` rather than `owner.getGatekeeperClassFor()`).
 
 This means no collaborator implicitly gains access to another user's connected third-party accounts.

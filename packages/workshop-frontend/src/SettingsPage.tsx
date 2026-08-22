@@ -7,7 +7,6 @@ import { CF_ACCESS_MODE } from './useAuth'
 import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash } from '@phosphor-icons/react'
 import { useAvatar, invalidateAvatarCache } from './useAvatar'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
-import UsageSettings from './components/billing/UsageSettings'
 import UsageCreditBalanceCard from './components/billing/UsageCreditBalanceCard'
 import { useDocumentTitle } from './useDocumentTitle'
 import { m as messages } from './paraglide/messages.js'
@@ -418,9 +417,6 @@ export default function SettingsPage() {
         </section>
 
         <UsageCreditBalanceCard />
-
-        {/* Legacy Cloudflare limits — only when that optional flow is enabled server-side */}
-        <UsageSettings />
 
         {/* Security — only for password accounts (hidden under CF Access or gatekeeper sign-in) */}
         {!CF_ACCESS_MODE && hasPassword === true && (

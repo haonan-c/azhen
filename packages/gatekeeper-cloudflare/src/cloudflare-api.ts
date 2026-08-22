@@ -1,5 +1,5 @@
-// Thin client over the Cloudflare REST API used by the gatekeeper: resolve the account's identity
-// (email) and enumerate accounts. All calls use the user's OAuth access token.
+// Thin client over the Cloudflare REST API used by the gatekeeper to resolve identity. All calls
+// use the transient sign-in grant's OAuth access token.
 
 import { VENDOR_ID } from "./vendor.js";
 import { obsContext } from "./observability.js";
@@ -55,16 +55,4 @@ export async function fetchIdentity(token: string): Promise<CloudflareIdentity |
     email: r.email,
     displayName: name || r.email.split("@")[0],
   };
-}
-
-export interface CloudflareAccount {
-  accountId: string;
-  accountName: string;
-}
-
-/** List the accounts the token can access. Requires `account-settings.read`. */
-export async function listAccounts(token: string): Promise<CloudflareAccount[]> {
-  const result = await cfGet<Array<{ id: string; name: string }>>(token, "/accounts");
-  if (!result) return [];
-  return result.map((a) => ({ accountId: a.id, accountName: a.name }));
 }

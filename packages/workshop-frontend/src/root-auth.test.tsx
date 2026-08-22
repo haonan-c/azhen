@@ -41,7 +41,6 @@ vi.mock('./components/AppShell/AppShell', () => ({
   default: ({ children }: { children: ReactNode }) => children,
 }));
 vi.mock('./OnboardingWizard', () => ({ default: () => null }));
-vi.mock('./components/billing/AccountSelectionModal', () => ({ default: () => null }));
 vi.mock('./LoginPage', () => ({
   default: ({ onLoginSuccess }: { onLoginSuccess?: () => void }) => {
     loginPage.onLoginSuccess = onLoginSuccess

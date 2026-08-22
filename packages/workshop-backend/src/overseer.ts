@@ -11,7 +11,6 @@ import * as Y from "yjs";
 import {
   LanguageModelGatekeeperProps,
   getModel,
-  UserGatewayRouting,
   type GatewayMetadataContext,
   type ModelHandle,
 } from "./ai-models";
@@ -36,9 +35,7 @@ import { AgentSpawnerBinding } from "./agent-spawner-binding";
 import { recordAnalytics } from "./analytics";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
 import type { ProductAnalyticsConnectionType, ProductAnalyticsGadgetInput } from "./analytics";
-import { checkUsageAndBalance } from "./ai-gateway-billing/limits/usage-checker";
 import { completeAgentCatalogSnapshot, normalizeAgentCatalog } from "./agent-catalog";
-import { refreshCachedBalance } from "./ai-gateway-billing/cloudflare/connection-service";
 import { SharingManager, SharingCaller, CollaboratorRecord, ShareKeyRecord } from "./sharing";
 import { AutoApprovalDrainer } from "./auto-approval";
 import { collectSlashCommands, invokeSlashCommand } from "./slash-commands";
@@ -4726,10 +4723,6 @@ class OverseerImpl implements AgentHooks {
                                  attribution: UsageAttribution,
                                  callbackInitiated: boolean,
                                  liveChat: LiveChatContext): Promise<void> {
-    // When this turn is billed to the user's own Cloudflare account, we refresh their cached credit
-    // balance once the turn completes (see the `finally` below) so the next billing decision
-    // reflects the spend this turn just incurred, rather than waiting for the cache TTL to lapse.
-    let byokOwnerStub: DurableObjectStub<UserDurableObject> | undefined;
     let startedAt = Date.now();
     const turnLogger = this.logger.with({
       operation: "agent.run",
@@ -4748,37 +4741,9 @@ class OverseerImpl implements AgentHooks {
       // wants it.
       await this.reconcilePendingGadgets(chatId);
 
-      // Enforce the optional free-tier usage limit before starting a user-initiated turn. Callback-
-      // initiated continuations are exempt so outstanding callbacks are never stranded mid-flow.
-      // When the Cloudflare limits flow is disabled, checkUsageAndBalance() always allows.
-      // (This runs inside the try so the `finally` below still clears the active-agent state and
-      // emits a stream "clear" — otherwise the UI would spin forever on a block.)
-      let byokRouting: UserGatewayRouting | undefined;
-      if (!callbackInitiated && this.ownerId) {
-        let ownerStub = this.users.get(this.users.idFromString(this.ownerId));
-        let usage = await checkUsageAndBalance(this.env, ownerStub);
-        if (!usage.allowed) {
-          this.postAgentErrorMessage(chatId, aiModel.profile,
-              usage.reason ?? "Usage limit reached.", "usage_limit");
-          turnLogger.debug("agent run finished", {
-            event: "agent.run.finished", outcome: "usage_limit",
-            durationMs: Date.now() - startedAt,
-          });
-          return;
-        }
-        // Free tier exhausted but the user can continue via their own Cloudflare gateway: route
-        // inference through it so the usage bills their account. checkUsageAndBalance already
-        // resolved the routing (reusing its connection lookup), so we don't decrypt the token again.
-        if (usage.shouldUseByok) {
-          byokRouting = usage.byokRouting;
-          if (byokRouting) byokOwnerStub = ownerStub;
-        }
-      }
-
       let sessionAffinity = await computeSessionAffinity(this.ctx.id.toString(), chatId);
       let routing = {
         sessionAffinity,
-        userGateway: byokRouting,
         metadata: { source: "chat", gadgetId: this.ctx.id.toString(), chatId } as const,
       };
       let usageRates = this.ctx.exports.AdminSettings.getByName("");
@@ -4931,14 +4896,6 @@ class OverseerImpl implements AgentHooks {
       }
       liveChat.activeAgentCallbacks.clear();
     } finally {
-      // If this turn billed the user's own Cloudflare account, refresh their cached balance now (in
-      // the background) so the next turn's billing decision reflects the spend just incurred. Runs
-      // on both the success and error paths — an "insufficient funds" failure is exactly when an
-      // up-to-date balance matters most.
-      if (byokOwnerStub) {
-        this.ctx.waitUntil(refreshCachedBalance(this.env, byokOwnerStub));
-      }
-
       // Belt-and-suspenders: reap any provisional gadget this turn created whose creation ended
       // up backed by nothing in the log. (Normally the turn's final flush -- which runs even on
       // error, in runAgent's own finally -- records every buffered creation, so this only

@@ -1009,24 +1009,6 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Mark the onboarding wizard as completed. */
   completeOnboarding(): Promise<void>;
 
-  // --- Optional Cloudflare limits / top-up flow (only meaningful when enabled server-side) ---
-
-  /** Get the user's current free-tier usage and connected-account balance. */
-  getCloudflareUsage(): Promise<CloudflareUsageInfo>;
-
-  /**
-   * List the Cloudflare accounts the connected grant can access. Used to prompt account selection
-   * when the user has more than one. Returns an empty array if not connected. Connecting Cloudflare
-   * is done via the Cloudflare gatekeeper (connectAccount("cloudflare")) or by signing in with it.
-   */
-  listCloudflareAccounts(): Promise<CloudflareAccountOption[]>;
-
-  /**
-   * Select which Cloudflare account to bill. Persists the choice. Throws if the account isn't
-   * accessible.
-   */
-  selectCloudflareAccount(accountId: string): Promise<void>;
-
   /**
    * Upload a user avatar image. The data should be a compressed image (JPEG/PNG), ideally under
    * 50 KB. Pass null to remove the avatar.
@@ -1681,12 +1663,6 @@ export type ServerConfig = {
   passwordAuthEnabled: boolean;
 
   /**
-   * Whether the optional Cloudflare free-tier limits + top-up flow is enabled. When false (the
-   * default, e.g. self-hosted), usage is unlimited and the credits UI is hidden.
-   */
-  cloudflareLimitsEnabled: boolean;
-
-  /**
    * Whether new account signups are allowed (admin-configurable, default true). The signup page
    * hides the create-account form when false.
    */
@@ -1715,47 +1691,11 @@ export type ServerConfig = {
   accentColor: string;
 };
 
-/**
- * Usage + Cloudflare-connection status for the optional limits flow. Returned by
- * `AuthenticatedApi.getCloudflareUsage()`.
- */
-export type CloudflareUsageInfo = {
-  /** Whether the limits flow is enabled at all. When false, the rest is informational only. */
-  cloudflareLimitsEnabled: boolean;
-  /** When true, the user has unlimited access (limits disabled) and counters are not tracked. */
-  unlimited: boolean;
-
-  /** Free-tier daily usage. */
-  dailyUsed: number;
-  dailyLimit: number;
-  remaining: number;
-  /** ISO timestamp when the daily window resets. */
-  resetAt?: string;
-
-  /** Whether the user has connected a Cloudflare account. */
-  connected: boolean;
-  /** The connected account's AI Gateway credit balance (USD), or null if unknown/not connected. */
-  balance: number | null;
-  accountId?: string;
-  accountName?: string;
-  /**
-   * True when connected but the user has multiple Cloudflare accounts and must pick which one to
-   * bill before usage can proceed. The client should prompt with selectCloudflareAccount().
-   */
-  needsAccountSelection?: boolean;
-};
-
-/** A Cloudflare account available to a connected user. Returned by `listCloudflareAccounts()`. */
-export type CloudflareAccountOption = {
-  accountId: string;
-  accountName: string;
-};
-
 /** Supported AI providers. */
 export type AiModelProvider =
     "openai" | "anthropic" | "google" | "cloudflare" | "deepseek" | "ollama";
 
-/** Providers that always use their model config's BYOK credentials instead of AI Gateway. */
+/** Providers that always use administrator-controlled Deployment Model credentials directly. */
 export const DIRECT_ONLY_AI_PROVIDERS: ReadonlySet<AiModelProvider> =
     new Set<AiModelProvider>(["deepseek", "ollama"]);
 
@@ -2964,10 +2904,7 @@ export type AiChatMessageBody = {
    */
   type: "error";
   message: string;
-  /**
-   * Optional machine-readable code so the client can react specially (e.g. "usage_limit" opens
-   * the "connect Cloudflare / add credits" modal instead of a generic error + retry).
-   */
+  /** Optional machine-readable code for presenting a stable category of error. */
   code?: string;
 } | {
   /**

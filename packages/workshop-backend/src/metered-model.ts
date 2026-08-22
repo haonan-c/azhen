@@ -18,10 +18,17 @@ import type { AiModelProvider, ModelChargeSnapshot } from "@gadgets/workshop-sha
 const MAX_SSE_LINE_BYTES = 1_048_576;
 const logger = createWorkshopLogger("workshop.metered-model");
 
-// Providers whose streamed response carries a Usage report this adapter can parse into exact
-// token categories. Metering a provider means observing its own report -- never estimating -- so a
-// provider joins this set only together with a parser for its report shape.
-const METERED_PROVIDERS: ReadonlySet<string> = new Set<AiModelProvider>(["deepseek"]);
+// Map pi's resolved provider identifiers to the stable Deployment Model provider recorded in Usage
+// state. Every supported provider creates an Attempt. Only DeepSeek currently has a verified Usage
+// parser and priced reservation bound; the others remain explicit zero-amount Unpriced Use.
+const METERED_PROVIDERS: ReadonlyMap<string, AiModelProvider> = new Map([
+  ["anthropic", "anthropic"],
+  ["openai", "openai"],
+  ["google", "google"],
+  ["cloudflare-workers-ai", "cloudflare"],
+  ["deepseek", "deepseek"],
+  ["ollama", "ollama"],
+]);
 
 type UsageRateIssuer = Pick<
   DurableObjectStub<AdminSettings>,
@@ -56,11 +63,11 @@ export type ModelMeteringOptions = {
 };
 
 /**
- * Whether this deployment can meter inference from `provider`.
+ * Whether `provider` is a supported resolved model provider.
  *
- * Metering reads the provider's own Usage report, so an unparsed provider is reported here rather
- * than charged from an estimate. `getModel()` refuses to meter what this returns false for, which
- * keeps the pass-through explicit at the one chokepoint instead of hidden per call site.
+ * Every supported provider creates a Metering Attempt. Providers without a verified Usage parser
+ * are recorded as zero-amount Unpriced Use rather than bypassing Usage Credit persistence or being
+ * charged from an estimate.
  *
  * Takes pi's own `Model.provider` string, which is what a resolved handle carries.
  */
@@ -104,8 +111,9 @@ export function deepSeekInputTokenUpperBound(
  */
 export function meterModelHandle(
     handle: ModelHandle, options: ModelMeteringOptions): ModelHandle {
-  if (!isMeteredModelProvider(handle.model.provider)) {
-    throw new TypeError("Model metering can wrap only a metered provider's model handle.");
+  const usageProvider = METERED_PROVIDERS.get(handle.model.provider);
+  if (!usageProvider) {
+    throw new TypeError("Model metering can wrap only a supported provider's model handle.");
   }
 
   return {
@@ -123,7 +131,9 @@ export function meterModelHandle(
         finish: () => {},
       };
       let operation: ModelUsageOperation | undefined;
-      const usageObserver = new DeepSeekSseUsageObserver();
+      const usageObserver: ModelUsageObserver = usageProvider === "deepseek"
+        ? new DeepSeekSseUsageObserver()
+        : new UnreportedUsageObserver();
       let began = false;
       let terminalBeforeExecution = false;
       let operationFinished = false;
@@ -136,21 +146,35 @@ export function meterModelHandle(
         onPayload: async (payload, payloadModel) => {
           const replaced = await callerOnPayload?.(payload, payloadModel);
           const finalPayload = replaced ?? payload;
-          const outputLimit = requestOutputLimit(finalPayload, model.maxTokens);
-          const inputBound = deepSeekInputTokenUpperBound(
-            finalPayload,
-            model.contextWindow,
-            outputLimit,
-          );
           const issuedSnapshot = await options.usageRates.issueModelChargeSnapshot(
-            "deepseek",
+            usageProvider,
             model.id,
           );
-          const issuedBound = reservationBoundFor(
-            issuedSnapshot,
-            inputBound,
-            BigInt(outputLimit),
-          );
+          let issuedBound: ModelUsageReservationBound;
+          if (usageProvider === "deepseek") {
+            const outputLimit = requestOutputLimit(finalPayload, model.maxTokens);
+            const inputBound = deepSeekInputTokenUpperBound(
+              finalPayload,
+              model.contextWindow,
+              outputLimit,
+            );
+            issuedBound = reservationBoundFor(
+              issuedSnapshot,
+              inputBound,
+              BigInt(outputLimit),
+            );
+          } else {
+            if (issuedSnapshot.pricing === "priced") {
+              throw new Error(
+                `Provider "${usageProvider}" has a price but no verified Usage parser.`,
+              );
+            }
+            issuedBound = {
+              cacheHitInputTokens: 0n,
+              cacheMissInputTokens: 0n,
+              outputTokens: 0n,
+            };
+          }
           operation = operations.acquire({
             chargeSnapshot: issuedSnapshot,
             reservationBound: issuedBound,
@@ -286,7 +310,22 @@ function billingFailureEvent(message: AssistantMessage): AssistantMessageEvent {
   };
 }
 
-class DeepSeekSseUsageObserver {
+type ModelUsageObserver = {
+  observe(response: Response): Response;
+  reportedUsage(): ModelUsageCompletion;
+};
+
+class UnreportedUsageObserver implements ModelUsageObserver {
+  observe(response: Response): Response {
+    return response;
+  }
+
+  reportedUsage(): ModelUsageCompletion {
+    return null;
+  }
+}
+
+class DeepSeekSseUsageObserver implements ModelUsageObserver {
   readonly #decoder = new TextDecoder();
   #line = "";
   #usage: ReportedModelUsage | undefined;

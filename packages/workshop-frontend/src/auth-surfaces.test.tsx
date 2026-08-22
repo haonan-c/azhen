@@ -45,7 +45,6 @@ const serverConfig = {
   authVendors: [],
   banner: '',
   bannerColor: 'neutral',
-  cloudflareLimitsEnabled: false,
   passwordAuthEnabled: true,
   signupsEnabled: true,
   siteName: '',

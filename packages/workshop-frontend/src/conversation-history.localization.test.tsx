@@ -38,8 +38,6 @@ vi.mock('./useVendorBranding', () => ({
 
 vi.mock('./GatekeeperModal', () => ({ default: () => null }))
 
-vi.mock('./components/billing/OutOfCreditsModal', () => ({ default: () => null }))
-
 vi.mock('./components/format/useOutputFormats', () => ({
   useOutputFormats: () => ({ formats: [], creating: null, create: vi.fn<() => void>() }),
 }))
@@ -178,7 +176,7 @@ const messages: AiChatMessage[] = [
     author: AGENT,
     type: 'error',
     code: 'usage_limit',
-    message: 'RAW USAGE LIMIT DETAIL VERBATIM',
+    message: 'You used all 10 free requests. Connect your Cloudflare account and add credits.',
   },
 ]
 
@@ -306,13 +304,14 @@ describe('localized conversation history', () => {
     expect(denyConnectionRequest).toHaveBeenCalledWith('request-1')
 
     expect(container.textContent).toContain('错误：RAW DIAGNOSTIC VERBATIM')
-    expect(container.textContent).toContain('错误：额度已用完。')
-    expect(container.textContent).toContain('继续')
-    expect(container.textContent).not.toContain('RAW USAGE LIMIT DETAIL VERBATIM')
+    expect(container.textContent).toContain('错误：此消息来自已停用的用量限制。请重试以使用当前的使用额度。')
+    expect(container.textContent).not.toContain('Connect your Cloudflare account')
+    expect(container.textContent).not.toContain('连接 Cloudflare')
+    expect(container.textContent).not.toContain('充值')
     const usageError = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.includes('额度已用完'))
+      .find(button => button.textContent?.includes('此消息来自已停用的用量限制'))
     await act(async () => usageError!.click())
-    expect(container.textContent).toContain('RAW USAGE LIMIT DETAIL VERBATIM')
+    expect(container.textContent).not.toContain('add credits')
     expect(container.textContent).toContain('待处理的更改')
     expect(container.textContent).toContain('接受更改')
     const discard = [...container.querySelectorAll<HTMLButtonElement>('button')]
@@ -452,8 +451,12 @@ describe('localized conversation history', () => {
     await act(async () => denyConnection!.click())
     expect(denyConnectionRequest).toHaveBeenCalledWith('request-1')
 
-    expect(container.textContent).toContain('Error: You’re out of credits.')
-    expect(container.textContent).toContain('Continue')
+    expect(container.textContent).toContain(
+      'Error: This message came from a retired usage limit. Retry to use the current Usage Credits.',
+    )
+    expect(container.textContent).not.toContain('Connect your Cloudflare account')
+    expect(container.textContent).not.toContain('Add credits')
+    expect(container.textContent).not.toContain('Continue')
     expect(container.textContent).toContain('Pending changes')
     expect(container.textContent).toContain('Accept changes')
     expect(container.textContent).toContain('RESULT TITLE VERBATIM')

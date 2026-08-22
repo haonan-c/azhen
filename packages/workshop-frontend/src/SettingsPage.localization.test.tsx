@@ -32,9 +32,6 @@ vi.mock('./AuthContext', () => {
     useAuthenticatedApi: () => ({ authenticatedApi }),
   }
 })
-vi.mock('./ServerConfigContext', () => ({
-  useCloudflareLimitsEnabled: () => false,
-}))
 vi.mock('./useAvatar', () => ({
   useAvatar: () => null,
   invalidateAvatarCache: () => {},
@@ -107,6 +104,10 @@ describe('Profile localization', () => {
     expect(container?.querySelector(`[aria-label="${copyLabel}"]`)).not.toBeNull()
     expect(container?.textContent).toContain('USER NAME 原样')
     expect(container?.textContent).toContain('USER-ID-原样')
+    expect(container?.textContent).not.toContain('Free daily allowance')
+    expect(container?.textContent).not.toContain('每日免费额度')
+    expect(container?.textContent).not.toContain('Cloudflare account')
+    expect(container?.textContent).not.toContain('Cloudflare 账户')
   })
 
   it('uses a localized error title and keeps an unknown profile diagnostic', async () => {

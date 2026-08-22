@@ -37,7 +37,6 @@ import {
   Swap,
   ArrowUUpLeft,
   ArrowsClockwise,
-  Lightning,
   Copy,
   WarningCircle,
   Code,
@@ -122,7 +121,6 @@ import { useResolveAction } from "./useResolveAction";
 import { safeExternalUrl } from "./utils/safeExternalUrl";
 import { useAuthenticatedApi } from "./AuthContext";
 import { useVendorBranding } from "./useVendorBranding";
-import OutOfCreditsModal from "./components/billing/OutOfCreditsModal";
 import { useSlashCommandPicker } from "./components/chat/SlashCommandPicker";
 import { formatFullTimestamp } from "./utils/formatTimestamp";
 import { formatLocaleNumber } from "./utils/formatNumber";
@@ -4660,10 +4658,6 @@ function ChatInterface({
   // UI state
   const [_isSubscribed, setIsSubscribed] = useState(false);
   const [chatListReady, setChatListReady] = useState(false);
-  // Out-of-credits modal (free-tier limit reached). `usageModalShownFor` tracks the error sequence
-  // we've already auto-opened for, so dismissing it doesn't immediately reopen.
-  const [usageModalOpen, setUsageModalOpen] = useState(false);
-  const usageModalShownForRef = useRef<number | null>(null);
   const [chatListScope, setChatListScope] = useState<ChatListScope>("all");
   const [chatListVersion, setChatListVersion] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -5032,20 +5026,6 @@ function ChatInterface({
   }, [currentMessages, currentUser]);
 
   const lastMessageSequence = currentMessages[currentMessages.length - 1]?.sequence;
-
-  // Auto-open the out-of-credits modal once when the latest message is a usage-limit error.
-  const lastMessage = currentMessages[currentMessages.length - 1];
-  useEffect(() => {
-    if (
-      lastMessage &&
-      lastMessage.type === "error" &&
-      lastMessage.code === "usage_limit" &&
-      usageModalShownForRef.current !== lastMessage.sequence
-    ) {
-      usageModalShownForRef.current = lastMessage.sequence;
-      setUsageModalOpen(true);
-    }
-  }, [lastMessage]);
 
   // Get metadata for selected chat
   const currentChatMetadata =
@@ -7799,8 +7779,8 @@ function ChatInterface({
                               msg.sequence === lastMessageSequence &&
                               !isAgentActive;
                             const expanded = expandedErrors.has(key);
-                            const summary = msg.code === "usage_limit"
-                              ? uiMessages.conversation_usage_limit()
+                            const errorMessage = msg.code === "usage_limit"
+                              ? uiMessages.conversation_legacy_usage_limit()
                               : msg.message;
                             return (
                               <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
@@ -7819,7 +7799,7 @@ function ChatInterface({
                                         <span className="flex min-w-0 flex-1 items-center gap-1">
                                           <span className="min-w-0 truncate">
                                             <span className="font-medium text-kumo-danger">{uiMessages.conversation_error_prefix()}</span>
-                                            <span className="text-kumo-subtle">{summary}</span>
+                                            <span className="text-kumo-subtle">{errorMessage}</span>
                                           </span>
                                           <CaretRight
                                             size={13}
@@ -7830,19 +7810,7 @@ function ChatInterface({
                                       </span>
                                     </Tooltip>
                                   </button>
-                                  {isLast && msg.code === "usage_limit" && (
-                                    <Tooltip content={uiMessages.conversation_add_credits()} asChild>
-                                      <button
-                                        type="button"
-                                        onClick={() => setUsageModalOpen(true)}
-                                        className="flex flex-shrink-0 cursor-pointer items-center gap-1 rounded-md px-1 py-0.5 text-[13px] leading-4 font-medium text-kumo-default transition-[color,opacity,transform] duration-150 ease-out hover:text-kumo-default-hover focus-visible:text-kumo-default-hover focus-visible:outline-none active:scale-[0.98]"
-                                      >
-                                        <Lightning size={12} weight="bold" />
-                                        {uiMessages.conversation_continue()}
-                                      </button>
-                                    </Tooltip>
-                                  )}
-                                  {isLast && msg.code !== "usage_limit" && (
+                                  {isLast && (
                                     <Tooltip content={uiMessages.conversation_retry_tooltip()} asChild>
                                       <button
                                         type="button"
@@ -7859,7 +7827,7 @@ function ChatInterface({
                                 {expanded && (
                                   <div className="ml-8 mt-1">
                                     <pre className="max-h-48 overflow-auto rounded-xl border border-kumo-line/70 bg-kumo-base p-3 font-mono text-[12px] leading-[18px] text-kumo-subtle whitespace-pre-wrap">
-                                      {msg.message}
+                                      {errorMessage}
                                     </pre>
                                   </div>
                                 )}
@@ -8252,10 +8220,6 @@ function ChatInterface({
         initialVendorId={connectionAccept?.vendorId}
         initialResourceUrl={connectionAccept?.resourceUrl}
         initialResourceUrlPattern={connectionAccept?.resourceUrlPattern}
-      />
-      <OutOfCreditsModal
-        open={usageModalOpen}
-        onClose={() => setUsageModalOpen(false)}
       />
     </div>
   );

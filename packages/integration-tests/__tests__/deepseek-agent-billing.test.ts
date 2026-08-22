@@ -9,6 +9,7 @@ import {
   USD_RATE_SUBUNITS_PER_USD,
   type ExactRatio,
   type ModelUsageRateCatalogEntry,
+  type UserModelUsageRecord,
 } from "@gadgets/workshop-shared/api";
 import {
   ADMIN_USERNAME,
@@ -49,6 +50,30 @@ let providerHandler: Handler | undefined;
 let deploymentModelId: string;
 let rateEntry: ModelUsageRateCatalogEntry;
 let creditConversion: ExactRatio;
+
+function recordsForDeploymentModel(records: UserModelUsageRecord[]): UserModelUsageRecord[] {
+  return records.filter(record => record.deploymentModelId === deploymentModelId);
+}
+
+async function signInWhenAvailable(username: string): Promise<{
+  publicApi: ReturnType<typeof connect>;
+  user: Awaited<ReturnType<typeof signIn>>;
+}> {
+  const deadline = Date.now() + 10_000;
+  let connectionFailure: Error | undefined;
+  while (Date.now() < deadline) {
+    const publicApi = connect(harness.url);
+    try {
+      return {publicApi, user: await signIn(publicApi, username)};
+    } catch (error) {
+      publicApi[Symbol.dispose]();
+      if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
+      connectionFailure = error;
+      await new Promise(done => setTimeout(done, 50));
+    }
+  }
+  throw connectionFailure ?? new Error("Workshop did not accept a WebSocket connection.");
+}
 
 function deepSeekSse(): Response {
   const frames = [
@@ -386,6 +411,8 @@ describe("DeepSeek Agent billing", () => {
     // message is visible, the first authoritative balance and record reads must already be final.
     const after = await user.getUsageCreditBalance();
     const usagePage = await user.listOwnUsageRecords({limit: 10});
+    const agentRecords = recordsForDeploymentModel(usagePage.records)
+      .filter(record => record.source === "agent");
     const expected = expectedCharge(rateEntry, providerRequestAt, creditConversion);
 
     expect(providerRequests).toHaveLength(1);
@@ -394,23 +421,21 @@ describe("DeepSeek Agent billing", () => {
       availableSubunits: before.availableSubunits - expected,
       reservedSubunits: 0n,
     });
-    expect(usagePage).toEqual({
-      records: [expect.objectContaining({
-        kind: "model",
-        source: "agent",
-        deploymentModelId,
-        outcome: "settled",
-        usageStatus: "reported",
-        usage: {
-          cacheHitInputTokens: USAGE.cacheHitInputTokens,
-          cacheMissInputTokens: USAGE.cacheMissInputTokens,
-          outputTokens: USAGE.outputTokens,
-          reasoningTokens: 2n,
-        },
-        chargeSubunits: expected,
-      })],
-      nextCursor: null,
-    });
+    expect(agentRecords).toEqual([expect.objectContaining({
+      kind: "model",
+      source: "agent",
+      deploymentModelId,
+      outcome: "settled",
+      usageStatus: "reported",
+      usage: {
+        cacheHitInputTokens: USAGE.cacheHitInputTokens,
+        cacheMissInputTokens: USAGE.cacheMissInputTokens,
+        outputTokens: USAGE.outputTokens,
+        reasoningTokens: 2n,
+      },
+      chargeSubunits: expected,
+    })]);
+    expect(usagePage.nextCursor).toBeNull();
     const safeUsageJson = JSON.stringify(usagePage, (_key, value) =>
       typeof value === "bigint" ? value.toString() : value);
     for (const forbidden of [
@@ -508,6 +533,8 @@ describe("DeepSeek Agent billing", () => {
 
     const after = await user.getUsageCreditBalance();
     const usagePage = await user.listOwnUsageRecords({limit: 10});
+    const agentRecords = recordsForDeploymentModel(usagePage.records)
+      .filter(record => record.source === "agent");
     const expectedTotal = requestTimes.reduce(
       (total, at) => total + expectedCharge(rateEntry, at, creditConversion),
       0n,
@@ -518,27 +545,24 @@ describe("DeepSeek Agent billing", () => {
       availableSubunits: before.availableSubunits - expectedTotal,
       reservedSubunits: 0n,
     });
-    expect(usagePage.records).toHaveLength(2);
-    expect(new Set(usagePage.records.map(record => record.id)).size).toBe(2);
-    expect(usagePage.records.every(record =>
+    expect(agentRecords).toHaveLength(2);
+    expect(new Set(agentRecords.map(record => record.id)).size).toBe(2);
+    expect(agentRecords.every(record =>
       record.outcome === "settled" && typeof record.chargeSubunits === "bigint")).toBe(true);
-    expect(usagePage.records.reduce(
+    expect(agentRecords.reduce(
       (total, record) => total + (record.chargeSubunits ?? 0n),
       0n,
     )).toBe(expectedTotal);
-    const firstPage = await user.listOwnUsageRecords({limit: 1});
-    if (!firstPage.nextCursor) throw new Error("Expected a second model Usage Record page.");
-    const secondPage = await user.listOwnUsageRecords({
-      limit: 1,
-      cursor: firstPage.nextCursor,
-    });
-    expect(firstPage.records).toHaveLength(1);
-    expect(secondPage.records).toHaveLength(1);
-    expect(secondPage.nextCursor).toBeNull();
-    expect(new Set([
-      firstPage.records[0]!.id,
-      secondPage.records[0]!.id,
-    ])).toEqual(new Set(usagePage.records.map(record => record.id)));
+    const pagedRecordIds: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await user.listOwnUsageRecords({limit: 1, cursor});
+      expect(page.records).toHaveLength(1);
+      pagedRecordIds.push(page.records[0]!.id);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    expect(new Set(pagedRecordIds))
+      .toEqual(new Set(usagePage.records.map(record => record.id)));
   });
 
   it("charges two overlapping collaborator calls to their own accounts in one shared App", async () => {
@@ -790,7 +814,8 @@ describe("DeepSeek Agent billing", () => {
     using reopenedSubmitter = await signIn(reopenedSubmitterPublicApi, submitterName);
     const submitterRecords = await waitFor("the delayed system-assistance Usage", async () => {
       const page = await reopenedSubmitter.listOwnUsageRecords({limit: 10});
-      return page.records.length === 2 && agentProviderCalls === 2 ? page.records : null;
+      const records = recordsForDeploymentModel(page.records);
+      return records.length === 2 && agentProviderCalls === 2 ? records : null;
     });
     const ownerRecords = (await owner.listOwnUsageRecords({limit: 10})).records;
     const ownerAfter = await owner.getUsageCreditBalance();
@@ -920,8 +945,9 @@ describe("DeepSeek Agent billing", () => {
     // persisted Hook capability still has a live reference to the Overseer.
     await harness.server.update(options => options);
 
-    const enablingPublicApi = connect(harness.url);
-    const enablingBuilder = await signIn(enablingPublicApi, builderName);
+    const enablingSession = await signInWhenAvailable(builderName);
+    const enablingPublicApi = enablingSession.publicApi;
+    const enablingBuilder = enablingSession.user;
     const enablingWorkspace = await enablingBuilder.openGadget(workspaceId);
     await enablingWorkspace.enableHook(hook.id);
     enablingWorkspace[Symbol.dispose]();
@@ -958,9 +984,11 @@ describe("DeepSeek Agent billing", () => {
       async () => {
         const ownerPage = await reopenedOwner.listOwnUsageRecords({limit: 10});
         const builderPage = await reopenedBuilder.listOwnUsageRecords({limit: 10});
-        return agentProviderCalls === 3 && ownerPage.records.length === 1 &&
-          builderPage.records.length === 2
-          ? [ownerPage.records, builderPage.records] as const
+        const currentOwnerRecords = recordsForDeploymentModel(ownerPage.records);
+        const currentBuilderRecords = recordsForDeploymentModel(builderPage.records);
+        return agentProviderCalls === 3 && currentOwnerRecords.length === 1 &&
+          currentBuilderRecords.length === 2
+          ? [currentOwnerRecords, currentBuilderRecords] as const
           : null;
       },
       40_000,
@@ -1184,8 +1212,9 @@ describe("DeepSeek Agent billing", () => {
     ownerPublicApi[Symbol.dispose]();
     await harness.server.update(options => options);
 
-    const secondAfterRestartPublicApi = connect(harness.url);
-    const secondAfterRestart = await signIn(secondAfterRestartPublicApi, secondName);
+    const secondAfterRestartSession = await signInWhenAvailable(secondName);
+    const secondAfterRestartPublicApi = secondAfterRestartSession.publicApi;
+    const secondAfterRestart = secondAfterRestartSession.user;
     const secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
     await secondAfterRestartWorkspace.approveAction(pendingAction.id);
     await Promise.race([
@@ -1195,6 +1224,14 @@ describe("DeepSeek Agent billing", () => {
           30_000)),
     ]);
     expect(await appliedActionCount(actionLabel)).toBe(1);
+    secondAfterRestartWorkspace[Symbol.dispose]();
+    secondAfterRestart[Symbol.dispose]();
+    secondAfterRestartPublicApi[Symbol.dispose]();
+
+    const schedulerSession = await signInWhenAvailable(secondName);
+    const schedulerPublicApi = schedulerSession.publicApi;
+    const schedulerUser = schedulerSession.user;
+    const schedulerWorkspace = await schedulerUser.openGadget(workspaceId);
 
     let schedulerProviderCalls = 0;
     let signalScheduled!: () => void;
@@ -1222,17 +1259,25 @@ describe("DeepSeek Agent billing", () => {
       if (schedulerProviderCalls === 3) signalScheduled();
       return deepSeekSse();
     };
-    const schedulerChatId = await secondAfterRestartWorkspace.newChat(
+    const schedulerChatId = await schedulerWorkspace.newChat(
       "Register the complete tracer schedule.",
       deploymentModelId,
     );
+    schedulerWorkspace[Symbol.dispose]();
+    schedulerUser[Symbol.dispose]();
+    schedulerPublicApi[Symbol.dispose]();
+
+    const hookSession = await signInWhenAvailable(secondName);
+    const hookPublicApi = hookSession.publicApi;
+    const hookUser = hookSession.user;
+    const hookWorkspace = await hookUser.openGadget(workspaceId);
     const hook = await waitFor("the complete tracer Scheduler Hook", async () => {
-      const chat = (await secondAfterRestartWorkspace.listChats())
+      const chat = (await hookWorkspace.listChats())
           .find(candidate => candidate.id === schedulerChatId);
-      const hooks = await secondAfterRestartWorkspace.listHooks();
+      const hooks = await hookWorkspace.listHooks();
       return chat?.activeAgent === undefined && hooks.length === 1 ? hooks[0]! : null;
     });
-    await secondAfterRestartWorkspace.enableHook(hook.id);
+    await hookWorkspace.enableHook(hook.id);
 
     const ownerManagementPublicApi = connect(harness.url);
     const ownerManagement = await signIn(ownerManagementPublicApi, ownerName);
@@ -1246,9 +1291,9 @@ describe("DeepSeek Agent billing", () => {
     schedulerManagement[Symbol.dispose]();
     ownerManagement[Symbol.dispose]();
     ownerManagementPublicApi[Symbol.dispose]();
-    secondAfterRestartWorkspace[Symbol.dispose]();
-    secondAfterRestart[Symbol.dispose]();
-    secondAfterRestartPublicApi[Symbol.dispose]();
+    hookWorkspace[Symbol.dispose]();
+    hookUser[Symbol.dispose]();
+    hookPublicApi[Symbol.dispose]();
 
     await Promise.race([
       scheduled,
@@ -1267,9 +1312,12 @@ describe("DeepSeek Agent billing", () => {
         const ownerPage = await finalOwner.listOwnUsageRecords({limit: 20});
         const firstPage = await finalFirst.listOwnUsageRecords({limit: 20});
         const secondPage = await finalSecond.listOwnUsageRecords({limit: 20});
-        return ownerPage.records.length === 1 && firstPage.records.length === 3 &&
-          secondPage.records.length === 3
-          ? [ownerPage.records, firstPage.records, secondPage.records] as const
+        const currentOwnerRecords = recordsForDeploymentModel(ownerPage.records);
+        const currentFirstRecords = recordsForDeploymentModel(firstPage.records);
+        const currentSecondRecords = recordsForDeploymentModel(secondPage.records);
+        return currentOwnerRecords.length === 1 && currentFirstRecords.length === 3 &&
+          currentSecondRecords.length === 3
+          ? [currentOwnerRecords, currentFirstRecords, currentSecondRecords] as const
           : null;
       },
       40_000,

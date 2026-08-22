@@ -51,6 +51,18 @@ function deepSeekHandle(metering: ModelMeteringOptions, model = "deepseek-v4-fla
   }, {metering});
 }
 
+function anthropicHandle(metering: ModelMeteringOptions) {
+  return getModel({CF_AI_GATEWAY: undefined} as Cloudflare.Env, {
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+    apiToken: "dummy-anthropic-token",
+  }, {
+    type: "user",
+    id: "metered-model@example.com",
+    name: "Metered Model",
+  }, {metering});
+}
+
 function deepSeekSse(usage: Record<string, unknown>): Response {
   const frames = [
     {
@@ -128,6 +140,62 @@ function usageThenStreamError(usage: Record<string, unknown>): Response {
     },
   }), {headers: {"content-type": "text/event-stream"}});
 }
+
+describe("Unpriced Deployment Model metering", () => {
+  it("persists a zero-amount Attempt before calling a provider without a Usage parser", async () => {
+    const user = await newUser();
+    const before = await user.getUsageCreditBalance();
+    const handle = anthropicHandle({
+      usageRates: testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      user,
+      attribution: {
+        principal: usagePrincipal(user),
+        source: "agent",
+        workspaceId: "f".repeat(64),
+        chatId: 101,
+        deploymentModelId: "anthropic-agent-unpriced",
+      },
+    });
+    let providerCalls = 0;
+
+    const result = await handle.stream(handle.model, {
+      messages: [{role: "user", content: "hello", timestamp: 0}],
+    }, {
+      maxRetries: 0,
+      fetch: (async () => {
+        providerCalls += 1;
+        return Response.json({error: {message: "stubbed"}}, {status: 400});
+      }) as typeof fetch,
+    }).result();
+
+    expect(result.stopReason).toBe("error");
+    expect(providerCalls).toBe(1);
+    expect(await user.getUsageCreditBalance()).toEqual(before);
+    const account = await runInDurableObject(user, (_instance, state) =>
+      new UsageAccount(state.storage).getSnapshot());
+    expect(account.unpricedUsageDecisions).toHaveLength(1);
+    expect(account.modelMeteringAttempts).toEqual([
+      expect.objectContaining({
+        state: "usage-unknown",
+        chargeSnapshot: expect.objectContaining({
+          pricing: "unpriced",
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+        }),
+        reservationId: null,
+      }),
+    ]);
+    expect(account.modelUsageRecords).toEqual([
+      expect.objectContaining({
+        outcome: "usage-unknown",
+        usageStatus: "not-reported",
+        chargeSubunits: null,
+        reservationId: null,
+      }),
+    ]);
+    expect(account.reservations).toEqual([]);
+  });
+});
 
 describe("DeepSeek Agent model metering", () => {
   it("reuses one persisted operation after an interrupted provider attempt", async () => {

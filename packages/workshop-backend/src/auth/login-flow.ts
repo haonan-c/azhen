@@ -16,13 +16,12 @@
 //
 // Sign-in only requests minimal scopes and the gatekeeper grant is transient (it self-destructs
 // shortly after we read the email) — so login does NOT create a persistent connected account.
-// Capability access (repos, docs, billing) is granted later when the user explicitly connects the
+// Capability access (repos, docs, and other resources) is granted later when the user explicitly connects the
 // gatekeeper, which requests the full scopes and persists the connection.
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { GatekeeperConnectCallback, GatekeeperUser } from "@gadgets/workshop-shared/gatekeeper";
 import { createWorkshopLogger } from "../observability";
-import { CLOUDFLARE_VENDOR_ID } from "../user.js";
 import { readAdminConfig } from "../admin-config.js";
 
 const logger = createWorkshopLogger("workshop.auth");
@@ -89,7 +88,7 @@ export class LoginConnectCallbackImpl
     return this.ctx.exports.PendingLogin.get(id);
   }
 
-  async complete(account: Fetcher<GatekeeperUser>, expiresAt?: Date): Promise<void> {
+  async complete(account: Fetcher<GatekeeperUser>, _expiresAt?: Date): Promise<void> {
     const loginLogger = logger.with({
       operation: "gatekeeper.login",
       vendorId: this.ctx.props.vendorId,
@@ -120,12 +119,6 @@ export class LoginConnectCallbackImpl
         await pending.fail("New sign-ups are currently disabled on this deployment.");
         return;
       }
-      // For Cloudflare, signing in also links the account for AI Gateway billing: startGatekeeperLogin
-      // requested full (non-transient) scopes, so persist the grant as a connected account before
-      // handing back the session. Other providers use minimal, transient sign-in grants (no persist).
-      if (this.ctx.props.vendorId === CLOUDFLARE_VENDOR_ID) {
-        await userStub.linkConnectedAccountFromLogin(account, this.ctx.props.vendorId, expiresAt);
-      }
       // Session tokens are "<doName>:<secret>"; PublicApi.authenticate() routes via idFromName of
       // the first part. The user DO is keyed by email, so the prefix must be the email.
       await pending.deliver(`${email}:${secret}`);
@@ -143,13 +136,7 @@ export class LoginConnectCallbackImpl
     }
   }
 
-  /**
-   * No-ops: for transient sign-in grants there's nothing persisted to update. For the Cloudflare
-   * billing connection (persisted on login) these would ideally flip the account's credential flag,
-   * but the callback doesn't carry the user/account identity (it's only learned in complete()). The
-   * billing path degrades gracefully regardless — getUsableAccessToken() returns null on expiry and
-   * the user falls back to the free tier / a reconnect prompt.
-   */
+  /** No-ops: transient sign-in grants are never persisted as connected accounts. */
   async credentialsExpired(): Promise<void> {}
   async credentialsRestored(_expiresAt?: Date): Promise<void> {}
 }
