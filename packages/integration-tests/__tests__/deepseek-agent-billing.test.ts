@@ -1249,9 +1249,9 @@ describe("DeepSeek Agent billing", () => {
     await harness.server.update(options => options);
 
     const secondAfterRestartSession = await signInWhenAvailable(secondName);
-    const secondAfterRestartPublicApi = secondAfterRestartSession.publicApi;
-    const secondAfterRestart = secondAfterRestartSession.user;
-    const secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
+    let secondAfterRestartPublicApi = secondAfterRestartSession.publicApi;
+    let secondAfterRestart = secondAfterRestartSession.user;
+    let secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
     await secondAfterRestartWorkspace.approveAction(pendingAction.id);
     await Promise.race([
       assistance,
@@ -1260,14 +1260,6 @@ describe("DeepSeek Agent billing", () => {
           30_000)),
     ]);
     expect(await appliedActionCount(actionLabel)).toBe(1);
-    secondAfterRestartWorkspace[Symbol.dispose]();
-    secondAfterRestart[Symbol.dispose]();
-    secondAfterRestartPublicApi[Symbol.dispose]();
-
-    const schedulerSession = await signInWhenAvailable(secondName);
-    const schedulerPublicApi = schedulerSession.publicApi;
-    const schedulerUser = schedulerSession.user;
-    const schedulerWorkspace = await schedulerUser.openGadget(workspaceId);
 
     let schedulerProviderCalls = 0;
     let signalScheduled!: () => void;
@@ -1295,25 +1287,34 @@ describe("DeepSeek Agent billing", () => {
       if (schedulerProviderCalls === 3) signalScheduled();
       return deepSeekSse();
     };
-    const schedulerChatId = await schedulerWorkspace.newChat(
+    const schedulerChatId = await secondAfterRestartWorkspace.newChat(
       "Register the complete tracer schedule.",
       deploymentModelId,
     );
-    schedulerWorkspace[Symbol.dispose]();
-    schedulerUser[Symbol.dispose]();
-    schedulerPublicApi[Symbol.dispose]();
-
-    const hookSession = await signInWhenAvailable(secondName);
-    const hookPublicApi = hookSession.publicApi;
-    const hookUser = hookSession.user;
-    const hookWorkspace = await hookUser.openGadget(workspaceId);
-    const hook = await waitFor("the complete tracer Scheduler Hook", async () => {
-      const chat = (await hookWorkspace.listChats())
-          .find(candidate => candidate.id === schedulerChatId);
-      const hooks = await hookWorkspace.listHooks();
-      return chat?.activeAgent === undefined && hooks.length === 1 ? hooks[0]! : null;
+    await waitFor("the complete tracer Scheduler Hook", async () => {
+      try {
+        const chat = (await secondAfterRestartWorkspace.listChats())
+            .find(candidate => candidate.id === schedulerChatId);
+        const hooks = await secondAfterRestartWorkspace.listHooks();
+        if (chat?.activeAgent !== undefined || hooks.length !== 1) return null;
+        await secondAfterRestartWorkspace.enableHook(hooks[0]!.id);
+        return hooks[0]!;
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") {
+          throw error;
+        }
+        // Worker Loader can reload the runtime while executeCode registers the Hook. Mirror the
+        // browser's reconnect path before polling the same durable workflow again.
+        secondAfterRestartWorkspace[Symbol.dispose]();
+        secondAfterRestart[Symbol.dispose]();
+        secondAfterRestartPublicApi[Symbol.dispose]();
+        const session = await signInWhenAvailable(secondName);
+        secondAfterRestartPublicApi = session.publicApi;
+        secondAfterRestart = session.user;
+        secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
+        return null;
+      }
     });
-    await hookWorkspace.enableHook(hook.id);
 
     const ownerManagementPublicApi = connect(harness.url);
     const ownerManagement = await signIn(ownerManagementPublicApi, ownerName);
@@ -1327,9 +1328,9 @@ describe("DeepSeek Agent billing", () => {
     schedulerManagement[Symbol.dispose]();
     ownerManagement[Symbol.dispose]();
     ownerManagementPublicApi[Symbol.dispose]();
-    hookWorkspace[Symbol.dispose]();
-    hookUser[Symbol.dispose]();
-    hookPublicApi[Symbol.dispose]();
+    secondAfterRestartWorkspace[Symbol.dispose]();
+    secondAfterRestart[Symbol.dispose]();
+    secondAfterRestartPublicApi[Symbol.dispose]();
 
     await Promise.race([
       scheduled,
