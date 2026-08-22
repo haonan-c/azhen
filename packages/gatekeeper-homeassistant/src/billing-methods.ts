@@ -1,4 +1,4 @@
-/** One fixed-rate Home Assistant caller-visible read operation. */
+/** One fixed-rate Home Assistant caller-visible business operation. */
 export type HomeAssistantBillingMethod = {
   /** Stable deployment pricing key. This value must not be derived from runtime input. */
   methodKey: string;
@@ -65,6 +65,55 @@ export const HOME_ASSISTANT_BILLING_METHODS = {
   "Dashboard.getConfig": operation("homeassistant.dashboard.get-config"),
 } as const satisfies Record<string, HomeAssistantBillingMethod>;
 
+/**
+ * Stable billing registry for every public Home Assistant write.
+ *
+ * `Dashboard.saveConfig` is one caller-visible replacement operation. Creating, updating, or
+ * deleting dashboard content within that replacement does not create extra charges.
+ */
+export const HOME_ASSISTANT_WRITE_BILLING_METHODS = {
+  "HomeAssistantSession.callService": operation("homeassistant.instance.call-service"),
+  "HomeAssistantSession.fireEvent": operation("homeassistant.instance.fire-event"),
+  "Area.callService": operation("homeassistant.area.call-service"),
+  "Label.callService": operation("homeassistant.label.call-service"),
+  "Device.callService": operation("homeassistant.device.call-service"),
+  "Entity.callService": operation("homeassistant.entity.call-service"),
+  "Entity.turnOn": operation("homeassistant.entity.turn-on"),
+  "Entity.turnOff": operation("homeassistant.entity.turn-off"),
+  "Entity.toggle": operation("homeassistant.entity.toggle"),
+  "Entity.open": operation("homeassistant.entity.open"),
+  "Entity.close": operation("homeassistant.entity.close"),
+  "Entity.stop": operation("homeassistant.entity.stop"),
+  "Entity.setPosition": operation("homeassistant.entity.set-position"),
+  "Entity.setTemperature": operation("homeassistant.entity.set-temperature"),
+  "Entity.setHvacMode": operation("homeassistant.entity.set-hvac-mode"),
+  "Entity.setFanMode": operation("homeassistant.entity.set-fan-mode"),
+  "Entity.lock": operation("homeassistant.entity.lock"),
+  "Entity.unlock": operation("homeassistant.entity.unlock"),
+  "Entity.play": operation("homeassistant.entity.play"),
+  "Entity.pause": operation("homeassistant.entity.pause"),
+  "Entity.next": operation("homeassistant.entity.next"),
+  "Entity.previous": operation("homeassistant.entity.previous"),
+  "Entity.setVolume": operation("homeassistant.entity.set-volume"),
+  "Entity.mute": operation("homeassistant.entity.mute"),
+  "Entity.playMedia": operation("homeassistant.entity.play-media"),
+  "Entity.setSpeed": operation("homeassistant.entity.set-speed"),
+  "Entity.start": operation("homeassistant.entity.start"),
+  "Entity.returnToBase": operation("homeassistant.entity.return-to-base"),
+  "Entity.locate": operation("homeassistant.entity.locate"),
+  "Entity.activate": operation("homeassistant.entity.activate"),
+  "Entity.run": operation("homeassistant.entity.run"),
+  "Entity.press": operation("homeassistant.entity.press"),
+  "Entity.setValue": operation("homeassistant.entity.set-value"),
+  "Entity.setText": operation("homeassistant.entity.set-text"),
+  "Entity.selectOption": operation("homeassistant.entity.select-option"),
+  "Entity.setDateTime": operation("homeassistant.entity.set-date-time"),
+  "Entity.trigger": operation("homeassistant.entity.trigger"),
+  "Entity.reload": operation("homeassistant.entity.reload"),
+  "Entity.notify": operation("homeassistant.entity.notify"),
+  "Dashboard.saveConfig": operation("homeassistant.dashboard.save-config"),
+} as const satisfies Record<string, HomeAssistantBillingMethod>;
+
 /** Public reads that are intentionally local and therefore create no Metering Attempt. */
 export const HOME_ASSISTANT_LOCAL_READ_METHODS = [
   "HomeAssistantSession.getDashboard",
@@ -72,3 +121,6 @@ export const HOME_ASSISTANT_LOCAL_READ_METHODS = [
 
 /** A public Home Assistant read that reaches the upstream instance. */
 export type HomeAssistantBillableReadMethod = keyof typeof HOME_ASSISTANT_BILLING_METHODS;
+
+/** A public Home Assistant write submitted through the Action approval queue. */
+export type HomeAssistantBillableWriteMethod = keyof typeof HOME_ASSISTANT_WRITE_BILLING_METHODS;

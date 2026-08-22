@@ -33,20 +33,21 @@ export type HomeAssistantReadAuthorizer = {
 };
 
 /**
- * Tracks only transport facts needed to classify a failed caller-visible read.
+ * Tracks only transport facts needed to classify a failed caller-visible operation.
  *
  * This does not begin, complete, or price an operation. Low-level REST and WebSocket helpers only
  * report whether a business request was dispatched and whether Home Assistant returned a definite
  * response. The public Session method remains the single billing boundary.
  */
-export interface HomeAssistantReadActivity {
+export interface HomeAssistantOperationActivity {
   requestDispatched(): void;
   responseReceived(): void;
   /** Record an upstream stage that failed before its business request was dispatched. */
   upstreamFailedBeforeDispatch(): void;
 }
 
-class ReadActivity implements HomeAssistantReadActivity {
+/** Tracks Home Assistant dispatch and response facts for one caller-visible operation. */
+export class HomeAssistantOperationActivityTracker implements HomeAssistantOperationActivity {
   #dispatched = 0;
   #responses = 0;
   #upstreamFailedBeforeDispatch = false;
@@ -99,7 +100,7 @@ export async function runHomeAssistantRead<T>(
   authorizer: HomeAssistantReadAuthorizer,
   externalAccountId: string,
   method: HomeAssistantBillingMethod,
-  read: (activity: HomeAssistantReadActivity) => Promise<T>,
+  read: (activity: HomeAssistantOperationActivity) => Promise<T>,
   describe: (result: T) => Omit<ObservationDescription, "billingOperationId">,
 ): Promise<T> {
   using operation = await authorizer.beginBillableOperation(
@@ -116,7 +117,7 @@ export async function runHomeAssistantRead<T>(
     throw error;
   }
 
-  const activity = new ReadActivity();
+  const activity = new HomeAssistantOperationActivityTracker();
   let result: T;
   try {
     result = await read(activity);

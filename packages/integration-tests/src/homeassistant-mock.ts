@@ -33,6 +33,10 @@ export class HomeAssistantMock {
     await this.#post("/control/drop-next-command", { type });
   }
 
+  async hangNextWebSocketCommand(type: string): Promise<void> {
+    await this.#post("/control/hang-next-command", { type });
+  }
+
   async failNextRestResponse(): Promise<void> {
     await this.#post("/control/fail-next-rest-response", {});
   }
@@ -40,6 +44,7 @@ export class HomeAssistantMock {
   async blockNextRequest(options: {
     transport?: HomeAssistantMockCall["transport"];
     operation?: string;
+    durationMs?: number;
   } = {}): Promise<void> {
     await this.#post("/control/block-next", options);
   }

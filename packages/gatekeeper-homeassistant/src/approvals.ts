@@ -11,7 +11,9 @@
 // - `executeAction()` — actually performs the action against HA (REST or WS).
 
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
+import type { HomeAssistantOperationActivity } from "./billing";
 import {
+  HomeAssistantError,
   HomeAssistantWebSocket,
   withWebSocket,
   type HomeAssistantCredentials,
@@ -21,6 +23,27 @@ import { resolveTargets } from "./registry-utils";
 import type { HATarget, HomeAssistantAction } from "./homeassistant";
 
 export { resolveTargets };
+
+const HOME_ASSISTANT_ACTION_TIMEOUT_MS = 15_000;
+
+/** Signals that an Action response deadline passed after its command was dispatched. */
+export class HomeAssistantActionTimeoutError extends HomeAssistantError {}
+
+async function awaitActionCommand<T>(command: Promise<T>): Promise<T> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new HomeAssistantActionTimeoutError(
+        `Home Assistant did not confirm the Action within ${HOME_ASSISTANT_ACTION_TIMEOUT_MS}ms.`,
+      ));
+    }, HOME_ASSISTANT_ACTION_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([command, timeout]);
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -405,27 +428,30 @@ function humanizeService(domain: string, service: string): string {
 export async function executeAction(
   action: HomeAssistantAction,
   creds: HomeAssistantCredentials,
+  activity?: HomeAssistantOperationActivity,
 ): Promise<void> {
   await withWebSocket(creds, async (ws) => {
     switch (action.type) {
       case "callService": {
-        await ws.callService(action.domain, action.service, action.data, action.target);
+        await awaitActionCommand(
+          ws.callService(action.domain, action.service, action.data, action.target),
+        );
         return;
       }
       case "fireEvent": {
-        await ws.fireEvent(action.eventType, action.data);
+        await awaitActionCommand(ws.fireEvent(action.eventType, action.data));
         return;
       }
       case "saveDashboard": {
-        await ws.send({
+        await awaitActionCommand(ws.send({
           type: "lovelace/config/save",
           url_path: action.urlPath,
           config: action.config,
-        });
+        }));
         return;
       }
     }
-  });
+  }, activity);
 }
 
 /** Fetch the current dashboard config so we can store it as revert info. */

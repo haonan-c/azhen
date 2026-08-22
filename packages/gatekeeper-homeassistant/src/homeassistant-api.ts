@@ -12,7 +12,7 @@
 // ---------------------------------------------------------------------------
 // Errors
 
-import type { HomeAssistantReadActivity } from "./billing";
+import type { HomeAssistantOperationActivity } from "./billing";
 
 export class HomeAssistantError extends Error {
   readonly status?: number;
@@ -75,7 +75,7 @@ async function fetchJson<T>(
   creds: HomeAssistantCredentials,
   path: string,
   init: RequestInit = {},
-  activity?: HomeAssistantReadActivity,
+  activity?: HomeAssistantOperationActivity,
 ): Promise<T> {
   const url = joinUrl(creds.baseUrl, path);
   const headers = new Headers(init.headers ?? {});
@@ -142,7 +142,7 @@ async function fetchJson<T>(
 export class HomeAssistantRest {
   constructor(
     private readonly creds: HomeAssistantCredentials,
-    private readonly activity?: HomeAssistantReadActivity,
+    private readonly activity?: HomeAssistantOperationActivity,
   ) {}
 
   async getConfig(): Promise<any> {
@@ -253,9 +253,9 @@ export class HomeAssistantWebSocket {
   #pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
   #closed = false;
   #closePromise: Promise<void>;
-  #activity?: HomeAssistantReadActivity;
+  #activity?: HomeAssistantOperationActivity;
 
-  private constructor(ws: WebSocket, activity?: HomeAssistantReadActivity) {
+  private constructor(ws: WebSocket, activity?: HomeAssistantOperationActivity) {
     this.#ws = ws;
     this.#activity = activity;
     this.#closePromise = new Promise<void>((resolve) => {
@@ -303,7 +303,7 @@ export class HomeAssistantWebSocket {
   /** Open a new authenticated WebSocket connection. */
   static async connect(
     creds: HomeAssistantCredentials,
-    activity?: HomeAssistantReadActivity,
+    activity?: HomeAssistantOperationActivity,
   ): Promise<HomeAssistantWebSocket> {
     const wsUrl = websocketUrl(creds.baseUrl);
     let ws: WebSocket;
@@ -459,7 +459,7 @@ export class HomeAssistantWebSocket {
 export async function withWebSocket<T>(
   creds: HomeAssistantCredentials,
   fn: (ws: HomeAssistantWebSocket) => Promise<T>,
-  activity?: HomeAssistantReadActivity,
+  activity?: HomeAssistantOperationActivity,
 ): Promise<T> {
   const ws = await HomeAssistantWebSocket.connect(creds, activity);
   try {
@@ -484,7 +484,7 @@ export interface RegistrySnapshot {
 
 export async function fetchRegistrySnapshot(
   creds: HomeAssistantCredentials,
-  activity?: HomeAssistantReadActivity,
+  activity?: HomeAssistantOperationActivity,
 ): Promise<RegistrySnapshot> {
   const states = await new HomeAssistantRest(creds, activity).getStates();
   const stateMap = new Map<string, any>();

@@ -4,6 +4,10 @@ import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionDescription,
+  type ActionExecution,
+  type ActionExecutionOutcome,
+  type ActionExecutionResult,
   type AvatarImage,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -16,10 +20,16 @@ import {
   type SupportedResource,
   type VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { runHomeAssistantRead, type HomeAssistantReadActivity } from "./billing";
+import {
+  HomeAssistantOperationActivityTracker,
+  runHomeAssistantRead,
+  type HomeAssistantOperationActivity,
+} from "./billing";
 import {
   HOME_ASSISTANT_BILLING_METHODS,
+  HOME_ASSISTANT_WRITE_BILLING_METHODS,
   type HomeAssistantBillableReadMethod,
+  type HomeAssistantBillableWriteMethod,
 } from "./billing-methods";
 import INSTANCE_CONFIGURATOR_HTML from "./generated/instance-configurator-ui.txt";
 import AREA_CONFIGURATOR_HTML from "./generated/area-configurator-ui.txt";
@@ -44,6 +54,7 @@ import {
   type RegistrySnapshot,
 } from "./homeassistant-api";
 import {
+  HomeAssistantActionTimeoutError,
   applyRevertForEntity,
   canRevert,
   describeAction,
@@ -1052,11 +1063,20 @@ type AppliedActionRow = {
   appliedAt: number;
 };
 
+type HomeAssistantActionExecutionRow = {
+  billingOperationId: string;
+  actionId: number;
+  providerIdempotencyKey?: string;
+  state: "preparing" | "applying" | ActionExecutionOutcome;
+};
+
 @validateRpc()
 export class HomeAssistantGatekeeperImpl
   extends DurableObject<Env, HomeAssistantGatekeeperImplProps>
   implements Gatekeeper<HomeAssistantSession | Area | Label | Device | Entity>
 {
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+
   #userAccount() {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     return this.ctx.exports.UserAccount.get(id);
@@ -1163,7 +1183,24 @@ export class HomeAssistantGatekeeperImpl
     }
   }
 
-  async applyAction(actionId: number): Promise<void> {
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult | void> {
+    if (!execution) return await this.#applyLegacyAction(actionId);
+
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return await active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
+      }
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return await work;
+  }
+
+  async #applyLegacyAction(actionId: number): Promise<void> {
     // The overseer only knows the numeric action ID; the full action lives in DO storage.
     const pending = this.#getPending(actionId);
     if (!pending) {
@@ -1193,6 +1230,101 @@ export class HomeAssistantGatekeeperImpl
     // later revertAction() can find it (the overseer passes back only the action ID).
     this.#storeApplied(action, revertInfo);
     this.#deletePending(actionId);
+  }
+
+  async #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const key = `execution:${execution.billingOperationId}`;
+    let row = this.ctx.storage.kv.get<HomeAssistantActionExecutionRow>(key);
+    if (row) {
+      if (row.actionId !== actionId ||
+          row.providerIdempotencyKey !== execution.providerIdempotencyKey) {
+        throw new Error("Home Assistant Action execution identity conflicts with its durable claim.");
+      }
+      if (row.state !== "preparing" && row.state !== "applying") {
+        return { outcome: row.state };
+      }
+      if (row.state === "applying") {
+        return this.#finishBillableAction(key, row, "unknown");
+      }
+    } else {
+      row = {
+        billingOperationId: execution.billingOperationId,
+        actionId,
+        ...(execution.providerIdempotencyKey
+          ? { providerIdempotencyKey: execution.providerIdempotencyKey }
+          : {}),
+        state: execution.mode === "recover" ? "unknown" : "preparing",
+      };
+      this.ctx.storage.kv.put(key, row);
+      if (row.state === "unknown") {
+        this.#deletePending(actionId);
+        return { outcome: "unknown" };
+      }
+      await this.ctx.storage.sync();
+    }
+
+    const pending = this.#getPending(actionId);
+    if (!pending) {
+      return this.#finishBillableAction(key, row, "failed-before-execution");
+    }
+    const action = pending.action;
+    let creds: HomeAssistantCredentials;
+    try {
+      creds = await this.#getCreds();
+    } catch {
+      return this.#finishBillableAction(key, row, "failed-before-execution");
+    }
+
+    let revertInfo: HomeAssistantRevertInfo;
+    try {
+      revertInfo = await this.#snapshotForRevert(action, creds);
+    } catch {
+      revertInfo = { type: "noRevert" };
+    }
+
+    row = { ...row, state: "applying" };
+    this.ctx.storage.kv.put(key, row);
+    await this.ctx.storage.sync();
+
+    const activity = new HomeAssistantOperationActivityTracker();
+    try {
+      await executeAction(action, creds, activity);
+    } catch (error) {
+      const outcome = error instanceof HomeAssistantActionTimeoutError ||
+          activity.failureOutcome() === "unknown"
+        ? "unknown"
+        : "failed-before-execution";
+      const result = this.#finishBillableAction(key, row, outcome);
+      if (error instanceof HomeAssistantError && error.isAuthError) {
+        await this.#userAccount().noteCredentialsExpired();
+      }
+      return result;
+    }
+
+    return this.#finishBillableAction(key, row, "accepted", action, revertInfo);
+  }
+
+  #finishBillableAction(
+    key: string,
+    row: HomeAssistantActionExecutionRow,
+    outcome: ActionExecutionOutcome,
+    action?: HomeAssistantAction,
+    revertInfo?: HomeAssistantRevertInfo,
+  ): ActionExecutionResult {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.put<HomeAssistantActionExecutionRow>(key, {
+        ...row,
+        state: outcome,
+      });
+      if (outcome === "accepted" && action && revertInfo) {
+        this.#storeApplied(action, revertInfo);
+      }
+      this.#deletePending(row.actionId);
+    });
+    return { outcome };
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
@@ -1298,7 +1430,7 @@ export class HomeAssistantGatekeeperImpl
           // Already-disposed / runtime-missing dispose: ignore.
         }
       },
-      async submitWrite(body) {
+      async submitWrite(method, body) {
         // Validate body up front so malformed calls fail immediately with a clear message
         // (rather than ending up in the approval queue or hitting Home Assistant later).
         validateWriteBody(body);
@@ -1308,7 +1440,7 @@ export class HomeAssistantGatekeeperImpl
         const row: PendingActionRow = { id, action, submittedAt: Date.now() };
         self.ctx.storage.kv.put<PendingActionRow>(`pending:${id}`, row);
 
-        let description;
+        let description: ActionDescription;
         try {
           const registry = await fetchRegistrySnapshot(creds);
           description = describeAction(action, registry);
@@ -1324,6 +1456,15 @@ export class HomeAssistantGatekeeperImpl
           };
           description = describeAction(action, emptyRegistry);
         }
+
+        description = {
+          ...description,
+          billing: {
+            methodKey: HOME_ASSISTANT_WRITE_BILLING_METHODS[method].methodKey,
+            externalAccountId: ctx.externalAccountId,
+            providerIdempotency: "unsupported",
+          },
+        };
 
         try {
           await approvalQueue.submitAction(id, description);
@@ -1516,11 +1657,11 @@ interface SessionContext {
 
   /** Submit a side-effecting action to the approval queue. Stores a pending row in DO storage
    * and awaits the approval queue. The action body is enriched with a fresh `id`. */
-  submitWrite(body: SubmitWriteBody): Promise<void>;
+  submitWrite(method: HomeAssistantBillableWriteMethod, body: SubmitWriteBody): Promise<void>;
 
   /** Fetch a fresh registry snapshot (no caching yet). Used both to enrich action descriptions
    * and to power simulation overlays. */
-  registrySnapshot(activity?: HomeAssistantReadActivity): Promise<RegistrySnapshot>;
+  registrySnapshot(activity?: HomeAssistantOperationActivity): Promise<RegistrySnapshot>;
 
   /** Return the current set of pending (submitted-but-not-yet-applied) actions for this
    * gatekeeper, in chronological (submit) order. Used by reads to overlay simulated state on
@@ -1532,7 +1673,7 @@ interface SessionContext {
    * read methods that derive from the states map (listEntities, describe, etc.) so simulation
    * is consistent regardless of which path the read takes. */
   registrySnapshotWithOverlay(
-    activity?: HomeAssistantReadActivity,
+    activity?: HomeAssistantOperationActivity,
   ): Promise<{ snapshot: RegistrySnapshot; appliedCount: number }>;
 }
 
@@ -1747,7 +1888,7 @@ function describeBadArg(value: unknown): string {
 
 async function callApi<T>(
   ctx: SessionContext,
-  activity: HomeAssistantReadActivity,
+  activity: HomeAssistantOperationActivity,
   fn: (rest: HomeAssistantRest) => Promise<T>,
 ): Promise<T> {
   const rest = new HomeAssistantRest(ctx.creds, activity);
@@ -1763,7 +1904,7 @@ async function callApi<T>(
 
 async function callWs<T>(
   ctx: SessionContext,
-  activity: HomeAssistantReadActivity,
+  activity: HomeAssistantOperationActivity,
   fn: (ws: HomeAssistantWebSocket) => Promise<T>,
 ): Promise<T> {
   try {
@@ -1779,7 +1920,7 @@ async function callWs<T>(
 function runRead<T>(
   ctx: SessionContext,
   method: HomeAssistantBillableReadMethod,
-  read: (activity: HomeAssistantReadActivity) => Promise<T>,
+  read: (activity: HomeAssistantOperationActivity) => Promise<T>,
   describe: (result: T) => Omit<ObservationDescription, "billingOperationId">,
 ): Promise<T> {
   return runHomeAssistantRead(
@@ -2288,7 +2429,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
     data?: Record<string, unknown>,
     target?: ServiceCallTarget,
   ): Promise<void> {
-    await this.#ctx.submitWrite({
+    await this.#ctx.submitWrite("HomeAssistantSession.callService", {
       type: "callService",
       domain,
       service,
@@ -2299,7 +2440,7 @@ class HomeAssistantSessionImpl extends RpcTarget implements HomeAssistantSession
   }
 
   async fireEvent(eventType: string, data?: Record<string, unknown>): Promise<void> {
-    await this.#ctx.submitWrite({
+    await this.#ctx.submitWrite("HomeAssistantSession.fireEvent", {
       type: "fireEvent",
       eventType,
       data,
@@ -2442,7 +2583,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   // Internal: fetch without authorize (used to build descriptions for child reads).
-  async #snapshot(activity: HomeAssistantReadActivity) {
+  async #snapshot(activity: HomeAssistantOperationActivity) {
     return await this.#ctx.registrySnapshot(activity);
   }
 
@@ -2590,7 +2731,7 @@ class AreaImpl extends RpcTarget implements Area {
   }
 
   async callService(domain: string, service: string, data?: Record<string, unknown>): Promise<void> {
-    await this.#ctx.submitWrite({
+    await this.#ctx.submitWrite("Area.callService", {
       type: "callService",
       domain,
       service,
@@ -2657,7 +2798,7 @@ class LabelImpl extends RpcTarget implements Label {
     this.#ctx.dispose();
   }
 
-  async #snapshot(activity: HomeAssistantReadActivity) {
+  async #snapshot(activity: HomeAssistantOperationActivity) {
     return await this.#ctx.registrySnapshot(activity);
   }
 
@@ -2736,7 +2877,7 @@ class LabelImpl extends RpcTarget implements Label {
   }
 
   async callService(domain: string, service: string, data?: Record<string, unknown>): Promise<void> {
-    await this.#ctx.submitWrite({
+    await this.#ctx.submitWrite("Label.callService", {
       type: "callService",
       domain,
       service,
@@ -2796,7 +2937,7 @@ class DeviceImpl extends RpcTarget implements Device {
     this.#ctx.dispose();
   }
 
-  async #snapshot(activity: HomeAssistantReadActivity) {
+  async #snapshot(activity: HomeAssistantOperationActivity) {
     return await this.#ctx.registrySnapshot(activity);
   }
 
@@ -2895,7 +3036,7 @@ class DeviceImpl extends RpcTarget implements Device {
   }
 
   async callService(domain: string, service: string, data?: Record<string, unknown>): Promise<void> {
-    await this.#ctx.submitWrite({
+    await this.#ctx.submitWrite("Device.callService", {
       type: "callService",
       domain,
       service,
@@ -3137,8 +3278,12 @@ class EntityImpl extends RpcTarget implements Entity {
 
   // ---- Writes ---------------------------------------------------------
 
-  #submitServiceCall(service: string, data?: Record<string, unknown>): Promise<void> {
-    return this.#ctx.submitWrite({
+  #submitServiceCall(
+    method: HomeAssistantBillableWriteMethod,
+    service: string,
+    data?: Record<string, unknown>,
+  ): Promise<void> {
+    return this.#ctx.submitWrite(method, {
       type: "callService",
       domain: this.#domain,
       service,
@@ -3149,7 +3294,7 @@ class EntityImpl extends RpcTarget implements Entity {
   }
 
   async callService(service: string, data?: Record<string, unknown>): Promise<void> {
-    await this.#submitServiceCall(service, data);
+    await this.#submitServiceCall("Entity.callService", service, data);
   }
 
   // ---- Typed helpers --------------------------------------------------
@@ -3165,95 +3310,100 @@ class EntityImpl extends RpcTarget implements Entity {
         throw new Error("brightnessPct must be between 0 and 100.");
       }
     }
-    await this.#submitServiceCall("turn_on", mapped);
+    await this.#submitServiceCall("Entity.turnOn", "turn_on", mapped);
   }
 
   async turnOff(data?: { transition?: number } | Record<string, unknown>): Promise<void> {
-    await this.#submitServiceCall("turn_off", data as Record<string, unknown> | undefined);
+    await this.#submitServiceCall(
+      "Entity.turnOff",
+      "turn_off",
+      data as Record<string, unknown> | undefined,
+    );
   }
 
   async toggle(data?: Record<string, unknown>): Promise<void> {
-    await this.#submitServiceCall("toggle", data);
+    await this.#submitServiceCall("Entity.toggle", "toggle", data);
   }
 
   async open(): Promise<void> {
-    await this.#submitServiceCall("open_cover");
+    await this.#submitServiceCall("Entity.open", "open_cover");
   }
 
   async close(): Promise<void> {
-    await this.#submitServiceCall("close_cover");
+    await this.#submitServiceCall("Entity.close", "close_cover");
   }
 
   async stop(): Promise<void> {
     const d = this.#domain;
-    if (d === "cover") await this.#submitServiceCall("stop_cover");
-    else if (d === "vacuum") await this.#submitServiceCall("stop");
-    else if (d === "media_player") await this.#submitServiceCall("media_stop");
-    else await this.#submitServiceCall("stop");
+    if (d === "cover") await this.#submitServiceCall("Entity.stop", "stop_cover");
+    else if (d === "vacuum") await this.#submitServiceCall("Entity.stop", "stop");
+    else if (d === "media_player") {
+      await this.#submitServiceCall("Entity.stop", "media_stop");
+    } else await this.#submitServiceCall("Entity.stop", "stop");
   }
 
   async setPosition(position: number): Promise<void> {
     if (position < 0 || position > 100) {
       throw new Error("position must be between 0 and 100.");
     }
-    await this.#submitServiceCall("set_cover_position", { position });
+    await this.#submitServiceCall("Entity.setPosition", "set_cover_position", { position });
   }
 
   async setTemperature(temperature: number, options?: { hvacMode?: string }): Promise<void> {
     const data: Record<string, unknown> = { temperature };
     if (options?.hvacMode != null) data.hvac_mode = options.hvacMode;
-    await this.#submitServiceCall("set_temperature", data);
+    await this.#submitServiceCall("Entity.setTemperature", "set_temperature", data);
   }
 
   async setHvacMode(mode: string): Promise<void> {
-    await this.#submitServiceCall("set_hvac_mode", { hvac_mode: mode });
+    await this.#submitServiceCall("Entity.setHvacMode", "set_hvac_mode", { hvac_mode: mode });
   }
 
   async setFanMode(mode: string): Promise<void> {
-    await this.#submitServiceCall("set_fan_mode", { fan_mode: mode });
+    await this.#submitServiceCall("Entity.setFanMode", "set_fan_mode", { fan_mode: mode });
   }
 
   async lock(code?: string): Promise<void> {
     const data: Record<string, unknown> = {};
     if (code != null) data.code = code;
-    await this.#submitServiceCall("lock", data);
+    await this.#submitServiceCall("Entity.lock", "lock", data);
   }
 
   async unlock(code?: string): Promise<void> {
     const data: Record<string, unknown> = {};
     if (code != null) data.code = code;
-    await this.#submitServiceCall("unlock", data);
+    await this.#submitServiceCall("Entity.unlock", "unlock", data);
   }
 
   async play(): Promise<void> {
-    await this.#submitServiceCall("media_play");
+    await this.#submitServiceCall("Entity.play", "media_play");
   }
 
   async pause(): Promise<void> {
-    await this.#submitServiceCall("media_pause");
+    await this.#submitServiceCall("Entity.pause", "media_pause");
   }
 
   async next(): Promise<void> {
-    await this.#submitServiceCall("media_next_track");
+    await this.#submitServiceCall("Entity.next", "media_next_track");
   }
 
   async previous(): Promise<void> {
-    await this.#submitServiceCall("media_previous_track");
+    await this.#submitServiceCall("Entity.previous", "media_previous_track");
   }
 
   async setVolume(volume: number): Promise<void> {
     if (volume < 0 || volume > 1) {
       throw new Error("volume must be between 0 and 1.");
     }
-    await this.#submitServiceCall("volume_set", { volume_level: volume });
+    await this.#submitServiceCall("Entity.setVolume", "volume_set", { volume_level: volume });
   }
 
   async mute(muted: boolean = true): Promise<void> {
-    await this.#submitServiceCall("volume_mute", { is_volume_muted: muted });
+    await this.#submitServiceCall("Entity.mute", "volume_mute", { is_volume_muted: muted });
   }
 
   async playMedia(mediaContentId: string, mediaContentType: string): Promise<void> {
-    await this.#submitServiceCall("play_media", {
+    await this.#submitServiceCall("Entity.playMedia", "play_media", {
       media_content_id: mediaContentId,
       media_content_type: mediaContentType,
     });
@@ -3263,43 +3413,47 @@ class EntityImpl extends RpcTarget implements Entity {
     if (percentage < 0 || percentage > 100) {
       throw new Error("percentage must be between 0 and 100.");
     }
-    await this.#submitServiceCall("set_percentage", { percentage });
+    await this.#submitServiceCall("Entity.setSpeed", "set_percentage", { percentage });
   }
 
   async start(): Promise<void> {
-    await this.#submitServiceCall("start");
+    await this.#submitServiceCall("Entity.start", "start");
   }
 
   async returnToBase(): Promise<void> {
-    await this.#submitServiceCall("return_to_base");
+    await this.#submitServiceCall("Entity.returnToBase", "return_to_base");
   }
 
   async locate(): Promise<void> {
-    await this.#submitServiceCall("locate");
+    await this.#submitServiceCall("Entity.locate", "locate");
   }
 
   async activate(): Promise<void> {
-    await this.#submitServiceCall("turn_on");
+    await this.#submitServiceCall("Entity.activate", "turn_on");
   }
 
   async run(variables?: Record<string, unknown>): Promise<void> {
-    await this.#submitServiceCall("turn_on", variables ? { variables } : undefined);
+    await this.#submitServiceCall(
+      "Entity.run",
+      "turn_on",
+      variables ? { variables } : undefined,
+    );
   }
 
   async press(): Promise<void> {
-    await this.#submitServiceCall("press");
+    await this.#submitServiceCall("Entity.press", "press");
   }
 
   async setValue(value: number): Promise<void> {
-    await this.#submitServiceCall("set_value", { value });
+    await this.#submitServiceCall("Entity.setValue", "set_value", { value });
   }
 
   async setText(value: string): Promise<void> {
-    await this.#submitServiceCall("set_value", { value });
+    await this.#submitServiceCall("Entity.setText", "set_value", { value });
   }
 
   async selectOption(option: string): Promise<void> {
-    await this.#submitServiceCall("select_option", { option });
+    await this.#submitServiceCall("Entity.selectOption", "select_option", { option });
   }
 
   async setDateTime(value: { date?: string; time?: string; datetime?: string }): Promise<void> {
@@ -3307,22 +3461,22 @@ class EntityImpl extends RpcTarget implements Entity {
     if (value.date != null) data.date = value.date;
     if (value.time != null) data.time = value.time;
     if (value.datetime != null) data.datetime = value.datetime;
-    await this.#submitServiceCall("set_datetime", data);
+    await this.#submitServiceCall("Entity.setDateTime", "set_datetime", data);
   }
 
   async trigger(): Promise<void> {
-    await this.#submitServiceCall("trigger");
+    await this.#submitServiceCall("Entity.trigger", "trigger");
   }
 
   async reload(): Promise<void> {
-    await this.#submitServiceCall("reload");
+    await this.#submitServiceCall("Entity.reload", "reload");
   }
 
   async notify(message: string, title?: string, data?: Record<string, unknown>): Promise<void> {
     const payload: Record<string, unknown> = { message };
     if (title != null) payload.title = title;
     if (data != null) payload.data = data;
-    await this.#submitServiceCall("send_message", payload);
+    await this.#submitServiceCall("Entity.notify", "send_message", payload);
   }
 }
 
@@ -3381,7 +3535,7 @@ class DashboardImpl extends RpcTarget implements Dashboard {
   }
 
   // Internal helper (no authorize) used by saveConfig() to look up the mode.
-  async #describeRaw(activity: HomeAssistantReadActivity): Promise<DashboardInfo> {
+  async #describeRaw(activity: HomeAssistantOperationActivity): Promise<DashboardInfo> {
     return await callWs(this.#ctx, activity, async (ws) => {
       const list = await ws.send<any[]>({ type: "lovelace/dashboards/list" });
       const found = list.find((d: any) => d.url_path === this.#urlPath);
@@ -3457,7 +3611,7 @@ class DashboardImpl extends RpcTarget implements Dashboard {
     // performs the check at apply time, where a WebSocket is already open for the save itself,
     // and HA itself returns an error for YAML-mode dashboards (which propagates as an action
     // failure that the user sees in the approval queue).
-    await this.#ctx.submitWrite({
+    await this.#ctx.submitWrite("Dashboard.saveConfig", {
       type: "saveDashboard",
       urlPath: this.#urlPath === "lovelace" ? null : this.#urlPath,
       config: config as unknown,

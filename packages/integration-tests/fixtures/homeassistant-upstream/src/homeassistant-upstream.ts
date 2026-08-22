@@ -8,11 +8,13 @@ type MockCall = { transport: "rest" | "websocket"; operation: string };
 let calls: MockCall[] = [];
 let rejectNextAuthentication = false;
 let dropNextCommand: string | undefined;
+let hangNextCommand: string | undefined;
 let failNextRestResponse = false;
 let barrier: {
   transport?: MockCall["transport"];
   operation?: string;
   reached: boolean;
+  durationMs: number;
 } | undefined;
 
 function state(entityId: string, value: string) {
@@ -40,7 +42,7 @@ async function record(call: MockCall): Promise<void> {
     return;
   }
   pending.reached = true;
-  await new Promise(resolve => setTimeout(resolve, 2_000));
+  await new Promise(resolve => setTimeout(resolve, pending.durationMs));
   if (barrier === pending) barrier = undefined;
 }
 
@@ -109,6 +111,10 @@ function openWebSocket(): Response {
         server.close(1011, "fixture response loss");
         return;
       }
+      if (hangNextCommand === type) {
+        hangNextCommand = undefined;
+        return;
+      }
       server.send(JSON.stringify({
         id: message.id,
         type: "result",
@@ -140,6 +146,9 @@ async function control(request: Request, url: URL): Promise<Response> {
     case "/control/drop-next-command":
       dropNextCommand = String(body.type);
       return new Response(null, { status: 204 });
+    case "/control/hang-next-command":
+      hangNextCommand = String(body.type);
+      return new Response(null, { status: 204 });
     case "/control/fail-next-rest-response":
       failNextRestResponse = true;
       return new Response(null, { status: 204 });
@@ -148,6 +157,7 @@ async function control(request: Request, url: URL): Promise<Response> {
         transport: body.transport as MockCall["transport"] | undefined,
         operation: typeof body.operation === "string" ? body.operation : undefined,
         reached: false,
+        durationMs: typeof body.durationMs === "number" ? body.durationMs : 2_000,
       };
       return new Response(null, { status: 204 });
     }

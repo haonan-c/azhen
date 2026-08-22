@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   HOME_ASSISTANT_BILLING_METHODS,
   HOME_ASSISTANT_LOCAL_READ_METHODS,
+  HOME_ASSISTANT_WRITE_BILLING_METHODS,
 } from "../src/billing-methods.js";
 
 const EXPECTED_METHOD_KEYS = [
@@ -49,6 +50,49 @@ const EXPECTED_METHOD_KEYS = [
   "homeassistant.dashboard.get-config",
 ] as const;
 
+const EXPECTED_WRITE_METHOD_KEYS = [
+  "homeassistant.instance.call-service",
+  "homeassistant.instance.fire-event",
+  "homeassistant.area.call-service",
+  "homeassistant.label.call-service",
+  "homeassistant.device.call-service",
+  "homeassistant.entity.call-service",
+  "homeassistant.entity.turn-on",
+  "homeassistant.entity.turn-off",
+  "homeassistant.entity.toggle",
+  "homeassistant.entity.open",
+  "homeassistant.entity.close",
+  "homeassistant.entity.stop",
+  "homeassistant.entity.set-position",
+  "homeassistant.entity.set-temperature",
+  "homeassistant.entity.set-hvac-mode",
+  "homeassistant.entity.set-fan-mode",
+  "homeassistant.entity.lock",
+  "homeassistant.entity.unlock",
+  "homeassistant.entity.play",
+  "homeassistant.entity.pause",
+  "homeassistant.entity.next",
+  "homeassistant.entity.previous",
+  "homeassistant.entity.set-volume",
+  "homeassistant.entity.mute",
+  "homeassistant.entity.play-media",
+  "homeassistant.entity.set-speed",
+  "homeassistant.entity.start",
+  "homeassistant.entity.return-to-base",
+  "homeassistant.entity.locate",
+  "homeassistant.entity.activate",
+  "homeassistant.entity.run",
+  "homeassistant.entity.press",
+  "homeassistant.entity.set-value",
+  "homeassistant.entity.set-text",
+  "homeassistant.entity.select-option",
+  "homeassistant.entity.set-date-time",
+  "homeassistant.entity.trigger",
+  "homeassistant.entity.reload",
+  "homeassistant.entity.notify",
+  "homeassistant.dashboard.save-config",
+] as const;
+
 describe("Home Assistant Billable Method inventory", () => {
   it("fixes the complete 42-method read registry", () => {
     const entries = Object.values(HOME_ASSISTANT_BILLING_METHODS);
@@ -82,5 +126,15 @@ describe("Home Assistant Billable Method inventory", () => {
     ]) {
       expect(publicMethods).not.toContain(excluded);
     }
+  });
+
+  it("fixes the complete public write registry", () => {
+    const entries = Object.values(HOME_ASSISTANT_WRITE_BILLING_METHODS);
+
+    expect(entries).toHaveLength(EXPECTED_WRITE_METHOD_KEYS.length);
+    expect(new Set(entries.map(entry => entry.methodKey)).size).toBe(entries.length);
+    expect(entries.map(entry => entry.methodKey)).toEqual(EXPECTED_WRITE_METHOD_KEYS);
+    expect(entries.every(entry => entry.rateUnit === "operation" && entry.quantity === 1))
+      .toBe(true);
   });
 });
