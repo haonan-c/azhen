@@ -319,6 +319,51 @@ describe("user-DO reset flags", () => {
 });
 
 describe("legacy paid work without a Usage Principal", () => {
+  it("migrates approved Actions and backfills their submission index after restart", async () => {
+    using publicApi = await connect();
+    const account = await createAccount(publicApi, "legacyapprovedaction");
+    using authenticated = await publicApi.authenticate(account.token);
+    const workspace = await authenticated.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
+    const overseer = exports.OverseerDurableObject.get(
+      exports.OverseerDurableObject.idFromString(workspaceId),
+    );
+    await runInDurableObject(overseer, (instance) => {
+      const impl = (instance as any).impl;
+      impl.storage.actions.put({
+        id: 999,
+        gatekeeperId: 44,
+        caller: {from: "user"},
+        createdAt: new Date(),
+        state: "approved",
+        type: "action",
+        action: 7,
+        description: {title: "Legacy approved action"},
+      });
+      impl.storage.version.put(3);
+    });
+    workspace[Symbol.dispose]();
+
+    await rejection(runInDurableObject(overseer, (_instance, state) => {
+      state.abort(USER_DO_ABORT_REASON);
+    }));
+    using reopened = await authenticated.openGadget(workspaceId);
+
+    expect((await reopened.listActions()).find(action => action.id === 999)?.state)
+      .toBe("accepted");
+    const restartedOverseer = exports.OverseerDurableObject.get(
+      exports.OverseerDurableObject.idFromString(workspaceId),
+    );
+    await runInDurableObject(restartedOverseer, (instance) => {
+      const impl = (instance as any).impl;
+      expect(impl.storage.version.get()).toBe(5);
+      expect(impl.storage.actionSubmissions.get("44:7")).toEqual({
+        id: "44:7",
+        actionId: 999,
+      });
+    });
+  });
+
   it("rejects a pending Action before resolving its upstream gatekeeper", async () => {
     using publicApi = await connect();
     const account = await createAccount(publicApi, "legacyaction");

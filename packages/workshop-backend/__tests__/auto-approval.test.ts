@@ -60,7 +60,7 @@ function makeImmediateApply(storage: AutoApprovalStorage) {
     calls.push(record.id);
     let fresh = storage.actions.get(record.id);
     if (fresh && fresh.type === "action") {
-      fresh.state = "approved";
+      fresh.state = "accepted";
       fresh.appliedAt = new Date();
       fresh.resolvedBy = resolvedBy;
       fresh.autoApproved = autoApproved;
@@ -82,7 +82,7 @@ function makeControlledApply(storage: AutoApprovalStorage) {
       gates.push(() => {
         let fresh = storage.actions.get(record.id);
         if (fresh && fresh.type === "action") {
-          fresh.state = "approved";
+          fresh.state = "accepted";
           fresh.appliedAt = new Date();
           fresh.resolvedBy = resolvedBy;
           fresh.autoApproved = autoApproved;
@@ -124,7 +124,7 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(calls).toEqual([1, 2, 3]);
     for (let id of [1, 2, 3]) {
       let record = getAction(storage, id);
-      expect(record.state).toBe("approved");
+      expect(record.state).toBe("accepted");
       expect(record.autoApproved).toBe(true);
       expect(record.resolvedBy?.id).toBe(ENABLER.id);
     }
@@ -148,12 +148,12 @@ describe("AutoApprovalDrainer.drain", () => {
 
     // Clear the gate (as a manual approval would) and re-drain: the rest applies, still in order.
     let gate = getAction(storage, 2);
-    gate.state = "approved";
+    gate.state = "accepted";
     storage.actions.put(gate);
     await drainer.drain(GK);
 
     expect(calls).toEqual([1, 3]);
-    expect(getAction(storage, 3).state).toBe("approved");
+    expect(getAction(storage, 3).state).toBe("accepted");
   });
 
   // Two concurrent drains for the same gatekeeper must not double-apply. The input gate is open
@@ -178,7 +178,7 @@ describe("AutoApprovalDrainer.drain", () => {
     await first;                     // rerun pass re-lists: action 1 no longer pending -> no re-apply
 
     expect(apply.calls).toEqual([1]);
-    expect(getAction(storage, 1).state).toBe("approved");
+    expect(getAction(storage, 1).state).toBe("accepted");
   });
 
   // Work that arrives while a drain is parked must still be applied -- the coalescing
@@ -208,7 +208,7 @@ describe("AutoApprovalDrainer.drain", () => {
     await first;
 
     expect(apply.calls).toEqual([1, 2]);
-    expect(getAction(storage, 1).state).toBe("approved");
-    expect(getAction(storage, 2).state).toBe("approved");
+    expect(getAction(storage, 1).state).toBe("accepted");
+    expect(getAction(storage, 2).state).toBe("accepted");
   });
 });

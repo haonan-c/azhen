@@ -567,6 +567,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       this.adminSettings.getByName(""),
       adminUserId,
       this.users,
+      this.overseers,
     );
   }
 }

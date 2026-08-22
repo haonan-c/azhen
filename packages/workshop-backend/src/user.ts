@@ -12,6 +12,7 @@ import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
 import {
   UsageAccount,
   type GatekeeperMeteringAttempt,
+  type GatekeeperUsageStart,
   type GatekeeperUsageAttribution,
   type GatekeeperUsageCompletion,
   type GatekeeperUsageRecord,
@@ -554,8 +555,29 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.beginGatekeeperUsage(operationId, attribution, chargeSnapshot);
   }
 
+  /** Begin a delayed Action and return a stable pre-execution denial without hiding RPC failure. */
+  async beginGatekeeperActionUsage(
+      operationId: string,
+      attribution: GatekeeperUsageAttribution,
+      chargeSnapshot: GatekeeperChargeSnapshot): Promise<
+        {status: "begun"; attempt: GatekeeperMeteringAttempt} |
+        {status: "insufficient-credit"}
+      > {
+    try {
+      return {
+        status: "begun",
+        attempt: await this.beginGatekeeperUsage(operationId, attribution, chargeSnapshot),
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message === "Insufficient Usage Credit.") {
+        return {status: "insufficient-credit"};
+      }
+      throw error;
+    }
+  }
+
   /** Persist the durable upstream-start handoff for one trusted Gatekeeper operation. */
-  async markGatekeeperUsageStarted(operationId: string): Promise<GatekeeperMeteringAttempt> {
+  async markGatekeeperUsageStarted(operationId: string): Promise<GatekeeperUsageStart> {
     await this.activateUsageAccount();
     return this.usageAccount.markGatekeeperUsageStarted(operationId);
   }
@@ -566,6 +588,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       completion: GatekeeperUsageCompletion): Promise<GatekeeperUsageRecord> {
     await this.activateUsageAccount();
     return this.usageAccount.completeGatekeeperUsage(operationId, completion);
+  }
+
+  /** Settle or release one unknown-held Gatekeeper operation under administrator authority. */
+  async reconcileUnknownGatekeeperUsage(
+      billingOperationId: string,
+      reconciliationOperationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string) {
+    await this.activateUsageAccount();
+    return this.usageAccount.reconcileUnknownGatekeeperUsage(
+      billingOperationId,
+      reconciliationOperationId,
+      decision,
+      reason,
+      actorUserId,
+    );
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */

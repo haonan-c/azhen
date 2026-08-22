@@ -1,7 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, ObserverBindingFailureCode, OpenGadgetObserverFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OBSERVER_BINDING_FAILURE_CODES, OPEN_GADGET_ERROR_CODES, resolveSiteName, type ModelChargeSnapshot } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind, type BillableOperation, type BillableOperationOutcome, type HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, ObserverBindingFailureCode, OpenGadgetObserverFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OBSERVER_BINDING_FAILURE_CODES, OPEN_GADGET_ERROR_CODES, resolveSiteName, type AdminActionReconciliationDecision, type AdminActionReconciliationResult, type GatekeeperChargeSnapshot, type ModelChargeSnapshot } from '@gadgets/workshop-shared/api';
+import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind, type ActionExecution, type ActionExecutionOutcome, type ActionExecutionResult, type BillableOperation, type BillableOperationOutcome, type HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -606,6 +606,13 @@ type ChatAttachmentContentRecord = {
 // the gatekeeper, so no lookup is ever attempted.
 const BUILTIN_TOOL_GATEKEEPER_ID = -1;
 
+type ActionExecutionStage =
+  | "claimed"
+  | "pricing-fixed"
+  | "begun"
+  | "started"
+  | "outcome-persisted";
+
 export type ActionRecord = {
   id: number,
   gatekeeperId: WorkpieceId;
@@ -623,11 +630,19 @@ export type ActionRecord = {
 } & ({
   type: "action";
   systemAssistanceId?: string;
+  approvedAt?: Date;
   appliedAt?: Date;
   action: number;  // action key assigned by the gatekeeper, passed back on apply/reject/revert
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+  providerIdempotencyKey?: string;
+  executionStage?: ActionExecutionStage;
+  chargeSnapshot?: GatekeeperChargeSnapshot;
+  executionOutcome?: ActionExecutionOutcome;
+  usageLedgerEntryId?: string;
+  reconciliations?: AdminActionReconciliationResult[];
+  revertOutcome?: "applying" | "reverted" | "unknown";
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -649,6 +664,11 @@ export type ActionRecord = {
   /** Denormalized for display purposes. */
   enabled: boolean;
 });
+
+type ActionSubmissionRecord = {
+  id: string;
+  actionId: number;
+};
 
 type BoundHookRecord = {
   id: number;
@@ -774,6 +794,7 @@ type PendingSystemAssistanceRecord = {
   modelId: string;
   attribution: UsageAttribution;
   state: "waiting" | "ready";
+  summaryAdded?: true;
   cause:
     | {type: "action"; actionId: number}
     | {type: "connectionRequest"; requestId: string};
@@ -862,6 +883,7 @@ function actionRecordToLog(record: ActionRecord): ActionLogEntry {
         resourceTitle: record.resourceTitle || "(title unavailable)",
         resourceUrl: record.resourceUrl,
         createdAt: record.createdAt,
+        approvedAt: record.approvedAt,
         appliedAt: record.appliedAt,
         state: record.state,
         type: "action",
@@ -1015,6 +1037,10 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
 
       actions: collection<ActionRecord>()({
         primaryKey: "id"
+      }),
+
+      actionSubmissions: collection<ActionSubmissionRecord>()({
+        primaryKey: "id",
       }),
 
       boundHooks: collection<BoundHookRecord>()({
@@ -1352,7 +1378,11 @@ class OverseerImpl implements AgentHooks {
 
   prepareApprovedActionSystemAssistance(
       decidedAction: ActionRecord & {type: "action"}):
-      {task: PendingSystemAssistanceRecord; actions: Array<ActionRecord & {type: "action"}>} |
+      {
+        task: PendingSystemAssistanceRecord;
+        siblingTaskIds: string[];
+        actions: Array<ActionRecord & {type: "action"}>;
+      } |
       undefined {
     let decidedTask = this.requireActionSystemAssistance(decidedAction);
     let tasks = [...this.storage.pendingSystemAssistances.byTurnId.get(decidedTask.turnId)]
@@ -1367,8 +1397,12 @@ class OverseerImpl implements AgentHooks {
       return action;
     }).toSorted((left, right) => left.id - right.id);
 
-    if (actions.some(action => action.state === "pending")) return undefined;
-    if (actions.some(action => action.state === "rejected")) {
+    if (actions.some(action =>
+      action.state === "pending" || action.state === "applying" || action.state === "unknown")) {
+      return undefined;
+    }
+    if (actions.some(action =>
+      action.state === "rejected" || action.state === "failed-before-execution")) {
       this.ctx.storage.transactionSync(() => {
         for (let task of tasks) this.storage.pendingSystemAssistances.delete(task.id);
       });
@@ -1379,13 +1413,8 @@ class OverseerImpl implements AgentHooks {
         actions[0].systemAssistanceId!);
     if (!selected) throw new Error("Usage Principal is missing for this pending Action.");
     selected.state = "ready";
-    this.ctx.storage.transactionSync(() => {
-      this.storage.pendingSystemAssistances.put(selected);
-      for (let task of tasks) {
-        if (task.id !== selected!.id) this.storage.pendingSystemAssistances.delete(task.id);
-      }
-    });
-    return {task: selected, actions};
+    this.storage.pendingSystemAssistances.put(selected);
+    return {task: selected, siblingTaskIds: tasks.map(task => task.id), actions};
   }
 
   deleteActionSystemAssistance(action: ActionRecord & {type: "action"}): void {
@@ -1437,16 +1466,39 @@ class OverseerImpl implements AgentHooks {
       this.storage.pendingSystemAssistances.delete(task.id);
       return;
     }
+    let aiModel = userMeta.aiModel;
 
     let freshTask = this.storage.pendingSystemAssistances.get(task.id);
     let freshMeta = this.storage.chatMeta.get(task.chatId);
     if (!freshTask || freshTask.state !== "ready" || !freshMeta || freshMeta.activeAgent) return;
 
-    freshMeta.activeAgent = userMeta.aiModel.profile;
-    freshMeta.lastActive = this.getChatTimestamp();
-    this.storage.chatMeta.put(freshMeta);
-    this.startAgent(task.chatId, userMeta.aiModel, userMeta.profile, attribution);
-    this.storage.pendingSystemAssistances.delete(task.id);
+    let activeAgent: ActiveAgentRecord = {
+      chatId: task.chatId,
+      turnId: `agent-turn:${crypto.randomUUID()}`,
+      attribution,
+      modelId: aiModel.profile.id,
+      initiator: userMeta.profile,
+      callbackInitiated: false,
+    };
+    this.ctx.storage.transactionSync(() => {
+      freshMeta.activeAgent = aiModel.profile;
+      freshMeta.lastActive = this.getChatTimestamp();
+      this.storage.chatMeta.put(freshMeta);
+      this.storage.activeAgents.put(activeAgent);
+      this.storage.pendingSystemAssistances.delete(task.id);
+    });
+    // The durable turn record and task consumption are one transaction. If this activation dies
+    // before launching the in-memory turn, the constructor resumes the ActiveAgentRecord.
+    this.#registerRunningAgent(task.chatId);
+    let liveChat = this.#getLiveChat(task.chatId);
+    this.#runAgentTurn(
+      task.chatId,
+      aiModel,
+      userMeta.profile,
+      attribution,
+      false,
+      liveChat,
+    );
   }
 
   resumeReadySystemAssistanceForChat(chatId: number): void {
@@ -1789,9 +1841,10 @@ class OverseerImpl implements AgentHooks {
         let action = this.storage.actions.get(task.cause.actionId);
         if (!action || action.type !== "action") {
           this.storage.pendingSystemAssistances.delete(task.id);
-        } else if (action.state === "approved") {
+        } else if (action.state === "accepted") {
           this.prepareApprovedActionSystemAssistance(action);
-        } else if (action.state === "rejected") {
+        } else if (action.state === "rejected" ||
+                   action.state === "failed-before-execution") {
           this.deleteActionSystemAssistance(action);
         }
         continue;
@@ -1827,6 +1880,15 @@ class OverseerImpl implements AgentHooks {
         this.storage,
         (record, resolvedBy, autoApproved) =>
             this.applyPendingAction(record, resolvedBy, autoApproved));
+
+    for (let action of this.storage.actions.list()) {
+      if (action.type !== "action" || action.state !== "applying") continue;
+      this.ctx.waitUntil(this.continueApplyingAction(action.id, true).catch(error => {
+        this.logger.error("failed to recover applying action", {
+          event: "action.execution.recovery.failed", actionId: action.id, error,
+        });
+      }));
+    }
 
     // Mirror every gadget-registry change into the owner's outputs index. Subscribing here makes
     // the registry the single chokepoint, so creation, acceptance, renaming, reverting and
@@ -1871,9 +1933,18 @@ class OverseerImpl implements AgentHooks {
     }
 
     this.#reconcilePendingSystemAssistances();
-    for (let task of this.storage.pendingSystemAssistances.list()) {
+    for (let task of Array.from(this.storage.pendingSystemAssistances.list())) {
       if (task.state === "ready") {
-        this.ctx.waitUntil(this.resumePendingSystemAssistance(task.id));
+        let recovery = task.cause.type === "action"
+          ? this.handleActionExecutionTerminal(task.cause.actionId)
+          : this.resumePendingSystemAssistance(task.id);
+        this.ctx.waitUntil(recovery.catch(error => {
+          this.logger.error("failed to recover pending system assistance", {
+            event: "system-assistance.recovery.failed",
+            chatId: task.chatId,
+            error,
+          });
+        }));
       }
     }
   }
@@ -1884,7 +1955,7 @@ class OverseerImpl implements AgentHooks {
 
   // Migrate storage to the current schema version. Runs synchronously in the constructor.
   #migrateStorage(): void {
-    if (this.storage.version.get() >= 2) return;
+    if (this.storage.version.get() >= 5) return;
     if (this.ownerId === undefined) {
       // Brand-new (or never-initialized) DO: there is nothing to migrate. We deliberately avoid
       // writing anything here, so that probing a nonexistent DO leaves no storage behind; the
@@ -2045,6 +2116,29 @@ class OverseerImpl implements AgentHooks {
       // A model binding keeps no facet state of its own, so nothing is lost.
       for (let id of reminted) this.ctx.facets.delete(`gatekeeper${id}`);
     }
+
+    if (this.storage.version.get() === 3) this.ctx.storage.transactionSync(() => {
+      // Version 4 names a successfully executed Action "accepted". Older records used
+      // "approved", which described the user's decision but not the provider outcome.
+      for (let stored of Array.from(this.storage.actions.list())) {
+        let legacy = stored as Omit<ActionRecord, "state"> & {state: ActionState | "approved"};
+        if (legacy.state === "approved") {
+          this.storage.actions.put({...legacy, state: "accepted"} as ActionRecord);
+        }
+      }
+      this.storage.version.put(4);
+    });
+
+    if (this.storage.version.get() === 4) this.ctx.storage.transactionSync(() => {
+      for (let action of this.storage.actions.list()) {
+        if (action.type !== "action") continue;
+        let id = actionSubmissionId(action.gatekeeperId, action.action);
+        if (!this.storage.actionSubmissions.get(id)) {
+          this.storage.actionSubmissions.put({id, actionId: action.id});
+        }
+      }
+      this.storage.version.put(5);
+    });
 
     this.logger.info("migrated workspace storage", {
       event: "storage.migration.completed", durationMs: Date.now() - startedAt,
@@ -3237,15 +3331,8 @@ class OverseerImpl implements AgentHooks {
     });
   }
 
-  // Apply a single pending action: invoke the gatekeeper, mark it approved, and persist (the put
-  // auto-notifies subscribeToActions). Shared by manual approval (`approveAction`) and the
-  // auto-approval drain (`drainAutoApprovals`). The caller is responsible for validating that the
-  // record is still pending before calling.
-  //
-  // `resolvedBy`/`autoApproved` are required (not defaulted) so that no apply path can omit how the
-  // gate was cleared: this is the single chokepoint where an action transitions to "approved", so
-  // requiring them here guarantees the audit log always records the resolving user and whether it
-  // was applied automatically. For an auto-approval, `resolvedBy` is the user who enabled the rule.
+  // Durably claim one pending Action before any billing or provider work. Manual and automatic
+  // approval share this compare-and-set chokepoint, so only one caller can cross the approval gate.
   async applyPendingAction(record: ActionRecord & {type: "action"},
                            resolvedBy: AiChatAuthorInfo, autoApproved: boolean): Promise<void> {
     record.caller = normalizeGatekeeperCaller(record.caller);
@@ -3253,13 +3340,322 @@ class OverseerImpl implements AgentHooks {
         record.description.awaitDecision) {
       this.requireActionSystemAssistance(record);
     }
-    let gatekeeper = this.getGatekeeperFacet(record.gatekeeperId);
-    await gatekeeper.applyAction(record.action);
-    record.state = "approved";
-    record.appliedAt = new Date();
-    record.resolvedBy = resolvedBy;
-    record.autoApproved = autoApproved;
-    this.storage.actions.put(record);
+
+    this.ctx.storage.transactionSync(() => {
+      let fresh = this.storage.actions.get(record.id);
+      if (!fresh || fresh.type !== "action" || fresh.state !== "pending") {
+        throw new Error(`Action is not pending: ${record.id}`);
+      }
+      fresh.caller = normalizeGatekeeperCaller(fresh.caller);
+      fresh.state = "applying";
+      fresh.approvedAt = new Date();
+      fresh.resolvedBy = resolvedBy;
+      fresh.autoApproved = autoApproved;
+      fresh.executionStage = "claimed";
+      this.storage.actions.put(fresh);
+    });
+
+    await this.continueApplyingAction(record.id, false);
+  }
+
+  #actionApplications = new Map<number, Promise<void>>();
+
+  // Continue one durable Action protocol. A same-activation duplicate shares the in-flight work;
+  // the stored state remains the authority across messages and Durable Object restarts.
+  continueApplyingAction(actionId: number, recovering: boolean): Promise<void> {
+    let active = this.#actionApplications.get(actionId);
+    if (active) return active;
+    let work = this.#continueApplyingAction(actionId, recovering).finally(() => {
+      if (this.#actionApplications.get(actionId) === work) {
+        this.#actionApplications.delete(actionId);
+      }
+    });
+    this.#actionApplications.set(actionId, work);
+    return work;
+  }
+
+  async #continueApplyingAction(actionId: number, recovering: boolean): Promise<void> {
+    let action = this.#getApplyingAction(actionId);
+    let gatekeeper = this.getGatekeeperFacet(action.gatekeeperId);
+
+    if (action.description.billing === undefined) {
+      let outcome: ActionExecutionOutcome;
+      try {
+        outcome = (await gatekeeper.applyAction(action.action))?.outcome ?? "accepted";
+      } catch (error) {
+        this.ctx.storage.transactionSync(() => {
+          let fresh = this.#getApplyingAction(actionId);
+          fresh.state = "pending";
+          delete fresh.approvedAt;
+          delete fresh.resolvedBy;
+          delete fresh.autoApproved;
+          delete fresh.executionStage;
+          this.storage.actions.put(fresh);
+        });
+        throw error;
+      }
+      this.#finishActionExecution(actionId, outcome);
+      await this.handleActionExecutionTerminal(actionId);
+      return;
+    }
+
+    let billing = action.description.billing;
+    let billingOperationId = action.description.billingOperationId;
+    if (!billingOperationId) throw new Error("Billable Action has no operation ID.");
+    let recoveredAfterStart = recovering && action.executionStage === "started";
+
+    if (action.executionStage === "claimed") {
+      let vendorId = gatekeeperVendorId(this.storage.gatekeepers.get(action.gatekeeperId));
+      if (!vendorId) throw new Error("This gatekeeper has no vendor identity to bill against.");
+      let chargeSnapshot = await this.ctx.exports.AdminSettings.getByName("")
+          .issueGatekeeperChargeSnapshot(vendorId, billing.methodKey);
+      this.ctx.storage.transactionSync(() => {
+        let fresh = this.#getApplyingAction(actionId);
+        if (fresh.executionStage !== "claimed") return;
+        fresh.chargeSnapshot = chargeSnapshot;
+        fresh.executionStage = "pricing-fixed";
+        this.storage.actions.put(fresh);
+      });
+      action = this.#getApplyingAction(actionId);
+    }
+
+    if (action.executionStage === "pricing-fixed") {
+      if (!action.chargeSnapshot) throw new Error("Billable Action has no Charge Snapshot.");
+      let begun = await this.userForPrincipal(action.caller.attribution.principal.userId)
+          .beginGatekeeperActionUsage(billingOperationId, {
+            ...action.caller.attribution,
+            vendorId: action.chargeSnapshot.vendorId,
+            billingMethodKey: billing.methodKey,
+            externalAccountId: billing.externalAccountId,
+          }, action.chargeSnapshot);
+      if (begun.status === "insufficient-credit") {
+        this.#finishActionExecution(actionId, "failed-before-execution");
+        await this.handleActionExecutionTerminal(actionId);
+        return;
+      }
+      this.#advanceActionExecution(actionId, "pricing-fixed", "begun");
+      action = this.#getApplyingAction(actionId);
+    }
+
+    if (action.executionStage === "begun") {
+      let start = await this.userForPrincipal(action.caller.attribution.principal.userId)
+          .markGatekeeperUsageStarted(billingOperationId);
+      // If this was a replay, a previous Overseer activation may have crossed the upstream
+      // boundary after receiving the first acknowledgement. Recover conservatively instead of
+      // asserting that this activation is making the first provider attempt.
+      if (!start.startedNow) recoveredAfterStart = true;
+      this.#advanceActionExecution(actionId, "begun", "started");
+      action = this.#getApplyingAction(actionId);
+    }
+
+    if (action.executionStage === "started") {
+      let execution: ActionExecution = {
+        billingOperationId,
+        ...(action.providerIdempotencyKey
+          ? {providerIdempotencyKey: action.providerIdempotencyKey}
+          : {}),
+        mode: recoveredAfterStart ? "recover" : "execute",
+      };
+      let result: ActionExecutionResult | void;
+      try {
+        result = await gatekeeper.applyAction(action.action, execution);
+      } catch {
+        try {
+          result = await gatekeeper.applyAction(action.action, {...execution, mode: "recover"});
+        } catch {
+          result = {outcome: "unknown"};
+        }
+      }
+      if (result === undefined) {
+        result = {outcome: "unknown"};
+      }
+      if (result.outcome !== "accepted" && result.outcome !== "failed-before-execution" &&
+          result.outcome !== "unknown") {
+        throw new Error("Gatekeeper returned an invalid Action execution outcome.");
+      }
+      this.ctx.storage.transactionSync(() => {
+        let fresh = this.#getApplyingAction(actionId);
+        if (fresh.executionStage !== "started") return;
+        fresh.executionOutcome = result.outcome;
+        fresh.executionStage = "outcome-persisted";
+        this.storage.actions.put(fresh);
+      });
+      action = this.#getApplyingAction(actionId);
+    }
+
+    if (action.executionStage === "outcome-persisted") {
+      let outcome = action.executionOutcome;
+      if (!outcome) throw new Error("Billable Action has no execution outcome.");
+      let usage = await this.userForPrincipal(action.caller.attribution.principal.userId)
+          .completeGatekeeperUsage(
+            billingOperationId,
+            outcome === "accepted" ? "executed" : outcome,
+          );
+      this.#finishActionExecution(actionId, outcome, usage.ledgerEntryId ?? undefined);
+      await this.handleActionExecutionTerminal(actionId);
+    }
+  }
+
+  #getApplyingAction(actionId: number): ActionRecord & {type: "action"} {
+    let action = this.storage.actions.get(actionId);
+    if (!action || action.type !== "action" || action.state !== "applying") {
+      throw new Error(`Action is not applying: ${actionId}`);
+    }
+    action.caller = normalizeGatekeeperCaller(action.caller);
+    return action;
+  }
+
+  #advanceActionExecution(
+      actionId: number, from: ActionExecutionStage, to: ActionExecutionStage): void {
+    this.ctx.storage.transactionSync(() => {
+      let action = this.#getApplyingAction(actionId);
+      if (action.executionStage !== from) return;
+      action.executionStage = to;
+      this.storage.actions.put(action);
+    });
+  }
+
+  #finishActionExecution(
+      actionId: number, outcome: ActionExecutionOutcome, usageLedgerEntryId?: string): void {
+    this.ctx.storage.transactionSync(() => {
+      let action = this.#getApplyingAction(actionId);
+      action.executionOutcome = outcome;
+      action.state = outcome;
+      action.appliedAt = new Date();
+      if (usageLedgerEntryId) action.usageLedgerEntryId = usageLedgerEntryId;
+      this.storage.actions.put(action);
+    });
+  }
+
+  async handleActionExecutionTerminal(actionId: number): Promise<void> {
+    let action = this.storage.actions.get(actionId);
+    if (!action || action.type !== "action" || action.caller.from !== "agent" ||
+        !action.description.awaitDecision) return;
+    if (!action.systemAssistanceId ||
+        !this.storage.pendingSystemAssistances.get(action.systemAssistanceId)) {
+      // A missing task on a terminal Action means a prior attempt already consumed it together
+      // with the durable ActiveAgentRecord. Terminal RPC retries therefore remain idempotent.
+      return;
+    }
+    if (action.state === "failed-before-execution") {
+      this.deleteActionSystemAssistance(action);
+      return;
+    }
+    if (action.state !== "accepted") return;
+
+    let prepared = this.prepareApprovedActionSystemAssistance(action);
+    if (!prepared) return;
+    if (!action.resolvedBy) throw new Error("Accepted Action has no approving user.");
+    let resolvedBy = action.resolvedBy;
+    let titleList = prepared.actions.map(record => `"${record.description.title}"`).join(", ");
+    let summary =
+        `The changes you submitted have been approved and applied: ${titleList}. ` +
+        `Reads now reflect them.`;
+    this.ctx.storage.transactionSync(() => {
+      let freshTask = this.storage.pendingSystemAssistances.get(prepared.task.id);
+      if (!freshTask || freshTask.state !== "ready") return;
+      if (!freshTask.summaryAdded) {
+        this.addChatMessages(
+          freshTask.chatId,
+          resolvedBy,
+          [{type: "message", message: summary}],
+        );
+        freshTask.summaryAdded = true;
+        this.storage.pendingSystemAssistances.put(freshTask);
+      }
+      for (let taskId of prepared.siblingTaskIds) {
+        if (taskId !== freshTask.id) this.storage.pendingSystemAssistances.delete(taskId);
+      }
+    });
+    await this.resumePendingSystemAssistance(prepared.task.id);
+  }
+
+  /** Coordinate one unknown Action or reverse its settled charge under administrator authority. */
+  async reconcileActionUsage(
+      actionId: number,
+      operationId: string,
+      decision: AdminActionReconciliationDecision,
+      reason: string,
+      actorUserId: string): Promise<AdminActionReconciliationResult> {
+    let action = this.storage.actions.get(actionId);
+    if (!action || action.type !== "action") throw new Error("Action does not exist.");
+    let replay = replayActionReconciliation(
+      action, operationId, decision, reason, actorUserId,
+    );
+    if (replay) {
+      await this.handleActionExecutionTerminal(actionId);
+      return replay;
+    }
+    let billingOperationId = action.description.billingOperationId;
+    if (!billingOperationId || !action.description.billing) {
+      throw new Error("Action has no Billable API Operation to reconcile.");
+    }
+
+    let previousState = action.state;
+    let newState: ActionState;
+    let ledgerEntryId: string | null;
+    let createdAt: string;
+    let user = this.userForPrincipal(action.caller.attribution.principal.userId);
+    if (decision === "settle" || decision === "release") {
+      if (previousState !== "unknown") {
+        throw new Error("Only an unknown Action can be settled or released.");
+      }
+      let financial = await user.reconcileUnknownGatekeeperUsage(
+        billingOperationId,
+        operationId,
+        decision,
+        reason,
+        actorUserId,
+      );
+      newState = decision === "settle" ? "accepted" : "failed-before-execution";
+      ledgerEntryId = financial.ledgerEntryId;
+      createdAt = financial.createdAt;
+    } else {
+      if ((previousState !== "accepted" && previousState !== "reverted") ||
+          !action.usageLedgerEntryId) {
+        throw new Error("Only a settled Action charge can be reversed.");
+      }
+      let financial = await user.adminReverseUsageCreditEntry(
+        operationId,
+        action.usageLedgerEntryId,
+        reason,
+        actorUserId,
+      );
+      newState = previousState;
+      ledgerEntryId = financial.ledgerEntryId;
+      createdAt = financial.createdAt;
+    }
+
+    let result: AdminActionReconciliationResult = {
+      workspaceId: this.ctx.id.toString(),
+      actionId,
+      operationId,
+      decision,
+      previousState,
+      newState,
+      ledgerEntryId,
+      actorUserId,
+      reason,
+      createdAt,
+    };
+    let coordinated = this.ctx.storage.transactionSync(() => {
+      let fresh = this.storage.actions.get(actionId);
+      if (!fresh || fresh.type !== "action") throw new Error("Action does not exist.");
+      let freshReplay = replayActionReconciliation(
+        fresh, operationId, decision, reason, actorUserId,
+      );
+      if (freshReplay) return freshReplay;
+      if (fresh.state !== previousState) {
+        throw new Error("Action state changed during reconciliation.");
+      }
+      fresh.state = newState;
+      fresh.reconciliations = [...(fresh.reconciliations ?? []), result];
+      if (decision === "settle" && ledgerEntryId) fresh.usageLedgerEntryId = ledgerEntryId;
+      this.storage.actions.put(fresh);
+      return result;
+    });
+    await this.handleActionExecutionTerminal(actionId);
+    return coordinated;
   }
 
   // Apply all currently-eligible pending actions of the given gatekeeper, in ascending id order.
@@ -3490,7 +3886,7 @@ class OverseerImpl implements AgentHooks {
       resourceTitle: gatekeeper?.resourceTitle,
       resourceUrl: gatekeeper?.resourceUrl,
       createdAt: new Date(),
-      state: "approved",
+      state: "accepted",
       type: "observation",
       description
     };
@@ -3665,7 +4061,7 @@ class OverseerImpl implements AgentHooks {
       resourceTitle,
       resourceUrl,
       createdAt: new Date(),
-      state: "approved",
+      state: "accepted",
       type: "observation",
       description
     };
@@ -3682,6 +4078,34 @@ class OverseerImpl implements AgentHooks {
       throw new Error(
           "This workspace has observed sensitive data. To prevent leaks, the workspace is prohibited " +
           "from performing actions.");
+    }
+
+    if (description.billingOperationId !== undefined) {
+      throw new TypeError("A Gatekeeper cannot supply an Action billing operation ID.");
+    }
+    if (description.billing !== undefined) {
+      let {methodKey, externalAccountId, providerIdempotency} = description.billing;
+      if (!isStableGatekeeperUsageDimension(methodKey) ||
+          !isStableGatekeeperUsageDimension(externalAccountId) ||
+          (providerIdempotency !== "supported" && providerIdempotency !== "unsupported")) {
+        throw new TypeError("Action billing description is invalid.");
+      }
+    }
+
+    let submissionId = actionSubmissionId(gatekeeperId, action);
+    let existingActionId = this.storage.actionSubmissions.get(submissionId)?.actionId;
+    let existing = existingActionId === undefined
+      ? undefined
+      : this.storage.actions.get(existingActionId);
+    if (existing) {
+      if (existing.type !== "action") {
+        throw new Error("Gatekeeper Action submission index is invalid.");
+      }
+      if (!sameSubmittedActionDescription(existing.description, description) ||
+          !sameGatekeeperCaller(existing.caller, caller)) {
+        throw new Error("Gatekeeper Action identity conflicts with its stored submission.");
+      }
+      return;
     }
 
     let actionId = this.storage.nextActionId.get();
@@ -3709,10 +4133,17 @@ class OverseerImpl implements AgentHooks {
       state: "pending",
       type: "action",
       ...(systemAssistance ? {systemAssistanceId: systemAssistance.id} : {}),
-      description
+      ...(description.billing?.providerIdempotency === "supported"
+        ? {providerIdempotencyKey: `gatekeeper-provider:${crypto.randomUUID()}`}
+        : {}),
+      description: description.billing === undefined ? description : {
+        ...description,
+        billingOperationId: `gatekeeper-action:${crypto.randomUUID()}`,
+      },
     };
 
     this.storage.actions.put(record);
+    this.storage.actionSubmissions.put({id: submissionId, actionId});
     this.#associateAction(caller, actionId);
 
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending.
@@ -3783,7 +4214,7 @@ class OverseerImpl implements AgentHooks {
       resourceTitle: gatekeeper?.resourceTitle,
       resourceUrl: gatekeeper?.resourceUrl,
       createdAt: new Date(),
-      state: "approved",
+      state: "accepted",
       type: "bindHook",
       hookId,
       description,
@@ -7341,7 +7772,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     // A workspace initialized by this version of the code is born at the current schema version;
     // there is nothing to migrate.
-    this.impl.storage.version.put(2);
+    this.impl.storage.version.put(5);
   }
 
   /**
@@ -7352,6 +7783,22 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   async getOutputsForOwnerBackfill(ownerId: string): Promise<WorkspaceOutputEntry[] | null> {
     if (this.impl.ownerId !== ownerId) return null;
     return this.impl.outputsSnapshot();
+  }
+
+  /** Apply one administrator Action reconciliation without exposing an Overseer client session. */
+  reconcileActionUsage(
+      actionId: number,
+      operationId: string,
+      decision: AdminActionReconciliationDecision,
+      reason: string,
+      actorUserId: string): Promise<AdminActionReconciliationResult> {
+    return this.impl.reconcileActionUsage(
+      actionId,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
   }
 
   /**
@@ -7806,6 +8253,61 @@ type GatekeeperCaller = ({
 
 function normalizeGatekeeperCaller(caller: GatekeeperCaller): GatekeeperCaller {
   return {...caller, attribution: normalizeUsageAttribution(caller.attribution)};
+}
+
+function sameGatekeeperCaller(left: GatekeeperCaller, right: GatekeeperCaller): boolean {
+  return left.from === right.from &&
+      ("chatId" in left ? left.chatId : undefined) ===
+        ("chatId" in right ? right.chatId : undefined) &&
+      ("gadgetId" in left ? left.gadgetId : undefined) ===
+        ("gadgetId" in right ? right.gadgetId : undefined) &&
+      sameUsageAttribution(left.attribution, right.attribution);
+}
+
+function sameSubmittedActionDescription(
+    stored: ActionDescription, submitted: ActionDescription): boolean {
+  return stored.title === submitted.title &&
+      stored.description === submitted.description &&
+      stored.implementsRevert === submitted.implementsRevert &&
+      stored.awaitDecision === submitted.awaitDecision &&
+      stored.autoApprovable === submitted.autoApprovable &&
+      stored.actionKind?.tag === submitted.actionKind?.tag &&
+      stored.actionKind?.label === submitted.actionKind?.label &&
+      stored.billing?.methodKey === submitted.billing?.methodKey &&
+      stored.billing?.externalAccountId === submitted.billing?.externalAccountId &&
+      stored.billing?.providerIdempotency === submitted.billing?.providerIdempotency;
+}
+
+function actionSubmissionId(gatekeeperId: number, action: number): string {
+  return `${gatekeeperId}:${action}`;
+}
+
+function isStableGatekeeperUsageDimension(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,199}$/.test(value);
+}
+
+function sameActionReconciliationRequest(
+    stored: AdminActionReconciliationResult,
+    operationId: string,
+    decision: AdminActionReconciliationDecision,
+    reason: string,
+    actorUserId: string): boolean {
+  return stored.operationId === operationId && stored.decision === decision &&
+      stored.reason === reason && stored.actorUserId === actorUserId;
+}
+
+function replayActionReconciliation(
+    action: ActionRecord & {type: "action"},
+    operationId: string,
+    decision: AdminActionReconciliationDecision,
+    reason: string,
+    actorUserId: string): AdminActionReconciliationResult | undefined {
+  let stored = action.reconciliations?.find(candidate => candidate.operationId === operationId);
+  if (!stored) return undefined;
+  if (sameActionReconciliationRequest(stored, operationId, decision, reason, actorUserId)) {
+    return stored;
+  }
+  throw new Error("Action reconciliation operation conflicts with its stored request.");
 }
 
 type GatekeeperLoopbackProps = {
@@ -8655,7 +9157,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return result;
   }
 
-  async approveAction(id: number): Promise<void> {
+  async approveAction(id: number): Promise<
+      "accepted" | "failed-before-execution" | "unknown" | "reverted"> {
     let action = this.impl.storage.actions.get(id);
     if (!action) {
       throw new Error(`No such action: ${id}`);
@@ -8664,27 +9167,40 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (action.type === "bindHook") {
       throw new Error("Hooks should be enabled/disabled, not approved/rejected.");
     }
-    if (action.state !== "pending") {
-      throw new Error(`Action is not pending: ${id}`);
-    }
     if (action.type === "observation") {
       throw new Error("Observations can't have 'pending' state.");
     }
+    if (action.state === "accepted" || action.state === "failed-before-execution" ||
+        action.state === "unknown" || action.state === "reverted") {
+      await this.impl.handleActionExecutionTerminal(id);
+      return action.state;
+    }
+    if (action.state === "applying") {
+      await this.impl.continueApplyingAction(id, true);
+      let continued = this.impl.storage.actions.get(id);
+      if (!continued || continued.type !== "action" || continued.state === "pending" ||
+          continued.state === "applying" || continued.state === "rejected") {
+        throw new Error(`Action did not reach an approval outcome: ${id}`);
+      }
+      return continued.state;
+    }
+    if (action.state !== "pending") throw new Error(`Action is not pending: ${id}`);
 
     // Resolve the approver's identity before applying, so a failed profile fetch can't leave the
     // action applied in the world but still "pending" in storage.
     let profile = await this.#getClientProfile();
     await this.impl.applyPendingAction(action, profile, false);
-
-    // If this was an awaited agent action, resume only after all awaited actions in the turn are
-    // approved. If applyPendingAction throws, the action stays pending and the turn stays suspended.
-    if (action.caller.from === "agent" && action.description.awaitDecision) {
-      await this.#maybeResumeAfterActionDecision(action);
-    }
+    let decided = this.impl.storage.actions.get(id);
+    if (!decided || decided.type !== "action") throw new Error(`No such action: ${id}`);
 
     // Clearing this manual gate may unblock later auto-eligible pending actions on the same
     // gatekeeper, so cascade a drain (in-order) once this one is applied.
-    this.impl.ctx.waitUntil(this.impl.drainAutoApprovals(action.gatekeeperId));
+    this.impl.ctx.waitUntil(this.impl.drainAutoApprovals(decided.gatekeeperId));
+    if (decided.state === "pending" || decided.state === "applying" ||
+        decided.state === "rejected") {
+      throw new Error(`Action did not reach an approval outcome: ${id}`);
+    }
+    return decided.state;
   }
 
   async listHooks(): Promise<BoundHookInfo[]> {
@@ -8764,23 +9280,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return this.impl.deleteHook(id);
   }
 
-  // Resume a turn suspended on awaitDecision once all Actions from its persisted Agent turn are
-  // approved. The durable task, not later Chat history, is the causal authority.
-  async #maybeResumeAfterActionDecision(
-      action: ActionRecord & {type: "action"}): Promise<void> {
-    let prepared = this.impl.prepareApprovedActionSystemAssistance(action);
-    if (!prepared) return;
-
-    let titleList = prepared.actions.map(record => `"${record.description.title}"`).join(", ");
-    let summary =
-        `The changes you submitted have been approved and applied: ${titleList}. ` +
-        `Reads now reflect them.`;
-    let author = await this.#getClientProfile();
-    this.impl.addChatMessages(prepared.task.chatId, author, [{type: "message", message: summary}]);
-    await this.impl.resumePendingSystemAssistance(prepared.task.id);
-  }
-
-  async rejectAction(id: number): Promise<void> {
+  async rejectAction(id: number): Promise<"rejected"> {
     let action = this.impl.storage.actions.get(id);
     if (!action) {
       throw new Error(`No such action: ${id}`);
@@ -8814,6 +9314,69 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
     // Deny leaves the turn ended, like denyConnectionRequest. The rejected record also prevents a
     // sibling approval from resuming this turn.
+    return "rejected";
+  }
+
+  async revertAction(id: number): Promise<void> {
+    let action = this.impl.storage.actions.get(id);
+    if (!action || action.type !== "action") throw new Error(`No such action: ${id}`);
+    if (action.state === "reverted") return;
+    if (action.state !== "accepted") throw new Error(`Action is not accepted: ${id}`);
+    if (!action.description.implementsRevert) {
+      throw new Error("This Action does not implement automatic revert.");
+    }
+    if (action.revertOutcome === "applying" || action.revertOutcome === "unknown") {
+      throw new Error("Action revert outcome is not safe to retry automatically.");
+    }
+
+    this.impl.ctx.storage.transactionSync(() => {
+      let fresh = this.impl.storage.actions.get(id);
+      if (!fresh || fresh.type !== "action" || fresh.state !== "accepted" ||
+          fresh.revertOutcome !== undefined) {
+        throw new Error(`Action cannot begin revert: ${id}`);
+      }
+      fresh.revertOutcome = "applying";
+      this.impl.storage.actions.put(fresh);
+    });
+
+    let gatekeeper = this.impl.getGatekeeperFacet(action.gatekeeperId);
+    try {
+      let result = await gatekeeper.revertAction(action.action);
+      if (result?.message !== undefined) {
+        if (result.canRetry) {
+          this.impl.ctx.storage.transactionSync(() => {
+            let fresh = this.impl.storage.actions.get(id);
+            if (!fresh || fresh.type !== "action") throw new Error(`No such action: ${id}`);
+            delete fresh.revertOutcome;
+            this.impl.storage.actions.put(fresh);
+          });
+        }
+        throw new Error(result.message);
+      }
+    } catch (error) {
+      this.impl.ctx.storage.transactionSync(() => {
+        let fresh = this.impl.storage.actions.get(id);
+        if (!fresh || fresh.type !== "action") {
+          throw new Error(`No such action: ${id}`, {cause: error});
+        }
+        if (fresh.revertOutcome === "applying") {
+          fresh.revertOutcome = "unknown";
+          this.impl.storage.actions.put(fresh);
+        }
+      });
+      throw error;
+    }
+
+    this.impl.ctx.storage.transactionSync(() => {
+      let fresh = this.impl.storage.actions.get(id);
+      if (!fresh || fresh.type !== "action" || fresh.state !== "accepted" ||
+          fresh.revertOutcome !== "applying") {
+        throw new Error(`Action cannot finish revert: ${id}`);
+      }
+      fresh.state = "reverted";
+      fresh.revertOutcome = "reverted";
+      this.impl.storage.actions.put(fresh);
+    });
   }
 
   // Enable auto-approval of actions carrying `actionKind` on the given gatekeeper. Stores the
@@ -10002,8 +10565,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     this.#deny();
   }
   async listActions(): Promise<ActionLogEntry[]> { this.#deny(); }
-  async approveAction(_id: number): Promise<void> { this.#deny(); }
-  async rejectAction(_id: number): Promise<void> { this.#deny(); }
+  async approveAction(_id: number): Promise<never> { this.#deny(); }
+  async rejectAction(_id: number): Promise<never> { this.#deny(); }
+  async revertAction(_id: number): Promise<void> { this.#deny(); }
   async listHooks(): Promise<BoundHookInfo[]> { this.#deny(); }
   async enableHook(_id: number): Promise<void> { this.#deny(); }
   async disableHook(_id: number): Promise<void> { this.#deny(); }
@@ -10729,7 +11293,7 @@ export class AgentSpawnerGatekeeper
         this.ctx, approvalQueue.dup() as NativeRpcStub<ApprovalQueueImpl>);
   }
 
-  applyAction(action: number): Promise<void> {
+  applyAction(action: number): Promise<never> {
     throw new Error("This gatekeeper implements no actions.");
   }
   rejectAction(action: number): Promise<void | {restart?: boolean}> {

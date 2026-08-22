@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -898,6 +898,31 @@ function normalizeAdminUsageReverseRequest(
   };
 }
 
+function normalizeAdminActionReconciliationRequest(
+    request: AdminActionReconciliationRequest): AdminActionReconciliationRequest {
+  assertExactRpcObject(
+    request,
+    ["workspaceId", "actionId", "operationId", "decision", "reason"],
+  );
+  if (typeof request.workspaceId !== "string" || !/^[0-9a-f]{64}$/.test(request.workspaceId)) {
+    throw new TypeError("Workspace identifier is invalid.");
+  }
+  if (!Number.isSafeInteger(request.actionId) || request.actionId < 0) {
+    throw new TypeError("Action identifier is invalid.");
+  }
+  if (request.decision !== "settle" && request.decision !== "release" &&
+      request.decision !== "reverse") {
+    throw new TypeError("Action reconciliation decision is invalid.");
+  }
+  return {
+    workspaceId: request.workspaceId,
+    actionId: request.actionId,
+    operationId: normalizeAdminUsageOperationId(request.operationId),
+    decision: request.decision,
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
 function hasAsciiControlCharacter(value: string): boolean {
   for (const character of value) {
     const codePoint = character.codePointAt(0)!;
@@ -912,7 +937,8 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   constructor(
       private admin: DurableObjectStub<AdminSettings>,
       private users: DurableObjectNamespace<UserDurableObject>,
-      private adminUserId: string) {
+      private adminUserId: string,
+      private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>) {
     super();
   }
 
@@ -965,6 +991,25 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     );
   }
 
+  async reconcileAction(
+      request: AdminActionReconciliationRequest): Promise<AdminActionReconciliationResult> {
+    const normalized = normalizeAdminActionReconciliationRequest(request);
+    if (!this.overseers) throw new Error("Action reconciliation is not configured.");
+    let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
+    try {
+      overseer = this.overseers.get(this.overseers.idFromString(normalized.workspaceId));
+    } catch (error) {
+      throw new Error("Workspace identifier is invalid.", {cause: error});
+    }
+    return overseer.reconcileActionUsage(
+      normalized.actionId,
+      normalized.operationId,
+      normalized.decision,
+      normalized.reason,
+      this.adminUserId,
+    );
+  }
+
   async #resolveUser(
       registeredUserRef: string): Promise<DurableObjectStub<UserDurableObject>> {
     const resolved = await this.admin.resolveRegisteredUsageUser(registeredUserRef);
@@ -994,7 +1039,8 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   constructor(
       private admin: DurableObjectStub<AdminSettings>,
       private adminUserId: string,
-      private users: DurableObjectNamespace<UserDurableObject>) {
+      private users: DurableObjectNamespace<UserDurableObject>,
+      private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>) {
     super();
   }
 
@@ -1004,7 +1050,7 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async getUsageApi(): Promise<RpcStub<AdminUsageApi>> {
     // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
-    return new AdminUsageApiImpl(this.admin, this.users, this.adminUserId);
+    return new AdminUsageApiImpl(this.admin, this.users, this.adminUserId, this.overseers);
   }
 
   getUsageRates(): Promise<UsageRateAdminView> {

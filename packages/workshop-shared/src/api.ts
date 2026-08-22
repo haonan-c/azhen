@@ -939,6 +939,47 @@ export type AdminUsageReverseRequest = {
   reason: string;
 };
 
+/** Administrator decision for an Action whose financial state needs explicit coordination. */
+export type AdminActionReconciliationDecision = "settle" | "release" | "reverse";
+
+/** Administrator request to coordinate one durable Action and its linked Usage Account state. */
+export type AdminActionReconciliationRequest = {
+  /** Stable Workshop identifier returned by `Overseer.getMetadata()`. */
+  workspaceId: string;
+  /** Workspace-local Action identifier returned by `Overseer.listActions()`. */
+  actionId: number;
+  /** Stable client retry identity for this coordination decision. */
+  operationId: string;
+  /** Financial decision allowed for the Action's current execution state. */
+  decision: AdminActionReconciliationDecision;
+  /** Required bounded human explanation retained in the Action audit. */
+  reason: string;
+};
+
+/** Auditable result of one idempotent administrator Action coordination decision. */
+export type AdminActionReconciliationResult = {
+  /** Stable Workshop identifier containing the coordinated Action. */
+  workspaceId: string;
+  /** Workspace-local coordinated Action identifier. */
+  actionId: number;
+  /** Stable client retry identity for this coordination decision. */
+  operationId: string;
+  /** Financial decision applied by the administrator capability. */
+  decision: AdminActionReconciliationDecision;
+  /** Action state before the decision. */
+  previousState: ActionState;
+  /** Action state after the decision. */
+  newState: ActionState;
+  /** Appended Usage Charge or Credit Reversal Ledger Entry, or null for release. */
+  ledgerEntryId: string | null;
+  /** Authenticated administrator identity bound by the server capability. */
+  actorUserId: string;
+  /** Trimmed bounded administrator reason retained for audit. */
+  reason: string;
+  /** Canonical UTC time created by the authoritative User transaction. */
+  createdAt: string;
+};
+
 /**
  * Administrator-only capability for authoritative User Registry search and Usage Account
  * corrections. It is minted only through an already-authorized AdminApi and never returns a User
@@ -959,6 +1000,11 @@ export interface AdminUsageApi {
 
   /** Append one exact linked Credit Reversal for a registered User. */
   reverse(request: AdminUsageReverseRequest): Promise<AdminUsageOperationResult>;
+
+  /** Coordinate one unknown Action, or reverse its already-settled Usage Charge exactly. */
+  reconcileAction(
+    request: AdminActionReconciliationRequest,
+  ): Promise<AdminActionReconciliationResult>;
 }
 
 /** Top-level API exposed to the user after they have authenticated. */
@@ -2054,13 +2100,15 @@ export interface CodeSubscriber {
   ready(): void;
 }
 
-/**
- * Specifies the state of an action in the action log:
- * * pending: Action has not been applied yet. It is waiting for approval.
- * * approved: Action was approved and applied.
- * * rejected: Action was rejected by the user.
- */
-export type ActionState = "pending" | "approved" | "rejected";
+/** Durable state of one Action, observation, or hook audit entry. */
+export type ActionState =
+  | "pending"
+  | "applying"
+  | "accepted"
+  | "failed-before-execution"
+  | "unknown"
+  | "rejected"
+  | "reverted";
 
 export type ActionLogEntry = {
   /** Sequential ID number for the action. Counts up from when the workspace was created. */
@@ -2076,6 +2124,8 @@ export type ActionLogEntry = {
   resourceUrl?: string;
 
   createdAt: Date;
+  /** Time approval was durably claimed, before any Billable API Operation began. */
+  approvedAt?: Date;
   appliedAt?: Date;
 
   state: ActionState;
@@ -2083,16 +2133,14 @@ export type ActionLogEntry = {
   type: "action";
   description: ActionDescription;
   /**
-   * Who resolved the action (approved or rejected it). Set when the action leaves "pending"; absent
-   * while still pending (or for legacy actions resolved before this was tracked). For an
-   * auto-approved action this is the user who enabled the rule -- auto-approvals run under their
-   * authority (see `autoApproved`).
+   * Who resolved the approval gate. Set when the Action leaves `pending`; absent while pending or
+   * for legacy records resolved before this was tracked. For an auto-approved Action this is the
+   * user who enabled the rule.
    */
   resolvedBy?: AiChatAuthorInfo;
 
   /**
-   * True when the action was applied automatically by an auto-approval rule rather than by a human
-   * clicking Approve. Only ever set alongside state "approved" (there is no automatic rejection).
+   * True when approval was claimed automatically rather than by a human clicking Approve.
    */
   autoApproved?: boolean;
 } | {
@@ -2109,7 +2157,7 @@ export type ActionLogEntry = {
   /** Is the hook currently enabled? */
   enabled: boolean;
 
-  // Note that `state` is not meaningful for hooks. Instead of being "approved" or "rejected", they
+  // Note that `state` is not meaningful for hooks. Instead of being "accepted" or "rejected", they
   // are enabled/disabled, which the user can freely toggle as often as they want.
 });
 
@@ -2302,15 +2350,25 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Approve an action that is currently in the "pending" state. The action will be performed on
-   * approval.
+   * approval. Returns its durable execution outcome so the caller does not infer success from the
+   * approval RPC completing.
    */
-  approveAction(id: number): Promise<void>;
+  approveAction(id: number): Promise<Extract<
+    ActionState,
+    "accepted" | "failed-before-execution" | "unknown" | "reverted"
+  >>;
 
   /**
    * Reject an action that is in the "pending" state. This notifies the gatekeeper that it will not
    * be approved in the future.
    */
-  rejectAction(id: number): Promise<void>;
+  rejectAction(id: number): Promise<"rejected">;
+
+  /**
+   * Revert an accepted Action through its Gatekeeper. This never starts a Billable API Operation
+   * and never changes or reverses the original Usage Charge.
+   */
+  revertAction(id: number): Promise<void>;
 
   /**
    * List information about bound hooks (which could wake up a gadget asynchronously).

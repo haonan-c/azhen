@@ -707,7 +707,7 @@ export class LanguageModelGatekeeper
     });
   }
 
-  applyAction(action: number): Promise<void> {
+  applyAction(action: number): Promise<never> {
     throw new Error("This gatekeeper implements no actions.");
   }
   rejectAction(action: number): Promise<void | {restart?: boolean}> {

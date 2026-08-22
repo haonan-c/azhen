@@ -817,16 +817,14 @@ export interface Gatekeeper<Session> extends DurableObject {
   // gatekeeper can look up the action details in its own storage.
 
   /**
-   * Action was approved. This call should apply the action (or schedule it to be applied).
+   * Apply or recover an approved Action and return only after its content-free outcome is durable.
    *
-   * If this throws an exception, the user will be informed that the action failed and given the
-   * opportunity to retry or discard.
-   *
-   * Depending on policy conditions, an action may be approved and applied automatically. However,
-   * the gatekeeper is nevertheless expected to submit all actions for approval; there is no mode
-   * in which it's OK to skip the check.
+   * A Billable Action receives `execution`. In `execute` mode the Gatekeeper must persist its claim
+   * before the first provider request. In `recover` mode it must inspect that claim without
+   * redispatching an indeterminate non-idempotent request; a provider-safe retry must reuse the
+   * supplied key. A legacy unmetered Action receives no execution context and may return void.
    */
-  applyAction(action: number): Promise<void>;
+  applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult | void>;
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any
@@ -873,6 +871,30 @@ export interface Gatekeeper<Session> extends DurableObject {
  * Gatekeeper cannot tell, and holds the Credit Reservation for later reconciliation.
  */
 export type BillableOperationOutcome = "executed" | "failed-before-execution" | "unknown";
+
+/** Host-attested inputs for one attempt to apply a delayed Gatekeeper Action. */
+export type ActionExecution = {
+  /** Stable Workshop-minted ID shared by the Action audit and Usage Account records. */
+  billingOperationId: string;
+
+  /**
+   * Stable provider key when trusted Gatekeeper code declared idempotency support. Absent for an
+   * Action that must not retry an indeterminate provider request.
+   */
+  providerIdempotencyKey?: string;
+
+  /** Execute a new claim, or recover only from the Gatekeeper's existing durable claim. */
+  mode: "execute" | "recover";
+};
+
+/** Durable provider outcome returned after a Gatekeeper has persisted its Action execution row. */
+export type ActionExecutionOutcome = "accepted" | "failed-before-execution" | "unknown";
+
+/** Content-free result of applying or recovering one delayed Gatekeeper Action. */
+export type ActionExecutionResult = {
+  /** Provider outcome persisted before this result is returned to the Workshop. */
+  outcome: ActionExecutionOutcome;
+};
 
 /**
  * Host-minted capability that meters exactly one Gatekeeper Billable API Operation.
@@ -1200,6 +1222,18 @@ export type ActionKind = {
   label: string;
 };
 
+/** Stable pricing and provider-retry facts for one delayed Gatekeeper Action. */
+export type ActionBilling = {
+  /** Stable caller-visible business-method key used by the deployment Usage Rate catalog. */
+  methodKey: string;
+
+  /** Connected external account whose provider quota the Action consumes. */
+  externalAccountId: string;
+
+  /** Whether trusted Gatekeeper code can safely retry with one provider idempotency key. */
+  providerIdempotency: "supported" | "unsupported";
+};
+
 /**
  * Describes an action submitted to the action approval queue. This contains all the information
  * needed to:
@@ -1212,9 +1246,15 @@ export type ActionDescription = {
   title: string;
 
   /**
-   * Operation ID of the Billable API Operation this action belongs to, from
-   * `BillableOperation.getOperationId()`. Audit and billing stay independent records; this only
-   * links them. Absent for actions that meter no upstream business call.
+   * Pricing and safe-retry facts captured when the Action enters the approval queue. Absent for a
+   * legacy Action that has not migrated to Billable API Operation charging.
+   */
+  billing?: ActionBilling;
+
+  /**
+   * Workshop-minted operation ID that links the Action audit to its Billable API Operation. A
+   * Gatekeeper must leave this absent when submitting an Action. The Workshop adds it before the
+   * Action is exposed and uses the same value if approval later begins charging.
    */
   billingOperationId?: string;
 

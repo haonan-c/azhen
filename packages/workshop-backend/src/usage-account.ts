@@ -37,6 +37,9 @@ const MODEL_USAGE_RECORD_PREFIX = "usageAccount:modelUsageRecord:";
 const MODEL_USAGE_TIME_INDEX_PREFIX = "usageAccount:modelUsageTimeIndex:";
 const GATEKEEPER_ATTEMPT_PREFIX = "usageAccount:gatekeeperAttempt:";
 const GATEKEEPER_USAGE_RECORD_PREFIX = "usageAccount:gatekeeperUsageRecord:";
+const GATEKEEPER_RECONCILIATION_PREFIX = "usageAccount:gatekeeperReconciliation:";
+const GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX =
+  "usageAccount:gatekeeperReconciliationByUsage:";
 const BILLING_BLOCK_KEY = "usageAccount:billingBlock:v1";
 const DEFAULT_USER_USAGE_PAGE_LIMIT = 50;
 const MAX_USER_USAGE_PAGE_LIMIT = 100;
@@ -139,6 +142,13 @@ export type GatekeeperMeteringAttempt = {
   usageRecordId?: string;
 };
 
+/** Result of durably marking a Gatekeeper operation started. */
+export type GatekeeperUsageStart = {
+  attempt: GatekeeperMeteringAttempt;
+  /** True only for the call that changed the Attempt from ready to started. */
+  startedNow: boolean;
+};
+
 /** Immutable result of one completed Gatekeeper Billable API Operation. */
 export type GatekeeperUsageRecord = {
   id: string;
@@ -149,6 +159,17 @@ export type GatekeeperUsageRecord = {
   ledgerEntryId: string | null;
   outcome: "settled" | "failed-before-execution" | "usage-unknown";
   chargeSubunits: bigint | null;
+  createdAt: string;
+};
+
+/** Durable audit result for one administrator decision on unknown Gatekeeper Usage. */
+export type GatekeeperUsageReconciliation = {
+  reconciliationOperationId: string;
+  billingOperationId: string;
+  decision: "settle" | "release";
+  actorUserId: string;
+  reason: string;
+  ledgerEntryId: string | null;
   createdAt: string;
 };
 
@@ -1013,9 +1034,9 @@ export class UsageAccount {
   }
 
   /** Persist that one Gatekeeper business operation is about to cross the upstream boundary. */
-  markGatekeeperUsageStarted(operationId: string): GatekeeperMeteringAttempt {
+  markGatekeeperUsageStarted(operationId: string): GatekeeperUsageStart {
     const result =
-        this.storage.transactionSync<TransactionResult<GatekeeperMeteringAttempt>>(() => {
+        this.storage.transactionSync<TransactionResult<GatekeeperUsageStart>>(() => {
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
       const key = GATEKEEPER_ATTEMPT_PREFIX + operationId;
@@ -1026,14 +1047,16 @@ export class UsageAccount {
       } catch (error) {
         return {error: error instanceof Error ? error : new Error(String(error))};
       }
-      if (attempt.state !== "ready") return {value: attempt};
+      if (attempt.state !== "ready") {
+        return {value: {attempt, startedNow: false}};
+      }
       const started: GatekeeperMeteringAttempt = {
         ...attempt,
         state: "started",
         startedAt: new Date().toISOString(),
       };
       this.storage.kv.put(key, started);
-      return {value: started};
+      return {value: {attempt: started, startedNow: true}};
     });
     return unwrapTransactionResult(result);
   }
@@ -1100,71 +1123,26 @@ export class UsageAccount {
       }
 
       const completedAt = new Date().toISOString();
-      const reservationKey = RESERVATION_PREFIX + operationId;
       let chargeSubunits: bigint | null = null;
       let ledgerEntryId: string | null = null;
 
       if (outcome === "settled") {
         chargeSubunits = attempt.chargeSnapshot.chargeSubunits;
         if (attempt.reservationId !== null) {
-          const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
-          if (!reservation) return {error: new Error("Credit Reservation does not exist.")};
           try {
-            this.assertStoredReservationConsistency(reservation, operationId);
+            ledgerEntryId = this.settleGatekeeperReservation(
+              operationId, chargeSubunits, totals, completedAt,
+            );
           } catch (error) {
             return {error: error instanceof Error ? error : new Error(String(error))};
           }
-          if (reservation.state !== "reserved" ||
-              chargeSubunits !== reservation.amountSubunits ||
-              totals.reservedSubunits < reservation.amountSubunits) {
-            return {error: new Error("Gatekeeper Metering reservation cannot be settled.")};
-          }
-          ledgerEntryId = chargeLedgerEntryId(operationId);
-          if (this.storage.kv.get(LEDGER_PREFIX + ledgerEntryId) !== undefined) {
-            return {error: new Error(
-              "Usage Credit Ledger entry already exists without a Usage Record.",
-            )};
-          }
-          this.storage.kv.put<CreditLedgerEntry>(LEDGER_PREFIX + ledgerEntryId, {
-            id: ledgerEntryId,
-            operationId,
-            kind: "usage-charge",
-            deltaSubunits: -chargeSubunits,
-            createdAt: completedAt,
-          });
-          this.storage.kv.put<CreditReservation>(reservationKey, {
-            ...reservation,
-            state: "settled",
-            settledAmountSubunits: chargeSubunits,
-            ledgerEntryId,
-            settledAt: completedAt,
-          });
-          this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
-            ledgerBalanceSubunits: totals.ledgerBalanceSubunits - chargeSubunits,
-            reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
-          });
         }
       } else if (outcome === "failed-before-execution" && attempt.reservationId !== null) {
-        const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
-        if (!reservation) return {error: new Error("Credit Reservation does not exist.")};
         try {
-          this.assertStoredReservationConsistency(reservation, operationId);
+          this.releaseGatekeeperReservation(operationId, totals, completedAt);
         } catch (error) {
           return {error: error instanceof Error ? error : new Error(String(error))};
         }
-        if (reservation.state !== "reserved" ||
-            totals.reservedSubunits < reservation.amountSubunits) {
-          return {error: new Error("Gatekeeper Metering reservation cannot be released.")};
-        }
-        this.storage.kv.put<CreditReservation>(reservationKey, {
-          ...reservation,
-          state: "released",
-          releasedAt: completedAt,
-        });
-        this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
-          ...totals,
-          reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
-        });
       }
       // `usage-unknown` deliberately leaves the Credit Reservation held.
 
@@ -1189,6 +1167,183 @@ export class UsageAccount {
       });
       return {value: record};
     });
+    return unwrapTransactionResult(result);
+  }
+
+  private settleGatekeeperReservation(
+      operationId: string,
+      amountSubunits: bigint,
+      totals: UsageAccountTotals,
+      settledAt: string): string {
+    const reservationKey = RESERVATION_PREFIX + operationId;
+    const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+    if (!reservation) throw new Error("Credit Reservation does not exist.");
+    this.assertStoredReservationConsistency(reservation, operationId);
+    if (reservation.state !== "reserved" || reservation.amountSubunits !== amountSubunits ||
+        totals.reservedSubunits < reservation.amountSubunits) {
+      throw new Error("Gatekeeper Metering reservation cannot be settled.");
+    }
+    const ledgerEntryId = chargeLedgerEntryId(operationId);
+    if (this.storage.kv.get(LEDGER_PREFIX + ledgerEntryId) !== undefined) {
+      throw new Error("Usage Credit Ledger entry already exists without its terminal audit.");
+    }
+    this.storage.kv.put<CreditLedgerEntry>(LEDGER_PREFIX + ledgerEntryId, {
+      id: ledgerEntryId,
+      operationId,
+      kind: "usage-charge",
+      deltaSubunits: -amountSubunits,
+      createdAt: settledAt,
+    });
+    this.storage.kv.put<CreditReservation>(reservationKey, {
+      ...reservation,
+      state: "settled",
+      settledAmountSubunits: amountSubunits,
+      ledgerEntryId,
+      settledAt,
+    });
+    this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+      ledgerBalanceSubunits: totals.ledgerBalanceSubunits - amountSubunits,
+      reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+    });
+    return ledgerEntryId;
+  }
+
+  private releaseGatekeeperReservation(
+      operationId: string,
+      totals: UsageAccountTotals,
+      releasedAt: string): void {
+    const reservationKey = RESERVATION_PREFIX + operationId;
+    const reservation = this.storage.kv.get<CreditReservation>(reservationKey);
+    if (!reservation) throw new Error("Credit Reservation does not exist.");
+    this.assertStoredReservationConsistency(reservation, operationId);
+    if (reservation.state !== "reserved" ||
+        totals.reservedSubunits < reservation.amountSubunits) {
+      throw new Error("Gatekeeper Metering reservation cannot be released.");
+    }
+    this.storage.kv.put<CreditReservation>(reservationKey, {
+      ...reservation,
+      state: "released",
+      releasedAt,
+    });
+    this.storage.kv.put<UsageAccountTotals>(TOTALS_KEY, {
+      ...totals,
+      reservedSubunits: totals.reservedSubunits - reservation.amountSubunits,
+    });
+  }
+
+  /** Atomically settle or release one unknown-held Gatekeeper reservation with an admin audit. */
+  reconcileUnknownGatekeeperUsage(
+      billingOperationId: string,
+      reconciliationOperationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): GatekeeperUsageReconciliation {
+    const result = this.storage.transactionSync<TransactionResult<GatekeeperUsageReconciliation>>(
+      () => {
+        const billingIdError = operationIdValidationError(billingOperationId);
+        const reconciliationIdError = operationIdValidationError(reconciliationOperationId);
+        if (billingIdError) return {error: billingIdError};
+        if (reconciliationIdError) return {error: reconciliationIdError};
+        if (decision !== "settle" && decision !== "release") {
+          return {error: new TypeError("Gatekeeper Usage reconciliation decision is invalid.")};
+        }
+        if (typeof reason !== "string" || reason.length === 0 ||
+            typeof actorUserId !== "string" || actorUserId.length === 0) {
+          return {error: new TypeError("Gatekeeper Usage reconciliation audit is invalid.")};
+        }
+
+        const key = GATEKEEPER_RECONCILIATION_PREFIX + reconciliationOperationId;
+        const existing = this.storage.kv.get<GatekeeperUsageReconciliation>(key);
+        if (existing) {
+          if (existing.billingOperationId !== billingOperationId ||
+              existing.decision !== decision || existing.reason !== reason ||
+              existing.actorUserId !== actorUserId) {
+            return {error: new Error(
+              "Gatekeeper Usage reconciliation operation conflicts with its stored decision.",
+            )};
+          }
+          return {value: existing};
+        }
+        if (this.storage.kv.get(ADMIN_OPERATION_PREFIX + reconciliationOperationId) !== undefined ||
+            this.storage.kv.get(GATEKEEPER_ATTEMPT_PREFIX + reconciliationOperationId) !== undefined ||
+            this.storage.kv.get(GATEKEEPER_USAGE_RECORD_PREFIX + reconciliationOperationId) !== undefined ||
+            this.storage.kv.get(MODEL_ATTEMPT_PREFIX + reconciliationOperationId) !== undefined ||
+            this.storage.kv.get(MODEL_USAGE_RECORD_PREFIX + reconciliationOperationId) !== undefined ||
+            this.storage.kv.get(RESERVATION_PREFIX + reconciliationOperationId) !== undefined ||
+            this.storage.kv.get(UNPRICED_DECISION_PREFIX + reconciliationOperationId) !== undefined) {
+          return {error: new Error(
+            "Operation ID already records a different Usage operation.",
+          )};
+        }
+
+        const linkedId = this.storage.kv.get<string>(
+          GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + billingOperationId,
+        );
+        if (linkedId !== undefined) {
+          return {error: new Error("Gatekeeper Usage already has a reconciliation decision.")};
+        }
+
+        const attempt = this.storage.kv.get<GatekeeperMeteringAttempt>(
+          GATEKEEPER_ATTEMPT_PREFIX + billingOperationId,
+        );
+        const usageRecord = this.storage.kv.get<GatekeeperUsageRecord>(
+          GATEKEEPER_USAGE_RECORD_PREFIX + billingOperationId,
+        );
+        if (!attempt || !usageRecord || attempt.state !== "usage-unknown" ||
+            usageRecord.outcome !== "usage-unknown") {
+          return {error: new Error("Gatekeeper Usage is not awaiting reconciliation.")};
+        }
+        try {
+          assertGatekeeperMeteringAttempt(attempt, billingOperationId);
+          assertGatekeeperUsageRecord(usageRecord, billingOperationId);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+
+        const totals = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+        if (!totals) return {error: new Error("Usage Credit totals are missing.")};
+        try {
+          assertUsageAccountTotals(totals);
+        } catch (error) {
+          return {error: error instanceof Error ? error : new Error(String(error))};
+        }
+
+        const createdAt = new Date().toISOString();
+        let ledgerEntryId: string | null = null;
+        if (attempt.reservationId !== null) {
+          try {
+            if (decision === "settle") {
+              ledgerEntryId = this.settleGatekeeperReservation(
+                billingOperationId,
+                attempt.reservationAmountSubunits,
+                totals,
+                createdAt,
+              );
+            } else {
+              this.releaseGatekeeperReservation(billingOperationId, totals, createdAt);
+            }
+          } catch (error) {
+            return {error: error instanceof Error ? error : new Error(String(error))};
+          }
+        }
+
+        const reconciliation: GatekeeperUsageReconciliation = {
+          reconciliationOperationId,
+          billingOperationId,
+          decision,
+          actorUserId,
+          reason,
+          ledgerEntryId,
+          createdAt,
+        };
+        this.storage.kv.put(key, reconciliation);
+        this.storage.kv.put(
+          GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + billingOperationId,
+          reconciliationOperationId,
+        );
+        return {value: reconciliation};
+      },
+    );
     return unwrapTransactionResult(result);
   }
 
