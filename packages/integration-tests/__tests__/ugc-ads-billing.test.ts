@@ -266,6 +266,38 @@ function article(id: string) {
   };
 }
 
+function assertXhsSearchQuery(url: URL): number {
+  const page = Number(url.searchParams.get("page"));
+  const hasContinuation = page > 1;
+  const expectedKeys = [
+    "ai_mode",
+    "keyword",
+    "note_type",
+    "page",
+    "sort_type",
+    "source",
+    "time_filter",
+    ...(hasContinuation ? ["search_id", "search_session_id"] : []),
+  ].toSorted();
+  const actualKeys = [...url.searchParams.keys()].toSorted();
+  if (!Number.isInteger(page) || page < 1 ||
+      url.searchParams.get("keyword") !== XHS_KEYWORD ||
+      url.searchParams.get("sort_type") !== "general" ||
+      url.searchParams.get("note_type") !== "不限" ||
+      url.searchParams.get("time_filter") !== "不限" ||
+      url.searchParams.get("source") !== "explore_feed" ||
+      url.searchParams.get("ai_mode") !== "0" ||
+      (hasContinuation &&
+        (url.searchParams.get("search_id") !== "private-search-id" ||
+         url.searchParams.get("search_session_id") !== "private-search-session-id")) ||
+      (!hasContinuation &&
+        (url.searchParams.has("search_id") || url.searchParams.has("search_session_id"))) ||
+      JSON.stringify(actualKeys) !== JSON.stringify(expectedKeys)) {
+    throw new Error("TikHub Xiaohongshu search query does not match the protocol.");
+  }
+  return page;
+}
+
 const tikHubHandler: Handler = async (url, method, headers, request) => {
   if (url.hostname !== "api.tikhub.io") return null;
   if ([
@@ -283,10 +315,13 @@ const tikHubHandler: Handler = async (url, method, headers, request) => {
         headers.get("accept") !== "application/json") {
       throw new Error("TikHub Xiaohongshu authentication or media type is invalid.");
     }
+    const xhsSearchPage = url.pathname === XHS_SEARCH_PATH
+      ? assertXhsSearchQuery(url)
+      : undefined;
     physicalCalls.push({
       path: url.pathname,
       method,
-      ...(url.pathname === XHS_SEARCH_PATH ? {page: Number(url.searchParams.get("page"))} : {}),
+      ...(xhsSearchPage === undefined ? {} : {page: xhsSearchPage}),
     });
     const attempt = (xhsPathAttempts.get(url.pathname) ?? 0) + 1;
     xhsPathAttempts.set(url.pathname, attempt);
@@ -311,15 +346,7 @@ const tikHubHandler: Handler = async (url, method, headers, request) => {
       });
     }
     if (url.pathname === XHS_SEARCH_PATH) {
-      if (url.searchParams.get("keyword") !== XHS_KEYWORD ||
-          url.searchParams.get("sort_type") !== "general" ||
-          url.searchParams.get("note_type") !== "不限" ||
-          url.searchParams.get("time_filter") !== "不限" ||
-          url.searchParams.get("source") !== "explore_feed" ||
-          url.searchParams.get("ai_mode") !== "0") {
-        throw new Error("TikHub Xiaohongshu search query does not match the protocol.");
-      }
-      const page = Number(url.searchParams.get("page"));
+      const page = xhsSearchPage!;
       const empty = xhsScenario === "empty";
       return providerEnvelope({
         code: 200,
@@ -1099,7 +1126,10 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
       await expect(context.session.searchXiaohongshuNotes(XHS_KEYWORD, {limit: 1}))
         .rejects.toThrow();
 
-      expect(physicalCalls).toHaveLength(2);
+      expect(physicalCalls).toEqual([
+        {path: XHS_SEARCH_PATH, method: "GET", page: 1},
+        {path: XHS_SEARCH_PATH, method: "GET", page: 1},
+      ]);
       expect(await context.user.getUsageCreditBalance()).toEqual({
         reservedSubunits: XHS_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - XHS_CHARGE_SUBUNITS,
@@ -1132,6 +1162,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
     const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsxhsreservation");
     const before = await context.user.getUsageCreditBalance();
+    expect(before.reservedSubunits).toBe(0n);
     await updateRate(
       XHS_BILLING_METHODS.search.methodKey,
       before.availableSubunits + 1n,
@@ -1142,6 +1173,9 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
       expect(await usageRecordsFor(context.user, XHS_BILLING_METHODS.search.methodKey)).toEqual([]);
+      const inspection = await inspectGatekeeperMetering(context.username);
+      expect(inspection.attempts).toEqual([]);
+      expect(inspection.usageRecords).toEqual([]);
       expectPrivateDiagnosticsAbsent(harness.server.getLogs().slice(logStart));
     } finally {
       await updateRate(
