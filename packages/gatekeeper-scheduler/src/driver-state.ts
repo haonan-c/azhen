@@ -1,5 +1,6 @@
 import type { ScheduleSpec } from "./schedule-types.js";
 import type { NormalizedScheduleOccurrences } from "./types.js";
+import type { BillableOperationOutcome } from "@gadgets/workshop-shared/gatekeeper";
 import { initialNextFire, nextFireAfter } from "./scheduler-core.js";
 
 /** Maximum callback attempts for one logical run. */
@@ -43,6 +44,14 @@ export type PendingSchedule = ScheduleProgress & {
   attempts: number;
   leaseExpiresAt: number;
   nextFire?: number;
+  /** Removal requested while this run still owns a billable operation. */
+  disableAfterBilling?: true;
+  /** A terminal billing result that must be confirmed before this logical run can finish. */
+  billingFinalization?: {
+    outcome: BillableOperationOutcome;
+    transition: "complete" | "reject" | "authorization_failed" | "callback_failed" | "disable";
+    finalizedAt: number;
+  };
 };
 
 /** A logical run waiting for its next callback attempt. */

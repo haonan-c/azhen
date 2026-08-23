@@ -1084,6 +1084,12 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
         primaryKey: "id",
       }),
 
+      // A deleted Hook can still have one in-flight billable run. Retain only the host-attested
+      // identity needed to recover that existing idempotent operation; it cannot start a new one.
+      deletedHookBilling: collection<HookBillingAttestation>()({
+        primaryKey: "hookId",
+      }),
+
       // User-enabled rules to auto-approve actions carrying a given action kind on a given
       // gatekeeper. Presence of a record -> the rule is enabled. Keyed by
       // `${gatekeeperId}:${actionKind.tag}`.
@@ -2612,6 +2618,16 @@ class OverseerImpl implements AgentHooks {
     if (record.enabled) {
       await record.controller.disable();
     }
+    let vendorId = record.vendorId ??
+        gatekeeperVendorId(this.storage.gatekeepers.get(record.gatekeeperId));
+    if (vendorId) {
+      this.storage.deletedHookBilling.put({
+        hookId: id,
+        gatekeeperId: record.gatekeeperId,
+        vendorId,
+        attribution: normalizeUsageAttribution(record.attribution),
+      });
+    }
     this.storage.boundHooks.delete(record.id);
 
     let actionRecord = this.storage.actions.get(record.actionId);
@@ -3877,14 +3893,23 @@ class OverseerImpl implements AgentHooks {
    */
   async beginBillableOperation(
       gatekeeperId: number, billingMethodKey: string, externalAccountId: string,
-      caller: GatekeeperCaller, idempotencyKey?: string): Promise<BillableOperation> {
+      caller: GatekeeperCaller, idempotencyKey?: string): Promise<BillableOperation>;
+  async beginBillableOperation(
+      gatekeeperId: number, billingMethodKey: string, externalAccountId: string,
+      caller: GatekeeperCaller, idempotencyKey: string,
+      recovery: {vendorId: string}): Promise<BillableOperation | null>;
+  async beginBillableOperation(
+      gatekeeperId: number, billingMethodKey: string, externalAccountId: string,
+      caller: GatekeeperCaller, idempotencyKey?: string,
+      recovery?: {vendorId: string}): Promise<BillableOperation | null> {
     caller = normalizeGatekeeperCaller(caller);
-    let vendorId = gatekeeperVendorId(this.storage.gatekeepers.get(gatekeeperId));
+    let vendorId = recovery?.vendorId ??
+        gatekeeperVendorId(this.storage.gatekeepers.get(gatekeeperId));
     if (!vendorId) {
       throw new Error("This gatekeeper has no vendor identity to bill against.");
     }
     let operationId: string;
-    let chargeSnapshot: GatekeeperChargeSnapshot;
+    let chargeSnapshot: GatekeeperChargeSnapshot | undefined;
     if (idempotencyKey !== undefined) {
       if (idempotencyKey.length === 0 || idempotencyKey.length > 200) {
         throw new TypeError("Gatekeeper billing idempotency key must contain 1 to 200 characters.");
@@ -3915,32 +3940,45 @@ class OverseerImpl implements AgentHooks {
         chargeSnapshot: GatekeeperChargeSnapshot;
       };
       let selected = this.ctx.storage.kv.get<IdempotencyRecord>(key);
-      if (!selected) {
-        const candidate: IdempotencyRecord = {
-          operationId: `gatekeeper-operation:${crypto.randomUUID()}`,
-          chargeSnapshot: await this.ctx.exports.AdminSettings.getByName("")
-              .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey),
-        };
-        selected = this.ctx.storage.transactionSync(() => {
-          const existing = this.ctx.storage.kv.get<IdempotencyRecord>(key);
-          if (existing) return existing;
-          this.ctx.storage.kv.put(key, candidate);
-          return candidate;
-        });
+      if (!selected && recovery) {
+        operationId = `gatekeeper-operation:${digest}`;
+      } else {
+        if (!selected) {
+          const candidate: IdempotencyRecord = {
+            operationId: `gatekeeper-operation:${digest}`,
+            chargeSnapshot: await this.ctx.exports.AdminSettings.getByName("")
+                .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey),
+          };
+          selected = this.ctx.storage.transactionSync(() => {
+            const existing = this.ctx.storage.kv.get<IdempotencyRecord>(key);
+            if (existing) return existing;
+            this.ctx.storage.kv.put(key, candidate);
+            return candidate;
+          });
+        }
+        if (selected.chargeSnapshot.vendorId !== vendorId) {
+          throw new Error("Hook billing recovery vendor does not match the existing operation.");
+        }
+        operationId = selected.operationId;
+        chargeSnapshot = selected.chargeSnapshot;
+        await this.ctx.storage.sync();
       }
-      operationId = selected.operationId;
-      chargeSnapshot = selected.chargeSnapshot;
-      await this.ctx.storage.sync();
     } else {
+      if (recovery) throw new Error("Hook billing recovery requires an idempotency key.");
       operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
       chargeSnapshot = await this.ctx.exports.AdminSettings.getByName("")
           .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
     }
     let principalUserId = caller.attribution.principal.userId;
-    await this.userForPrincipal(principalUserId).beginGatekeeperUsage(
-        operationId,
-        {...caller.attribution, vendorId, billingMethodKey, externalAccountId},
-        chargeSnapshot);
+    let user = this.userForPrincipal(principalUserId);
+    if (recovery) {
+      if (!await user.resumeGatekeeperUsage(operationId)) return null;
+    } else {
+      await user.beginGatekeeperUsage(
+          operationId,
+          {...caller.attribution, vendorId, billingMethodKey, externalAccountId},
+          chargeSnapshot!);
+    }
     return new BillableOperationImpl(this, operationId, principalUserId);
   }
 
@@ -7827,22 +7865,24 @@ type OverseerRestoreParams = {
   codeId?: string;
 };
 
+class HookNotDeliverableError extends Error {}
+
 async function requireDeliverableHook(
     impl: OverseerImpl, env: Cloudflare.Env, hookId: number): Promise<{
       record: BoundHookRecord;
       vendorId: string;
     }> {
   let record = impl.storage.boundHooks.get(hookId);
-  if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
+  if (!record?.enabled) throw new HookNotDeliverableError("Hook has been deleted or disabled.");
 
   let vendorId = record.vendorId ??
       gatekeeperVendorId(impl.storage.gatekeepers.get(record.gatekeeperId));
-  if (!vendorId) throw new Error("Hook vendor is unavailable.");
+  if (!vendorId) throw new HookNotDeliverableError("Hook vendor is unavailable.");
 
   let config = await readAdminConfig(env);
   if (config.disabledGatekeepers.includes(vendorId) ||
       ambientGatekeeperMode(config, vendorId) === "disabled") {
-    throw new Error("Gatekeeper is disabled.");
+    throw new HookNotDeliverableError("Gatekeeper is disabled.");
   }
   return {record, vendorId};
 }
@@ -8313,10 +8353,22 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   /** Begin one unattended Hook operation from its persisted owner and stable run identity. */
   async beginHookBillableOperation(
       hookId: number, run: HookRunMetadata, billingMethodKey: string,
-      externalAccountId: string, idempotencyKey: string): Promise<BillableOperation> {
-    let {record, vendorId} = await requireDeliverableHook(this.impl, this.env, hookId);
+      externalAccountId: string, idempotencyKey: string,
+      recovery?: HookBillingAttestation): Promise<BillableOperation | null> {
+    let current = this.impl.storage.boundHooks.get(hookId);
+    let record: BoundHookRecord | undefined;
+    let vendorId: string;
+    try {
+      ({record, vendorId} = await requireDeliverableHook(this.impl, this.env, hookId));
+    } catch (error) {
+      if (!(error instanceof HookNotDeliverableError)) throw error;
+      recovery ??= current ? hookBillingAttestation(this.impl, current) :
+        this.impl.storage.deletedHookBilling.get(hookId);
+      if (!recovery || recovery.hookId !== hookId) throw error;
+      vendorId = recovery.vendorId;
+    }
 
-    let attribution = normalizeUsageAttribution(record.attribution);
+    let attribution = normalizeUsageAttribution(record?.attribution ?? recovery!.attribution);
     if (vendorId === "scheduler") {
       if (!("automationId" in run)) throw new Error("Scheduled run attribution is required.");
       if (idempotencyKey !== run.automationRunId) {
@@ -8337,9 +8389,14 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
 
+    if (record) {
+      return this.impl.beginBillableOperation(
+          record.gatekeeperId, billingMethodKey, externalAccountId,
+          {from: "hook", hookId, attribution}, idempotencyKey);
+    }
     return this.impl.beginBillableOperation(
-        record.gatekeeperId, billingMethodKey, externalAccountId,
-        {from: "hook", hookId, attribution}, idempotencyKey);
+        recovery!.gatekeeperId, billingMethodKey, externalAccountId,
+        {from: "hook", hookId, attribution}, idempotencyKey, {vendorId});
   }
 
   async deliverGadgetLogs(chatId: number | null, logs: ConsoleLogEvent[]) {
@@ -8590,7 +8647,28 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 type GatekeeperHookLoopbackProps = {
   overseerId: string;
   hookId: number;
+  billing?: HookBillingAttestation;
 };
+
+type HookBillingAttestation = {
+  hookId: number;
+  gatekeeperId: number;
+  vendorId: string;
+  attribution: UsageAttribution;
+};
+
+function hookBillingAttestation(
+    impl: OverseerImpl, record: BoundHookRecord): HookBillingAttestation {
+  let vendorId = record.vendorId ??
+      gatekeeperVendorId(impl.storage.gatekeepers.get(record.gatekeeperId));
+  if (!vendorId) throw new Error("Hook vendor is unavailable.");
+  return {
+    hookId: record.id,
+    gatekeeperId: record.gatekeeperId,
+    vendorId,
+    attribution: normalizeUsageAttribution(record.attribution),
+  };
+}
 
 /**
  * When a gatekeeper's hook is connected, it receives a Fetcher to this class, which implements
@@ -8603,13 +8681,14 @@ export class GatekeeperHookLoopback
     implements HookInitiator<RpcTarget> {
   beginBillableOperation(
       run: HookRunMetadata, billingMethodKey: string, externalAccountId: string,
-      idempotencyKey: string): Promise<BillableOperation> {
+      idempotencyKey: string): Promise<BillableOperation | null> {
     let ns = this.ctx.exports.OverseerDurableObject;
     let overseer: DurableObjectStub<OverseerDurableObject> =
         ns.get(ns.idFromString(this.ctx.props.overseerId));
 
     return overseer.beginHookBillableOperation(
-        this.ctx.props.hookId, run, billingMethodKey, externalAccountId, idempotencyKey);
+        this.ctx.props.hookId, run, billingMethodKey, externalAccountId, idempotencyKey,
+        this.ctx.props.billing);
   }
 
   startHook(run?: HookRunMetadata): Promise<
@@ -9090,7 +9169,21 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // TODO: If any disablement fails, deletion will be blocked. We could ignore failures, but that
     //   would leave gatekeepers pointing at gadgets that don't exist anymore, which is also bad.
     //   What do we really want here?
+    let hookBillingRecovery = new Map(
+      Array.from(this.impl.storage.deletedHookBilling.list(), recovery =>
+        [recovery.hookId, recovery] as const),
+    );
     for (let record of Array.from(this.impl.storage.boundHooks.list())) {
+      let vendorId = record.vendorId ??
+          gatekeeperVendorId(this.impl.storage.gatekeepers.get(record.gatekeeperId));
+      if (vendorId) {
+        hookBillingRecovery.set(record.id, {
+          hookId: record.id,
+          gatekeeperId: record.gatekeeperId,
+          vendorId,
+          attribution: normalizeUsageAttribution(record.attribution),
+        });
+      }
       if (record.enabled) {
         await this.disableHook(record.id);
       }
@@ -9099,6 +9192,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     await this.impl.ctx.blockConcurrencyWhile(async () => {
       await this.#owner.deleteGadget(this.impl.ctx.id.toString());
       await this.impl.ctx.storage.deleteAll();
+      for (let recovery of hookBillingRecovery.values()) {
+        this.impl.storage.deletedHookBilling.put(recovery);
+      }
       this.impl.scheduleRevocationRestart();
       this.impl.ownerId = undefined;
     });
@@ -9386,9 +9482,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!record) throw new Error("Invalid hook ID.");
 
     if (!record.enabled) {
+      let billing = hookBillingAttestation(this.impl, record);
       let props: GatekeeperHookLoopbackProps = {
         overseerId: this.impl.ctx.id.toString(),
         hookId: id,
+        billing,
       }
 
       // TODO(hooks): enable()/disable() race. controller.enable() is awaited RPC to the gatekeeper;

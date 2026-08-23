@@ -17,9 +17,11 @@ type TestMode =
   | "success"
   | "start-reject"
   | "billing-reject"
+  | "billing-not-found"
+  | "billing-complete-reject"
   | "authorization-reject"
   | "callback-reject";
-type BlockPoint = "start" | "authorization" | "callback";
+type BlockPoint = "billing" | "start" | "authorization" | "callback";
 
 let mode: TestMode = "success";
 let events: string[] = [];
@@ -86,8 +88,9 @@ class TestBillableOperation extends RpcTarget {
   }
 
   async complete(outcome: string): Promise<void> {
-    this.operation.outcome ??= outcome;
     billingEvents.push(`complete:${outcome}:${this.runId}`);
+    if (mode === "billing-complete-reject") throw new Error("billing completion rejected");
+    this.operation.outcome ??= outcome;
   }
 }
 
@@ -119,6 +122,8 @@ export class TestHooks extends WorkerEntrypoint {
     externalAccountId: string,
     idempotencyKey: string,
   ) {
+    await pauseIfBlocked("billing");
+    if (mode === "billing-not-found") return null;
     return await new TestApprovalQueue().beginBillableOperation(
       methodKey, externalAccountId, idempotencyKey);
   }

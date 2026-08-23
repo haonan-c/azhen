@@ -27,6 +27,7 @@ function makeOverseer(
       storage: {
         boundHooks: { get: () => hook && ({
           ...hook,
+          id: 1,
           gatekeeperId: 1,
           gadgetId: 7,
           attribution: {
@@ -129,6 +130,95 @@ describe("OverseerDurableObject.startHook", () => {
     );
   });
 
+  it("uses sealed owner attribution only to recover billing after a Hook is disabled", async () => {
+    let overseer = makeOverseer(
+        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
+        {enabled: false, vendorId: "scheduler", callback: {}});
+    const beginBillableOperation = vi.fn(async () => ({operation: true}));
+    Object.assign((overseer as unknown as {impl: object}).impl, {beginBillableOperation});
+    const attribution = {
+      principal: {version: 1 as const, kind: "user" as const, userId: "a".repeat(64)},
+      source: "scheduled" as const,
+      workspaceId: "b".repeat(64),
+      gadgetId: 7,
+    };
+
+    await expect(overseer.beginHookBillableOperation(
+        1,
+        {automationId: "schedule-1", automationRunId: "run-1"},
+        "scheduler.schedule.delivery.v1",
+        "scheduler-account",
+        "run-1",
+        {hookId: 1, gatekeeperId: 1, vendorId: "scheduler", attribution},
+    )).resolves.toEqual({operation: true});
+
+    expect(beginBillableOperation).toHaveBeenCalledWith(
+      1,
+      "scheduler.schedule.delivery.v1",
+      "scheduler-account",
+      {
+        from: "hook",
+        hookId: 1,
+        attribution: {
+          ...attribution,
+          automationId: "schedule-1",
+          automationRunId: "run-1",
+        },
+      },
+      "run-1",
+      {vendorId: "scheduler"},
+    );
+  });
+
+  it("uses a host tombstone only to recover billing after a Hook is deleted", async () => {
+    let overseer = makeOverseer(
+        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG), null);
+    const beginBillableOperation = vi.fn(async () => ({operation: true}));
+    const attribution = {
+      principal: {version: 1 as const, kind: "user" as const, userId: "a".repeat(64)},
+      source: "scheduled" as const,
+      workspaceId: "b".repeat(64),
+      gadgetId: 7,
+    };
+    const impl = (overseer as unknown as {impl: {
+      storage: object;
+      beginBillableOperation?: typeof beginBillableOperation;
+    }}).impl;
+    Object.assign(impl, {beginBillableOperation});
+    Object.assign(impl.storage, {
+      deletedHookBilling: {get: () => ({
+        hookId: 1,
+        gatekeeperId: 1,
+        vendorId: "scheduler",
+        attribution,
+      })},
+    });
+
+    await expect(overseer.beginHookBillableOperation(
+        1,
+        {automationId: "schedule-1", automationRunId: "run-1"},
+        "scheduler.schedule.delivery.v1",
+        "scheduler-account",
+        "run-1",
+    )).resolves.toEqual({operation: true});
+    expect(beginBillableOperation).toHaveBeenCalledWith(
+      1,
+      "scheduler.schedule.delivery.v1",
+      "scheduler-account",
+      {
+        from: "hook",
+        hookId: 1,
+        attribution: {
+          ...attribution,
+          automationId: "schedule-1",
+          automationRunId: "run-1",
+        },
+      },
+      "run-1",
+      {vendorId: "scheduler"},
+    );
+  });
+
   it("attaches an opaque delivery ID to an ordinary Hook callback", async () => {
     let overseer = makeOverseer(
         async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
@@ -159,6 +249,9 @@ describe("OverseerDurableObject.startHook", () => {
       async (_kind, config, vendorId) => {
         let overseer = makeOverseer(
             async () => serializeAdminConfig(config), {enabled: true, vendorId});
+        Object.assign((overseer as unknown as {impl: object}).impl, {
+          beginBillableOperation: async () => null,
+        });
         const run = vendorId === "scheduler"
           ? {automationId: "schedule-1", automationRunId: "run-1"} as const
           : {deliveryId: "delivery-1"} as const;
@@ -169,7 +262,7 @@ describe("OverseerDurableObject.startHook", () => {
             `${vendorId}.delivery.v1`,
             `${vendorId}-account`,
             vendorId === "scheduler" ? "run-1" : "delivery-1",
-        )).rejects.toThrow("Gatekeeper is disabled.");
+        )).resolves.toBeNull();
       });
 
   it("rejects billing begin when admin-config KV access fails", async () => {
@@ -233,7 +326,14 @@ async function makeTargetOverseer(gadgetId?: number) {
     id: 4,
     actionId: 12,
     gatekeeperId: 1,
+    vendorId: "email",
     gadgetId,
+    attribution: {
+      principal: {version: 1 as const, kind: "user" as const, userId: "a".repeat(64)},
+      source: "hook" as const,
+      workspaceId: "b".repeat(64),
+      ...(gadgetId !== undefined ? {gadgetId} : {}),
+    },
     controller: {enable: controllerEnable},
     callback: {},
     description: {title: "Incoming email", description: "Receives email"},

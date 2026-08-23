@@ -1414,13 +1414,15 @@ export interface HookInitiator<Hook extends RpcTarget> extends WorkerEntrypoint 
   /**
    * Begins metering one unattended Hook operation from the Hook's persisted owner attribution.
    * The stable run metadata and idempotency key let a retried delivery recover the same operation.
+   * Returns null only after the Hook is disabled or deleted and no existing operation can be
+   * recovered; the Gatekeeper may then remove that unbegun delivery without completing billing.
    */
   beginBillableOperation(
     run: HookRunMetadata,
     billingMethodKey: string,
     externalAccountId: string,
     idempotencyKey: string,
-  ): Promise<BillableOperation>;
+  ): Promise<BillableOperation | null>;
 
   /**
    * Indicates that the hook is about to be invoked.

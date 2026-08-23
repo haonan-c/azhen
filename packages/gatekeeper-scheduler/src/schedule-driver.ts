@@ -13,6 +13,7 @@ import {
   completeRun,
   createSchedule,
   failRun,
+  MAX_ATTEMPTS,
   rejectRun,
   type EnabledSchedule,
   type ScheduleRegistration,
@@ -81,6 +82,8 @@ type PreparedRun = {
   runId: string;
   scheduledTime: number;
   recoveredDelivery?: true;
+  disableAfterBilling?: true;
+  billingFinalization?: NonNullable<PendingState["billingFinalization"]>;
 };
 
 type PendingState = Extract<EnabledSchedule, { status: "pending" }>;
@@ -118,6 +121,9 @@ export class ScheduleDriver extends DurableObject {
         const existing = this.#readSchedule(key);
         let state: EnabledSchedule;
         if (existing) {
+          if (existing.state.status === "pending" && existing.state.disableAfterBilling) {
+            throw new Error("Schedule disable is waiting for billing finalization.");
+          }
           state = existing.state;
           this.ctx.storage.kv.put(key, {
             ...existing,
@@ -175,7 +181,14 @@ export class ScheduleDriver extends DurableObject {
           return;
         }
         const key = scheduleKey(workspaceId, scheduleId);
-        this.#readSchedule(key);
+        const stored = this.#readSchedule(key);
+        if (stored?.state.status === "pending") {
+          this.ctx.storage.kv.put<StoredSchedule>(key, {
+            ...stored,
+            state: { ...stored.state, disableAfterBilling: true },
+          });
+          return;
+        }
         capabilities = this.ctx.storage.kv.get<StoredCapabilities>(
           capabilitiesKey(workspaceId, scheduleId),
         );
@@ -192,12 +205,17 @@ export class ScheduleDriver extends DurableObject {
 
   async getSchedule(workspaceId: string, scheduleId: string): Promise<StoredSchedule | undefined> {
     if (this.#requireMetadata().revoked) return undefined;
-    return this.#readSchedule(scheduleKey(workspaceId, scheduleId));
+    const stored = this.#readSchedule(scheduleKey(workspaceId, scheduleId));
+    return stored?.state.status === "pending" && stored.state.disableAfterBilling
+      ? undefined
+      : stored;
   }
 
   async listWorkspace(workspaceId: string): Promise<ScheduleSummary[]> {
     if (this.#requireMetadata().revoked) return [];
     return this.#listSchedules(workspaceSchedulePrefix(workspaceId))
+      .filter(([, schedule]) =>
+        schedule.state.status !== "pending" || !schedule.state.disableAfterBilling)
       .map(([, schedule]) => toScheduleSummary(schedule))
       .toSorted(compareScheduleSummaries);
   }
@@ -205,14 +223,17 @@ export class ScheduleDriver extends DurableObject {
   async listAccount(options?: ManagementListOptions): Promise<ManagementSchedulePage> {
     if (this.#requireMetadata().revoked) return { schedules: [] };
     return paginateManagementSchedules(
-      this.#listSchedules().map(([key, schedule]) => ({
-        key,
-        schedule: {
-          ...toScheduleSummary(schedule),
-          workspaceId: schedule.state.workspaceId,
-          ...(schedule.gadgetId !== undefined ? { gadgetId: schedule.gadgetId } : {}),
-        },
-      })),
+      this.#listSchedules()
+        .filter(([, schedule]) =>
+          schedule.state.status !== "pending" || !schedule.state.disableAfterBilling)
+        .map(([key, schedule]) => ({
+          key,
+          schedule: {
+            ...toScheduleSummary(schedule),
+            workspaceId: schedule.state.workspaceId,
+            ...(schedule.gadgetId !== undefined ? { gadgetId: schedule.gadgetId } : {}),
+          },
+        })),
       options,
     );
   }
@@ -224,6 +245,14 @@ export class ScheduleDriver extends DurableObject {
         this.ctx.storage.transactionSync(() => {
           const metadata = this.#requireMetadata();
           if (metadata.revoked) return;
+          for (const [key, stored] of this.#listSchedules()) {
+            if (stored.state.status === "pending") {
+              this.ctx.storage.kv.put<StoredSchedule>(key, {
+                ...stored,
+                state: { ...stored.state, disableAfterBilling: true },
+              });
+            }
+          }
           this.ctx.storage.kv.put<DriverMetadata>(METADATA_KEY, {
             schemaVersion: 1,
             revoked: true,
@@ -279,8 +308,23 @@ export class ScheduleDriver extends DurableObject {
     const now = Date.now();
     await this.ctx.storage.setAlarm(checkedAdd(now, RECOVERY_DELAY_MS));
     if (this.#requireMetadata().revoked) {
+      const due = this.#listSchedules()
+        .filter(([, schedule]) =>
+          schedule.state.status === "pending" &&
+          schedule.state.disableAfterBilling &&
+          isDue(schedule, now))
+        .toSorted(compareDueSchedules);
+      const batch = due.slice(0, ALARM_BATCH_SIZE);
+      await runBounded(batch, DELIVERY_CONCURRENCY, async ([key, schedule]) => {
+        await this.#deliverSafely(key, schedule);
+      });
       await this.#cleanupRevokedAccount();
-      return { dueCount: 0, batchSize: 0, backlogCount: 0, startHookRejectedCount: 0 };
+      return {
+        dueCount: due.length,
+        batchSize: batch.length,
+        backlogCount: due.length - batch.length,
+        startHookRejectedCount: 0,
+      };
     }
 
     const due = this.#listSchedules()
@@ -426,13 +470,40 @@ export class ScheduleDriver extends DurableObject {
         this.ctx.id.toString(),
         prepared.runId,
       );
-      let operationResult: RpcStub<BillableOperation>;
+      let operationResult: RpcStub<BillableOperation> | null;
       try {
         operationResult = await operationCall;
       } catch {
         return false;
       }
+      if (!operationResult) {
+        if (this.#removeAfterBilling(prepared)) return false;
+        if (prepared.recoveredDelivery) {
+          this.#failPending(prepared, "callback_failed", Date.now());
+        } else {
+          this.#rejectPending(prepared, Date.now());
+        }
+        return false;
+      }
       using operation = operationResult;
+      if (prepared.billingFinalization) {
+        if (await this.#completeBillingQuietly(
+          operation, prepared.billingFinalization.outcome,
+        )) {
+          this.#finishBillingFinalization(prepared, prepared.billingFinalization);
+        }
+        return false;
+      }
+      if (prepared.disableAfterBilling) {
+        await this.#finalizeBilling(
+          prepared,
+          operation,
+          prepared.recoveredDelivery ? "unknown" : "failed-before-execution",
+          "disable",
+          Date.now(),
+        );
+        return false;
+      }
       // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
       using hookCall = capabilities.initiator.startHook(run);
       try {
@@ -442,28 +513,30 @@ export class ScheduleDriver extends DurableObject {
         hookResult = await hookCall;
       } catch {
         if (prepared.recoveredDelivery) {
-          const state = this.#failPending(prepared, "callback_failed", Date.now());
-          if (state?.status === "dead") {
-            await this.#completeBillingQuietly(operation, "unknown");
-          }
+          await this.#failOrFinalize(
+            prepared, operation, "callback_failed", "unknown", Date.now());
         } else {
-          this.#rejectPending(prepared, Date.now());
-          await this.#completeBillingQuietly(operation, "failed-before-execution");
+          await this.#finalizeBilling(
+            prepared, operation, "failed-before-execution", "reject", Date.now());
         }
         return true;
       }
       if (!hookResult) return false;
 
       if (prepared.recoveredDelivery) {
-        const state = this.#failPending(prepared, "callback_failed", Date.now());
-        if (state?.status === "dead") {
-          await this.#completeBillingQuietly(operation, "unknown");
-        }
+        await this.#failOrFinalize(
+          prepared, operation, "callback_failed", "unknown", Date.now());
         return false;
       }
 
       const admitted = this.#markAdmitted(prepared, Date.now());
-      if (!admitted) return false;
+      if (!admitted) {
+        if (this.#matchesPendingRun(prepared)) {
+          await this.#finalizeBilling(
+            prepared, operation, "failed-before-execution", "disable", Date.now());
+        }
+        return false;
+      }
 
       const firing: ScheduledFiring = {
         scheduleId: prepared.scheduleId,
@@ -480,34 +553,34 @@ export class ScheduleDriver extends DurableObject {
           description: `Deliver scheduled task ${prepared.scheduleId} for its planned occurrence at ${prepared.scheduledTime}.`,
         });
       } catch {
-        const state = this.#failPending(prepared, "authorization_failed", Date.now());
-        if (state?.status === "dead") {
-          await this.#completeBillingQuietly(operation, "failed-before-execution");
-        }
+        await this.#failOrFinalize(
+          prepared, operation, "authorization_failed", "failed-before-execution", Date.now());
         return false;
       }
 
-      if (!this.#isPendingDelivery(prepared)) return false;
+      if (!this.#isPendingDelivery(prepared)) {
+        if (this.#matchesPendingRun(prepared)) {
+          await this.#finalizeBilling(
+            prepared, operation, "failed-before-execution", "disable", Date.now());
+        }
+        return false;
+      }
       try {
         await operation.markStarted();
       } catch {
-        const state = this.#failPending(prepared, "callback_failed", Date.now());
-        if (state?.status === "dead") {
-          await this.#completeBillingQuietly(operation, "failed-before-execution");
-        }
+        await this.#failOrFinalize(
+          prepared, operation, "callback_failed", "failed-before-execution", Date.now());
         return false;
       }
       try {
         await hookResult.callback.onSchedule(firing);
       } catch {
-        const state = this.#failPending(prepared, "callback_failed", Date.now());
-        if (state?.status === "dead") {
-          await this.#completeBillingQuietly(operation, "unknown");
-        }
+        await this.#failOrFinalize(
+          prepared, operation, "callback_failed", "unknown", Date.now());
         return false;
       }
-      await this.#completeBillingQuietly(operation, "executed");
-      this.#completePending(prepared, Date.now());
+      await this.#finalizeBilling(
+        prepared, operation, "executed", "complete", Date.now());
       return false;
     } finally {
       disposeStub(capabilities.initiator);
@@ -539,9 +612,13 @@ export class ScheduleDriver extends DurableObject {
 
   #prepareRun(key: string, now: number): PreparedRun | undefined {
     return this.ctx.storage.transactionSync(() => {
-      this.#requireLiveMetadata();
+      const metadata = this.#requireMetadata();
       const stored = this.#readSchedule(key);
       if (!stored || !isDue(stored, now)) return undefined;
+      if (
+        metadata.revoked &&
+        (stored.state.status !== "pending" || !stored.state.disableAfterBilling)
+      ) return undefined;
 
       let state = stored.state;
       if (state.status === "pending" && state.stage === "delivery") {
@@ -551,6 +628,18 @@ export class ScheduleDriver extends DurableObject {
           runId: state.runId,
           scheduledTime: state.scheduledTime,
           recoveredDelivery: true,
+          disableAfterBilling: state.disableAfterBilling,
+          billingFinalization: state.billingFinalization,
+        };
+      }
+      if (state.status === "pending" && state.billingFinalization) {
+        return {
+          workspaceId: state.workspaceId,
+          scheduleId: state.scheduleId,
+          runId: state.runId,
+          scheduledTime: state.scheduledTime,
+          disableAfterBilling: state.disableAfterBilling,
+          billingFinalization: state.billingFinalization,
         };
       }
       const leaseExpiresAt = checkedAdd(now, RECOVERY_DELAY_MS);
@@ -566,6 +655,7 @@ export class ScheduleDriver extends DurableObject {
         scheduleId: state.scheduleId,
         runId: state.runId,
         scheduledTime: state.scheduledTime,
+        disableAfterBilling: state.disableAfterBilling,
       };
     });
   }
@@ -601,15 +691,106 @@ export class ScheduleDriver extends DurableObject {
       failRun(state, prepared.runId, failureCode, failedAt));
   }
 
+  async #failOrFinalize(
+    prepared: PreparedRun,
+    operation: RpcStub<BillableOperation>,
+    failureCode: "authorization_failed" | "callback_failed",
+    outcome: BillableOperationOutcome,
+    failedAt: number,
+  ): Promise<void> {
+    const stored = this.#readSchedule(scheduleKey(prepared.workspaceId, prepared.scheduleId));
+    if (!matchesPending(stored, prepared)) return;
+    if (!stored.state.disableAfterBilling && stored.state.attempts < MAX_ATTEMPTS) {
+      this.#failPending(prepared, failureCode, failedAt);
+      return;
+    }
+    await this.#finalizeBilling(prepared, operation, outcome, failureCode, failedAt);
+  }
+
+  async #finalizeBilling(
+    prepared: PreparedRun,
+    operation: RpcStub<BillableOperation>,
+    outcome: BillableOperationOutcome,
+    transition: NonNullable<PendingState["billingFinalization"]>["transition"],
+    finalizedAt: number,
+  ): Promise<void> {
+    const finalization = {outcome, transition, finalizedAt};
+    const persisted = this.ctx.storage.transactionSync(() => {
+      const key = scheduleKey(prepared.workspaceId, prepared.scheduleId);
+      const stored = this.#readSchedule(key);
+      if (!matchesPending(stored, prepared)) return false;
+      const existing = stored.state.billingFinalization;
+      if (existing && (existing.outcome !== outcome || existing.transition !== transition)) {
+        throw new Error("Scheduler billing finalization conflicts with its persisted outcome.");
+      }
+      this.ctx.storage.kv.put<StoredSchedule>(key, {
+        ...stored,
+        state: {
+          ...stored.state,
+          billingFinalization: existing ?? finalization,
+          leaseExpiresAt: checkedAdd(finalizedAt, RECOVERY_DELAY_MS),
+        },
+      });
+      return true;
+    });
+    if (!persisted) return;
+    await this.ctx.storage.sync();
+    if (await this.#completeBillingQuietly(operation, outcome)) {
+      this.#finishBillingFinalization(prepared, finalization);
+    }
+  }
+
+  #finishBillingFinalization(
+    prepared: PreparedRun,
+    finalization: NonNullable<PendingState["billingFinalization"]>,
+  ): void {
+    if (this.#removeAfterBilling(prepared)) return;
+    switch (finalization.transition) {
+      case "complete":
+        this.#completePending(prepared, finalization.finalizedAt);
+        return;
+      case "reject":
+        this.#rejectPending(prepared, finalization.finalizedAt);
+        return;
+      case "authorization_failed":
+      case "callback_failed":
+        this.#failPending(prepared, finalization.transition, finalization.finalizedAt);
+        return;
+      case "disable":
+        throw new Error("A deferred scheduler removal lost its persisted removal marker.");
+    }
+  }
+
+  #removeAfterBilling(prepared: PreparedRun): boolean {
+    let capabilities: StoredCapabilities | undefined;
+    const removed = this.ctx.storage.transactionSync(() => {
+      const key = scheduleKey(prepared.workspaceId, prepared.scheduleId);
+      const stored = this.#readSchedule(key);
+      if (!matchesPending(stored, prepared) || !stored.state.disableAfterBilling) return false;
+      capabilities = this.#takeCapabilities(stored.state);
+      this.ctx.storage.kv.delete(key);
+      return true;
+    });
+    disposeCapabilities(capabilities);
+    return removed;
+  }
+
+  #matchesPendingRun(prepared: PreparedRun): boolean {
+    return matchesPending(
+      this.#readSchedule(scheduleKey(prepared.workspaceId, prepared.scheduleId)),
+      prepared,
+    );
+  }
+
   async #completeBillingQuietly(
     operation: RpcStub<BillableOperation>,
     outcome: BillableOperationOutcome,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let error: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         await operation.complete(outcome);
-        return;
+        return true;
       } catch (caught) {
         error = caught;
       }
@@ -618,7 +799,7 @@ export class ScheduleDriver extends DurableObject {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           await operation.complete("unknown");
-          return;
+          return true;
         } catch (caught) {
           error = caught;
         }
@@ -632,6 +813,7 @@ export class ScheduleDriver extends DurableObject {
       handled: true,
       attributes: obsContext.get(),
     });
+    return false;
   }
 
   #completePending(prepared: PreparedRun, completedAt: number): void {
@@ -642,13 +824,38 @@ export class ScheduleDriver extends DurableObject {
   #isPendingDelivery(prepared: PreparedRun): boolean {
     if (this.#requireMetadata().revoked) return false;
     const stored = this.#readSchedule(scheduleKey(prepared.workspaceId, prepared.scheduleId));
-    return matchesPending(stored, prepared) && stored.state.stage === "delivery";
+    return matchesPending(stored, prepared) &&
+      stored.state.stage === "delivery" &&
+      !stored.state.disableAfterBilling;
   }
 
   async #planAlarm(): Promise<void> {
     const metadata = this.#requireMetadata();
     if (metadata.revoked) {
-      await this.ctx.storage.setAlarm(Date.now());
+      const protectedKeys = new Set<string>();
+      for (const [key, schedule] of this.#listSchedules()) {
+        if (schedule.state.status === "pending" && schedule.state.disableAfterBilling) {
+          protectedKeys.add(key);
+          protectedKeys.add(capabilitiesKey(schedule.state.workspaceId, schedule.state.scheduleId));
+        }
+      }
+      let target: number | undefined;
+      let hasCleanup = false;
+      for (const [key, value] of this.ctx.storage.kv.list<unknown>()) {
+        if (key === METADATA_KEY) continue;
+        if (protectedKeys.has(key) && key.startsWith(SCHEDULE_PREFIX)) {
+          const schedule = decodeStoredSchedule(key, value, "skip");
+          if (schedule?.state.status === "pending") {
+            const candidate = schedule.state.leaseExpiresAt;
+            if (target === undefined || candidate < target) target = candidate;
+          }
+          continue;
+        }
+        if (!protectedKeys.has(key)) hasCleanup = true;
+      }
+      if (hasCleanup) await this.ctx.storage.setAlarm(Date.now());
+      else if (target !== undefined) await this.ctx.storage.setAlarm(target);
+      else await this.ctx.storage.deleteAlarm();
       return;
     }
     let target: number | undefined;
@@ -662,9 +869,16 @@ export class ScheduleDriver extends DurableObject {
   }
 
   async #cleanupRevokedAccount(): Promise<void> {
-    const entries = [...this.ctx.storage.kv.list({ limit: REVOCATION_CLEANUP_BATCH_SIZE + 1 })];
+    const protectedKeys = new Set<string>();
+    for (const [key, schedule] of this.#listSchedules()) {
+      if (schedule.state.status === "pending" && schedule.state.disableAfterBilling) {
+        protectedKeys.add(key);
+        protectedKeys.add(capabilitiesKey(schedule.state.workspaceId, schedule.state.scheduleId));
+      }
+    }
+    const entries = [...this.ctx.storage.kv.list()];
     const cleanup = entries
-      .filter(([key]) => key !== METADATA_KEY)
+      .filter(([key]) => key !== METADATA_KEY && !protectedKeys.has(key))
       .slice(0, REVOCATION_CLEANUP_BATCH_SIZE);
     for (const [key, value] of cleanup) {
       if (key.startsWith(CAPABILITIES_PREFIX)) disposeCapabilities(value as StoredCapabilities);
@@ -672,11 +886,7 @@ export class ScheduleDriver extends DurableObject {
     this.ctx.storage.transactionSync(() => {
       for (const [key] of cleanup) this.ctx.storage.kv.delete(key);
     });
-    const remains = [...this.ctx.storage.kv.list({ limit: 2 })].some(
-      ([key]) => key !== METADATA_KEY,
-    );
-    if (remains) await this.ctx.storage.setAlarm(Date.now());
-    else await this.ctx.storage.deleteAlarm();
+    await this.#planAlarm();
   }
 
   #readSchedule(key: string): StoredSchedule | undefined {

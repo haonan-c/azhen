@@ -19,9 +19,10 @@ type ScheduleHookTarget = RpcTarget & ScheduledTaskHook;
 type TestHooks = HookInitiator<ScheduleHookTarget> & {
   configure(
     mode: "success" | "start-reject" | "billing-reject" |
+      "billing-not-found" | "billing-complete-reject" |
       "authorization-reject" | "callback-reject",
   ): Promise<void>;
-  blockAt(point: "start" | "authorization" | "callback"): Promise<void>;
+  blockAt(point: "billing" | "start" | "authorization" | "callback"): Promise<void>;
   read(): Promise<{
     events: string[];
     callbackScheduleIds: string[];
@@ -320,6 +321,179 @@ describe("ScheduleDriver", () => {
     expect(rejected.billingEvents).toEqual([
       expect.stringMatching("^begin:scheduler\\.schedule\\.delivery\\.v1:.+:.+$"),
     ]);
+  });
+
+  it("persists billing finalization and does not replay an accepted callback", async () => {
+    let driver = testEnv.SCHEDULE_DRIVER.getByName("billing-finalization-recovery");
+    const activationTime = Date.now();
+    await testEnv.TEST_HOOKS.configure("billing-complete-reject");
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "one-shot",
+        spec: { kind: "once", fireAt: activationTime + 60_000, timeZone: "UTC" },
+        title: "One shot",
+        description: "Finish billing without replaying the callback.",
+        gadgetId,
+      },
+      activationTime,
+    );
+
+    await makeActiveScheduleDue(driver, "workspace-a", "one-shot");
+    await runDurableObjectAlarm(driver);
+
+    expect((await driver.getSchedule("workspace-a", "one-shot"))?.state).toMatchObject({
+      status: "pending",
+      stage: "delivery",
+      billingFinalization: {outcome: "executed", transition: "complete"},
+    });
+    const first = await testEnv.TEST_HOOKS.read();
+    expect(first.events.filter(event => event.startsWith("callback:"))).toHaveLength(1);
+
+    await abortAllDurableObjects();
+    driver = testEnv.SCHEDULE_DRIVER.getByName("billing-finalization-recovery");
+    await testEnv.TEST_HOOKS.configure("success");
+    await updateSchedule(driver, "workspace-a", "one-shot", stored => {
+      if (stored.state.status !== "pending") throw new Error("Expected pending finalization");
+      return {...stored, state: {...stored.state, leaseExpiresAt: 1}};
+    });
+    await runDurableObjectAlarm(driver);
+
+    expect((await driver.getSchedule("workspace-a", "one-shot"))?.state).toMatchObject({
+      status: "completed",
+    });
+    const recovered = await testEnv.TEST_HOOKS.read();
+    expect(recovered.events.filter(event => event.startsWith("callback:"))).toHaveLength(1);
+    expect(recovered.billingEvents.filter(event => event.startsWith("begin:"))).toHaveLength(2);
+  });
+
+  it("retains an executing schedule until disable can finalize its billing", async () => {
+    const driver = testEnv.SCHEDULE_DRIVER.getByName("disable-during-callback");
+    const activationTime = Date.now();
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "schedule-a",
+        spec: { kind: "interval", everyMs: 60_000, anchorMs: activationTime },
+        title: "Blocked task",
+        description: "Disable while the callback is executing.",
+        gadgetId,
+      },
+      activationTime,
+    );
+    await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
+    await testEnv.TEST_HOOKS.blockAt("callback");
+
+    const alarm = runDurableObjectAlarm(driver);
+    try {
+      await testEnv.TEST_HOOKS.waitUntilBlocked();
+      await driver.disable("workspace-a", "schedule-a");
+      expect(await driver.getSchedule("workspace-a", "schedule-a")).toBeUndefined();
+      const retained = await runInDurableObject(driver, (_instance, state) => ({
+        schedule: state.storage.kv.get<StoredSchedule>("schedule:workspace-a:schedule-a"),
+        hasCapabilities: state.storage.kv.get("caps:workspace-a:schedule-a") !== undefined,
+      }));
+      expect(retained.schedule?.state).toMatchObject({
+        status: "pending",
+        stage: "delivery",
+        disableAfterBilling: true,
+      });
+      expect(retained.hasCapabilities).toBe(true);
+    } finally {
+      await testEnv.TEST_HOOKS.release();
+    }
+    await alarm;
+
+    const keys = await runInDurableObject(driver, (_instance, state) =>
+      [...state.storage.kv.list()].map(([key]) => key),
+    );
+    expect(keys).toEqual(["metadata"]);
+    const events = await testEnv.TEST_HOOKS.read();
+    expect(events.events.filter(event => event.startsWith("callback:"))).toHaveLength(1);
+    expect(events.billingEvents.filter(event => event.startsWith("complete:executed")))
+      .toHaveLength(1);
+  });
+
+  it("removes a disabled pending run when the host confirms billing never began", async () => {
+    const driver = testEnv.SCHEDULE_DRIVER.getByName("disable-unbegun-recovery");
+    const activationTime = Date.now();
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "schedule-a",
+        spec: { kind: "interval", everyMs: 60_000, anchorMs: activationTime },
+        title: "Unbegun task",
+        description: "Remove a disabled run that has no billing Attempt.",
+        gadgetId,
+      },
+      activationTime,
+    );
+    await updateSchedule(driver, "workspace-a", "schedule-a", stored => ({
+      ...stored,
+      state: {
+        ...stored.state,
+        status: "pending",
+        stage: "admission",
+        runId: "unbegun-run",
+        scheduledTime: 1,
+        attempts: 0,
+        leaseExpiresAt: 1,
+        disableAfterBilling: true,
+      },
+    }));
+    await testEnv.TEST_HOOKS.configure("billing-not-found");
+
+    await runDurableObjectAlarm(driver);
+
+    const keys = await runInDurableObject(driver, (_instance, state) =>
+      [...state.storage.kv.list()].map(([key]) => key),
+    );
+    expect(keys).toEqual(["metadata"]);
+    expect(await testEnv.TEST_HOOKS.read()).toMatchObject({
+      events: [],
+      billingEvents: [],
+    });
+  });
+
+  it("uses the persisted disable marker when an in-flight billing begin returns null", async () => {
+    const driver = testEnv.SCHEDULE_DRIVER.getByName("disable-during-billing-begin");
+    const activationTime = Date.now();
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "schedule-a",
+        spec: { kind: "interval", everyMs: 60_000, anchorMs: activationTime },
+        title: "Blocked begin",
+        description: "Disable while the host is beginning billing.",
+        gadgetId,
+      },
+      activationTime,
+    );
+    await makeActiveScheduleDue(driver, "workspace-a", "schedule-a");
+    await testEnv.TEST_HOOKS.configure("billing-not-found");
+    await testEnv.TEST_HOOKS.blockAt("billing");
+
+    const alarm = runDurableObjectAlarm(driver);
+    try {
+      await testEnv.TEST_HOOKS.waitUntilBlocked();
+      await driver.disable("workspace-a", "schedule-a");
+    } finally {
+      await testEnv.TEST_HOOKS.release();
+    }
+    await alarm;
+
+    const keys = await runInDurableObject(driver, (_instance, state) =>
+      [...state.storage.kv.list()].map(([key]) => key),
+    );
+    expect(keys).toEqual(["metadata"]);
+    expect(await testEnv.TEST_HOOKS.read()).toMatchObject({
+      events: ["blocked:billing"],
+      billingEvents: [],
+    });
   });
 
   it("replaces and removes stored activation capabilities", async () => {
@@ -802,11 +976,13 @@ describe("ScheduleDriver", () => {
     expect(events).toEqual(["start", "authorize", "blocked:authorization"]);
   });
 
-  it.skip("does not persist completion when revoked during callback", async () => {
+  it("finalizes an executing callback before revoked storage is removed", async () => {
     const events = await revokeWhileDeliveryIsBlocked("revoke-callback", "callback");
     expect(events).toHaveLength(4);
     expect(events.slice(0, 3)).toEqual(["start", "authorize", expect.stringMatching(/^callback:/)]);
     expect(events[3]).toBe("blocked:callback");
+    expect((await testEnv.TEST_HOOKS.read()).billingEvents)
+      .toContainEqual(expect.stringMatching(/^complete:executed:/));
   });
 
   it("bounds callback concurrency and immediately continues a due backlog", async () => {

@@ -18,7 +18,7 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { AdminSettings } from "../src/admin-settings.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
-import type { UserDurableObject } from "../src/user.js";
+import { UserDurableObject } from "../src/user.js";
 import type { UsageAttribution } from "../src/usage-attribution.js";
 
 declare module "cloudflare:workers" {
@@ -38,7 +38,7 @@ const CHARGE = 3n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
 // The subset of OverseerImpl that ApprovalQueueImpl forwards to for a read operation.
 type OverseerBillingImpl = {
   storage: {
-    gatekeepers: { put(record: unknown): void };
+    gatekeepers: { put(record: unknown): void; delete(id: number): void };
     nextActionId: { get(): number };
     actions: {
       get(id: number): { type: string; description: ObservationDescription } | undefined;
@@ -51,6 +51,14 @@ type OverseerBillingImpl = {
     caller: { from: "agent"; chatId: number; attribution: UsageAttribution },
     idempotencyKey?: string,
   ): Promise<BillableOperation>;
+  beginBillableOperation(
+    gatekeeperId: number,
+    billingMethodKey: string,
+    externalAccountId: string,
+    caller: { from: "agent"; chatId: number; attribution: UsageAttribution },
+    idempotencyKey: string,
+    recovery: {vendorId: string},
+  ): Promise<BillableOperation | null>;
   authorizeObservation(
     gatekeeperId: number,
     description: ObservationDescription,
@@ -369,6 +377,111 @@ describe("Gatekeeper billing tracer: priced two-stage lifecycle", () => {
       .toBe("settled");
     expect((await user.stub.getUsageCreditBalance()).availableSubunits)
       .toBe(before.availableSubunits - CHARGE);
+  });
+
+  it("recovers an existing operation after its Hook is gone but cannot create a new one", async () => {
+    await configurePricedRate(PRICED_METHOD_KEY, CHARGE);
+    const user = await newUser();
+    const stub = env.TEST_OVERSEER.getByName(`tracer-hook-recovery-${crypto.randomUUID()}`);
+
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      const impl = (instance as unknown as { impl: OverseerBillingImpl }).impl;
+      const workspaceId = (instance as unknown as { ctx: { id: { toString(): string } } })
+        .ctx.id.toString();
+      impl.storage.gatekeepers.put({
+        id: 1,
+        class: { type: "vendor", vendorId: VENDOR_ID, accountId: EXTERNAL_ACCOUNT_ID },
+        creationSpec: {
+          type: "gatekeeper",
+          vendorId: VENDOR_ID,
+          resourceUrl: "https://context.local/",
+          typeUrlPattern: "https://context.local/*",
+        },
+      });
+      const caller = {
+        from: "agent" as const,
+        chatId: 1,
+        attribution: {
+          principal: { version: 1 as const, kind: "user" as const, userId: user.id },
+          source: "agent" as const,
+          workspaceId,
+          chatId: 1,
+        },
+      };
+      const first = await impl.beginBillableOperation(
+        1, PRICED_METHOD_KEY, EXTERNAL_ACCOUNT_ID, caller, "existing-hook-run");
+      const operationId = await first.getOperationId();
+
+      impl.storage.gatekeepers.delete(1);
+      const storage = (instance as unknown as {
+        ctx: {storage: {kv: {
+          list<T>(options: {prefix: string}): Iterable<[string, T]>;
+          delete(key: string): void;
+        }}};
+      }).ctx.storage;
+      for (const [key] of storage.kv.list({prefix: "gatekeeperBillingIdempotency:"})) {
+        storage.kv.delete(key);
+      }
+      const resumed = await impl.beginBillableOperation(
+        1, PRICED_METHOD_KEY, EXTERNAL_ACCOUNT_ID, caller, "existing-hook-run",
+        {vendorId: VENDOR_ID});
+      if (!resumed) throw new Error("Expected the existing operation to resume.");
+      expect(await resumed.getOperationId()).toBe(operationId);
+      await expect(impl.beginBillableOperation(
+        1, PRICED_METHOD_KEY, EXTERNAL_ACCOUNT_ID, caller, "new-hook-run",
+        {vendorId: VENDOR_ID},
+      )).resolves.toBeNull();
+
+      await resumed.complete("failed-before-execution");
+    });
+  });
+
+  it("does not create an Attempt when recovery finds only an Overseer idempotency mapping", async () => {
+    await configurePricedRate(PRICED_METHOD_KEY, CHARGE);
+    const user = await newUser();
+    const stub = env.TEST_OVERSEER.getByName(`tracer-partial-hook-begin-${crypto.randomUUID()}`);
+    const failedBegin = vi.spyOn(UserDurableObject.prototype, "beginGatekeeperUsage")
+      .mockRejectedValueOnce(new Error("simulated User DO begin failure"));
+
+    try {
+      await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+        const impl = (instance as unknown as { impl: OverseerBillingImpl }).impl;
+        const workspaceId = (instance as unknown as { ctx: { id: { toString(): string } } })
+          .ctx.id.toString();
+        impl.storage.gatekeepers.put({
+          id: 1,
+          class: { type: "vendor", vendorId: VENDOR_ID, accountId: EXTERNAL_ACCOUNT_ID },
+          creationSpec: {
+            type: "gatekeeper",
+            vendorId: VENDOR_ID,
+            resourceUrl: "https://context.local/",
+            typeUrlPattern: "https://context.local/*",
+          },
+        });
+        const caller = {
+          from: "agent" as const,
+          chatId: 1,
+          attribution: {
+            principal: { version: 1 as const, kind: "user" as const, userId: user.id },
+            source: "agent" as const,
+            workspaceId,
+            chatId: 1,
+          },
+        };
+
+        await expect(impl.beginBillableOperation(
+          1, PRICED_METHOD_KEY, EXTERNAL_ACCOUNT_ID, caller, "partial-hook-run",
+        )).rejects.toThrow("simulated User DO begin failure");
+        failedBegin.mockRestore();
+        impl.storage.gatekeepers.delete(1);
+        await expect(impl.beginBillableOperation(
+          1, PRICED_METHOD_KEY, EXTERNAL_ACCOUNT_ID, caller, "partial-hook-run",
+          {vendorId: VENDOR_ID},
+        )).resolves.toBeNull();
+      });
+    } finally {
+      failedBegin.mockRestore();
+    }
   });
 
   it("refuses to redirect a Gatekeeper charge to another User's Usage Account", async () => {

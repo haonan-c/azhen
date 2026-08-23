@@ -599,6 +599,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.beginGatekeeperUsage(operationId, attribution, chargeSnapshot);
   }
 
+  /** Recover an existing Gatekeeper Metering Attempt without creating a new Attempt. */
+  async resumeGatekeeperUsage(operationId: string): Promise<GatekeeperMeteringAttempt | null> {
+    await this.activateUsageAccount();
+    return this.usageAccount.resumeGatekeeperUsage(operationId);
+  }
+
   /** Begin one direct account-management operation under this initiating User's authority. */
   async beginDirectGatekeeperOperation(
       vendorId: string,

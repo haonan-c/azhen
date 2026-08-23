@@ -1106,6 +1106,18 @@ export class UsageAccount {
     return unwrapTransactionResult(result);
   }
 
+  /** Return an existing Gatekeeper Metering Attempt without creating one or reserving Credit. */
+  resumeGatekeeperUsage(operationId: string): GatekeeperMeteringAttempt | null {
+    const operationIdError = operationIdValidationError(operationId);
+    if (operationIdError) throw operationIdError;
+    const attempt = this.storage.kv.get<GatekeeperMeteringAttempt>(
+      GATEKEEPER_ATTEMPT_PREFIX + operationId,
+    );
+    if (!attempt) return null;
+    assertGatekeeperMeteringAttempt(attempt, operationId);
+    return attempt;
+  }
+
   /** Persist that one Gatekeeper business operation is about to cross the upstream boundary. */
   markGatekeeperUsageStarted(operationId: string): GatekeeperUsageStart {
     const result =
