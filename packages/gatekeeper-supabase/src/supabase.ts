@@ -1474,13 +1474,13 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
   }
 
   async query(sql: string, params?: SupabaseValue[]): Promise<SupabaseQueryResult> {
-    assertReadOnlyQuerySafe(sql);
     // Read-only queries are not cached (the SQL and parameters are arbitrary and dynamic). The
     // result size is bounded inside runReadOnlyQuery (it throws before returning an oversized body).
     return this.#ctx.read(
       "SupabaseDatabase.query",
       this.#ref,
       async api => {
+        assertReadOnlyQuerySafe(sql);
         const rows = await api.runReadOnlyQuery(this.#ref, sql, params);
         return { rows: rows as SupabaseQueryResult["rows"], rowCount: rows.length };
       },

@@ -126,15 +126,14 @@ describe("revertStoredAction", () => {
     expect(store.getAction(id)?.state).toBe("reverted");
   });
 
-  it("leaves the record applied when an append cannot be reverted", async () => {
+  it("captures the prior body during apply so an append can be reverted", async () => {
     const { api } = makeApi();
     const store = storeWith(api);
     const id = stage(store, { type: "appendContent", contentId: "123", markdown: "x" }); // no previousMarkdown
     await applyStoredAction(store, id);
 
-    const result = await revertStoredAction(store, id);
+    await revertStoredAction(store, id);
 
-    expect(result).toMatchObject({ message: expect.any(String) });
-    expect(store.getAction(id)?.state).toBe("applied");
+    expect(store.getAction(id)?.state).toBe("reverted");
   });
 });

@@ -71,6 +71,7 @@ const objectEntries = Object.entries;
 const objectFromEntries = Object.fromEntries;
 const arrayIsArray = Array.isArray;
 const arrayMap = Array.prototype.map;
+const SafeMap = Map;
 
 function wrapBinding(binding) {
   return new TrustedProxy(binding, {
@@ -125,8 +126,43 @@ export function createAttributedGadgetClass(UserGadget) {
     constructor(ctx, env) {
       super(ctx, env);
       this.#delegate = new UserGadget(ctx, wrapEnv(env));
+      const hookDeliveries = new SafeMap();
       const invoke = (invocation, methodName, args) =>
         invokeWithUsage(this.#delegate, invocation, methodName, args);
+      const invokeHookDelivery = async (invocation, methodName, args, deliveryId) => {
+        if (typeof deliveryId !== "string" || deliveryId.length === 0 || deliveryId.length > 200) {
+          throw new TypeError("Invalid Hook delivery ID.");
+        }
+        const key = "__workshop_hook_delivery:" + deliveryId + ":" + methodName;
+        const inFlight = hookDeliveries.get(key);
+        if (inFlight !== undefined) return await inFlight;
+        const delivery = (async () => {
+          const claimed = ctx.storage.transactionSync(() => {
+            const existing = ctx.storage.kv.get(key);
+            if (existing?.state === "delivered") return "delivered";
+            if (existing?.state === "claimed") return "unknown";
+            // A crash after this claim may have run arbitrary user code. This compact tombstone
+            // must not expire, because recovery cannot prove that replay is safe.
+            ctx.storage.kv.put(key, {state: "claimed"});
+            return "claimed";
+          });
+          if (claimed === "delivered") return;
+          if (claimed === "unknown") {
+            throw new Error("Hook callback delivery outcome is unknown.");
+          }
+          await ctx.storage.sync();
+          const result = await invokeWithUsage(this.#delegate, invocation, methodName, args);
+          ctx.storage.kv.put(key, {state: "delivered"});
+          await ctx.storage.sync();
+          return result;
+        })();
+        hookDeliveries.set(key, delivery);
+        try {
+          return await delivery;
+        } finally {
+          hookDeliveries.delete(key);
+        }
+      };
       const restoreUserTarget = (params) => {
         const restoreMethod = reflectGet(UserGadget.prototype, restore, this.#delegate);
         if (typeof restoreMethod !== "function") {
@@ -138,6 +174,7 @@ export function createAttributedGadgetClass(UserGadget) {
       return new TrustedProxy(this, {
         get: (target, prop) => {
           if (prop === "__workshopInvoke") return invoke;
+          if (prop === "__workshopInvokeHookDelivery") return invokeHookDelivery;
           if (prop === restore) return restoreUserTarget;
           const value = reflectGet(this.#delegate, prop, this.#delegate);
           return typeof value === "function"
@@ -2843,7 +2880,7 @@ class OverseerImpl implements AgentHooks {
 
   async invokeAttributedHookCallback(
       hookId: number, attributionValue: UsageAttribution,
-      methodName: string, args: unknown[]): Promise<unknown> {
+      methodName: string, args: unknown[], deliveryId?: string): Promise<unknown> {
     let record = this.storage.boundHooks.get(hookId);
     if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
     let base = normalizeUsageAttribution(record.attribution);
@@ -2864,8 +2901,14 @@ class OverseerImpl implements AgentHooks {
       chatId: attribution.chatId,
       attribution,
     }});
-    let invoke = Reflect.get(record.callback, "__workshopInvoke", record.callback);
-    return Reflect.apply(invoke, record.callback, [invocation, methodName, args]);
+    let invokeName = deliveryId === undefined
+      ? "__workshopInvoke"
+      : "__workshopInvokeHookDelivery";
+    let invoke = Reflect.get(record.callback, invokeName, record.callback);
+    return Reflect.apply(invoke, record.callback,
+        deliveryId === undefined
+          ? [invocation, methodName, args]
+          : [invocation, methodName, args, deliveryId]);
   }
 
   // Build the agent's executeCode env from the chat's binding map: each name resolves to a
@@ -3834,15 +3877,62 @@ class OverseerImpl implements AgentHooks {
    */
   async beginBillableOperation(
       gatekeeperId: number, billingMethodKey: string, externalAccountId: string,
-      caller: GatekeeperCaller): Promise<BillableOperation> {
+      caller: GatekeeperCaller, idempotencyKey?: string): Promise<BillableOperation> {
     caller = normalizeGatekeeperCaller(caller);
     let vendorId = gatekeeperVendorId(this.storage.gatekeepers.get(gatekeeperId));
     if (!vendorId) {
       throw new Error("This gatekeeper has no vendor identity to bill against.");
     }
-    let operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
-    let chargeSnapshot = await this.ctx.exports.AdminSettings.getByName("")
-        .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
+    let operationId: string;
+    let chargeSnapshot: GatekeeperChargeSnapshot;
+    if (idempotencyKey !== undefined) {
+      if (idempotencyKey.length === 0 || idempotencyKey.length > 200) {
+        throw new TypeError("Gatekeeper billing idempotency key must contain 1 to 200 characters.");
+      }
+      let identity = new TextEncoder().encode(JSON.stringify([
+        gatekeeperId,
+        billingMethodKey,
+        externalAccountId,
+        idempotencyKey,
+        caller.from,
+        "chatId" in caller ? caller.chatId : undefined,
+        "gadgetId" in caller ? caller.gadgetId : undefined,
+        "hookId" in caller ? caller.hookId : undefined,
+        caller.attribution.principal.version,
+        caller.attribution.principal.kind,
+        caller.attribution.principal.userId,
+        caller.attribution.source,
+        caller.attribution.workspaceId,
+        caller.attribution.chatId,
+        caller.attribution.gadgetId,
+        caller.attribution.automationId,
+        caller.attribution.automationRunId,
+      ]));
+      let digest = new Uint8Array(await crypto.subtle.digest("SHA-256", identity)).toHex();
+      let key = `gatekeeperBillingIdempotency:${digest}`;
+      type IdempotencyRecord = {
+        operationId: string;
+        chargeSnapshot: GatekeeperChargeSnapshot;
+      };
+      const candidate: IdempotencyRecord = {
+        operationId: `gatekeeper-operation:${crypto.randomUUID()}`,
+        chargeSnapshot: await this.ctx.exports.AdminSettings.getByName("")
+            .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey),
+      };
+      const selected = this.ctx.storage.transactionSync(() => {
+        const existing = this.ctx.storage.kv.get<IdempotencyRecord>(key);
+        if (existing) return existing;
+        this.ctx.storage.kv.put(key, candidate);
+        return candidate;
+      });
+      operationId = selected.operationId;
+      chargeSnapshot = selected.chargeSnapshot;
+      await this.ctx.storage.sync();
+    } else {
+      operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+      chargeSnapshot = await this.ctx.exports.AdminSettings.getByName("")
+          .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
+    }
     let principalUserId = caller.attribution.principal.userId;
     await this.userForPrincipal(principalUserId).beginGatekeeperUsage(
         operationId,
@@ -8136,9 +8226,10 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   /** Invoke one persisted Hook callback under its host-attested Usage attribution. */
   async invokeAttributedHookCallback(
       hookId: number, attribution: UsageAttribution,
-      methodName: string, args: unknown[]): Promise<unknown> {
+      methodName: string, args: unknown[], deliveryId?: string): Promise<unknown> {
     try {
-      return await this.impl.invokeAttributedHookCallback(hookId, attribution, methodName, args);
+      return await this.impl.invokeAttributedHookCallback(
+          hookId, attribution, methodName, args, deliveryId);
     } catch (error) {
       this.impl.logger.warn("hook callback delivery failed", {
         event: "hook.callback.delivery.failed",
@@ -8174,27 +8265,34 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 
     let attribution = normalizeUsageAttribution(record.attribution);
     if (vendorId === "scheduler") {
-      if (!run) throw new Error("Scheduled run attribution is required.");
+      if (!run || !("automationId" in run)) {
+        throw new Error("Scheduled run attribution is required.");
+      }
       attribution = normalizeUsageAttribution({
         ...attribution,
         source: "scheduled",
         automationId: run.automationId,
         automationRunId: run.automationRunId,
       });
-    } else if (run !== undefined) {
+    } else if (run !== undefined && !("deliveryId" in run)) {
       throw new Error("Automation dimensions are only valid for scheduled hooks.");
+    } else if (run?.deliveryId !== undefined &&
+        (run.deliveryId.length === 0 || run.deliveryId.length > 200)) {
+      throw new TypeError("Hook delivery ID must contain 1 to 200 characters.");
     }
 
     let callback = this.impl.ctx.exports.HookCallbackLoopback({props: {
       overseerId: this.impl.ctx.id.toString(),
       hookId,
       attribution,
+      ...(run?.deliveryId ? {deliveryId: run.deliveryId} : {}),
     }});
 
     return {
       callback: callback as unknown as NativeRpcStub<RpcTarget>,
       approvalQueue: new ApprovalQueueImpl(this.impl, record.gatekeeperId, {
         from: "hook",
+        hookId,
         attribution,
       }),
     };
@@ -8249,6 +8347,7 @@ type GatekeeperCaller = ({
   chatId?: number;
 } | {
   from: "hook";
+  hookId?: number;
 }) & {attribution: UsageAttribution};
 
 function normalizeGatekeeperCaller(caller: GatekeeperCaller): GatekeeperCaller {
@@ -8261,6 +8360,8 @@ function sameGatekeeperCaller(left: GatekeeperCaller, right: GatekeeperCaller): 
         ("chatId" in right ? right.chatId : undefined) &&
       ("gadgetId" in left ? left.gadgetId : undefined) ===
         ("gadgetId" in right ? right.gadgetId : undefined) &&
+      ("hookId" in left ? left.hookId : undefined) ===
+        ("hookId" in right ? right.hookId : undefined) &&
       sameUsageAttribution(left.attribution, right.attribution);
 }
 
@@ -8329,6 +8430,7 @@ type HookCallbackLoopbackProps = {
   overseerId: string;
   hookId: number;
   attribution: UsageAttribution;
+  deliveryId?: string;
 };
 
 type BindingLoopbackTarget = {
@@ -8365,7 +8467,7 @@ export class HookCallbackLoopback
         }
         if (prop === "then") return undefined;
         return (...args: unknown[]) => overseer.invokeAttributedHookCallback(
-            ctx.props.hookId, ctx.props.attribution, String(prop), args);
+            ctx.props.hookId, ctx.props.attribution, String(prop), args, ctx.props.deliveryId);
       },
       getPrototypeOf() {
         return WorkerEntrypoint.prototype;
@@ -11208,9 +11310,10 @@ class SlashCommandAuthorizerImpl extends NativeRpcTarget implements ObservationA
   }
 
   beginBillableOperation(
-      billingMethodKey: string, externalAccountId: string): Promise<BillableOperation> {
+      billingMethodKey: string, externalAccountId: string,
+      idempotencyKey?: string): Promise<BillableOperation> {
     return this.impl.beginBillableOperation(
-        this.gatekeeperId, billingMethodKey, externalAccountId, this.caller);
+        this.gatekeeperId, billingMethodKey, externalAccountId, this.caller, idempotencyKey);
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {
@@ -11226,9 +11329,10 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   }
 
   beginBillableOperation(
-      billingMethodKey: string, externalAccountId: string): Promise<BillableOperation> {
+      billingMethodKey: string, externalAccountId: string,
+      idempotencyKey?: string): Promise<BillableOperation> {
     return this.impl.beginBillableOperation(
-        this.gatekeeperId, billingMethodKey, externalAccountId, this.caller);
+        this.gatekeeperId, billingMethodKey, externalAccountId, this.caller, idempotencyKey);
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {

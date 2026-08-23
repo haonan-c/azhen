@@ -1,10 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { testGatekeeperBillingContract } from "../../backend-utils/test/gatekeeper-billing-contract";
+import {
+  testGatekeeperBillingContract,
+  testPublicBillingSurface,
+} from "../../backend-utils/test/gatekeeper-billing-contract";
 import {
   SUPABASE_BILLING_METHODS,
   SUPABASE_WRITE_BILLING_METHODS,
   supabaseActionBilling,
 } from "../src/billing-methods";
+
+testPublicBillingSurface(
+  "Supabase",
+  new URL("../src/types.d.ts", import.meta.url),
+  ["SupabaseOrganization", "SupabaseProject", "SupabaseDatabase"],
+  {
+    "SupabaseOrganization.getInfo": "R", "SupabaseOrganization.listProjects": "R",
+    "SupabaseOrganization.getProject": "R", "SupabaseProject.getInfo": "R",
+    "SupabaseProject.getDatabase": {
+      kind: "C", reason: "Constructs a database capability without reading provider or cache data.",
+    },
+    "SupabaseProject.checkHealth": "R",
+    "SupabaseProject.listEdgeFunctions": "R", "SupabaseProject.getEdgeFunctionSource": "R",
+    "SupabaseProject.listStorageBuckets": "R", "SupabaseDatabase.query": "R",
+    "SupabaseDatabase.execute": "A", "SupabaseDatabase.listSchemas": "R",
+    "SupabaseDatabase.listTables": "R", "SupabaseDatabase.describeTable": "R",
+  },
+  { ...SUPABASE_BILLING_METHODS, ...SUPABASE_WRITE_BILLING_METHODS },
+);
 
 testGatekeeperBillingContract(
   "Supabase",
@@ -22,7 +44,7 @@ describe("Supabase billing methods", () => {
 
   it("adds approved Action billing facts", () => {
     expect(supabaseActionBilling("account-1")).toEqual({
-      methodKey: "supabase.database.execute",
+      methodKey: "supabase.database.sql.execute.v1",
       externalAccountId: "account-1",
       providerIdempotency: "unsupported",
     });

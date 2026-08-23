@@ -49,6 +49,7 @@ type OverseerBillingImpl = {
     billingMethodKey: string,
     externalAccountId: string,
     caller: { from: "agent"; chatId: number; attribution: UsageAttribution },
+    idempotencyKey?: string,
   ): Promise<BillableOperation>;
   authorizeObservation(
     gatekeeperId: number,
@@ -88,6 +89,10 @@ async function traceRead(options: {
   authorize?: boolean;
   /** Retries and extra pages the Gatekeeper makes while serving this one business operation. */
   upstreamAttempts?: number;
+  /** Repeat begin with this ingress identity to simulate recovery after local state loss. */
+  idempotencyKey?: string;
+  /** Race this many retries through the same Durable Object input gate. */
+  concurrentBegins?: number;
 }): Promise<{ trace: string[]; operationId: string; result: string | null }> {
   const trace: string[] = [];
   const stub = env.TEST_OVERSEER.getByName(options.overseerName);
@@ -120,11 +125,30 @@ async function traceRead(options: {
 
     // ---- The Gatekeeper's side of the contract starts here. ----
     trace.push("gatekeeper:begin");
-    let operation = await impl.beginBillableOperation(
-      1, options.billingMethodKey, EXTERNAL_ACCOUNT_ID, caller);
+    let operation: BillableOperation;
+    if (options.concurrentBegins) {
+      const operations = await Promise.all(Array.from(
+        {length: options.concurrentBegins},
+        () => impl.beginBillableOperation(
+          1, options.billingMethodKey, EXTERNAL_ACCOUNT_ID, caller, options.idempotencyKey),
+      ));
+      operation = operations[0];
+      const operationIds = await Promise.all(operations.map(item => item.getOperationId()));
+      expect(new Set(operationIds).size).toBe(1);
+      trace.push("workshop:concurrent-retries-shared-operation");
+    } else {
+      operation = await impl.beginBillableOperation(
+        1, options.billingMethodKey, EXTERNAL_ACCOUNT_ID, caller, options.idempotencyKey);
+    }
     trace.push("workshop:began");
 
     const operationId = await operation.getOperationId();
+    if (options.idempotencyKey && !options.concurrentBegins) {
+      operation = await impl.beginBillableOperation(
+        1, options.billingMethodKey, EXTERNAL_ACCOUNT_ID, caller, options.idempotencyKey);
+      expect(await operation.getOperationId()).toBe(operationId);
+      trace.push("workshop:resumed-same-operation");
+    }
 
     trace.push("gatekeeper:markStarted");
     await operation.markStarted();
@@ -289,6 +313,27 @@ describe("Gatekeeper billing tracer: priced two-stage lifecycle", () => {
       .toMatchObject({attempt: {state: "settled"}, startedNow: false});
 
     // Exactly one fixed API charge for the whole business operation.
+    expect((await user.stub.getUsageCreditBalance()).availableSubunits)
+      .toBe(before.availableSubunits - CHARGE);
+  });
+
+  it("restores one operation when a trusted ingress repeats its idempotency key", async () => {
+    await configurePricedRate(PRICED_METHOD_KEY, CHARGE);
+    const user = await newUser();
+    const before = await user.stub.getUsageCreditBalance();
+
+    const { trace, operationId } = await traceRead({
+      overseerName: `tracer-ingress-retry-${crypto.randomUUID()}`,
+      principalUserId: user.id,
+      billingMethodKey: PRICED_METHOD_KEY,
+      idempotencyKey: "opaque-delivery-1",
+      concurrentBegins: 2,
+      upstream: async () => "delivery",
+    });
+
+    expect(trace).toContain("workshop:concurrent-retries-shared-operation");
+    expect((await user.stub.completeGatekeeperUsage(operationId, "executed")).outcome)
+      .toBe("settled");
     expect((await user.stub.getUsageCreditBalance()).availableSubunits)
       .toBe(before.availableSubunits - CHARGE);
   });

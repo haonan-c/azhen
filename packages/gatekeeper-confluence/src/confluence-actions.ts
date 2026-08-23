@@ -29,6 +29,7 @@ import {
   ConfluenceApi,
   contentBodyMarkdown,
   contentToSummary,
+  spaceKeyFromWebui,
   type ContentResponse,
 } from "./confluence-api";
 import { markdownToStorage, storageToMarkdown } from "./confluence-markdown";
@@ -51,9 +52,9 @@ export type ConfluenceAction =
       content?: string;
       status: "current" | "draft";
     }
-  | { type: "setContent"; contentId: string; markdown: string; previousMarkdown: string }
+  | { type: "setContent"; contentId: string; markdown: string; previousMarkdown?: string }
   | { type: "appendContent"; contentId: string; markdown: string; previousMarkdown?: string }
-  | { type: "setTitle"; contentId: string; title: string; previousTitle: string }
+  | { type: "setTitle"; contentId: string; title: string; previousTitle?: string }
   | { type: "addComment"; contentId: string; text: string }
   | { type: "addLabel"; contentId: string; name: string }
   | { type: "removeLabel"; contentId: string; name: string }
@@ -389,7 +390,7 @@ function describeAction(action: ConfluenceAction): ActionDescription {
     case "setTitle":
       return {
         title: "Rename Confluence content",
-        description: `Change the title to **${action.title}** (was “${action.previousTitle}”).`,
+        description: `Change the title to **${action.title}**.`,
         implementsRevert: true,
         actionKind: kind("setTitle", "Rename content"),
       };
@@ -486,7 +487,12 @@ function preservedStatus(current: ContentResponse): "draft" | "current" {
   return current.status === "draft" ? "draft" : "current";
 }
 
-async function applyAction(store: ConfluenceStore, record: StoredActionRecord): Promise<void> {
+async function applyAction(
+  store: ConfluenceStore,
+  record: StoredActionRecord,
+  prepared?: PreparedConfluenceAction,
+): Promise<void> {
+  prepared ??= await prepareAction(store, record);
   const api = store.api;
   const action = record.action;
 
@@ -494,7 +500,8 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     case "createContent": {
       const spaceKey = action.parent.spaceKey;
       if (!spaceKey) throw new Error("Cannot create content without a space.");
-      const spaceId = await store.getSpaceId(spaceKey);
+      const spaceId = prepared.spaceId;
+      if (!spaceId) throw new Error("Cannot create content without a resolved space.");
       const storageValue = markdownToStorage(action.content ?? "");
       const created = action.kind === "blogpost"
         ? await api.createBlogPost({ spaceId, title: action.title, status: action.status, storageValue })
@@ -512,7 +519,7 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     }
     case "setContent": {
       const id = requireResolved(store, action.contentId);
-      const current = await store.getContentResponse(id, true);
+      const current = prepared.current!;
       await api.updateContent({
         id,
         type: current.type === "blogpost" ? "blogpost" : "page",
@@ -526,7 +533,7 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     }
     case "appendContent": {
       const id = requireResolved(store, action.contentId);
-      const current = await store.getContentResponse(id, true);
+      const current = prepared.current!;
       const combined = (current.body?.storage?.value ?? "") + markdownToStorage(action.markdown);
       await api.updateContent({
         id,
@@ -541,7 +548,7 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     }
     case "setTitle": {
       const id = requireResolved(store, action.contentId);
-      const current = await store.getContentResponse(id, true);
+      const current = prepared.current!;
       await api.updateContent({
         id,
         type: current.type === "blogpost" ? "blogpost" : "page",
@@ -556,7 +563,7 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     case "addComment": {
       const id = requireResolved(store, action.contentId);
       // The comment container type must match the target (blog posts reject a "page" container).
-      const target = await store.getContentResponse(id, true);
+      const target = prepared.current!;
       const created = await api.addComment(id, markdownToStorage(action.text),
         target.type === "blogpost" ? "blogpost" : "page");
       record.createdContentId = created.id;
@@ -580,7 +587,7 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
     }
     case "trash": {
       const id = requireResolved(store, action.contentId);
-      await api.trashContent(id, await store.getContentKind(id));
+      await api.trashContent(id, prepared.current?.type === "blogpost" ? "blogpost" : "page");
       store.invalidateContent(action.contentId);
       break;
     }
@@ -594,6 +601,39 @@ async function applyAction(store: ConfluenceStore, record: StoredActionRecord): 
   // overlaying it on top of the (refetched) real state.
   record.state = "applied";
   store.putAction(record);
+}
+
+type PreparedConfluenceAction = {
+  record: StoredActionRecord;
+  current?: ContentResponse;
+  spaceId?: string;
+};
+
+async function prepareAction(
+  store: ConfluenceStore,
+  record: StoredActionRecord,
+): Promise<PreparedConfluenceAction> {
+  const action = record.action;
+  if (action.type === "createContent") {
+    if (action.parent.type === "page" && !action.parent.spaceKey) {
+      const parent = await store.getContentResponse(requireResolved(store, action.parent.parentId), true);
+      action.parent.spaceKey = spaceKeyFromWebui(parent._links?.webui);
+    }
+    if (!action.parent.spaceKey) throw new Error("Cannot create content without a space.");
+    return { record, spaceId: await store.getSpaceId(action.parent.spaceKey) };
+  }
+  if (action.type === "setContent" || action.type === "appendContent" ||
+      action.type === "setTitle" || action.type === "addComment" || action.type === "trash") {
+    const current = await store.getContentResponse(requireResolved(store, action.contentId), true);
+    if (action.type === "setContent" || action.type === "appendContent") {
+      action.previousMarkdown ??= contentBodyMarkdown(current);
+    } else if (action.type === "setTitle") {
+      action.previousTitle ??= current.title;
+    }
+    store.putAction(record);
+    return { record, current };
+  }
+  return { record };
 }
 
 export async function applyStoredAction(store: ConfluenceStore, id: number): Promise<void> {
@@ -614,6 +654,7 @@ export function applyBillableStoredAction(
     actionId: id,
     execution,
     getPending: () => store.getAction(id),
+    recoverApplying: () => store.getAction(id)?.state === "applied" ? "accepted" : undefined,
     removePending: outcome => {
       const record = store.getAction(id);
       if (record && outcome === "failed-before-execution") {
@@ -623,8 +664,9 @@ export function applyBillableStoredAction(
         store.putAction(record);
       }
     },
-    prepare: async record => record,
-    execute: (record, activity) => applyAction(store.withActivity(activity), record),
+    prepare: (record, activity) => prepareAction(store.withActivity(activity), record),
+    execute: (prepared, activity) => applyAction(
+      store.withActivity(activity), prepared.record, prepared),
   });
 }
 
@@ -690,8 +732,8 @@ async function revertAction(store: ConfluenceStore, record: StoredActionRecord):
       return;
     case "setContent":
     case "appendContent": {
-      if (action.type === "appendContent" && action.previousMarkdown === undefined) {
-        return { message: "Cannot automatically revert this append (the prior content was not captured)." };
+      if (action.previousMarkdown === undefined) {
+        return { message: "Cannot automatically revert this edit (the prior content was not captured)." };
       }
       const id2 = requireResolved(store, action.contentId);
       const current = await store.getContentResponse(id2, true);
@@ -707,6 +749,9 @@ async function revertAction(store: ConfluenceStore, record: StoredActionRecord):
       return;
     }
     case "setTitle": {
+      if (action.previousTitle === undefined) {
+        return { message: "Cannot automatically revert this rename (the prior title was not captured)." };
+      }
       const id2 = requireResolved(store, action.contentId);
       const current = await store.getContentResponse(id2, true);
       await api.updateContent({

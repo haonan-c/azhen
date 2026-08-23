@@ -92,6 +92,19 @@ describe("OverseerDurableObject.startHook", () => {
     })});
   });
 
+  it("attaches an opaque delivery ID to an ordinary Hook callback", async () => {
+    let overseer = makeOverseer(
+        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
+        {enabled: true, vendorId: "email", callback: {}});
+
+    const result = await overseer.startHook(1, {deliveryId: "opaque-receipt-1"});
+    expect(result.callback).toEqual({props: expect.objectContaining({
+      hookId: 1,
+      deliveryId: "opaque-receipt-1",
+      attribution: expect.objectContaining({source: "hook"}),
+    })});
+  });
+
   it("rejects delivery for an administratively disabled ordinary vendor", async () => {
     let config = { ...DEFAULT_ADMIN_CONFIG, disabledGatekeepers: ["email"] };
     let overseer = makeOverseer(async () => serializeAdminConfig(config));

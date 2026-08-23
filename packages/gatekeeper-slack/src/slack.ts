@@ -1,6 +1,9 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { runBillableRead } from "@gadgets/backend-utils/gatekeeper-billing";
+import {
+  BillableCursorBilling,
+  runBillableRead,
+} from "@gadgets/backend-utils/gatekeeper-billing";
 import {
   GatekeeperUser, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription,
   ApprovalQueue, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions,
@@ -843,8 +846,15 @@ function validateSearchQuery(query: string): void {
 class SlackCursor<T> extends RpcTarget implements Cursor<T> {
   #ctx: SlackSessionContext;
   #loadPage: (
-    ctx: SlackSessionContext, cursor: string | undefined,
-  ) => Promise<{ items: T[]; nextCursor?: string }>;
+    ctx: SlackSessionContext, api: SlackApi, cursor: string | undefined,
+  ) => Promise<{
+    items: T[];
+    nextCursor?: string;
+    description: ObservationDescription;
+    conversationIds: string[];
+  }>;
+  #billing: BillableCursorBilling;
+  #lastConversationIds: string[] = [];
   #cursor: string | undefined;
   #exhausted = false;
   // Serialize concurrent next() calls so each consumes a distinct page.
@@ -852,15 +862,32 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
 
   constructor(
       ctx: SlackSessionContext,
+      method: SlackBillingMethod,
       loadPage: (
-        ctx: SlackSessionContext, cursor: string | undefined,
-      ) => Promise<{ items: T[]; nextCursor?: string }>) {
+        ctx: SlackSessionContext, api: SlackApi, cursor: string | undefined,
+      ) => Promise<{
+        items: T[];
+        nextCursor?: string;
+        description: ObservationDescription;
+        conversationIds: string[];
+      }>) {
     super();
     this.#ctx = dupSessionContext(ctx);
     this.#loadPage = loadPage;
+    this.#billing = new BillableCursorBilling(
+      {
+        beginBillableOperation: (methodKey, externalAccountId) =>
+          this.#ctx.approvalQueue.beginBillableOperation(methodKey, externalAccountId),
+        authorizeObservation: description => authorizeConversationObservation(
+          this.#ctx, this.#lastConversationIds, description),
+      },
+      this.#ctx.externalAccountId,
+      SLACK_BILLING_METHODS[method].methodKey,
+    );
   }
 
   [Symbol.dispose]() {
+    this.#billing[Symbol.dispose]();
     this.#ctx.approvalQueue[Symbol.dispose]();
   }
 
@@ -872,7 +899,15 @@ class SlackCursor<T> extends RpcTarget implements Cursor<T> {
 
   async #nextPage(): Promise<T[] | null> {
     while (!this.#exhausted) {
-      let page = await this.#loadPage(this.#ctx, this.#cursor);
+      const page = await this.#billing.page(
+        async activity => {
+          const result = await this.#loadPage(
+            this.#ctx, this.#ctx.api.withActivity(activity), this.#cursor);
+          this.#lastConversationIds = result.conversationIds;
+          return result;
+        },
+        result => result.description,
+      );
       this.#cursor = page.nextCursor;
       this.#exhausted = !page.nextCursor;
       if (page.items.length > 0) return page.items;
@@ -1226,37 +1261,31 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
 
   #listConversations(
       types: SlackConversationTypeFilter[], title: string,
-      method: "SlackWorkspaceSession.listChannels.next" |
-        "SlackWorkspaceSession.listDirectMessages.next"): Cursor<SlackConversationEntry> {
-    return new SlackCursor<SlackConversationEntry>(this.#ctx, async (ctx, cursor) => {
-      return runSlackRead(
-        ctx,
-        method,
-        async api => {
+      method: "SlackWorkspaceSession.listChannels" |
+        "SlackWorkspaceSession.listDirectMessages"): Cursor<SlackConversationEntry> {
+    return new SlackCursor<SlackConversationEntry>(this.#ctx, method,
+      async (ctx, api, cursor) => {
           const page = await api.listUserConversations(types, cursor, CONVERSATION_PAGE_SIZE);
           return {
             items: page.items.map(info => conversationEntry(ctx, info)),
             nextCursor: page.nextCursor,
-            conversations: page.items,
-          };
-        },
-        page => ({
-          title: `${title} (${page.items.length})`,
-          description: page.items.length > 0
-              ? `Listed conversations:\n${page.conversations.map(info =>
+            description: {
+              title: `${title} (${page.items.length})`,
+              description: page.items.length > 0
+              ? `Listed conversations:\n${page.items.map(info =>
                   `- ${info.name ? "#" + info.name : conversationLabel(info)}`).join("\n")}`
               : "No conversations on this page.",
-        }),
-        page => page.conversations.map(info => info.id),
-      );
-    });
+            },
+            conversationIds: page.items.map(info => info.id),
+          };
+      });
   }
 
   async listChannels(): Promise<Cursor<SlackConversationEntry>> {
     return this.#listConversations(
       ["public_channel", "private_channel"],
       "List Slack channels",
-      "SlackWorkspaceSession.listChannels.next",
+      "SlackWorkspaceSession.listChannels",
     );
   }
 
@@ -1264,22 +1293,23 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
     return this.#listConversations(
       ["im", "mpim"],
       "List Slack direct messages",
-      "SlackWorkspaceSession.listDirectMessages.next",
+      "SlackWorkspaceSession.listDirectMessages",
     );
   }
 
   async listUsers(): Promise<Cursor<SlackUser>> {
-    return new SlackCursor<SlackUser>(this.#ctx, async (ctx, cursor) => {
-      return runSlackRead(
-        ctx,
-        "SlackWorkspaceSession.listUsers.next",
-        api => api.listUsers(cursor, USER_PAGE_SIZE),
-        page => ({
-          title: `List Slack members (${page.items.length})`,
-          description: `Read a page of ${page.items.length} workspace members.`,
-        }),
-      );
-    });
+    return new SlackCursor<SlackUser>(
+      this.#ctx, "SlackWorkspaceSession.listUsers", async (_ctx, api, cursor) => {
+        const page = await api.listUsers(cursor, USER_PAGE_SIZE);
+        return {
+          ...page,
+          description: {
+            title: `List Slack members (${page.items.length})`,
+            description: `Read a page of ${page.items.length} workspace members.`,
+          },
+          conversationIds: [],
+        };
+      });
   }
 
   async getUser(userId: string): Promise<SlackUser> {
@@ -1295,42 +1325,26 @@ class SlackWorkspaceSessionImpl extends RpcTarget implements SlackWorkspaceSessi
   }
 
   async getConversation(conversationId: string): Promise<SlackConversation> {
-    const info = await runSlackRead(
-      this.#ctx,
-      "SlackWorkspaceSession.getConversation",
-      api => api.getConversationInfo(conversationId),
-      value => ({
-        title: `Open Slack conversation ${value.name ? "#" + value.name : value.id}`,
-        description: `Open ${conversationLabel(value)} for reading.`,
-      }),
-      value => [value.id],
-    );
-    return new SlackConversationImpl(dupSessionContext(this.#ctx), info.id);
+    return new SlackConversationImpl(dupSessionContext(this.#ctx), conversationId);
   }
 
   async search(query: string): Promise<Cursor<SlackMessageEntry>> {
-    validateSearchQuery(query);
-    return new SlackCursor<SlackMessageEntry>(this.#ctx, async (ctx, cursor) => {
-      return runSlackRead(
-        ctx,
-        "SlackWorkspaceSession.search.next",
-        async api => {
+    return new SlackCursor<SlackMessageEntry>(
+      this.#ctx, "SlackWorkspaceSession.search", async (ctx, api, cursor) => {
+          validateSearchQuery(query);
           const page = await api.searchMessages(query, cursor, SEARCH_PAGE_SIZE);
           return {
             items: page.items.map(match => messageEntry(ctx, match.channelId, match.message)),
             nextCursor: page.nextCursor,
-            channelIds: [...new Set(page.items.map(match => match.channelId))],
-          };
-        },
-        page => ({
-          title: `Search Slack (${page.items.length} results)`,
-          description:
+            description: {
+              title: `Search Slack (${page.items.length} results)`,
+              description:
               `Search the workspace for messages.\n\nQuery: ${truncate(query)}\n\n` +
               `Matched ${page.items.length} messages on this page.`,
-        }),
-        page => page.channelIds,
-      );
-    });
+            },
+            conversationIds: [...new Set(page.items.map(match => match.channelId))],
+          };
+      });
   }
 }
 
@@ -1364,72 +1378,52 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
 
   async members(): Promise<Cursor<SlackUser>> {
     let conversationId = this.#conversationId;
-    return new SlackCursor<SlackUser>(this.#ctx, async (ctx, cursor) => {
-      return runSlackRead(
-        ctx,
-        "SlackConversation.members.next",
-        async api => {
+    return new SlackCursor<SlackUser>(
+      this.#ctx, "SlackConversation.members", async (_ctx, api, cursor) => {
           const page = await api.listConversationMembers(
             conversationId, cursor, MEMBER_PAGE_SIZE,
           );
           const users = await mapWithConcurrency(page.items, id => api.getUser(id));
-          return { items: users, nextCursor: page.nextCursor };
-        },
-        page => ({
-          title: `List Slack conversation members (${page.items.length})`,
-          description: `Read ${page.items.length} members of conversation ${conversationId}.`,
-        }),
-        () => [conversationId],
-      );
-    });
+          return {
+            items: users,
+            nextCursor: page.nextCursor,
+            description: {
+              title: `List Slack conversation members (${users.length})`,
+              description: `Read ${users.length} members of conversation ${conversationId}.`,
+            },
+            conversationIds: [conversationId],
+          };
+      });
   }
 
   async listMessages(): Promise<Cursor<SlackMessageEntry>> {
     let conversationId = this.#conversationId;
-    return new SlackCursor<SlackMessageEntry>(this.#ctx, async (ctx, cursor) => {
-      return runSlackRead(
-        ctx,
-        "SlackConversation.listMessages.next",
-        async api => {
+    return new SlackCursor<SlackMessageEntry>(
+      this.#ctx, "SlackConversation.listMessages", async (ctx, api, cursor) => {
           const page = await api.listHistory(conversationId, cursor, HISTORY_PAGE_SIZE);
           return {
             items: page.items.map(message => messageEntry(ctx, conversationId, message)),
             nextCursor: page.nextCursor,
-          };
-        },
-        page => ({
-          title: `Read Slack messages (${page.items.length})`,
-          description:
+            description: {
+              title: `Read Slack messages (${page.items.length})`,
+              description:
               `Read a page of ${page.items.length} messages from conversation ${conversationId}.`,
-        }),
-        () => [conversationId],
-      );
-    });
+            },
+            conversationIds: [conversationId],
+          };
+      });
   }
 
   async getThread(threadTs: string): Promise<SlackThread> {
-    await runSlackRead(
-      this.#ctx,
-      "SlackConversation.getThread",
-      api => api.listReplies(this.#conversationId, threadTs, undefined, 1),
-      () => ({
-        title: "Open Slack thread",
-        description: `Open a thread in conversation ${this.#conversationId}.`,
-      }),
-      () => [this.#conversationId],
-    );
     return new SlackThreadImpl(dupSessionContext(this.#ctx), this.#conversationId, threadTs);
   }
 
   async search(query: string): Promise<Cursor<SlackMessageEntry>> {
-    validateSearchQuery(query);
     // The name narrows Slack's search; ID filtering below remains the security boundary.
     let conversationId = this.#conversationId;
-    return new SlackCursor<SlackMessageEntry>(this.#ctx, async (ctx, cursor) => {
-      return runSlackRead(
-        ctx,
-        "SlackConversation.search.next",
-        async api => {
+    return new SlackCursor<SlackMessageEntry>(
+      this.#ctx, "SlackConversation.search", async (ctx, api, cursor) => {
+          validateSearchQuery(query);
           const info = await api.getConversationInfo(conversationId);
           const effectiveQuery = info.name ? `in:#${info.name} ${query}` : query;
           const page = await api.searchMessages(
@@ -1438,18 +1432,15 @@ class SlackConversationImpl extends RpcTarget implements SlackConversation {
           return {
             items: page.items.map(match => messageEntry(ctx, match.channelId, match.message)),
             nextCursor: page.nextCursor,
-            info,
-          };
-        },
-        page => ({
-          title: `Search Slack conversation (${page.items.length} results)`,
-          description:
-              `Search within ${conversationLabel(page.info)}.\n\nQuery: ${truncate(query)}\n\n` +
+            description: {
+              title: `Search Slack conversation (${page.items.length} results)`,
+              description:
+              `Search within ${conversationLabel(info)}.\n\nQuery: ${truncate(query)}\n\n` +
               `Matched ${page.items.length} messages on this page.`,
-        }),
-        () => [conversationId],
-      );
-    });
+            },
+            conversationIds: [conversationId],
+          };
+      });
   }
 }
 

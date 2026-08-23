@@ -18,6 +18,8 @@ export type EmailAttachment = {
 
 /** An inbound email message, parsed into structured fields. */
 export type IncomingEmail = {
+  /** Opaque stable identifier for deduplicating a retried delivery callback. */
+  receiptId: string;
   /** Sender address. */
   from: EmailAddress;
   /** Recipient addresses. */

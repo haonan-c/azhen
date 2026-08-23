@@ -943,10 +943,15 @@ export interface ObservationAuthorizer extends RpcTarget {
    * Metering Attempt instead, so Unpriced Use stays visible rather than silently free.
    *
    * Call this once per caller-visible business operation, not once per HTTP request.
+   *
+   * `idempotencyKey` is an optional opaque, content-free delivery identity for unattended work
+   * that the trusted Gatekeeper ingress may retry after losing its local state. Repeating the same
+   * key with the same host-attested caller and billing dimensions restores the original operation.
    */
   beginBillableOperation(
     billingMethodKey: string,
     externalAccountId: string,
+    idempotencyKey?: string,
   ): Promise<BillableOperation>;
 
   /**
@@ -1411,10 +1416,16 @@ export interface HookInitiator<Hook extends RpcTarget> extends WorkerEntrypoint 
       Promise<{callback: RpcStub<Hook>, approvalQueue: RpcStub<ApprovalQueue>}>;
 }
 
-/** Content-free automation dimensions supplied by a trusted scheduled-event gatekeeper. */
-export interface HookRunMetadata {
+/** Content-free run identity supplied by a trusted unattended-event Gatekeeper. */
+export type HookRunMetadata = {
   /** Stable ID of the automation definition that caused this run. */
   automationId: string;
   /** Stable ID of this individual automation run. */
   automationRunId: string;
-}
+  deliveryId?: never;
+} | {
+  /** Opaque stable identity used to deduplicate one retried Hook callback delivery. */
+  deliveryId: string;
+  automationId?: never;
+  automationRunId?: never;
+};

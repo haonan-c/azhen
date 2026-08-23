@@ -696,30 +696,55 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
     execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     const store = new EnrichmentStore(this.ctx.storage.kv);
+    const durableOutcome = store.getResult(action);
+    if (durableOutcome?.status === "ready" &&
+        durableOutcome.billingOperationId === execution.billingOperationId) {
+      store.removePending(action);
+      return { outcome: "accepted" };
+    }
     const account = this.#userAccount();
-    return runBillableAction({
+    const result = await runBillableAction({
       storage: durableBillableActionStorage(this.ctx.storage),
       actionId: action,
       execution,
       getPending: () => store.getPending(action),
+      recoverApplying: () => {
+        const result = store.getResult(action);
+        return result?.status === "ready" &&
+          result.billingOperationId === execution.billingOperationId
+          ? "accepted"
+          : undefined;
+      },
       removePending: () => store.removePending(action),
       prepare: async pending => pending,
       execute: async (pending, activity) => {
-        try {
-          const result = await callZoomInfo(
-            account,
-            () => performEnrichment(this.#makeApi(account).withActivity(activity), pending),
-          );
-          store.putResult(action, { status: "ready", result });
-        } catch (error) {
-          store.putResult(action, {
-            status: "failed",
-            message: error instanceof Error ? error.message : String(error),
-          });
-          throw error;
-        }
+        const enrichment = await callZoomInfo(
+          account,
+          () => performEnrichment(this.#makeApi(account).withActivity(activity), pending),
+        );
+        store.putResult(action, {
+          status: "ready",
+          result: enrichment,
+          billingOperationId: execution.billingOperationId,
+        });
       },
     });
+    if (result.outcome === "failed-before-execution") {
+      store.putResult(action, {
+        status: "failed",
+        message: "The enrichment failed before ZoomInfo accepted it.",
+        billingOperationId: execution.billingOperationId,
+      });
+    } else if (result.outcome === "unknown") {
+      const providerOutcome = store.getResult(action);
+      if (providerOutcome?.status !== "ready") {
+        store.putResult(action, {
+          status: "pending",
+          billingOperationId: execution.billingOperationId,
+        });
+      }
+    }
+    return result;
   }
 
   /** Rejected: discard the queued enrichment (no credits spent) and record the outcome. */
@@ -927,9 +952,10 @@ type PendingEnrichment = {
 // The stored outcome once the user has decided (mirrors EnrichmentOutcome minus the "pending" state,
 // which is represented by the absence of a stored outcome while the request is still pending).
 type StoredEnrichmentOutcome =
-  | { status: "ready"; result: unknown }
+  | { status: "ready"; result: unknown; billingOperationId: string }
+  | { status: "pending"; billingOperationId: string }
   | { status: "rejected" }
-  | { status: "failed"; message: string };
+  | { status: "failed"; message: string; billingOperationId: string };
 
 class EnrichmentStore {
   #kv: DurableObjectStorage["kv"];
@@ -1209,16 +1235,17 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // Companies
 
   async searchCompanies(criteria: CompanySearchCriteria, page?: PageRequest): Promise<SearchPage<CompanyMatch>> {
-    assertCompatibleLocation(criteria, "searchCompanies");
     return this.#read(
       "ZoomInfoSession.searchCompanies",
-      async api => toSearchPage(
-        await api.post(
+      async api => {
+        assertCompatibleLocation(criteria, "searchCompanies");
+        return toSearchPage(await api.post(
           "/data/v1/companies/search", "CompanySearch", clean({ ...criteria }), pageQuery(page),
         ),
         mapCompanyMatch,
         page,
-      ),
+        );
+      },
       result => ({
         title: "Search ZoomInfo companies",
         description:
@@ -1268,15 +1295,17 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
 
   async searchContacts(criteria: ContactSearchCriteria, page?: PageRequest): Promise<SearchPage<ContactMatch>> {
     const { company, ...contact } = criteria;
-    assertCompatibleLocation(company, "searchContacts");
     const attributes = clean({ ...company, ...contact });
     return this.#read(
       "ZoomInfoSession.searchContacts",
-      async api => toSearchPage(
-        await api.post("/data/v1/contacts/search", "ContactSearch", attributes, pageQuery(page)),
+      async api => {
+        assertCompatibleLocation(company, "searchContacts");
+        return toSearchPage(
+          await api.post("/data/v1/contacts/search", "ContactSearch", attributes, pageQuery(page)),
         mapContactMatch,
         page,
-      ),
+        );
+      },
       result => ({
         title: "Search ZoomInfo contacts",
         description:
@@ -1310,16 +1339,18 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
 
   async searchIntent(criteria: IntentSearchCriteria, page?: PageRequest): Promise<SearchPage<IntentSignal>> {
     const { company, ...intent } = criteria;
-    assertNoCompanyIdentity(company, "searchIntent", "enrichIntent");
-    assertCompatibleLocation(company, "searchIntent");
     const attributes = clean({ ...company, ...intent });
     return this.#read(
       "ZoomInfoSession.searchIntent",
-      async api => toSearchPage(
-        await api.post("/data/v1/intent/search", "IntentSearch", attributes, pageQuery(page)),
+      async api => {
+        assertNoCompanyIdentity(company, "searchIntent", "enrichIntent");
+        assertCompatibleLocation(company, "searchIntent");
+        return toSearchPage(
+          await api.post("/data/v1/intent/search", "IntentSearch", attributes, pageQuery(page)),
         mapIntentSignal,
         page,
-      ),
+        );
+      },
       result => ({
         title: "Search ZoomInfo intent signals",
         description:
@@ -1348,16 +1379,18 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
 
   async searchScoops(criteria: ScoopSearchCriteria, page?: PageRequest): Promise<SearchPage<Scoop>> {
     const { contact, company, ...scoop } = criteria;
-    assertNoCompanyIdentity(company, "searchScoops", "enrichScoops");
-    assertCompatibleLocation(company, "searchScoops");
     const attributes = clean({ ...contact, ...company, ...scoop });
     return this.#read(
       "ZoomInfoSession.searchScoops",
-      async api => toSearchPage(
-        await api.post("/data/v1/scoops/search", "ScoopSearch", attributes, pageQuery(page)),
+      async api => {
+        assertNoCompanyIdentity(company, "searchScoops", "enrichScoops");
+        assertCompatibleLocation(company, "searchScoops");
+        return toSearchPage(
+          await api.post("/data/v1/scoops/search", "ScoopSearch", attributes, pageQuery(page)),
         mapScoop,
         page,
-      ),
+        );
+      },
       result => ({
         title: "Search ZoomInfo scoops",
         description:
@@ -1424,9 +1457,15 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
       // The stored result payload is untyped (see StoredEnrichmentOutcome); its shape was produced
       // by performEnrichment for this ticket's kind, so we re-attach the kind discriminant to form a
       // correctly-shaped EnrichmentReady. This cast is the single trust boundary for that fact.
-      outcome = stored.status === "ready"
-        ? ({ status: "ready", kind: ticket.kind, result: stored.result } as EnrichmentOutcome)
-        : stored;
+      if (stored.status === "ready") {
+        outcome = {
+          status: "ready", kind: ticket.kind, result: stored.result,
+        } as EnrichmentOutcome;
+      } else if (stored.status === "failed") {
+        outcome = { status: "failed", message: stored.message };
+      } else {
+        outcome = stored.status === "pending" ? { status: "pending" } : stored;
+      }
     } else if (store.getPending(ticket.id)) {
       outcome = { status: "pending" };
     } else {
@@ -1435,6 +1474,9 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     await this.#approvalQueue.authorizeObservation({
       title: `Read ZoomInfo enrichment result #${ticket.id}`,
       description: `Enrichment \`${ticket.kind}\` (${ticket.summary}): **${outcome.status}**.`,
+      ...(stored && "billingOperationId" in stored
+        ? { billingOperationId: stored.billingOperationId }
+        : {}),
     });
     return outcome;
   }

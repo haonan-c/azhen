@@ -5,6 +5,7 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
+  BillableCursorBilling,
   runBillableAction,
   runBillableRead,
   type BillableActionStorage,
@@ -36,8 +37,10 @@ function makeAuthorizer(trace: string[]) {
   };
 }
 
-function makeStorage(trace: string[]): BillableActionStorage {
-  const rows = new Map<string, unknown>();
+function makeStorage(
+  trace: string[],
+  rows = new Map<string, unknown>(),
+): BillableActionStorage {
   return {
     get<T>(key: string) {
       return rows.get(key) as T | undefined;
@@ -114,6 +117,37 @@ describe("Gatekeeper read billing", () => {
   });
 });
 
+describe("Gatekeeper Cursor billing", () => {
+  it("uses one Metering Attempt for all pages", async () => {
+    const trace: string[] = [];
+    const billing = new BillableCursorBilling(
+      makeAuthorizer(trace), "account-1", "vendor.records.list.v1");
+
+    const first = await billing.page(
+      async activity => {
+        activity.requestDispatched();
+        activity.responseReceived(200);
+        return { items: [1], nextCursor: "next" };
+      },
+      result => ({ title: "List", description: `${result.items.length} record` }),
+    );
+    const second = await billing.page(
+      async activity => {
+        activity.requestDispatched();
+        activity.responseReceived(200);
+        return { items: [2], nextCursor: undefined };
+      },
+      result => ({ title: "List", description: `${result.items.length} record` }),
+    );
+
+    expect(first.items).toEqual([1]);
+    expect(second.items).toEqual([2]);
+    expect(trace.filter(event => event.startsWith("begin:"))).toHaveLength(1);
+    expect(trace.filter(event => event === "complete:executed")).toHaveLength(1);
+    expect(trace.filter(event => event === "authorize:operation-1")).toHaveLength(2);
+  });
+});
+
 describe("Gatekeeper approved Action billing", () => {
   it("persists applying before the provider write and accepted before returning", async () => {
     const trace: string[] = [];
@@ -138,8 +172,9 @@ describe("Gatekeeper approved Action billing", () => {
     expect(result).toEqual({ outcome: "accepted" });
     expect(trace.indexOf("sync")).toBeLessThan(trace.indexOf("execute:change"));
     expect(trace).toContain("put:applying");
-    expect(trace.at(-2)).toBe("put:accepted");
-    expect(trace.at(-1)).toBe("remove-pending");
+    expect(trace).toContain("put:accepted");
+    expect(trace).toContain("remove-pending");
+    expect(trace.at(-1)).toBe("sync");
   });
 
   it("does not replay an unknown or completed provider effect", async () => {
@@ -187,5 +222,29 @@ describe("Gatekeeper approved Action billing", () => {
 
     expect(result).toEqual({ outcome: "unknown" });
     expect(effects).toEqual([]);
+  });
+
+  it("settles a durable provider result without replaying an applying Action", async () => {
+    const rows = new Map<string, unknown>([["execution:operation-action-1", {
+      billingOperationId: "operation-action-1",
+      actionId: 10,
+      state: "applying",
+    }]]);
+    let removed = false;
+    const result = await runBillableAction({
+      storage: makeStorage([], rows),
+      actionId: 10,
+      execution: { ...EXECUTION, mode: "recover" },
+      getPending: () => ({ value: "change", providerResult: "saved" }),
+      removePending: () => { removed = true; },
+      recoverApplying: () => "accepted",
+      prepare: async action => action,
+      execute: async () => {
+        throw new Error("must not replay");
+      },
+    });
+
+    expect(result).toEqual({ outcome: "accepted" });
+    expect(removed).toBe(true);
   });
 });

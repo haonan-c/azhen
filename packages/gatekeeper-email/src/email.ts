@@ -32,6 +32,7 @@ import type { EmailMailboxConfiguratorRpc } from "./configurator/email-configura
 import EMAIL_LOGO_SVG from "./email-logo.svg";
 import { obsContext } from "./observability.js";
 import { EMAIL_BILLING_METHODS } from "./billing-methods";
+import { runBillableRead } from "@gadgets/backend-utils/gatekeeper-billing";
 
 const VENDOR_ID = "email";
 
@@ -202,44 +203,11 @@ export default {
     let stub: DurableObjectStub<EmailAddress> =
         ctx.exports.EmailAddress.getByName(name);
 
-    // Parse the email using postal-mime.
-    let parsed: Email = await PostalMime.parse(message.raw);
-
-    // Build the structured IncomingEmail.
-    let from: EmailAddressType = parsed.from
-        ? { name: parsed.from.name || "", address: parsed.from.address || "" }
-        : { name: "", address: message.from };
-
-    let to: EmailAddressType[] = (parsed.to || []).map(addr => ({
-      name: addr.name || "",
-      address: addr.address || "",
-    }));
-
-    let cc: EmailAddressType[] = (parsed.cc || []).map(addr => ({
-      name: addr.name || "",
-      address: addr.address || "",
-    }));
-
-    let attachments: EmailAttachment[] = (parsed.attachments || []).map(att => ({
-      filename: att.filename || null,
-      mimeType: att.mimeType,
-      disposition: att.disposition || null,
-      content: att.content as ArrayBuffer,
-    }));
-
-    let incomingEmail: IncomingEmail = {
-      from,
-      to,
-      cc,
-      subject: parsed.subject || "",
-      date: parsed.date || new Date().toISOString(),
-      text: parsed.text || null,
-      html: parsed.html || null,
-      attachments,
-    };
+    const providerDeliveryId = readProviderDeliveryId(message.headers);
+    const raw = await new Response(message.raw).arrayBuffer();
 
     try {
-      await stub.receiveEmail(incomingEmail);
+      await stub.receiveEmail(providerDeliveryId, raw, message.from);
     } catch (err) {
       logger.error("email delivery failed", {
         event: "email.delivery.failed", error: err,
@@ -249,6 +217,52 @@ export default {
     }
   }
 };
+
+function readProviderDeliveryId(headers: Headers): string {
+  // Cloudflare prepends this Received hop before the Email Worker runs. Its transport ID is
+  // content-free and distinguishes byte-identical deliveries; sender-controlled Message-ID and
+  // MIME content are not part of the receipt identity.
+  const received = headers.get("received");
+  const match = received?.match(
+    /^[^;]*\bby\s+cloudflare-email\.com\b[^;]*\bid\s+([A-Za-z0-9_-]{6,200})\b[^;]*;/i,
+  );
+  if (!match) {
+    throw new Error("Cloudflare Email delivery ID is unavailable.");
+  }
+  return match[1];
+}
+
+async function parseIncomingEmail(raw: ArrayBuffer, fallbackFrom: string): Promise<IncomingEmail> {
+  const parsed: Email = await PostalMime.parse(raw);
+  const from: EmailAddressType = parsed.from
+    ? { name: parsed.from.name || "", address: parsed.from.address || "" }
+    : { name: "", address: fallbackFrom };
+  const to: EmailAddressType[] = (parsed.to || []).map(address => ({
+    name: address.name || "",
+    address: address.address || "",
+  }));
+  const cc: EmailAddressType[] = (parsed.cc || []).map(address => ({
+    name: address.name || "",
+    address: address.address || "",
+  }));
+  const attachments: EmailAttachment[] = (parsed.attachments || []).map(attachment => ({
+    filename: attachment.filename || null,
+    mimeType: attachment.mimeType,
+    disposition: attachment.disposition || null,
+    content: attachment.content as ArrayBuffer,
+  }));
+  return {
+    receiptId: "",
+    from,
+    to,
+    cc,
+    subject: parsed.subject || "",
+    date: parsed.date || new Date().toISOString(),
+    text: parsed.text || null,
+    html: parsed.html || null,
+    attachments,
+  };
+}
 
 // =======================================================================================
 // Top-level API exposed to the Workshop.
@@ -485,15 +499,17 @@ class EmailSessionImpl extends RpcTarget implements EmailSession {
   #emailHost: string;
   #ctx: DurableObjectState<EmailGatekeeperImplProps>;
   #approvalQueue: RpcStub<ApprovalQueue>;
+  #externalAccountId: string;
 
   constructor(emailName: string, emailHost: string,
       ctx: DurableObjectState<EmailGatekeeperImplProps>,
-      approvalQueue: RpcStub<ApprovalQueue>) {
+      approvalQueue: RpcStub<ApprovalQueue>, externalAccountId: string) {
     super();
     this.#emailName = emailName;
     this.#emailHost = emailHost;
     this.#ctx = ctx;
     this.#approvalQueue = approvalQueue;
+    this.#externalAccountId = externalAccountId;
   }
 
   [Symbol.dispose]() {
@@ -501,7 +517,21 @@ class EmailSessionImpl extends RpcTarget implements EmailSession {
   }
 
   async getAddress(): Promise<string> {
-    return `${this.#emailName}@${this.#emailHost}`;
+    return runBillableRead(
+      {
+        beginBillableOperation: (methodKey, externalAccountId) =>
+          this.#approvalQueue.beginBillableOperation(methodKey, externalAccountId),
+        authorizeObservation: description =>
+          this.#approvalQueue.authorizeObservation(description),
+      },
+      this.#externalAccountId,
+      EMAIL_BILLING_METHODS["EmailSession.getAddress"].methodKey,
+      async () => `${this.#emailName}@${this.#emailHost}`,
+      address => ({
+        title: "Read email mailbox address",
+        description: `Read the connected mailbox address ${address}.`,
+      }),
+    );
   }
 
   async subscribe(callback: RpcStub<EmailHookTarget>): Promise<void> {
@@ -557,7 +587,9 @@ export class EmailGatekeeperImpl extends DurableObject<Env, EmailGatekeeperImplP
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<EmailSession> {
     let emailName = this.ctx.props.emailName;
     let host = getEmailHost(this.env);
-    return new EmailSessionImpl(emailName, host, this.ctx, approvalQueue.dup());
+    return new EmailSessionImpl(
+      emailName, host, this.ctx, approvalQueue.dup(), this.ctx.props.userAccountId,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -618,6 +650,14 @@ export class EmailHookControllerImpl extends WorkerEntrypoint<Env, EmailGatekeep
 // Named by the local part of the email address (the part before @).
 // Stores the hook Fetcher and dispatches inbound emails to it.
 
+type EmailReceiptRecord = {
+  billingOperationId?: string;
+  state: "pending" | "billed" | "delivering" | "delivered" | "failed" | "unknown" |
+    "withheld";
+  ingressKey: string;
+  updatedAt: number;
+};
+
 export class EmailAddress extends DurableObject<Env> {
   /**
    * Claim this email address for a user account. The first caller to claim an address becomes
@@ -659,7 +699,30 @@ export class EmailAddress extends DurableObject<Env> {
     }
   }
 
-  async receiveEmail(email: IncomingEmail): Promise<void> {
+  async receiveEmail(
+    providerDeliveryId: string,
+    raw: ArrayBuffer,
+    fallbackFrom: string,
+  ): Promise<void> {
+    const now = Date.now();
+    const ingressKey = `ingress:${providerDeliveryId}`;
+    let receiptId = this.ctx.storage.kv.get<string>(ingressKey);
+    if (!receiptId) {
+      receiptId = crypto.randomUUID();
+      const receiptKey = `receipt:${receiptId}`;
+      this.ctx.storage.kv.put(ingressKey, receiptId);
+      this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+        state: "pending",
+        ingressKey,
+        updatedAt: now,
+      });
+      await this.ctx.storage.sync();
+    }
+    const receiptKey = `receipt:${receiptId}`;
+    const previous = this.ctx.storage.kv.get<EmailReceiptRecord>(receiptKey);
+    if (previous?.state === "delivered" || previous?.state === "failed" ||
+        previous?.state === "unknown" || previous?.state === "withheld") return;
+
     let hookInitiator =
         this.ctx.storage.kv.get<Fetcher<HookInitiator<EmailHookTarget>>>("hook");
     if (!hookInitiator) {
@@ -670,20 +733,57 @@ export class EmailAddress extends DurableObject<Env> {
     // and an ApprovalQueue for logging observations. Use `using` to dispose the result (and its
     // contained stubs, including approvalQueue) at end of scope.
     // @ts-ignore TODO: TS doesn't understand that the returned promise is disposable?
-    using startHookResult = hookInitiator.startHook();
+    using startHookResult = hookInitiator.startHook({ deliveryId: receiptId });
 
     const externalAccountId = this.ctx.storage.kv.get<string>("owner");
     if (!externalAccountId) throw new Error("This email address has no owner");
     using operation = await startHookResult.approvalQueue.beginBillableOperation(
       EMAIL_BILLING_METHODS["EmailHook.receiveEmail"].methodKey,
       externalAccountId,
+      receiptId,
     );
     const operationId = await operation.getOperationId();
+    if (previous?.billingOperationId && previous.billingOperationId !== operationId) {
+      throw new Error("Inbound email billing operation changed during recovery.");
+    }
+    await operation.markStarted();
+
+    let email: IncomingEmail;
+    try {
+      email = await parseIncomingEmail(raw, fallbackFrom);
+      email.receiptId = receiptId;
+    } catch (error) {
+      try {
+        await operation.complete("failed-before-execution");
+        this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+          billingOperationId: operationId,
+          state: "failed",
+          ingressKey,
+          updatedAt: Date.now(),
+        });
+        await this.ctx.storage.sync();
+      } catch (completionError) {
+        logger.error("failed to release inbound email billing", {
+          event: "email.billing.complete.failed",
+          error: completionError,
+        });
+      }
+      throw error;
+    }
+
+    await operation.complete("executed");
+    this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+      billingOperationId: operationId,
+      state: "billed",
+      ingressKey,
+      updatedAt: Date.now(),
+    });
+    await this.ctx.storage.sync();
 
     // Pipeline: access approvalQueue on the not-yet-resolved promise and call through it.
     let sender = email.from.name
-        ? `${email.from.name} <${email.from.address}>`
-        : email.from.address;
+      ? `${email.from.name} <${email.from.address}>`
+      : email.from.address;
     try {
       await startHookResult.approvalQueue.authorizeObservation({
         title: `Email from ${email.from.address}: ${email.subject}`,
@@ -698,18 +798,44 @@ export class EmailAddress extends DurableObject<Env> {
                 : ""),
         billingOperationId: operationId,
       });
-      await operation.markStarted();
     } catch (error) {
-      await operation.complete("failed-before-execution");
+      this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+        billingOperationId: operationId,
+        state: "withheld",
+        ingressKey,
+        updatedAt: Date.now(),
+      });
+      await this.ctx.storage.sync();
       throw error;
     }
 
+    // Persist the delivery phase before the callback. The Gadget claims the same opaque receipt
+    // before it runs user code, so a lost response cannot invoke that code a second time.
+    this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+      billingOperationId: operationId,
+      state: "delivering",
+      ingressKey,
+      updatedAt: Date.now(),
+    });
+    await this.ctx.storage.sync();
     try {
       await startHookResult.callback.receiveEmail(email);
+      this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+        billingOperationId: operationId,
+        state: "delivered",
+        ingressKey,
+        updatedAt: Date.now(),
+      });
+      await this.ctx.storage.sync();
     } catch (error) {
-      await operation.complete("unknown");
+      this.ctx.storage.kv.put<EmailReceiptRecord>(receiptKey, {
+        billingOperationId: operationId,
+        state: "unknown",
+        ingressKey,
+        updatedAt: Date.now(),
+      });
+      await this.ctx.storage.sync();
       throw error;
     }
-    await operation.complete("executed");
   }
 }

@@ -16,7 +16,10 @@
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { runBillableRead } from "@gadgets/backend-utils/gatekeeper-billing";
+import {
+  BillableCursorBilling,
+  runBillableRead,
+} from "@gadgets/backend-utils/gatekeeper-billing";
 import {
   type AccountDescription,
   type ActionExecution,
@@ -582,9 +585,9 @@ function applyConfluenceAction(
   if (!execution) throw new Error("This Confluence Action predates billing and cannot be applied.");
   const existing = active.get(execution.billingOperationId);
   if (existing) return existing;
-  const applying = applyBillableStoredAction(store, storage, action, execution);
+  const applying = applyBillableStoredAction(store, storage, action, execution)
+    .finally(() => active.delete(execution.billingOperationId));
   active.set(execution.billingOperationId, applying);
-  void applying.finally(() => active.delete(execution.billingOperationId));
   return applying;
 }
 
@@ -771,10 +774,15 @@ class PagedCursor<T> extends RpcTarget implements Cursor<T> {
   #fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>;
   #cursor: string | undefined = undefined;
   #done = false;
+  #billing?: BillableCursorBilling;
 
-  constructor(fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>) {
+  constructor(
+    fetchPage: (cursor: string | undefined) => Promise<{ items: T[]; nextCursor?: string }>,
+    billing?: BillableCursorBilling,
+  ) {
     super();
     this.#fetchPage = fetchPage;
+    this.#billing = billing;
   }
 
   async next(): Promise<T[] | null> {
@@ -783,6 +791,10 @@ class PagedCursor<T> extends RpcTarget implements Cursor<T> {
     if (nextCursor) this.#cursor = nextCursor;
     else this.#done = true;
     return items;
+  }
+
+  [Symbol.dispose](): void {
+    this.#billing?.[Symbol.dispose]();
   }
 }
 
@@ -839,6 +851,44 @@ async function runConfluenceRead<T>(
   );
 }
 
+function confluenceCursor<T>(
+  store: ConfluenceStore,
+  queue: RpcStub<ApprovalQueue>,
+  observe: ObserveHook,
+  method: ConfluenceBillableReadMethod,
+  description: ObservationDescription,
+  fetchPage: (
+    store: ConfluenceStore,
+    cursor: string | undefined,
+  ) => Promise<{
+    value: { items: T[]; nextCursor?: string };
+    sets: ConfluenceObservedSet[];
+  }>,
+): Cursor<T> {
+  let sets: ConfluenceObservedSet[] = [];
+  const billing = new BillableCursorBilling(
+    {
+      beginBillableOperation: (methodKey, externalAccountId) =>
+        queue.beginBillableOperation(methodKey, externalAccountId),
+      authorizeObservation: billedDescription =>
+        authorizeConfluenceObservation(queue, observe, sets, billedDescription),
+    },
+    store.externalAccountId,
+    CONFLUENCE_BILLING_METHODS[method].methodKey,
+  );
+  return new PagedCursor<T>(
+    cursor => billing.page(
+      async activity => {
+        const result = await fetchPage(store.withActivity(activity), cursor);
+        sets = result.sets;
+        return result.value;
+      },
+      () => description,
+    ),
+    billing,
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sessions
 
@@ -865,18 +915,26 @@ class SiteSessionImpl extends RpcTarget implements ConfluenceSiteSession {
   [Symbol.dispose]() { disposeQueue(this.#approvalQueue); }
 
   async getMetadata(): Promise<SiteMetadata> {
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-      observation("Read Confluence site info", "Read the connected Confluence site's name and URL."));
-    return { name: this.#webBase.replace(/^https?:\/\//, "").replace(/\/wiki$/, ""), url: this.#webBase, cloudId: this.#store.api.cloudId };
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.getMetadata",
+      observation("Read Confluence site info", "Read the connected Confluence site's name and URL."),
+      async store => ({
+        value: {
+          name: this.#webBase.replace(/^https?:\/\//, "").replace(/\/wiki$/, ""),
+          url: this.#webBase,
+          cloudId: store.api.cloudId,
+        },
+        sets: [],
+      }),
+    );
   }
 
   listSpaces(options?: ListSpacesOptions): Promise<Cursor<SpaceSummary>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<SpaceSummary>(async cursor => {
-      return runConfluenceRead(
-        this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.listSpaces.next",
-        observation("List Confluence spaces", "List the spaces on the Confluence site."),
-        async store => {
+    return Promise.resolve(confluenceCursor(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.listSpaces",
+      observation("List Confluence spaces", "List the spaces on the Confluence site."),
+      async (store, cursor) => {
           const { results, nextCursor } = await store.api.listSpaces({
             type: options?.type, cursor, limit,
           });
@@ -884,18 +942,17 @@ class SiteSessionImpl extends RpcTarget implements ConfluenceSiteSession {
             value: { items: results.map(s => spaceToMetadata(s, this.#webBase)), nextCursor },
             sets: spaceSets(results.map(s => s.id)),
           };
-        },
-      );
-    }));
+      },
+    ));
   }
 
   async getSpace(keyOrIdOrUrl: string): Promise<ConfluenceSpaceSession> {
-    const ref = parseSpaceKeyOrId(keyOrIdOrUrl);
     // Resolve to the space's key (the session is keyed by key); numeric IDs and URLs are accepted.
     const space = await runConfluenceRead(
       this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.getSpace",
       observation("Open Confluence space", "Open a Confluence space."),
       async store => {
+        const ref = parseSpaceKeyOrId(keyOrIdOrUrl);
         const value = "key" in ref
           ? await store.api.getSpaceByKey(ref.key)
           : await store.api.getSpaceById(ref.id);
@@ -907,20 +964,18 @@ class SiteSessionImpl extends RpcTarget implements ConfluenceSiteSession {
   }
 
   async getContent(idOrUrl: string): Promise<ConfluenceContentSession> {
-    const id = resolveHandle(this.#store, idOrUrl);
-    if (!ConfluenceStore.isProvisional(id)) {
-      await runConfluenceRead(
+    const id = await runConfluenceRead(
         this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.getContent",
         observation("Open Confluence content", "Open a Confluence page or blog post."),
-        async store => ({
-          value: await store.getContentResponse(id),
-          sets: contentSets([id]),
-        }),
+        async store => {
+          const resolvedId = resolveHandle(store, idOrUrl);
+          if (ConfluenceStore.isProvisional(resolvedId)) {
+            return { value: resolvedId, sets: [] };
+          }
+          await store.getContentResponse(resolvedId);
+          return { value: resolvedId, sets: contentSets([resolvedId]) };
+        },
       );
-    } else {
-      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-        observation("Open Confluence content", "Open a pending Confluence page or blog post."));
-    }
     return new ContentSessionImpl(
       this.#store, this.#approvalQueue.dup(), this.#webBase, id, this.#observe);
   }
@@ -930,14 +985,18 @@ class SiteSessionImpl extends RpcTarget implements ConfluenceSiteSession {
   }
 
   async getCurrentUser(): Promise<ConfluenceUser> {
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-      observation("Read Confluence user", "Read the authorizing Confluence user's profile."));
-    const id = this.#identity;
-    return {
-      accountId: id?.accountId ?? "unknown",
-      displayName: id?.name,
-      avatarUrl: id?.picture,
-    };
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.getCurrentUser",
+      observation("Read Confluence user", "Read the authorizing Confluence user's profile."),
+      async () => ({
+        value: {
+          accountId: this.#identity?.accountId ?? "unknown",
+          displayName: this.#identity?.name,
+          avatarUrl: this.#identity?.picture,
+        },
+        sets: [],
+      }),
+    );
   }
 }
 
@@ -984,16 +1043,15 @@ class SpaceSessionImpl extends RpcTarget implements ConfluenceSpaceSession {
 
   #listContent(type: "page" | "blogpost", depth: "root" | "all" | undefined, pageSize?: number): Cursor<ContentSummary> {
     const limit = clampPageSize(pageSize);
-    return new PagedCursor<ContentSummary>(async cursor => {
-      const method = type === "blogpost"
-        ? "ConfluenceSpace.listBlogPosts.next" as const
-        : "ConfluenceSpace.listPages.next" as const;
-      return runConfluenceRead(
-        this.#store, this.#approvalQueue, this.#observe, method,
-        observation(
-          `List Confluence ${type === "blogpost" ? "blog posts" : "pages"}`,
-          `List the ${type === "blogpost" ? "blog posts" : "pages"} in space ${this.#spaceKey}.`),
-        async store => {
+    const method = type === "blogpost"
+      ? "ConfluenceSpace.listBlogPosts" as const
+      : "ConfluenceSpace.listPages" as const;
+    return confluenceCursor(
+      this.#store, this.#approvalQueue, this.#observe, method,
+      observation(
+        `List Confluence ${type === "blogpost" ? "blog posts" : "pages"}`,
+        `List the ${type === "blogpost" ? "blog posts" : "pages"} in space ${this.#spaceKey}.`),
+      async (store, cursor) => {
           const spaceId = await store.getSpaceId(this.#spaceKey);
           const { results, nextCursor } = type === "blogpost"
             ? await store.api.listBlogPostsInSpace({ spaceId, cursor, limit })
@@ -1001,26 +1059,26 @@ class SpaceSessionImpl extends RpcTarget implements ConfluenceSpaceSession {
           const items = overlaySpaceContent(
             results.map(c => contentToSummary(c, this.#webBase)), store, this.#spaceKey, type, !cursor);
           return { value: { items, nextCursor }, sets: contentSets(items.map(item => item.id)) };
-        },
-      );
-    });
+      },
+    );
   }
 
   async getContent(idOrUrl: string): Promise<ConfluenceContentSession> {
-    const id = resolveHandle(this.#store, idOrUrl);
-    if (!ConfluenceStore.isProvisional(id)) {
-      const content = await runConfluenceRead(
+    const id = await runConfluenceRead(
         this.#store, this.#approvalQueue, this.#observe, "ConfluenceSpace.getContent",
         observation("Open Confluence content", `Open a page or blog post in space ${this.#spaceKey}.`),
-        async store => ({ value: await store.getContentResponse(id), sets: contentSets([id]) }),
+        async store => {
+          const resolvedId = resolveHandle(store, idOrUrl);
+          if (ConfluenceStore.isProvisional(resolvedId)) {
+            return { value: resolvedId, sets: [] };
+          }
+          const content = await store.getContentResponse(resolvedId);
+          if (spaceKeyFromWebui(content._links?.webui) !== this.#spaceKey) {
+            throw new ConfluenceApiError(404, "No such page or blog post in this space.");
+          }
+          return { value: resolvedId, sets: contentSets([resolvedId]) };
+        },
       );
-      if (spaceKeyFromWebui(content._links?.webui) !== this.#spaceKey) {
-        throw new ConfluenceApiError(404, "No such page or blog post in this space.");
-      }
-    } else {
-      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-        observation("Open Confluence content", `Open pending content in space ${this.#spaceKey}.`));
-    }
     return new ContentSessionImpl(
       this.#store, this.#approvalQueue.dup(), this.#webBase, id, this.#observe);
   }
@@ -1136,37 +1194,29 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
   }
 
   async setContent(markdown: string): Promise<void> {
-    const base = await this.#base();
-    const previous = simulateBody(base ? contentBodyMarkdown(base) : null, this.#pending());
     await this.#stage("ConfluenceContent.setContent", {
-      type: "setContent", contentId: this.#contentId, markdown, previousMarkdown: previous,
+      type: "setContent", contentId: this.#contentId, markdown,
     });
   }
 
   async appendContent(markdown: string): Promise<void> {
-    const base = await this.#base();
-    const previous = simulateBody(base ? contentBodyMarkdown(base) : null, this.#pending());
     await this.#stage("ConfluenceContent.appendContent", {
-      type: "appendContent", contentId: this.#contentId, markdown, previousMarkdown: previous,
+      type: "appendContent", contentId: this.#contentId, markdown,
     });
   }
 
   async setTitle(title: string): Promise<void> {
-    const records = this.#pending();
-    const base = await this.#base();
-    const previousTitle = simulateTitle(records, base ? base.title : "");
     await this.#stage("ConfluenceContent.setTitle", {
-      type: "setTitle", contentId: this.#contentId, title, previousTitle,
+      type: "setTitle", contentId: this.#contentId, title,
     });
   }
 
   listChildPages(options?: ListOptions): Promise<Cursor<ContentSummary>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<ContentSummary>(async cursor => {
-      return runConfluenceRead(
-        this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listChildPages.next",
+    return Promise.resolve(confluenceCursor(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listChildPages",
         observation("List Confluence child pages", `List the child pages of Confluence content ${this.#ref()}.`),
-        async store => {
+        async (store, cursor) => {
           let items: ContentSummary[] = [];
           let nextCursor: string | undefined;
           if (!this.#isProvisional() && await this.#kind(store) === "page") {
@@ -1181,20 +1231,22 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
             sets: [...this.#sets(store), ...contentSets(items.map(item => item.id))],
           };
         },
-      );
-    }));
+    ));
   }
 
   async createChildPage(options: CreateChildPageOptions): Promise<ConfluenceContentSession> {
-    if (await this.#kind() === "blogpost") {
+    const create = this.#store.createActionFor(this.#contentId)?.action;
+    if (create?.type === "createContent" && create.kind === "blogpost") {
       throw new ConfluenceApiError(400, "Blog posts cannot have child pages.");
     }
-    const create = this.#store.createActionFor(this.#contentId)?.action;
-    const spaceKey = await this.#spaceKey(create);
     const provisionalId = this.#store.nextProvisionalId();
     await this.#stage("ConfluenceContent.createChildPage", {
       type: "createContent", provisionalId, kind: "page",
-      parent: { type: "page", parentId: this.#contentId, spaceKey },
+      parent: {
+        type: "page",
+        parentId: this.#contentId,
+        spaceKey: create?.type === "createContent" ? create.parent.spaceKey : undefined,
+      },
       title: options.title, content: options.content, status: options.status ?? "current",
     });
     return new ContentSessionImpl(
@@ -1228,11 +1280,10 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
 
   listComments(options?: ListOptions): Promise<Cursor<Comment>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<Comment>(async cursor => {
-      return runConfluenceRead(
-        this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listComments.next",
+    return Promise.resolve(confluenceCursor(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listComments",
         observation("Read Confluence comments", `Read the comments on Confluence content ${this.#ref()}.`),
-        async store => {
+        async (store, cursor) => {
           let items: Comment[] = [];
           let nextCursor: string | undefined;
           if (!this.#isProvisional()) {
@@ -1244,8 +1295,7 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
           if (!cursor) items = simulateComments(items, this.#pending(store));
           return { value: { items, nextCursor }, sets: this.#sets(store) };
         },
-      );
-    }));
+    ));
   }
 
   async addComment(markdown: string): Promise<void> {
@@ -1256,11 +1306,10 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
 
   listAttachments(options?: ListOptions): Promise<Cursor<Attachment>> {
     const limit = clampPageSize(options?.pageSize);
-    return Promise.resolve(new PagedCursor<Attachment>(async cursor => {
-      return runConfluenceRead(
-        this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listAttachments.next",
+    return Promise.resolve(confluenceCursor(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listAttachments",
         observation("List Confluence attachments", `List the attachments on Confluence content ${this.#ref()}.`),
-        async store => {
+        async (store, cursor) => {
           const res = this.#isProvisional()
             ? { results: [], nextCursor: undefined }
             : await store.api.listAttachments(
@@ -1270,8 +1319,7 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
             sets: this.#sets(store),
           };
         },
-      );
-    }));
+    ));
   }
 
   async downloadAttachment(id: string): Promise<AttachmentDownload> {
@@ -1337,11 +1385,6 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
     return content.type === "blogpost" ? "blogpost" : "page";
   }
 
-  async #spaceKey(create: ConfluenceAction | undefined): Promise<string> {
-    if (create?.type === "createContent" && create.parent.spaceKey) return create.parent.spaceKey;
-    const content = await this.#store.getContentResponse(this.#contentId);
-    return spaceKeyFromWebui(content._links?.webui) ?? "";
-  }
 }
 
 // Resolve a user-supplied content handle (provisional ID, numeric ID, or URL) to a stored handle.
@@ -1358,13 +1401,17 @@ function searchCursor(
   options: SearchOptions | undefined, spaceKey?: string,
 ): Cursor<ContentSummary> {
   const limit = clampPageSize(options?.pageSize);
-  const cql = buildCql({ text: options?.text, cql: options?.cql, type: options?.type, spaceKey });
-  return new PagedCursor<ContentSummary>(async cursor => {
-    return runConfluenceRead(
+  return confluenceCursor(
       store, approvalQueue, observe,
-      spaceKey ? "ConfluenceSpace.search.next" : "ConfluenceSite.search.next",
+      spaceKey ? "ConfluenceSpace.search" : "ConfluenceSite.search",
       observation("Search Confluence", `Search Confluence for “${options?.cql ?? options?.text ?? ""}”.`),
-      async billedStore => {
+      async (billedStore, cursor) => {
+        const cql = buildCql({
+          text: options?.text,
+          cql: options?.cql,
+          type: options?.type,
+          spaceKey,
+        });
         const { results, nextCursor } = await billedStore.api.search(cql, { cursor, limit });
         const items = overlaySearch(results, billedStore, !cursor, options?.type);
         return {
@@ -1372,6 +1419,5 @@ function searchCursor(
           sets: contentSets(items.map(item => item.id)),
         };
       },
-    );
-  });
+  );
 }

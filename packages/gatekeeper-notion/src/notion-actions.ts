@@ -11,6 +11,7 @@
 import {
   NotionApi,
   blocksToMarkdown,
+  iconStringToInput,
   iconInputToNotion,
   markdownToBlocks,
   notionUrlFromId,
@@ -20,6 +21,7 @@ import {
   plainToRichText,
   primaryDataSourceId,
   propertiesToValues,
+  propertyValueToInput,
   propertyInputsToNotion,
   type BlockWithChildren,
   type NotionDataSourceResponse,
@@ -65,14 +67,14 @@ export type NotionActionParent =
 
 export type NotionAction =
   | { type: "appendContent"; pageId: string; markdown: string }
-  | { type: "setTitle"; pageId: string; title: string; previousTitle: string }
+  | { type: "setTitle"; pageId: string; title: string; previousTitle?: string }
   | {
       type: "setProperties";
       pageId: string;
       properties: Record<string, NotionPropertyInput>;
-      previousProperties: Record<string, NotionPropertyInput>;
+      previousProperties?: Record<string, NotionPropertyInput>;
     }
-  | { type: "setIcon"; pageId: string; icon: NotionIconInput | null; previousIcon: NotionIconInput | null }
+  | { type: "setIcon"; pageId: string; icon: NotionIconInput | null; previousIcon?: NotionIconInput | null }
   | { type: "archive"; pageId: string }
   | { type: "restore"; pageId: string }
   | { type: "addComment"; pageId: string; text: string }
@@ -711,7 +713,7 @@ export function describeAction(action: NotionAction): ActionDescription {
     case "setTitle":
       return {
         title: "Rename Notion page",
-        description: `Change the page title to **${action.title}** (was “${action.previousTitle}”).`,
+        description: `Change the page title to **${action.title}**.`,
         implementsRevert: true,
       };
     case "setProperties":
@@ -774,7 +776,49 @@ function truncate(text: string, max = 2000): string {
  * Apply a previously-submitted action against Notion. Mutates and persists the record (e.g. to
  * store created IDs for later revert). Throws on failure (the overseer surfaces this to the user).
  */
-export async function applyNotionAction(store: NotionStore, record: StoredActionRecord): Promise<void> {
+type PreparedNotionAction = {
+  record: StoredActionRecord;
+  titlePropertyName?: string;
+  parent?: Awaited<ReturnType<typeof resolveCreateParent>>;
+};
+
+async function prepareNotionAction(
+  store: NotionStore,
+  record: StoredActionRecord,
+): Promise<PreparedNotionAction> {
+  const action = record.action;
+  if (action.type === "createPage") {
+    return { record, parent: await resolveCreateParent(store, action.parent) };
+  }
+  if (action.type === "setTitle" || action.type === "setProperties" || action.type === "setIcon") {
+    const page = await store.getPageResponse(requireResolved(store, action.pageId), true);
+    if (action.type === "setTitle") {
+      action.previousTitle ??= pageToMetadata(page).title;
+      const entry = Object.entries(page.properties ?? {}).find(([, value]) => value.type === "title");
+      store.putAction(record);
+      return { record, titlePropertyName: entry?.[0] ?? "title" };
+    }
+    if (action.type === "setProperties" && action.previousProperties === undefined) {
+      const current = propertiesToValues(page.properties ?? {});
+      action.previousProperties = {};
+      for (const name of Object.keys(action.properties)) {
+        const previous = current[name] ? propertyValueToInput(current[name]) : null;
+        if (previous) action.previousProperties[name] = previous;
+      }
+    } else if (action.type === "setIcon" && action.previousIcon === undefined) {
+      action.previousIcon = iconStringToInput(pageToMetadata(page).icon);
+    }
+    store.putAction(record);
+  }
+  return { record };
+}
+
+export async function applyNotionAction(
+  store: NotionStore,
+  record: StoredActionRecord,
+  prepared?: PreparedNotionAction,
+): Promise<void> {
+  prepared ??= await prepareNotionAction(store, record);
   const api = store.api;
   const action = record.action;
 
@@ -791,7 +835,9 @@ export async function applyNotionAction(store: NotionStore, record: StoredAction
     }
     case "setTitle": {
       const pageId = requireResolved(store, action.pageId);
-      await api.updatePage(pageId, { properties: { [await titlePropName(store, action.pageId)]: { title: plainToRichText(action.title) } } });
+      await api.updatePage(pageId, { properties: {
+        [prepared.titlePropertyName ?? "title"]: { title: plainToRichText(action.title) },
+      } });
       store.invalidatePage(action.pageId);
       break;
     }
@@ -825,7 +871,8 @@ export async function applyNotionAction(store: NotionStore, record: StoredAction
       break;
     }
     case "createPage": {
-      const parent = await resolveCreateParent(store, action.parent);
+      const parent = prepared.parent;
+      if (!parent) throw new Error("Cannot create a Notion page without a resolved parent.");
       const body = buildCreateBody(
         parent, action.title, action.properties, action.content, action.icon, action.titlePropertyName);
       const page = await api.createPage(body);
@@ -872,12 +919,18 @@ export async function revertNotionAction(
       break;
     }
     case "setTitle": {
+      if (action.previousTitle === undefined) {
+        return { message: "Cannot restore the prior title because it was not captured." };
+      }
       const pageId = requireResolved(store, action.pageId);
       await api.updatePage(pageId, { properties: { [await titlePropName(store, action.pageId)]: { title: plainToRichText(action.previousTitle) } } });
       store.invalidatePage(action.pageId);
       break;
     }
     case "setProperties": {
+      if (action.previousProperties === undefined) {
+        return { message: "Cannot restore the prior properties because they were not captured." };
+      }
       const pageId = requireResolved(store, action.pageId);
       await api.updatePage(pageId, { properties: propertyInputsToNotion(action.previousProperties) });
       store.invalidatePage(action.pageId);
@@ -1074,6 +1127,7 @@ export function applyBillableStoredAction(
     actionId: id,
     execution,
     getPending: () => store.getAction(id),
+    recoverApplying: () => store.getAction(id)?.state === "applied" ? "accepted" : undefined,
     removePending: outcome => {
       const record = store.getAction(id);
       if (record && outcome === "failed-before-execution") {
@@ -1083,8 +1137,9 @@ export function applyBillableStoredAction(
         store.putAction(record);
       }
     },
-    prepare: async record => record,
-    execute: (record, activity) => applyNotionAction(store.withActivity(activity), record),
+    prepare: (record, activity) => prepareNotionAction(store.withActivity(activity), record),
+    execute: (prepared, activity) => applyNotionAction(
+      store.withActivity(activity), prepared.record, prepared),
   });
 }
 

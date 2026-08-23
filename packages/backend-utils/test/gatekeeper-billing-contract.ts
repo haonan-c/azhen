@@ -11,6 +11,53 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
+/** One exhaustive public Gatekeeper method classification from the usage-credit oracle. */
+export type BillingSurfaceClass =
+  | "R"
+  | "A"
+  | "H"
+  | { kind: "C" | "K"; reason: string };
+
+/**
+ * Verify that every method in selected public Session interfaces is classified exactly once and
+ * that every billable method, but no control or continuation method, has a registry entry.
+ */
+export function testPublicBillingSurface(
+  vendor: string,
+  typesUrl: URL,
+  interfaces: readonly string[],
+  classification: Readonly<Record<string, BillingSurfaceClass>>,
+  billingRegistry: Readonly<Record<string, { methodKey: string }>>,
+): void {
+  describe(`${vendor} public billing surface`, () => {
+    it("exhaustively classifies every public Session method", () => {
+      const source = readFileSync(typesUrl, "utf8");
+      const methods: string[] = [];
+      for (const interfaceName of interfaces) {
+        const match = source.match(new RegExp(
+          `export interface ${interfaceName}(?:\\s+extends[^\\{]+)?\\s*\\{([\\s\\S]*?)^\\}`,
+          "m",
+        ));
+        expect(match, `missing interface ${interfaceName}`).not.toBeNull();
+        for (const member of match![1].matchAll(/^\s{2}([A-Za-z_$][\w$]*)\s*\(/gm)) {
+          methods.push(`${interfaceName}.${member[1]}`);
+        }
+      }
+      expect(Object.keys(classification).toSorted()).toEqual(methods.toSorted());
+      const billable = Object.entries(classification)
+        .filter(([, entry]) => entry === "R" || entry === "A" || entry === "H")
+        .map(([method]) => method)
+        .toSorted();
+      expect(Object.keys(billingRegistry).toSorted()).toEqual(billable);
+      const allowlist = Object.values(classification)
+        .filter((entry): entry is Extract<BillingSurfaceClass, object> => typeof entry === "object");
+      expect(allowlist.every(entry => entry.reason.trim().length >= 20)).toBe(true);
+      expect(Object.values(billingRegistry).every(({ methodKey }) => /\.v\d+$/.test(methodKey)))
+        .toBe(true);
+    });
+  });
+}
+
 class MemoryActionStorage implements BillableActionStorage {
   readonly rows = new Map<string, unknown>();
   get<T>(key: string): T | undefined { return this.rows.get(key) as T | undefined; }
@@ -119,3 +166,4 @@ export function testGatekeeperBillingContract(
     }
   });
 }
+import { readFileSync } from "node:fs";
