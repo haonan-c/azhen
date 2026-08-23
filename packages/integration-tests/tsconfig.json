@@ -14,5 +14,7 @@
     }
   },
   "include": ["src", "__tests__", "fixtures"],
-  "exclude": ["node_modules"]
+  // The runtime-only wrapper imports the generated Workshop module under its own production
+  // tsconfig. Pulling that generated tree into this narrower integration-test program is invalid.
+  "exclude": ["node_modules", "fixtures/workshop-usage-inspection.mjs"]
 }
