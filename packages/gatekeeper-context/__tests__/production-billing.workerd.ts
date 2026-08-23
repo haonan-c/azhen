@@ -28,7 +28,12 @@ import type {
   AdminSettings,
   ArtifactRepoMock,
   ArtifactsTrace,
+  GitHttpControl,
 } from "./production-worker.js";
+import {
+  buildGitHttpFixture,
+  updateGitHttpFixture,
+} from "./git-http-fixture.js";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv {
@@ -40,6 +45,7 @@ declare module "cloudflare:test" {
     TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
     TEST_ARTIFACTS_TRACE: Fetcher<ArtifactsTrace>;
     TEST_ARTIFACT_REPO: DurableObjectNamespace<ArtifactRepoMock>;
+    TEST_GIT_HTTP: Fetcher<GitHttpControl>;
   }
 }
 
@@ -52,11 +58,19 @@ const PRICED_LOCAL_MANAGEMENT_METHODS = [
   "ContextApi.getContextDocument",
   "ContextApi.deleteContextCollection",
 ] as const;
+const PRICED_GIT_MANAGEMENT_METHODS = [
+  "ContextApi.syncContextCollectionArtifactSource",
+  "ContextApi.createContextCollectionGitToken",
+  "ContextApi.listContextCollectionGitTokens",
+  "ContextApi.revokeContextCollectionGitToken",
+] as const;
 const PRICED_METHODS = [
   CONTEXT_BILLING_METHODS["LibraryReadSession.list"].methodKey,
   CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey,
   CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
   ...PRICED_LOCAL_MANAGEMENT_METHODS.map(method =>
+    CONTEXT_BILLING_METHODS[method].methodKey),
+  ...PRICED_GIT_MANAGEMENT_METHODS.map(method =>
     CONTEXT_BILLING_METHODS[method].methodKey),
 ];
 
@@ -758,6 +772,361 @@ describe("production Context billing runtime", () => {
       .toEqual(listed.snapshot.gatekeeperMeteringAttempts);
     expect(afterBackground.gatekeeperUsageRecords)
       .toEqual(listed.snapshot.gatekeeperUsageRecords);
+  });
+
+  it("meters Git collection creation and its token lifecycle once per management call", async () => {
+    const consoleCalls = captureConsoleCalls();
+    const user = await newUser();
+    const sharingDomain = `git-token-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const before = await user.getUsageCreditBalance();
+    await env.TEST_ARTIFACTS_TRACE.reset();
+
+    const traced = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => {
+        const collection = await ui.createContextCollection(
+          "Git token collection", "Git token fixture", "private", undefined, "git");
+        const created = await ui.createContextCollectionGitToken(collection.id);
+        const listed = await ui.listContextCollectionGitTokens(collection.id);
+        const revoked = await ui.revokeContextCollectionGitToken(collection.id, created.id);
+        return { collection, created, listed, revoked };
+      },
+    });
+
+    expect(traced.result.collection.content.source).toBe("git");
+    expect(traced.result.listed.tokens).toEqual([
+      expect.objectContaining({ id: traced.result.created.id }),
+    ]);
+    expect(traced.result.revoked).toBe(true);
+    const gitMethodKeys = [
+      CONTEXT_BILLING_METHODS["ContextApi.createContextCollection"].methodKey,
+      ...PRICED_GIT_MANAGEMENT_METHODS.slice(1).map(method =>
+        CONTEXT_BILLING_METHODS[method].methodKey),
+    ];
+    expect(traced.snapshot.gatekeeperMeteringAttempts.map(attempt =>
+      attempt.attribution.billingMethodKey).toSorted()).toEqual(gitMethodKeys.toSorted());
+    expect(new Set(traced.snapshot.gatekeeperMeteringAttempts.map(attempt =>
+      attempt.operationId)).size).toBe(4);
+    expect(traced.snapshot.gatekeeperMeteringAttempts.every(attempt =>
+      attempt.state === "settled" && attempt.chargeSnapshot.pricing === "priced")).toBe(true);
+    expect(traced.snapshot.gatekeeperUsageRecords).toHaveLength(4);
+    expect(traced.snapshot.reservedSubunits).toBe(0n);
+    expect(traced.snapshot.availableSubunits)
+      .toBe(before.availableSubunits - 4n * PRICED_CHARGE);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.create:${traced.result.collection.id}`,
+      `artifacts.get:${traced.result.collection.id}`,
+      "repo.revokeToken",
+      `artifacts.get:${traced.result.collection.id}`,
+      "repo.createToken:write",
+      `artifacts.get:${traced.result.collection.id}`,
+      "repo.listTokens",
+      `artifacts.get:${traced.result.collection.id}`,
+      "repo.revokeToken",
+    ]);
+    expectUsagePrivacy(traced.snapshot, {
+      remote: traced.result.created.remote,
+      token: traced.result.created.plaintext,
+    }, consoleCalls);
+
+    const createTokenAttempt = traced.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.createContextCollectionGitToken"].methodKey)!;
+    const physicalBeforeReplay = await env.TEST_ARTIFACTS_TRACE.get();
+    await user.completeGatekeeperUsage(createTokenAttempt.operationId, "executed");
+    const replayed = await runInDurableObject(user, instance => userSnapshot(instance));
+    expect(replayed).toEqual(traced.snapshot);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual(physicalBeforeReplay);
+  });
+
+  it("keeps explicit clone, fetch, and document traversal inside each sync operation", async () => {
+    const consoleCalls = captureConsoleCalls();
+    const user = await newUser();
+    const sharingDomain = `git-sync-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const filename = `private-${crypto.randomUUID()}.md`;
+    const body = `private-git-body-${crypto.randomUUID()}`;
+    const fixtureId = crypto.randomUUID();
+    const fixture = await buildGitHttpFixture({
+      body,
+      filename,
+      fixtureId,
+    });
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Git sync collection", "Git sync fixture", "private", undefined, "git"),
+    });
+    if (created.result.content.source !== "git") {
+      throw new Error("Expected a Git-backed Context collection.");
+    }
+    await env.TEST_ARTIFACTS_TRACE.reset();
+    await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
+    await env.TEST_GIT_HTTP.configure({
+      advertisement: fixture.advertisement,
+      remote: created.result.content.remote,
+      uploadPack: fixture.uploadPack,
+    });
+
+    const synced = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => {
+        await ui.syncContextCollectionArtifactSource(created.result.id);
+        return ui.getContextDocument(created.result.id, filename);
+      },
+    });
+
+    expect(synced.result).toEqual(expect.objectContaining({ body, path: filename }));
+    const syncAttempts = synced.snapshot.gatekeeperMeteringAttempts.filter(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.syncContextCollectionArtifactSource"].methodKey);
+    expect(syncAttempts).toEqual([
+      expect.objectContaining({
+        state: "settled",
+        chargeSnapshot: expect.objectContaining({ pricing: "priced" }),
+      }),
+    ]);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:read",
+      "repo.revokeToken",
+    ]);
+    expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.upload-pack",
+    ]);
+
+    const updatedBody = `private-git-updated-body-${crypto.randomUUID()}`;
+    const updatedFixture = await updateGitHttpFixture({
+      body: updatedBody,
+      filename,
+      fixtureId,
+    });
+    await env.TEST_ARTIFACTS_TRACE.reset();
+    await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
+    await env.TEST_GIT_HTTP.configure({
+      advertisement: updatedFixture.advertisement,
+      remote: created.result.content.remote,
+      uploadPack: updatedFixture.uploadPack,
+    });
+    const fetched = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => {
+        await ui.syncContextCollectionArtifactSource(created.result.id);
+        return ui.getContextDocument(created.result.id, filename);
+      },
+    });
+    expect(fetched.result).toEqual(expect.objectContaining({ body: updatedBody, path: filename }));
+    const allSyncAttempts = fetched.snapshot.gatekeeperMeteringAttempts.filter(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.syncContextCollectionArtifactSource"].methodKey);
+    expect(allSyncAttempts).toHaveLength(2);
+    expect(new Set(allSyncAttempts.map(attempt => attempt.operationId)).size).toBe(2);
+    expect(allSyncAttempts.every(attempt => attempt.state === "settled")).toBe(true);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:read",
+      "repo.revokeToken",
+    ]);
+    expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.upload-pack",
+    ]);
+    expectUsagePrivacy(fetched.snapshot, {
+      remote: created.result.content.remote,
+      branch: "main",
+      commit: updatedFixture.commit,
+      fileBody: updatedBody,
+      readToken: "write-plaintext-2",
+    }, consoleCalls);
+  });
+
+  it("holds an accepted Git sync when index propagation fails after commit", async () => {
+    const user = await newUser();
+    const sharingDomain = `git-propagation-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const filename = `committed-${crypto.randomUUID()}.md`;
+    const body = `committed-git-body-${crypto.randomUUID()}`;
+    const fixture = await buildGitHttpFixture({
+      body,
+      filename,
+      fixtureId: crypto.randomUUID(),
+    });
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Git propagation collection", "Committed Git fixture", "private", undefined, "git"),
+    });
+    if (created.result.content.source !== "git") {
+      throw new Error("Expected a Git-backed Context collection.");
+    }
+    await env.TEST_ARTIFACTS_TRACE.reset();
+    await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
+    await env.TEST_GIT_HTTP.configure({
+      advertisement: fixture.advertisement,
+      remote: created.result.content.remote,
+      uploadPack: fixture.uploadPack,
+    });
+    vi.spyOn(UserLibraryDurableObject.prototype, "updateOwnedCollection")
+      .mockImplementationOnce(() => {
+        throw new Error("Simulated Git propagation failure.");
+      });
+
+    const failed = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => rejectionMessage(() =>
+        ui.syncContextCollectionArtifactSource(created.result.id)),
+    });
+
+    expect(failed.result).toBe("Simulated Git propagation failure.");
+    const document = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.getContextDocument(created.result.id, filename),
+    });
+    expect(document.result).toEqual(expect.objectContaining({ body, path: filename }));
+    const syncAttempt = failed.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.syncContextCollectionArtifactSource"].methodKey);
+    expect(syncAttempt).toMatchObject({
+      state: "usage-unknown",
+      chargeSnapshot: { pricing: "priced", chargeSubunits: PRICED_CHARGE },
+    });
+    expect(failed.snapshot.gatekeeperUsageRecords.find(record =>
+      record.operationId === syncAttempt?.operationId)?.outcome).toBe("usage-unknown");
+    expect(failed.snapshot.reservations.find(reservation =>
+      reservation.operationId === syncAttempt?.operationId)).toMatchObject({
+        state: "reserved",
+        amountSubunits: PRICED_CHARGE,
+      });
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:read",
+      "repo.revokeToken",
+    ]);
+    expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.upload-pack",
+    ]);
+  });
+
+  it("releases explicit sync once when local source validation rejects before dispatch", async () => {
+    const user = await newUser();
+    const sharingDomain = `git-predispatch-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Web collection", "Must reject Git sync", "private"),
+    });
+    await env.TEST_ARTIFACTS_TRACE.reset();
+    await env.TEST_GIT_HTTP.reset();
+
+    const rejected = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => rejectionMessage(() =>
+        ui.syncContextCollectionArtifactSource(created.result.id)),
+    });
+
+    expect(rejected.result).toBe("Collection is not git-based.");
+    const syncAttempt = rejected.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.syncContextCollectionArtifactSource"].methodKey);
+    expect(syncAttempt).toMatchObject({
+      state: "failed-before-execution",
+      chargeSnapshot: { pricing: "priced", chargeSubunits: PRICED_CHARGE },
+    });
+    expect(rejected.snapshot.gatekeeperUsageRecords.find(record =>
+      record.operationId === syncAttempt?.operationId)?.outcome).toBe("failed-before-execution");
+    expect(rejected.snapshot.reservations.find(reservation =>
+      reservation.operationId === syncAttempt?.operationId)).toMatchObject({
+        state: "released",
+        amountSubunits: PRICED_CHARGE,
+      });
+    expect(rejected.snapshot.reservedSubunits).toBe(0n);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([]);
+    expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([]);
+  });
+
+  it("holds an accepted Git token operation when the Artifacts response is lost", async () => {
+    const user = await newUser();
+    const sharingDomain = `git-unknown-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Unknown token collection", "Artifacts response-loss fixture",
+        "private", undefined, "git"),
+    });
+    await env.TEST_ARTIFACTS_TRACE.reset();
+    await env.TEST_ARTIFACTS_TRACE.loseNextWriteTokenResponse();
+
+    const lost = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => ({
+        message: await rejectionMessage(() =>
+          ui.createContextCollectionGitToken(created.result.id)),
+        tokens: await ui.listContextCollectionGitTokens(created.result.id),
+      }),
+    });
+
+    expect(lost.result.message).toBe("Simulated Artifacts response loss.");
+    expect(lost.result.tokens.tokens).toHaveLength(1);
+    const tokenAttempt = lost.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.createContextCollectionGitToken"].methodKey);
+    expect(tokenAttempt).toMatchObject({
+      state: "usage-unknown",
+      chargeSnapshot: { pricing: "priced", chargeSubunits: PRICED_CHARGE },
+    });
+    expect(lost.snapshot.gatekeeperUsageRecords.find(record =>
+      record.operationId === tokenAttempt?.operationId)?.outcome).toBe("usage-unknown");
+    expect(lost.snapshot.reservations.find(reservation =>
+      reservation.operationId === tokenAttempt?.operationId)).toMatchObject({
+        state: "reserved",
+        amountSubunits: PRICED_CHARGE,
+      });
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:write",
+      `artifacts.get:${created.result.id}`,
+      "repo.listTokens",
+    ]);
+    const beforeReplay = lost.snapshot;
+    await user.completeGatekeeperUsage(tokenAttempt!.operationId, "unknown");
+    expect(await runInDurableObject(user, instance => userSnapshot(instance)))
+      .toEqual(beforeReplay);
   });
 
   it("keeps caller-controlled attribution and Git/token data off the Session RPC surface", () => {

@@ -9,9 +9,12 @@ const EXPECTED_BILLING_REJECTIONS = new Set([
   "Observation withheld by the host.",
   "Admin access required.",
   "Simulated propagation failure.",
+  "Simulated Git propagation failure.",
   "Simulated completion response loss.",
   "Gatekeeper Metering completion conflicts with its Usage Record.",
   "Simulated background artifact refresh failure.",
+  "Simulated Artifacts response loss.",
+  "Collection is not git-based.",
 ]);
 
 export default defineConfig({
@@ -39,7 +42,9 @@ export default defineConfig({
         serviceBindings: {
           ARTIFACTS: { name: kCurrentWorker, entrypoint: "ArtifactsMock" },
           TEST_ARTIFACTS_TRACE: { name: kCurrentWorker, entrypoint: "ArtifactsTrace" },
+          TEST_GIT_HTTP: { name: kCurrentWorker, entrypoint: "GitHttpControl" },
         },
+        outboundService: { name: kCurrentWorker, entrypoint: "GitHttpMock" },
       },
     }),
   ],
