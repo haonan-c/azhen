@@ -87,8 +87,6 @@ async function deleteCachedRepo(dir: string): Promise<void> {
     if (isEnoent(cleanupErr)) return;
     logger.warn("failed to clean up Artifacts git cache", {
       event: "artifacts.git.cache.cleanup.failed",
-      dir,
-      error: cleanupErr,
     });
   });
 }
@@ -119,8 +117,6 @@ async function cloneRepo(dir: string, url: string, branch: string, onAuth: () =>
   } catch (err) {
     logger.warn("artifacts git clone failed; cleaning up partial clone", {
       event: "artifacts.git.clone.failed",
-      dir,
-      error: err,
     });
     await deleteCachedRepo(dir);
     throw err;
@@ -154,7 +150,6 @@ async function fetchOrRecloneRepo(dir: string, url: string, branch: string, onAu
   if (remainingBytes <= 0) {
     logger.warn("artifacts git cache exceeded transfer budget; recloning shallow cache", {
       event: "artifacts.git.cache.transfer.budget.exceeded",
-      dir,
       sizeBytes,
       maxGitDirBytes: MAX_GIT_DIR_BYTES,
     });
@@ -163,11 +158,9 @@ async function fetchOrRecloneRepo(dir: string, url: string, branch: string, onAu
 
   try {
     return await fetchRepo(dir, url, branch, onAuth, remainingBytes);
-  } catch (err) {
+  } catch {
     logger.warn("artifacts git fetch failed; cleaning up before recloning", {
       event: "artifacts.git.fetch.failed",
-      dir,
-      error: err,
     });
     return recloneRepo(dir, url, branch, onAuth);
   }
@@ -187,9 +180,8 @@ export function readArtifactRepoDocuments(
   currentCommit?: string,
 ): Promise<ArtifactRepoReadResult> {
   const dir = `/tmp/artifacts/${repoName}`;
-  return obsContext.with({
-    operation: "artifacts.repo.read", repoName, branch, dir,
-  }, () => readArtifactRepoDocumentsWithContext(
+  return obsContext.with({ operation: "artifacts.repo.read" }, () =>
+    readArtifactRepoDocumentsWithContext(
       artifacts, repoName, url, branch, dir, currentCommit));
 }
 
@@ -241,7 +233,6 @@ async function readArtifactRepoDocumentsWithContext(
       if (bodyBytes > MAX_DOCUMENT_BODY_BYTES) {
         logger.warn("skipping oversized mirrored context file", {
           event: "context.file.oversized.skipped",
-          filepath,
           bodyBytes,
           maxBodyBytes: MAX_DOCUMENT_BODY_BYTES,
         });
@@ -260,12 +251,9 @@ async function readArtifactRepoDocumentsWithContext(
 
     return { commit, changed: true, documents };
   } finally {
-    await repo.revokeToken(token.id).catch((err) => {
+    await repo.revokeToken(token.id).catch(() => {
       logger.warn("failed to revoke temporary Artifacts read token for context collection sync", {
         event: "artifacts.read.token.revoke.failed",
-        repoName,
-        tokenId: token.id,
-        error: err,
       });
     });
   }

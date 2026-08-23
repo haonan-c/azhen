@@ -226,8 +226,8 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     // have direct control over this.
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
+    await this.#assertGitBased(collectionId);
     await this.#bill("ContextApi.syncContextCollectionArtifactSource", async activity => {
-      await this.#assertGitBased(collectionId);
       activity.requestDispatched();
       await this.#collection(collectionId).syncArtifactSource();
       activity.responseReceived(200);
@@ -237,8 +237,8 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   async createContextCollectionGitToken(collectionId: string): Promise<ContextGitTokenCreateResult> {
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
+    await this.#assertGitBased(collectionId);
     return this.#bill("ContextApi.createContextCollectionGitToken", async activity => {
-      await this.#assertGitBased(collectionId);
       activity.requestDispatched();
       let result = await this.#collection(collectionId).createGitToken();
       activity.responseReceived(200);
@@ -249,8 +249,8 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   async listContextCollectionGitTokens(collectionId: string): Promise<ContextGitTokenList> {
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
+    await this.#assertGitBased(collectionId);
     return this.#bill("ContextApi.listContextCollectionGitTokens", async activity => {
-      await this.#assertGitBased(collectionId);
       activity.requestDispatched();
       let result = await this.#collection(collectionId).listGitTokens();
       activity.responseReceived(200);
@@ -261,8 +261,8 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   async revokeContextCollectionGitToken(collectionId: string, tokenId: string): Promise<boolean> {
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
+    await this.#assertGitBased(collectionId);
     return this.#bill("ContextApi.revokeContextCollectionGitToken", async activity => {
-      await this.#assertGitBased(collectionId);
       activity.requestDispatched();
       let result = await this.#collection(collectionId).revokeGitToken(tokenId);
       activity.responseReceived(200);

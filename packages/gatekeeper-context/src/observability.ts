@@ -3,16 +3,11 @@ import { createObservabilityContext } from "@gadgets/backend-utils/observability
 /** Observability fields emitted by the Context gatekeeper. */
 export type ContextObservabilityFields = {
   bodyBytes: number;
-  branch: string;
   collectionId: string;
-  dir: string;
-  filepath: string;
   maxBodyBytes: number;
   maxGitDirBytes: number;
   operation: string;
-  repoName: string;
   sizeBytes: number;
-  tokenId: number | string;
   vendorId: string;
 };
 

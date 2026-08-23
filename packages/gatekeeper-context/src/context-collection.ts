@@ -138,11 +138,10 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     let repo = await artifacts.get(metadata.id);
     // Artifacts auto-creates an initial write token when the repo is first
     // created. We don't want or need this token, so we immediately revoke it.
-    await repo.revokeToken(created.token).catch((err) => {
+    await repo.revokeToken(created.token).catch(() => {
       logger.warn("failed to revoke initial Artifacts token for context collection", {
         event: "artifacts.initial.token.revoke.failed",
         collectionId: metadata.id,
-        error: err,
       });
     });
     return created.remote;
@@ -486,11 +485,10 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     if (content.source !== "git") return;
     if (Date.now() - content.lastRefreshedAt.getTime() < GIT_REFRESH_MIN_INTERVAL_MS) return;
 
-    void this.#refreshArtifactSource().catch((err) => {
+    void this.#refreshArtifactSource().catch(() => {
       logger.warn("failed to refresh git-based context collection in the background", {
         event: "context.collection.git.refresh.failed",
         collectionId: this.getMetadata().id,
-        error: err,
       });
     });
   }
@@ -626,11 +624,10 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     }
 
     if (meta.content.source === "git" && this.env.ARTIFACTS) {
-      await this.env.ARTIFACTS.delete(id).catch((err) => {
+      await this.env.ARTIFACTS.delete(id).catch(() => {
         logger.warn("failed to delete Artifacts repo for context collection", {
           event: "artifacts.repo.delete.failed",
           collectionId: id,
-          error: err,
         });
       });
     }
@@ -642,11 +639,10 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   async deleteForRevokedOwner(): Promise<void> {
     let meta = this.getMetadata();
     if (meta.content.source === "git" && meta.id && this.env.ARTIFACTS) {
-      await this.env.ARTIFACTS.delete(meta.id).catch((err) => {
+      await this.env.ARTIFACTS.delete(meta.id).catch(() => {
         logger.warn("failed to delete Artifacts repo while revoking context collection owner", {
           event: "artifacts.repo.delete.for.revoked.owner.failed",
           collectionId: meta.id,
-          error: err,
         });
       });
     }

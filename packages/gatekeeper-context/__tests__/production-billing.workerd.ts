@@ -3,6 +3,7 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { USAGE_CREDIT_SUBUNITS_PER_CREDIT } from "@gadgets/workshop-shared/api";
 import type {
+  AppUiContext,
   ApprovalQueue,
   BillableOperation,
   BillableOperationOutcome,
@@ -32,6 +33,7 @@ import type {
 } from "./production-worker.js";
 import {
   buildGitHttpFixture,
+  type GitHttpFixture,
   updateGitHttpFixture,
 } from "./git-http-fixture.js";
 
@@ -79,7 +81,11 @@ async function runManagement<T>(options: {
   sharingDomain: string;
   accountId: string;
   isAdmin?: boolean;
-  run: (ui: ContextApi, iframeHtml: string) => Promise<T>;
+  run: (
+    ui: ContextApi,
+    iframeHtml: string,
+    snapshot: () => UsageAccountSnapshot,
+  ) => Promise<T>;
 }) {
   return runInDurableObject(options.user, async (user, state) => {
     if (await user.describeConnectedAccount(1) === null) {
@@ -97,7 +103,7 @@ async function runManagement<T>(options: {
     }
     const frame = await user.startAccountAppUi(1, { isAdmin: options.isAdmin ?? false });
     using ui = frame.ui;
-    const result = await options.run(ui, frame.iframeHtml);
+    const result = await options.run(ui, frame.iframeHtml, () => userSnapshot(user));
     return { result, snapshot: userSnapshot(user) };
   });
 }
@@ -131,6 +137,17 @@ class TracedBillableOperation extends RpcTarget implements BillableOperation {
     this.trace.events.push(`complete:${outcome}:${this.operationId}`);
     await this.operation.complete(outcome);
     this.trace.events.push(`completed:${outcome}:${this.operationId}`);
+  }
+}
+
+class LosingManagementResultTransport extends RpcTarget {
+  constructor(private readonly ui: ContextApi) {
+    super();
+  }
+
+  async createGitToken(collectionId: string): Promise<never> {
+    await this.ui.createContextCollectionGitToken(collectionId);
+    throw new Error("Simulated management result delivery failure.");
   }
 }
 
@@ -296,6 +313,23 @@ async function rejectionMessage(run: () => Promise<unknown>): Promise<string> {
   } catch (caught) {
     return caught instanceof Error ? caught.message : String(caught);
   }
+}
+
+async function configureGitScenario(options: {
+  collectionId: string;
+  fixture: GitHttpFixture;
+  remote: string;
+}): Promise<void> {
+  await env.TEST_ARTIFACTS_TRACE.reset();
+  await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
+  await env.TEST_GIT_HTTP.configure({
+    advertisement: options.fixture.advertisement,
+    expectedOid: options.fixture.commit,
+    expectedRef: "refs/heads/main",
+    repoName: options.collectionId,
+    remote: options.remote,
+    uploadPack: options.fixture.uploadPack,
+  });
 }
 
 function createCollectionWithUntrustedIframeData(
@@ -800,6 +834,7 @@ describe("production Context billing runtime", () => {
     expect(traced.result.listed.tokens).toEqual([
       expect.objectContaining({ id: traced.result.created.id }),
     ]);
+    expect(JSON.stringify(traced.result.listed.tokens)).not.toContain("plaintext");
     expect(traced.result.revoked).toBe(true);
     const gitMethodKeys = [
       CONTEXT_BILLING_METHODS["ContextApi.createContextCollection"].methodKey,
@@ -819,27 +854,123 @@ describe("production Context billing runtime", () => {
     expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
       `artifacts.create:${traced.result.collection.id}`,
       `artifacts.get:${traced.result.collection.id}`,
-      "repo.revokeToken",
+      "repo.revokeToken:matched",
       `artifacts.get:${traced.result.collection.id}`,
       "repo.createToken:write",
       `artifacts.get:${traced.result.collection.id}`,
       "repo.listTokens",
       `artifacts.get:${traced.result.collection.id}`,
-      "repo.revokeToken",
+      "repo.revokeToken:matched",
     ]);
     expectUsagePrivacy(traced.snapshot, {
       remote: traced.result.created.remote,
-      token: traced.result.created.plaintext,
+      tokenId: traced.result.created.id,
+      tokenPlaintext: traced.result.created.plaintext,
+      initialToken: `initial-plaintext-${traced.result.collection.id}`,
     }, consoleCalls);
+  });
 
-    const createTokenAttempt = traced.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+  it("reuses one host-issued management delivery without a second business effect", async () => {
+    const user = await newUser();
+    const sharingDomain = `git-delivery-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Git delivery collection", "Duplicate delivery fixture", "private", undefined, "git"),
+    });
+    const before = await user.getUsageCreditBalance();
+    await env.TEST_ARTIFACTS_TRACE.reset();
+
+    const replayed = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async (ui, _iframeHtml, snapshot) => {
+        // Cap'n Web assigns this call once. Both consumers observe the same transport delivery;
+        // no operation identity is accepted from the iframe or supplied by this test.
+        const delivery = ui.createContextCollectionGitToken(created.result.id);
+        const first = await delivery;
+        const firstSnapshot = snapshot();
+        const duplicate = await delivery;
+        return { first, firstSnapshot, duplicate, duplicateSnapshot: snapshot() };
+      },
+    });
+
+    expect(replayed.result.duplicate).toEqual(replayed.result.first);
+    expect(replayed.result.duplicateSnapshot).toEqual(replayed.result.firstSnapshot);
+    const attempts = replayed.snapshot.gatekeeperMeteringAttempts.filter(attempt =>
       attempt.attribution.billingMethodKey ===
-        CONTEXT_BILLING_METHODS["ContextApi.createContextCollectionGitToken"].methodKey)!;
-    const physicalBeforeReplay = await env.TEST_ARTIFACTS_TRACE.get();
-    await user.completeGatekeeperUsage(createTokenAttempt.operationId, "executed");
-    const replayed = await runInDurableObject(user, instance => userSnapshot(instance));
-    expect(replayed).toEqual(traced.snapshot);
-    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual(physicalBeforeReplay);
+        CONTEXT_BILLING_METHODS["ContextApi.createContextCollectionGitToken"].methodKey);
+    expect(attempts).toHaveLength(1);
+    expect(new Set(attempts.map(attempt => attempt.operationId)).size).toBe(1);
+    expect(replayed.snapshot.gatekeeperUsageRecords.filter(record =>
+      record.operationId === attempts[0]!.operationId)).toHaveLength(1);
+    expect(replayed.snapshot.availableSubunits).toBe(before.availableSubunits - PRICED_CHARGE);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:write",
+    ]);
+  });
+
+  it("does not refund accepted Git work when its management result delivery fails", async () => {
+    const consoleCalls = captureConsoleCalls();
+    const user = await newUser();
+    const sharingDomain = `git-result-loss-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Git result collection", "Result delivery fixture", "private", undefined, "git"),
+    });
+    if (created.result.content.source !== "git") {
+      throw new Error("Expected a Git-backed Context collection.");
+    }
+    const before = await user.getUsageCreditBalance();
+    await env.TEST_ARTIFACTS_TRACE.reset();
+
+    const lost = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => {
+        using transport = new RpcStub(new LosingManagementResultTransport(ui));
+        return rejectionMessage(() => transport.createGitToken(created.result.id));
+      },
+    });
+
+    expect(lost.result).toBe("Simulated management result delivery failure.");
+    const tokenAttempt = lost.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.createContextCollectionGitToken"].methodKey);
+    expect(tokenAttempt).toMatchObject({ state: "settled" });
+    expect(lost.snapshot.gatekeeperUsageRecords.find(record =>
+      record.operationId === tokenAttempt?.operationId)?.outcome).toBe("settled");
+    expect(lost.snapshot.reservedSubunits).toBe(0n);
+    expect(lost.snapshot.availableSubunits).toBe(before.availableSubunits - PRICED_CHARGE);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:write",
+    ]);
+    const delivered = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.listContextCollectionGitTokens(created.result.id),
+    });
+    expect(delivered.result.tokens).toEqual([
+      expect.objectContaining({ id: "write-token-1" }),
+    ]);
+    expectUsagePrivacy(lost.snapshot, {
+      remote: created.result.content.remote,
+      branch: "main",
+      tokenId: "write-token-1",
+      tokenPlaintext: "write-plaintext-1",
+    }, consoleCalls);
   });
 
   it("keeps explicit clone, fetch, and document traversal inside each sync operation", async () => {
@@ -865,12 +996,10 @@ describe("production Context billing runtime", () => {
     if (created.result.content.source !== "git") {
       throw new Error("Expected a Git-backed Context collection.");
     }
-    await env.TEST_ARTIFACTS_TRACE.reset();
-    await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
-    await env.TEST_GIT_HTTP.configure({
-      advertisement: fixture.advertisement,
+    await configureGitScenario({
+      collectionId: created.result.id,
+      fixture,
       remote: created.result.content.remote,
-      uploadPack: fixture.uploadPack,
     });
 
     const synced = await runManagement({
@@ -896,7 +1025,7 @@ describe("production Context billing runtime", () => {
     expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
       `artifacts.get:${created.result.id}`,
       "repo.createToken:read",
-      "repo.revokeToken",
+      "repo.revokeToken:matched",
     ]);
     expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
       "git.auth-challenge",
@@ -912,12 +1041,10 @@ describe("production Context billing runtime", () => {
       filename,
       fixtureId,
     });
-    await env.TEST_ARTIFACTS_TRACE.reset();
-    await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
-    await env.TEST_GIT_HTTP.configure({
-      advertisement: updatedFixture.advertisement,
+    await configureGitScenario({
+      collectionId: created.result.id,
+      fixture: updatedFixture,
       remote: created.result.content.remote,
-      uploadPack: updatedFixture.uploadPack,
     });
     const fetched = await runManagement({
       user,
@@ -938,7 +1065,7 @@ describe("production Context billing runtime", () => {
     expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
       `artifacts.get:${created.result.id}`,
       "repo.createToken:read",
-      "repo.revokeToken",
+      "repo.revokeToken:matched",
     ]);
     expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
       "git.auth-challenge",
@@ -952,11 +1079,85 @@ describe("production Context billing runtime", () => {
       branch: "main",
       commit: updatedFixture.commit,
       fileBody: updatedBody,
-      readToken: "write-plaintext-2",
+      filepath: filename,
+      readTokenId: "read-token-2",
+      readToken: "read-plaintext-2",
+      authorization: `Basic ${btoa("x-access-token:read-plaintext-2")}`,
+    }, consoleCalls);
+  });
+
+  it("settles accepted Git sync when read-token cleanup fails", async () => {
+    const consoleCalls = captureConsoleCalls();
+    const user = await newUser();
+    const sharingDomain = `git-cleanup-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const filename = `cleanup-${crypto.randomUUID()}.md`;
+    const body = `cleanup-git-body-${crypto.randomUUID()}`;
+    const fixture = await buildGitHttpFixture({
+      body,
+      filename,
+      fixtureId: crypto.randomUUID(),
+    });
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Git cleanup collection", "Cleanup failure fixture", "private", undefined, "git"),
+    });
+    if (created.result.content.source !== "git") {
+      throw new Error("Expected a Git-backed Context collection.");
+    }
+    await configureGitScenario({
+      collectionId: created.result.id,
+      fixture,
+      remote: created.result.content.remote,
+    });
+    await env.TEST_ARTIFACTS_TRACE.failNextReadTokenRevoke();
+
+    const synced = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => {
+        await ui.syncContextCollectionArtifactSource(created.result.id);
+        return ui.getContextDocument(created.result.id, filename);
+      },
+    });
+
+    expect(synced.result).toEqual(expect.objectContaining({ body, path: filename }));
+    const syncAttempt = synced.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.syncContextCollectionArtifactSource"].methodKey);
+    expect(syncAttempt).toMatchObject({ state: "settled" });
+    expect(synced.snapshot.gatekeeperUsageRecords.find(record =>
+      record.operationId === syncAttempt?.operationId)?.outcome).toBe("settled");
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+      `artifacts.get:${created.result.id}`,
+      "repo.createToken:read",
+      "repo.revokeToken:matched",
+    ]);
+    expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.auth-challenge",
+      "git.info-refs",
+      "git.upload-pack",
+    ]);
+    expectUsagePrivacy(synced.snapshot, {
+      remote: created.result.content.remote,
+      branch: "main",
+      commit: fixture.commit,
+      fileBody: body,
+      filepath: filename,
+      readTokenId: "read-token-1",
+      readToken: "read-plaintext-1",
+      authorization: `Basic ${btoa("x-access-token:read-plaintext-1")}`,
     }, consoleCalls);
   });
 
   it("holds an accepted Git sync when index propagation fails after commit", async () => {
+    const consoleCalls = captureConsoleCalls();
     const user = await newUser();
     const sharingDomain = `git-propagation-domain-${crypto.randomUUID()}`;
     const accountId = crypto.randomUUID();
@@ -977,12 +1178,10 @@ describe("production Context billing runtime", () => {
     if (created.result.content.source !== "git") {
       throw new Error("Expected a Git-backed Context collection.");
     }
-    await env.TEST_ARTIFACTS_TRACE.reset();
-    await env.TEST_ARTIFACTS_TRACE.allowReadTokens();
-    await env.TEST_GIT_HTTP.configure({
-      advertisement: fixture.advertisement,
+    await configureGitScenario({
+      collectionId: created.result.id,
+      fixture,
       remote: created.result.content.remote,
-      uploadPack: fixture.uploadPack,
     });
     vi.spyOn(UserLibraryDurableObject.prototype, "updateOwnedCollection")
       .mockImplementationOnce(() => {
@@ -1022,7 +1221,7 @@ describe("production Context billing runtime", () => {
     expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
       `artifacts.get:${created.result.id}`,
       "repo.createToken:read",
-      "repo.revokeToken",
+      "repo.revokeToken:matched",
     ]);
     expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([
       "git.auth-challenge",
@@ -1031,6 +1230,16 @@ describe("production Context billing runtime", () => {
       "git.info-refs",
       "git.upload-pack",
     ]);
+    expectUsagePrivacy(failed.snapshot, {
+      remote: created.result.content.remote,
+      branch: "main",
+      commit: fixture.commit,
+      fileBody: body,
+      filepath: filename,
+      readTokenId: "read-token-1",
+      readToken: "read-plaintext-1",
+      authorization: `Basic ${btoa("x-access-token:read-plaintext-1")}`,
+    }, consoleCalls);
   });
 
   it("releases explicit sync once when local source validation rejects before dispatch", async () => {
@@ -1046,6 +1255,8 @@ describe("production Context billing runtime", () => {
     });
     await env.TEST_ARTIFACTS_TRACE.reset();
     await env.TEST_GIT_HTTP.reset();
+    const beginBilling = vi.spyOn(
+      UserDurableObject.prototype, "beginDirectGatekeeperOperation");
 
     const rejected = await runManagement({
       user,
@@ -1056,26 +1267,19 @@ describe("production Context billing runtime", () => {
     });
 
     expect(rejected.result).toBe("Collection is not git-based.");
-    const syncAttempt = rejected.snapshot.gatekeeperMeteringAttempts.find(attempt =>
-      attempt.attribution.billingMethodKey ===
-        CONTEXT_BILLING_METHODS["ContextApi.syncContextCollectionArtifactSource"].methodKey);
-    expect(syncAttempt).toMatchObject({
-      state: "failed-before-execution",
-      chargeSnapshot: { pricing: "priced", chargeSubunits: PRICED_CHARGE },
-    });
-    expect(rejected.snapshot.gatekeeperUsageRecords.find(record =>
-      record.operationId === syncAttempt?.operationId)?.outcome).toBe("failed-before-execution");
-    expect(rejected.snapshot.reservations.find(reservation =>
-      reservation.operationId === syncAttempt?.operationId)).toMatchObject({
-        state: "released",
-        amountSubunits: PRICED_CHARGE,
-      });
+    expect(beginBilling).not.toHaveBeenCalled();
+    expect(rejected.snapshot.gatekeeperMeteringAttempts).toEqual(
+      created.snapshot.gatekeeperMeteringAttempts);
+    expect(rejected.snapshot.gatekeeperUsageRecords).toEqual(
+      created.snapshot.gatekeeperUsageRecords);
+    expect(rejected.snapshot.reservations).toEqual(created.snapshot.reservations);
     expect(rejected.snapshot.reservedSubunits).toBe(0n);
     expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([]);
     expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([]);
   });
 
   it("holds an accepted Git token operation when the Artifacts response is lost", async () => {
+    const consoleCalls = captureConsoleCalls();
     const user = await newUser();
     const sharingDomain = `git-unknown-domain-${crypto.randomUUID()}`;
     const accountId = crypto.randomUUID();
@@ -1123,10 +1327,13 @@ describe("production Context billing runtime", () => {
       `artifacts.get:${created.result.id}`,
       "repo.listTokens",
     ]);
-    const beforeReplay = lost.snapshot;
-    await user.completeGatekeeperUsage(tokenAttempt!.operationId, "unknown");
-    expect(await runInDurableObject(user, instance => userSnapshot(instance)))
-      .toEqual(beforeReplay);
+    expectUsagePrivacy(lost.snapshot, {
+      remote: created.result.content.remote,
+      branch: "main",
+      tokenId: "write-token-1",
+      tokenPlaintext: "write-plaintext-1",
+      initialToken: `initial-plaintext-${created.result.id}`,
+    }, consoleCalls);
   });
 
   it("keeps caller-controlled attribution and Git/token data off the Session RPC surface", () => {
@@ -1143,6 +1350,9 @@ describe("production Context billing runtime", () => {
 
     type ContextGitTokenMethods = Extract<keyof ContextApi, `${string}GitToken${string}`>;
     type SessionGitTokenMethods = Extract<keyof LibraryReadSession, ContextGitTokenMethods>;
+    type ManagementObservationAuthorization = Extract<
+      keyof AppUiContext["billingAuthorizer"], "authorizeObservation"
+    >;
     type SessionCollectionEntry = Extract<ContextListingEntry, { type: "collection" }>;
     type SessionGitMetadata = Extract<
       keyof SessionCollectionEntry,
@@ -1152,6 +1362,8 @@ describe("production Context billing runtime", () => {
     // the separate management ContextApi capability. Do not pretend document text is either one.
     const hasNoGitTokenMethods: [SessionGitTokenMethods] extends [never] ? true : false = true;
     const hasNoGitMetadata: [SessionGitMetadata] extends [never] ? true : false = true;
+    const managementHasNoObservationAuthorization:
+      [ManagementObservationAuthorization] extends [never] ? true : false = true;
     expectTypeOf<ContextGitTokenMethods>().toEqualTypeOf<
       | "createContextCollectionGitToken"
       | "listContextCollectionGitTokens"
@@ -1159,6 +1371,7 @@ describe("production Context billing runtime", () => {
     >();
     expect(hasNoGitTokenMethods).toBe(true);
     expect(hasNoGitMetadata).toBe(true);
+    expect(managementHasNoObservationAuthorization).toBe(true);
   });
 
   it("boots the shipping Worker and SQLite Durable Objects in workerd", async () => {

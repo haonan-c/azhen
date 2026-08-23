@@ -14,6 +14,8 @@ const EXPECTED_BILLING_REJECTIONS = new Set([
   "Gatekeeper Metering completion conflicts with its Usage Record.",
   "Simulated background artifact refresh failure.",
   "Simulated Artifacts response loss.",
+  "Simulated Artifacts read-token cleanup failure.",
+  "Simulated management result delivery failure.",
   "Collection is not git-based.",
 ]);
 
