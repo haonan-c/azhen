@@ -11,7 +11,7 @@
     "typecheck:app": "tsc -p tsconfig.app.json && tsc -p tsconfig.vite.json",
     "build": "pnpm run typecheck:app && pnpm run build:app && tsc",
     "clean": "rm -rf dist src/generated",
-    "test": "vitest run"
+    "test": "pnpm run build:app && vitest run && vitest run --config vitest.production.config.ts"
   },
   "dependencies": {
     "@gadgets/backend-utils": "workspace:*",
@@ -25,6 +25,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "catalog:",
     "@cloudflare/kumo": "^2.9.2",
     "@codemirror/commands": "^6.10.4",
     "@codemirror/lang-javascript": "^6.2.5",
