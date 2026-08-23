@@ -1,17 +1,19 @@
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import { env, runInDurableObject, SELF } from "cloudflare:test";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { USAGE_CREDIT_SUBUNITS_PER_CREDIT } from "@gadgets/workshop-shared/api";
 import type {
   ApprovalQueue,
   BillableOperation,
   BillableOperationOutcome,
+  GatekeeperUserVerifier,
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { UsageAccountSnapshot } from "../../workshop-backend/src/usage-account.js";
 import type { UserDurableObject } from "../../workshop-backend/src/user.js";
 import { CONTEXT_BILLING_METHODS } from "../src/billing-methods.js";
 import type { ContextCollectionDurableObject } from "../src/context-collection.js";
+import type { ContextApi, ContextListingEntry } from "../src/context-types.js";
 import { domainName } from "../src/domain.js";
 import type { ContextGatekeeper } from "../src/library-gatekeeper.js";
 import type { LibraryReadSession } from "../src/library-read.js";
@@ -40,6 +42,7 @@ type ContextExports = {
   ContextGatekeeper: (options: {
     props: { sharingDomain: string; accountId: string };
   }) => DurableObjectClass<ContextGatekeeper>;
+  ObserverVerifier: (options: object) => Fetcher<GatekeeperUserVerifier>;
 };
 
 type Trace = {
@@ -108,6 +111,7 @@ class HostBillingAuthorizer extends RpcTarget {
 
 type SessionContext = {
   gatekeeper: ContextGatekeeper;
+  createObserverVerifier: () => Fetcher<GatekeeperUserVerifier>;
   session: LibraryReadSession;
   authorizer: HostBillingAuthorizer;
 };
@@ -180,7 +184,12 @@ async function runSession<T>(options: {
     const authorizer = new HostBillingAuthorizer(user, options.withholdObservation);
     using authorizerStub = new RpcStub(authorizer) as unknown as RpcStub<ApprovalQueue>;
     using session = await gatekeeper.startSession(authorizerStub);
-    const result = await options.run({ gatekeeper, session, authorizer });
+    const result = await options.run({
+      gatekeeper,
+      createObserverVerifier: () => exports.ObserverVerifier({}),
+      session,
+      authorizer,
+    });
     return { result, trace: authorizer.trace, snapshot: userSnapshot(user) };
   });
 }
@@ -190,8 +199,17 @@ function snapshotText(snapshot: UsageAccountSnapshot): string {
     typeof value === "bigint" ? value.toString() : value);
 }
 
+async function rejectionMessage(run: () => Promise<unknown>): Promise<string> {
+  try {
+    await run();
+    return "";
+  } catch (caught) {
+    return caught instanceof Error ? caught.message : String(caught);
+  }
+}
+
 beforeAll(async () => {
-  env.TEST_ADMIN_SETTINGS.getByName("").configure(PRICED_METHODS.map(billingMethodKey => ({
+  await env.TEST_ADMIN_SETTINGS.getByName("").configure(PRICED_METHODS.map(billingMethodKey => ({
     kind: "gatekeeper-operation-rate" as const,
     vendorId: VENDOR_ID,
     billingMethodKey,
@@ -204,6 +222,38 @@ afterEach(() => {
 });
 
 describe("production Context billing runtime", () => {
+  it("keeps caller-controlled attribution and Git/token data off the Session RPC surface", () => {
+    // These exact public signatures leave no argument slot for principal, source, or host
+    // dimensions. The caller supplies only the Context business input.
+    expectTypeOf<Parameters<LibraryReadSession["search"]>>().toEqualTypeOf<[
+      query: string,
+      opts?: { collectionId?: string; limit?: number },
+    ]>();
+    expectTypeOf<Parameters<LibraryReadSession["list"]>>().toEqualTypeOf<[
+      opts?: { collectionId?: string; path?: string },
+    ]>();
+    expectTypeOf<Parameters<LibraryReadSession["read"]>>().toEqualTypeOf<[docId: string]>();
+
+    type ContextGitTokenMethods = Extract<keyof ContextApi, `${string}GitToken${string}`>;
+    type SessionGitTokenMethods = Extract<keyof LibraryReadSession, ContextGitTokenMethods>;
+    type SessionCollectionEntry = Extract<ContextListingEntry, { type: "collection" }>;
+    type SessionGitMetadata = Extract<
+      keyof SessionCollectionEntry,
+      "content" | "remote" | "branch" | "commit"
+    >;
+    // Git metadata is not part of the Session collection summary, and token methods live only on
+    // the separate management ContextApi capability. Do not pretend document text is either one.
+    const hasNoGitTokenMethods: [SessionGitTokenMethods] extends [never] ? true : false = true;
+    const hasNoGitMetadata: [SessionGitMetadata] extends [never] ? true : false = true;
+    expectTypeOf<ContextGitTokenMethods>().toEqualTypeOf<
+      | "createContextCollectionGitToken"
+      | "listContextCollectionGitTokens"
+      | "revokeContextCollectionGitToken"
+    >();
+    expect(hasNoGitTokenMethods).toBe(true);
+    expect(hasNoGitMetadata).toBe(true);
+  });
+
   it("boots the shipping Worker and SQLite Durable Objects in workerd", async () => {
     expect(navigator.userAgent).toBe("Cloudflare-Workers");
     expect(await (await SELF.fetch("https://context.test/")).text())
@@ -249,38 +299,43 @@ describe("production Context billing runtime", () => {
       }],
     });
 
-    const search = await runSession({
+    const fanout = await runSession({
       user,
       sharingDomain,
       accountId,
-      run: async ({ session }) => ({
-        fanout: await session.search("shared tracer phrase"),
-        empty: await session.search("absent-query-sentinel"),
-      }),
+      run: ({ session }) => session.search("shared tracer phrase"),
     });
-    expect(search.result.fanout.map(result => result.collectionId).toSorted())
+    expect(fanout.result.map(result => result.collectionId).toSorted())
       .toEqual(["alpha", "beta"]);
-    expect(search.result.empty).toEqual([]);
-    expect(search.snapshot.gatekeeperMeteringAttempts).toHaveLength(2);
-    expect(search.snapshot.gatekeeperMeteringAttempts.every(attempt =>
+    expect(fanout.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
+    expect(fanout.snapshot.gatekeeperMeteringAttempts[0]?.chargeSnapshot.pricing)
+      .toBe("unpriced");
+    expect(fanout.trace.events.filter(event => event.startsWith("begin:"))).toHaveLength(1);
+
+    const emptySearch = await runSession({
+      user,
+      sharingDomain,
+      accountId,
+      run: ({ session }) => session.search("absent-query-sentinel"),
+    });
+    expect(emptySearch.result).toEqual([]);
+    expect(emptySearch.snapshot.gatekeeperMeteringAttempts).toHaveLength(2);
+    expect(emptySearch.snapshot.gatekeeperMeteringAttempts.every(attempt =>
       attempt.chargeSnapshot.pricing === "unpriced")).toBe(true);
-    expect(search.trace.events.filter(event => event.startsWith("begin:"))).toHaveLength(2);
+    expect(emptySearch.trace.events.filter(event => event.startsWith("begin:"))).toHaveLength(1);
 
     const emptyUser = await newUser();
-    const empty = await runSession({
+    const emptyList = await runSession({
       user: emptyUser,
       sharingDomain: `empty-domain-${crypto.randomUUID()}`,
       accountId: `empty-account-${crypto.randomUUID()}`,
-      run: async ({ session }) => ({
-        listing: await session.list(),
-        missing: await session.read("missing/notes/none.md"),
-      }),
+      run: ({ session }) => session.list(),
     });
-    expect(empty.result.listing.entries).toEqual([]);
-    expect(empty.result.missing).toBeNull();
-    expect(empty.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
-    expect(empty.snapshot.gatekeeperMeteringAttempts[0]?.attribution.billingMethodKey)
+    expect(emptyList.result.entries).toEqual([]);
+    expect(emptyList.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
+    expect(emptyList.snapshot.gatekeeperMeteringAttempts[0]?.attribution.billingMethodKey)
       .toBe(CONTEXT_BILLING_METHODS["LibraryReadSession.list"].methodKey);
+    expect(emptyList.trace.events.filter(event => event.startsWith("begin:"))).toHaveLength(1);
 
     const missing = await runSession({
       user,
@@ -289,9 +344,11 @@ describe("production Context billing runtime", () => {
       run: ({ session }) => session.read("alpha/notes/missing.md"),
     });
     expect(missing.result).toBeNull();
+    expect(missing.snapshot.gatekeeperMeteringAttempts).toHaveLength(3);
     expect(missing.snapshot.gatekeeperMeteringAttempts.filter(attempt =>
       attempt.attribution.billingMethodKey ===
         CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey)).toHaveLength(1);
+    expect(missing.trace.events.filter(event => event.startsWith("begin:"))).toHaveLength(1);
   });
 
   it("meters Slash Command invoke once without billing its delegated read", async () => {
@@ -319,7 +376,7 @@ describe("production Context billing runtime", () => {
         const command = (await provider.list())[0];
         if (!command) throw new Error("Expected one Context Slash Command.");
         using authorizerStub = new RpcStub(authorizer);
-        return provider.invoke(command.id, "fixture arguments", authorizerStub);
+        return await provider.invoke(command.id, "fixture arguments", authorizerStub);
       },
     });
 
@@ -353,15 +410,7 @@ describe("production Context billing runtime", () => {
       sharingDomain,
       accountId,
       withholdObservation: true,
-      run: async ({ session }) => {
-        let error = "";
-        try {
-          await session.read("ordering/readme.md");
-        } catch (caught) {
-          error = caught instanceof Error ? caught.message : String(caught);
-        }
-        return error;
-      },
+      run: ({ session }) => rejectionMessage(() => session.read("ordering/readme.md")),
     });
     expect(withheld.result).toBe("Observation withheld by the host.");
     expect(withheld.trace.events.map(event => event.split(":")[0])).toEqual([
@@ -383,15 +432,7 @@ describe("production Context billing runtime", () => {
       user: rejectedUser,
       sharingDomain,
       accountId,
-      run: async ({ session }) => {
-        let error = "";
-        try {
-          await session.read("ordering/readme.md");
-        } catch (caught) {
-          error = caught instanceof Error ? caught.message : String(caught);
-        }
-        return error;
-      },
+      run: ({ session }) => rejectionMessage(() => session.read("ordering/readme.md")),
     });
     expect(rejected.result).toContain("Insufficient Usage Credit");
     expect(rejected.trace.events).toHaveLength(1);
@@ -399,7 +440,7 @@ describe("production Context billing runtime", () => {
     expect(rejected.snapshot.gatekeeperMeteringAttempts).toEqual([]);
   });
 
-  it("keeps host attribution, idempotent finance, and content out of Usage facts and logs", async () => {
+  it("keeps host attribution, idempotent finance, and observed content out of Usage facts and logs", async () => {
     const log = vi.spyOn(console, "log");
     const info = vi.spyOn(console, "info");
     const warn = vi.spyOn(console, "warn");
@@ -410,12 +451,10 @@ describe("production Context billing runtime", () => {
       path: `private-path-${crypto.randomUUID()}.md`,
       title: `private-title-${crypto.randomUUID()}`,
       content: `private-content-${crypto.randomUUID()}`,
-      gitCommit: `private-git-commit-${crypto.randomUUID()}`,
-      token: `private-token-${crypto.randomUUID()}`,
       observer: `private-observer-${crypto.randomUUID()}`,
     };
     const user = await newUser();
-    const accountId = `safe-account-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
     await addCollection({
       sharingDomain: sentinels.sharingDomain,
       accountId,
@@ -423,8 +462,8 @@ describe("production Context billing runtime", () => {
       title: sentinels.title,
       documents: [{
         path: sentinels.path,
-        description: sentinels.gitCommit,
-        body: `${sentinels.content} ${sentinels.token} ${sentinels.observer}`,
+        description: "Private document",
+        body: sentinels.content,
       }],
     });
 
@@ -432,8 +471,12 @@ describe("production Context billing runtime", () => {
       user,
       sharingDomain: sentinels.sharingDomain,
       accountId,
-      run: ({ session }) => session.read(`private/${sentinels.path}`),
+      run: async ({ gatekeeper, createObserverVerifier, session }) => {
+        await gatekeeper.addObserver(sentinels.observer, createObserverVerifier());
+        return session.read(`private/${sentinels.path}`);
+      },
     });
+    expect(first.trace.observations[0]?.excludeObservers).toEqual([sentinels.observer]);
     const second = await runSession({
       user,
       sharingDomain: sentinels.sharingDomain,
@@ -454,9 +497,12 @@ describe("production Context billing runtime", () => {
       attempt.attribution.source === "direct-user" &&
       attempt.attribution.vendorId === VENDOR_ID &&
       attempt.attribution.externalAccountId === accountId)).toBe(true);
-    expect(Object.keys(attempts[0]?.attribution ?? {}).toSorted()).toEqual([
-      "billingMethodKey", "externalAccountId", "principal", "source", "vendorId",
-    ]);
+    expect(accountId).toMatch(/^[0-9a-f-]{36}$/);
+    for (const attempt of attempts) {
+      expect(Object.keys(attempt.attribution).toSorted()).toEqual([
+        "billingMethodKey", "externalAccountId", "principal", "source", "vendorId",
+      ]);
+    }
 
     const operationId = attempts.find(attempt =>
       attempt.attribution.billingMethodKey ===
@@ -465,6 +511,13 @@ describe("production Context billing runtime", () => {
     const replayed = await user.completeGatekeeperUsage(operationId, "executed");
     expect(replayed.operationId).toBe(operationId);
     expect(await user.getUsageCreditBalance()).toEqual(beforeReplay);
+    const afterReplay = await runInDurableObject(user, instance => userSnapshot(instance));
+    expect(afterReplay.gatekeeperMeteringAttempts)
+      .toEqual(queried.snapshot.gatekeeperMeteringAttempts);
+    expect(afterReplay.gatekeeperUsageRecords)
+      .toEqual(queried.snapshot.gatekeeperUsageRecords);
+    expect(afterReplay.ledgerEntries).toEqual(queried.snapshot.ledgerEntries);
+    expect(afterReplay.reservations).toEqual(queried.snapshot.reservations);
     expect(first.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
     expect(second.snapshot.gatekeeperMeteringAttempts).toHaveLength(2);
 
