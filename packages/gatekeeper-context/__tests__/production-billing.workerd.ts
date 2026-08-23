@@ -16,14 +16,17 @@ import type { ContextCollectionDurableObject } from "../src/context-collection.j
 import type { ContextApi, ContextListingEntry } from "../src/context-types.js";
 import { domainName } from "../src/domain.js";
 import type { ContextGatekeeper } from "../src/library-gatekeeper.js";
+import type { ContextAccount } from "../src/library-gatekeeper.js";
+import type { LibraryRegistryDurableObject } from "../src/registry-do.js";
 import type { LibraryReadSession } from "../src/library-read.js";
-import type { UserLibraryDurableObject } from "../src/user-library.js";
+import { UserLibraryDurableObject } from "../src/user-library.js";
 import type { AdminSettings } from "./production-worker.js";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv {
     TEST_CONTEXT_COLLECTION: DurableObjectNamespace<ContextCollectionDurableObject>;
     TEST_USER_LIBRARY: DurableObjectNamespace<UserLibraryDurableObject>;
+    TEST_LIBRARY_REGISTRY: DurableObjectNamespace<LibraryRegistryDurableObject>;
     TEST_CONTEXT_GATEKEEPER: DurableObjectNamespace<ContextGatekeeper>;
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
     TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
@@ -32,18 +35,60 @@ declare module "cloudflare:test" {
 
 const VENDOR_ID = "context";
 const PRICED_CHARGE = 3n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
+const PRICED_LOCAL_MANAGEMENT_METHODS = [
+  "ContextApi.createContextCollection",
+  "ContextApi.getContextCollectionMetadata",
+  "ContextApi.putContextDocument",
+  "ContextApi.getContextDocument",
+  "ContextApi.deleteContextCollection",
+] as const;
 const PRICED_METHODS = [
   CONTEXT_BILLING_METHODS["LibraryReadSession.list"].methodKey,
   CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey,
   CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
+  ...PRICED_LOCAL_MANAGEMENT_METHODS.map(method =>
+    CONTEXT_BILLING_METHODS[method].methodKey),
 ];
 
 type ContextExports = {
+  ContextAccount: (options: {
+    props: { sharingDomain: string; accountId: string };
+  }) => Fetcher<ContextAccount>;
   ContextGatekeeper: (options: {
     props: { sharingDomain: string; accountId: string };
   }) => DurableObjectClass<ContextGatekeeper>;
   ObserverVerifier: (options: object) => Fetcher<GatekeeperUserVerifier>;
 };
+
+async function runManagement<T>(options: {
+  user: DurableObjectStub<UserDurableObject>;
+  sharingDomain: string;
+  accountId: string;
+  isAdmin?: boolean;
+  run: (ui: ContextApi, iframeHtml: string) => Promise<T>;
+}) {
+  return runInDurableObject(options.user, async user => {
+    const state = (user as unknown as { ctx: DurableObjectState }).ctx;
+    const exports = state.exports as unknown as ContextExports;
+    if (await user.describeConnectedAccount(1) === null) {
+      const account = exports.ContextAccount({
+        props: { sharingDomain: options.sharingDomain, accountId: options.accountId },
+      });
+      const description = await account.describe();
+      await user.putConnectedAccount({
+        id: 1,
+        account,
+        description,
+        vendorId: VENDOR_ID,
+        autoProvisioned: true,
+      });
+    }
+    const frame = await user.startAccountAppUi(1, { isAdmin: options.isAdmin ?? false });
+    using ui = frame.ui;
+    const result = await options.run(ui, frame.iframeHtml);
+    return { result, snapshot: userSnapshot(user) };
+  });
+}
 
 type Trace = {
   events: string[];
@@ -248,6 +293,368 @@ afterEach(() => {
 });
 
 describe("production Context billing runtime", () => {
+  it("opens the production management capability through the Workshop User", async () => {
+    const user = await newUser();
+    const opened = await runManagement({
+      user,
+      sharingDomain: `management-domain-${crypto.randomUUID()}`,
+      accountId: crypto.randomUUID(),
+      run: async (ui, iframeHtml) => ({
+        iframeHtml,
+        viewer: await ui.getViewerInfo(),
+        canWrite: await ui.canWriteContextCollection("missing-collection"),
+      }),
+    });
+
+    expect(opened.result.iframeHtml).not.toBe("");
+    expect(opened.result.viewer).toEqual({
+      isAdmin: false,
+      supportsGitCollections: false,
+    });
+    expect(opened.result.canWrite).toBe(false);
+    expect(opened.snapshot.gatekeeperMeteringAttempts).toEqual([]);
+    expect(opened.snapshot.gatekeeperUsageRecords).toEqual([]);
+  });
+
+  it("meters all ten local management methods once through the production UI capability", async () => {
+    const consoleCalls = captureConsoleCalls();
+    const user = await newUser();
+    const accountId = crypto.randomUUID();
+    const sentinels = {
+      sharingDomain: `private-management-domain-${crypto.randomUUID()}`,
+      title: `private-management-title-${crypto.randomUUID()}`,
+      description: `private-management-description-${crypto.randomUUID()}`,
+      path: `private-management-path-${crypto.randomUUID()}.md`,
+      movedPath: `private-management-moved-${crypto.randomUUID()}.md`,
+      body: `private-management-body-${crypto.randomUUID()}`,
+    };
+    const before = await user.getUsageCreditBalance();
+
+    const traced = await runManagement({
+      user,
+      sharingDomain: sentinels.sharingDomain,
+      accountId,
+      run: async ui => {
+        let collectionId = "";
+        const calls: Array<{
+          method: keyof typeof CONTEXT_BILLING_METHODS;
+          invoke: () => Promise<void>;
+        }> = [
+          {
+            method: "ContextApi.createContextCollection",
+            invoke: async () => {
+              const created = await ui.createContextCollection(
+                sentinels.title, sentinels.description, "private");
+              collectionId = created.id;
+            },
+          },
+          {
+            method: "ContextApi.updateContextCollection",
+            invoke: () => ui.updateContextCollection(collectionId, {
+              description: `${sentinels.description}-updated`,
+            }),
+          },
+          {
+            method: "ContextApi.getContextCollectionMetadata",
+            invoke: async () => {
+              const metadata = await ui.getContextCollectionMetadata(collectionId);
+              expect(metadata?.id).toBe(collectionId);
+            },
+          },
+          {
+            method: "ContextApi.listEnabledContextCollections",
+            invoke: async () => {
+              expect(await ui.listEnabledContextCollections()).toEqual([
+                expect.objectContaining({ id: collectionId, source: "private" }),
+              ]);
+            },
+          },
+          {
+            method: "ContextApi.putContextDocument",
+            invoke: () => ui.putContextDocument(collectionId, sentinels.path, {
+              description: "Private management document",
+              body: sentinels.body,
+            }),
+          },
+          {
+            method: "ContextApi.listContextDocuments",
+            invoke: async () => {
+              expect(await ui.listContextDocuments(collectionId)).toEqual([
+                expect.objectContaining({ path: sentinels.path }),
+              ]);
+            },
+          },
+          {
+            method: "ContextApi.getContextDocument",
+            invoke: async () => {
+              expect(await ui.getContextDocument(collectionId, sentinels.path))
+                .toEqual(expect.objectContaining({ body: sentinels.body }));
+            },
+          },
+          {
+            method: "ContextApi.moveContextDocument",
+            invoke: () => ui.moveContextDocument(
+              collectionId, sentinels.path, sentinels.movedPath),
+          },
+          {
+            method: "ContextApi.deleteContextDocument",
+            invoke: () => ui.deleteContextDocument(collectionId, sentinels.movedPath),
+          },
+          {
+            method: "ContextApi.deleteContextCollection",
+            invoke: () => ui.deleteContextCollection(collectionId),
+          },
+        ];
+
+        for (const call of calls) await call.invoke();
+        return calls.map(call => call.method);
+      },
+    });
+
+    const expectedKeys = traced.result.map(method =>
+      CONTEXT_BILLING_METHODS[method].methodKey);
+    const attempts = traced.snapshot.gatekeeperMeteringAttempts;
+    expect(attempts).toHaveLength(10);
+    expect(attempts.map(attempt => attempt.attribution.billingMethodKey).toSorted())
+      .toEqual(expectedKeys.toSorted());
+    expect(new Set(attempts.map(attempt => attempt.operationId)).size).toBe(10);
+    expect(attempts.every(attempt =>
+      attempt.state === "settled" &&
+      attempt.attribution.principal.userId === user.id.toString() &&
+      attempt.attribution.source === "direct-user" &&
+      attempt.attribution.vendorId === VENDOR_ID &&
+      attempt.attribution.externalAccountId === accountId)).toBe(true);
+    expect(attempts.filter(attempt => attempt.chargeSnapshot.pricing === "priced")
+      .map(attempt => attempt.attribution.billingMethodKey).toSorted()).toEqual(
+      PRICED_LOCAL_MANAGEMENT_METHODS.map(method =>
+        CONTEXT_BILLING_METHODS[method].methodKey).toSorted(),
+    );
+    expect(attempts.filter(attempt => attempt.chargeSnapshot.pricing === "unpriced"))
+      .toHaveLength(5);
+    expect(traced.snapshot.gatekeeperUsageRecords).toHaveLength(10);
+    expect(traced.snapshot.unpricedUsageDecisions).toHaveLength(5);
+    expect(traced.snapshot.availableSubunits)
+      .toBe(before.availableSubunits - 5n * PRICED_CHARGE);
+    expect(traced.snapshot.reservedSubunits).toBe(0n);
+    expect(traced.result.every(method => CONTEXT_BILLING_METHODS[method].quantity === 1))
+      .toBe(true);
+    expectUsagePrivacy(traced.snapshot, sentinels, consoleCalls);
+
+    const replayOperationId = attempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.putContextDocument"].methodKey)!.operationId;
+    await user.completeGatekeeperUsage(replayOperationId, "executed");
+    const afterReplay = await runInDurableObject(user, instance => userSnapshot(instance));
+    expect(afterReplay.availableSubunits).toBe(traced.snapshot.availableSubunits);
+    expect(afterReplay.gatekeeperMeteringAttempts)
+      .toEqual(traced.snapshot.gatekeeperMeteringAttempts);
+    expect(afterReplay.gatekeeperUsageRecords)
+      .toEqual(traced.snapshot.gatekeeperUsageRecords);
+    expect(afterReplay.ledgerEntries).toEqual(traced.snapshot.ledgerEntries);
+  });
+
+  it("binds shared management calls to each opening User and ignores forged iframe authority", async () => {
+    const sharingDomain = `collaboration-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const firstUser = await newUser();
+    const secondUser = await newUser();
+    const firstBefore = await firstUser.getUsageCreditBalance();
+    const secondBefore = await secondUser.getUsageCreditBalance();
+
+    const first = await runManagement({
+      user: firstUser,
+      sharingDomain,
+      accountId,
+      run: async ui => {
+        const forgedAuthority = {
+          principal: { version: 1, kind: "user", userId: secondUser.id.toString() },
+          source: "scheduled",
+          externalAccountId: `forged-account-${crypto.randomUUID()}`,
+          isAdmin: true,
+          billingAuthorizer: {},
+        };
+        const createWithExtraIframeData = ui.createContextCollection as unknown as (
+          title: string,
+          description: string,
+          visibility: "private",
+          icon: undefined,
+          source: "web",
+          iframeData: typeof forgedAuthority,
+        ) => Promise<{ id: string }>;
+        const collection = await createWithExtraIframeData(
+          "Shared collection", "Shared description", "private", undefined, "web",
+          forgedAuthority,
+        );
+        await ui.getContextCollectionMetadata(collection.id);
+        return collection.id;
+      },
+    });
+    const second = await runManagement({
+      user: secondUser,
+      sharingDomain,
+      accountId,
+      run: ui => ui.getContextCollectionMetadata(first.result),
+    });
+
+    expect(second.result?.id).toBe(first.result);
+    expect(first.snapshot.gatekeeperMeteringAttempts).toHaveLength(2);
+    expect(second.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
+    expect(first.snapshot.gatekeeperMeteringAttempts.every(attempt =>
+      attempt.attribution.principal.userId === firstUser.id.toString() &&
+      attempt.attribution.source === "direct-user" &&
+      attempt.attribution.externalAccountId === accountId)).toBe(true);
+    expect(second.snapshot.gatekeeperMeteringAttempts.every(attempt =>
+      attempt.attribution.principal.userId === secondUser.id.toString() &&
+      attempt.attribution.source === "direct-user" &&
+      attempt.attribution.externalAccountId === accountId)).toBe(true);
+    expect(first.snapshot.availableSubunits)
+      .toBe(firstBefore.availableSubunits - 2n * PRICED_CHARGE);
+    expect(second.snapshot.availableSubunits)
+      .toBe(secondBefore.availableSubunits - PRICED_CHARGE);
+
+    const nonAdmin = await newUser();
+    const denied = await runManagement({
+      user: nonAdmin,
+      sharingDomain,
+      accountId: crypto.randomUUID(),
+      run: async ui => {
+        const createWithExtraIframeData = ui.createContextCollection as unknown as (
+          title: string,
+          description: string,
+          visibility: "public",
+          icon: undefined,
+          source: "web",
+          iframeData: { isAdmin: true },
+        ) => Promise<unknown>;
+        return rejectionMessage(() => createWithExtraIframeData(
+          "Forged public collection", "Must remain denied", "public", undefined, "web",
+          { isAdmin: true },
+        ));
+      },
+    });
+    expect(denied.result).toBe("Admin access required.");
+    expect(denied.snapshot.gatekeeperMeteringAttempts).toEqual([]);
+    expect(denied.snapshot.reservations).toEqual([]);
+  });
+
+  it("holds a committed local mutation when propagation loses its response", async () => {
+    const user = await newUser();
+    const sharingDomain = `propagation-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const created = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.createContextCollection(
+        "Propagation collection", "Propagation fixture", "private"),
+    });
+    const path = `committed-${crypto.randomUUID()}.md`;
+    const body = `committed-body-${crypto.randomUUID()}`;
+    vi.spyOn(UserLibraryDurableObject.prototype, "updateOwnedCollection")
+      .mockImplementationOnce(() => {
+        throw new Error("Simulated propagation failure.");
+      });
+
+    const failedDelivery = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => rejectionMessage(() => ui.putContextDocument(created.result.id, path, {
+        description: "Committed before propagation",
+        body,
+      })),
+    });
+
+    expect(failedDelivery.result).toBe("Simulated propagation failure.");
+    const document = await env.TEST_CONTEXT_COLLECTION.getByName(
+      domainName(sharingDomain, created.result.id),
+    ).getContextDocument(path);
+    expect(document?.body).toBe(body);
+    const putAttempt = failedDelivery.snapshot.gatekeeperMeteringAttempts.find(attempt =>
+      attempt.attribution.billingMethodKey ===
+        CONTEXT_BILLING_METHODS["ContextApi.putContextDocument"].methodKey);
+    expect(putAttempt).toMatchObject({
+      state: "usage-unknown",
+      chargeSnapshot: { pricing: "priced", chargeSubunits: PRICED_CHARGE },
+    });
+    expect(failedDelivery.snapshot.gatekeeperUsageRecords.find(record =>
+      record.operationId === putAttempt?.operationId)?.outcome).toBe("usage-unknown");
+    expect(failedDelivery.snapshot.reservations.find(reservation =>
+      reservation.operationId === putAttempt?.operationId)).toMatchObject({
+      state: "reserved",
+      amountSubunits: PRICED_CHARGE,
+    });
+  });
+
+  it("rejects authoritative billing before local management execution", async () => {
+    const user = await newUser();
+    const sharingDomain = `preexecution-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const balance = await user.getUsageCreditBalance();
+    await user.adminDeductUsageCredits(
+      `empty-management-balance-${crypto.randomUUID()}`,
+      balance.availableSubunits,
+      "Empty balance for Context management pre-execution tracer",
+      "test-admin",
+    );
+
+    const rejected = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => rejectionMessage(() => ui.createContextCollection(
+        "Must not be created", "Rejected before execution", "private")),
+    });
+
+    expect(rejected.result).toContain("Insufficient Usage Credit");
+    expect(rejected.snapshot.gatekeeperMeteringAttempts).toEqual([]);
+    expect(rejected.snapshot.gatekeeperUsageRecords).toEqual([]);
+    expect(rejected.snapshot.reservations).toEqual([]);
+    expect(await env.TEST_USER_LIBRARY.getByName(
+      domainName(sharingDomain, accountId),
+    ).listOwnedCollections()).toEqual([]);
+  });
+
+  it("keeps background artifact refresh outside local management billing", async () => {
+    const user = await newUser();
+    const sharingDomain = `background-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const collectionId = crypto.randomUUID();
+    await addCollection({
+      sharingDomain,
+      accountId,
+      collectionId,
+      title: "Local collection",
+      documents: [{
+        path: "cached.md",
+        description: "Cached document",
+        body: "Cached content",
+      }],
+    });
+
+    const listed = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: ui => ui.listContextDocuments(collectionId),
+    });
+    expect(listed.result).toEqual([expect.objectContaining({ path: "cached.md" })]);
+    expect(listed.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
+    expect(listed.snapshot.gatekeeperMeteringAttempts[0]?.attribution.billingMethodKey)
+      .toBe(CONTEXT_BILLING_METHODS["ContextApi.listContextDocuments"].methodKey);
+    expect(listed.snapshot.gatekeeperMeteringAttempts[0]?.chargeSnapshot.pricing)
+      .toBe("unpriced");
+    expect(Object.keys(CONTEXT_BILLING_METHODS).some(method =>
+      method.toLowerCase().includes("background"))).toBe(false);
+
+    await Promise.resolve();
+    const afterBackground = await runInDurableObject(user, instance => userSnapshot(instance));
+    expect(afterBackground.gatekeeperMeteringAttempts)
+      .toEqual(listed.snapshot.gatekeeperMeteringAttempts);
+    expect(afterBackground.gatekeeperUsageRecords)
+      .toEqual(listed.snapshot.gatekeeperUsageRecords);
+  });
+
   it("keeps caller-controlled attribution and Git/token data off the Session RPC surface", () => {
     // These exact public signatures leave no argument slot for principal, source, or host
     // dimensions. The caller supplies only the Context business input.

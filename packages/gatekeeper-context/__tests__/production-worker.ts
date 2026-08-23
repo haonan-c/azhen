@@ -11,6 +11,7 @@ export {
   ContextCollectionDurableObject,
   UserLibraryDurableObject,
   LibraryRegistryDurableObject,
+  ContextAccount,
   ContextGatekeeper,
 } from "../src/index.js";
 export { UserDurableObject } from "../../workshop-backend/src/user.js";

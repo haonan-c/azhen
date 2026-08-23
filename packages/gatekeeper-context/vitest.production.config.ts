@@ -6,6 +6,8 @@ import tsconfigPaths from "vite-tsconfig-paths";
 const EXPECTED_BILLING_REJECTIONS = new Set([
   "Insufficient Usage Credit.",
   "Observation withheld by the host.",
+  "Admin access required.",
+  "Simulated propagation failure.",
 ]);
 
 export default defineConfig({
@@ -23,6 +25,7 @@ export default defineConfig({
             useSQLite: true,
           },
           TEST_USER_LIBRARY: { className: "UserLibraryDurableObject", useSQLite: true },
+          TEST_LIBRARY_REGISTRY: { className: "LibraryRegistryDurableObject", useSQLite: true },
           TEST_CONTEXT_GATEKEEPER: { className: "ContextGatekeeper", useSQLite: true },
           TEST_USER: { className: "UserDurableObject", useSQLite: true },
           TEST_ADMIN_SETTINGS: { className: "AdminSettings", useSQLite: true },
