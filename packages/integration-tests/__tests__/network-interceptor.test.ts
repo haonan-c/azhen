@@ -99,6 +99,25 @@ it("gives every declining handler an independently readable request body", async
   expect(fetchedByReal).toEqual([]);
 });
 
+it("rejects an outbound body larger than the inspection limit before asking handlers", async () => {
+  let handlerCalls = 0;
+  const interceptor = new NetworkInterceptor([() => {
+    handlerCalls++;
+    return new Response(null, {status: 204});
+  }]);
+  interceptor.install();
+
+  await expect(fetch("https://body.test/too-large", {
+    method: "POST",
+    body: new Uint8Array(1024 * 1024 + 1),
+  })).rejects.toThrow("Outbound request body exceeds the 1048576 byte inspection limit");
+  expect(handlerCalls).toBe(0);
+  expect(interceptor.getUnmockedCalls()).toEqual([
+    "POST https://body.test/too-large (body exceeds 1048576 bytes)",
+  ]);
+  expect(fetchedByReal).toEqual([]);
+});
+
 it("throws on an unmatched request and records it", async () => {
   const interceptor = new NetworkInterceptor([() => null]);
   interceptor.install();

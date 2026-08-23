@@ -9,7 +9,7 @@ import { UGC_ADS_BILLING_METHODS, UGC_ADS_EXTERNAL_ACCOUNT_ID } from "../src/bil
 import { UgcAdsSession, UgcAdsSlashCommandProvider } from "../src/ugc-ads";
 import { OfficialAccountInteractionRateLimiter } from "../src/tikhub-api";
 
-function approvalQueue(trace: string[]): RpcStub<ApprovalQueue> {
+function approvalQueue(trace: string[], authorizationError?: Error): RpcStub<ApprovalQueue> {
   return {
     async beginBillableOperation(methodKey: string, externalAccountId: string) {
       trace.push(`begin:${methodKey}:${externalAccountId}`);
@@ -24,14 +24,15 @@ function approvalQueue(trace: string[]): RpcStub<ApprovalQueue> {
     },
     async authorizeObservation(description: ObservationDescription) {
       trace.push(`authorize:${description.billingOperationId}`);
+      if (authorizationError) throw authorizationError;
     },
     [Symbol.dispose]() { trace.push("dispose-queue"); },
   } as unknown as RpcStub<ApprovalQueue>;
 }
 
-function session(trace: string[]): UgcAdsSession {
+function session(trace: string[], authorizationError?: Error): UgcAdsSession {
   return new UgcAdsSession(
-    approvalQueue(trace),
+    approvalQueue(trace, authorizationError),
     "deployment-key",
     {} as BrowserRun,
     new OfficialAccountInteractionRateLimiter(),
@@ -121,6 +122,38 @@ describe("UGC Ads Session billing", () => {
     ]);
     expect(trace).toContain("complete:executed");
     expect(trace).toContain("authorize:operation-1");
+    vi.unstubAllGlobals();
+  });
+
+  it("settles Official Account use before observation authorization is withheld", async () => {
+    const trace: string[] = [];
+    const authorizationError = new Error("authorization withheld");
+    vi.stubGlobal("fetch", vi.fn(async input => {
+      const url = input instanceof URL ? input : new URL(String(input));
+      const data = url.pathname.endsWith("fetch_search")
+        ? {items: [{
+            title: "Private article",
+            url: "https://mp.weixin.qq.com/s/private-article",
+            account_name: "Private account",
+            publish_time: new Date().toISOString(),
+          }]}
+        : {read_num: 1};
+      return Response.json({code: 200, data});
+    }));
+    using target = session(trace, authorizationError);
+
+    await expect(target.searchOfficialAccountArticles(["private query"], 30))
+      .rejects.toBe(authorizationError);
+
+    expect(trace).toEqual([
+      `begin:${UGC_ADS_BILLING_METHODS[
+        "UgcAdsSession.searchOfficialAccountArticles"
+      ].methodKey}:${UGC_ADS_EXTERNAL_ACCOUNT_ID}`,
+      "markStarted",
+      "complete:executed",
+      "authorize:operation-1",
+      "dispose-operation",
+    ]);
     vi.unstubAllGlobals();
   });
 
