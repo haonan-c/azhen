@@ -31,6 +31,7 @@ import EMAIL_CONFIGURATOR_HTML from "./generated/email-configurator-ui.txt";
 import type { EmailMailboxConfiguratorRpc } from "./configurator/email-configurator-types";
 import EMAIL_LOGO_SVG from "./email-logo.svg";
 import { obsContext } from "./observability.js";
+import { EMAIL_BILLING_METHODS } from "./billing-methods";
 
 const VENDOR_ID = "email";
 
@@ -671,24 +672,44 @@ export class EmailAddress extends DurableObject<Env> {
     // @ts-ignore TODO: TS doesn't understand that the returned promise is disposable?
     using startHookResult = hookInitiator.startHook();
 
+    const externalAccountId = this.ctx.storage.kv.get<string>("owner");
+    if (!externalAccountId) throw new Error("This email address has no owner");
+    using operation = await startHookResult.approvalQueue.beginBillableOperation(
+      EMAIL_BILLING_METHODS["EmailHook.receiveEmail"].methodKey,
+      externalAccountId,
+    );
+    const operationId = await operation.getOperationId();
+
     // Pipeline: access approvalQueue on the not-yet-resolved promise and call through it.
     let sender = email.from.name
         ? `${email.from.name} <${email.from.address}>`
         : email.from.address;
-    await startHookResult.approvalQueue.authorizeObservation({
-      title: `Email from ${email.from.address}: ${email.subject}`,
-      description: `Received email from ${sender}\n\n`
-          + `**Subject:** ${email.subject}\n`
-          + `**Date:** ${email.date}\n`
-          + (email.to.length > 0
-              ? `**To:** ${email.to.map(a => a.address).join(", ")}\n`
-              : "")
-          + (email.cc.length > 0
-              ? `**CC:** ${email.cc.map(a => a.address).join(", ")}\n`
-              : ""),
-    });
+    try {
+      await startHookResult.approvalQueue.authorizeObservation({
+        title: `Email from ${email.from.address}: ${email.subject}`,
+        description: `Received email from ${sender}\n\n`
+            + `**Subject:** ${email.subject}\n`
+            + `**Date:** ${email.date}\n`
+            + (email.to.length > 0
+                ? `**To:** ${email.to.map(a => a.address).join(", ")}\n`
+                : "")
+            + (email.cc.length > 0
+                ? `**CC:** ${email.cc.map(a => a.address).join(", ")}\n`
+                : ""),
+        billingOperationId: operationId,
+      });
+      await operation.markStarted();
+    } catch (error) {
+      await operation.complete("failed-before-execution");
+      throw error;
+    }
 
-    // Deliver the email to the gadget's hook entrypoint.
-    await startHookResult.callback.receiveEmail(email);
+    try {
+      await startHookResult.callback.receiveEmail(email);
+    } catch (error) {
+      await operation.complete("unknown");
+      throw error;
+    }
+    await operation.complete("executed");
   }
 }

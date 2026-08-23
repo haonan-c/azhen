@@ -1,4 +1,5 @@
 import "cloudflare:workers";
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
 
 /**
  * Thin wrapper around the Supabase Management API (https://api.supabase.com) plus helpers for the
@@ -226,9 +227,16 @@ export async function revokeRefreshToken(
  */
 export class SupabaseApi {
   #getToken: () => Promise<string>;
+  #activity?: BillableOperationActivity;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, activity?: BillableOperationActivity) {
     this.#getToken = getToken;
+    this.#activity = activity;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: BillableOperationActivity): SupabaseApi {
+    return new SupabaseApi(this.#getToken, activity);
   }
 
   async #request<T>(
@@ -263,12 +271,14 @@ export class SupabaseApi {
       body = JSON.stringify(options.body);
     }
 
+    this.#activity?.requestDispatched();
     const response = await fetch(url.toString(), {
       method,
       headers,
       body,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
+    this.#activity?.responseReceived(response.status);
 
     if (!response.ok) {
       const parsed = await parseBody(response);

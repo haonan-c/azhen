@@ -2,6 +2,7 @@
 // resolves known mentions.
 
 import { AccountDescription } from "@gadgets/workshop-shared/gatekeeper";
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
 import {
   SlackConversationInfo, SlackConversationKind, SlackFile, SlackMessage, SlackReaction,
   SlackUser, SlackWorkspaceInfo,
@@ -303,13 +304,20 @@ export type SlackConversationTypeFilter = SlackConversationKind;
 
 export class SlackApi {
   #getToken: () => Promise<string>;
+  #activity?: BillableOperationActivity;
   // Per-client cache for author and mention resolution.
   #userCache = new Map<string, SlackUser>();
   // Empty string records a failed workspace-host lookup.
   #host?: string;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, activity?: BillableOperationActivity) {
     this.#getToken = getToken;
+    this.#activity = activity;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: BillableOperationActivity): SlackApi {
+    return new SlackApi(this.#getToken, activity);
   }
 
   // auth.test needs no extra scope, so permalink construction works for scoped tokens.
@@ -346,9 +354,11 @@ export class SlackApi {
 
     for (let attempt = 0; ; attempt++) {
       let token = await this.#getToken();
+      this.#activity?.requestDispatched();
       let response = await fetch(url.toString(), {
         headers: { "Authorization": `Bearer ${token}` },
       });
+      this.#activity?.responseReceived(response.status);
 
       if (response.status === 429 && attempt < RATE_LIMIT_MAX_RETRIES) {
         let retryAfter = Number(response.headers.get("Retry-After")) || 1;

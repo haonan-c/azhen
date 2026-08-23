@@ -4,6 +4,8 @@
 // HTTP to Linear and returns lightly-typed response nodes. Normalization into the Session API's
 // public shapes happens in `linear.ts`.
 
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
+
 const GRAPHQL_ENDPOINT = "https://api.linear.app/graphql";
 const OAUTH_AUTHORIZE_URL = "https://linear.app/oauth/authorize";
 const OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
@@ -330,13 +332,21 @@ export type IssueUpdateInput = {
 
 export class LinearApi {
   #getToken: () => Promise<string>;
+  #activity?: BillableOperationActivity;
 
-  constructor(getToken: () => Promise<string>) {
+  constructor(getToken: () => Promise<string>, activity?: BillableOperationActivity) {
     this.#getToken = getToken;
+    this.#activity = activity;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: BillableOperationActivity): LinearApi {
+    return new LinearApi(this.#getToken, activity);
   }
 
   async graphql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
     const token = await this.#getToken();
+    this.#activity?.requestDispatched();
     const response = await fetch(GRAPHQL_ENDPOINT, {
       method: "POST",
       headers: {
@@ -346,6 +356,7 @@ export class LinearApi {
       body: JSON.stringify({ query, variables }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
+    this.#activity?.responseReceived(response.status);
 
     if (response.status === 401) {
       throw new LinearApiError(401, "Linear rejected the access token.");

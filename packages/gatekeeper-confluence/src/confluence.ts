@@ -16,8 +16,11 @@
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import { runBillableRead } from "@gadgets/backend-utils/gatekeeper-billing";
 import {
   type AccountDescription,
+  type ActionExecution,
+  type ActionExecutionResult,
   type ApprovalQueue,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -58,7 +61,7 @@ import {
 } from "./confluence-api";
 import {
   ConfluenceStore,
-  applyStoredAction,
+  applyBillableStoredAction,
   observation,
   overlayChildPages,
   overlaySearch,
@@ -74,6 +77,10 @@ import {
   type ConfluenceAction,
   type ContentParent,
 } from "./confluence-actions";
+import {
+  CONFLUENCE_BILLING_METHODS,
+  type ConfluenceBillableReadMethod,
+} from "./billing-methods";
 import { ConfluenceConfiguratorUI } from "./confluence-configurators";
 import {
   ConfluenceAccessChecker,
@@ -565,10 +572,30 @@ function makeApi(ctx: { exports: Cloudflare.Env }, props: BaseProps): Confluence
   });
 }
 
+function applyConfluenceAction(
+  active: Map<string, Promise<ActionExecutionResult>>,
+  store: ConfluenceStore,
+  storage: DurableObjectStorage,
+  action: number,
+  execution?: ActionExecution,
+): Promise<ActionExecutionResult> {
+  if (!execution) throw new Error("This Confluence Action predates billing and cannot be applied.");
+  const existing = active.get(execution.billingOperationId);
+  if (existing) return existing;
+  const applying = applyBillableStoredAction(store, storage, action, execution);
+  active.set(execution.billingOperationId, applying);
+  void applying.finally(() => active.delete(execution.billingOperationId));
+  return applying;
+}
+
 @validateRpc()
 export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekeeperProps>
     implements Gatekeeper<ConfluenceSiteSession> {
-  #store() { return new ConfluenceStore(this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props)); }
+  #store() {
+    return new ConfluenceStore(
+      this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props), this.ctx.props.userObjectId,
+    );
+  }
   #tracker() { return new ConfluenceObserverTracker(this.ctx.storage.kv, this.ctx.props.cloudId); }
 
   async describe(): Promise<ResourceDescription> {
@@ -609,7 +636,12 @@ export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekee
 
   async removeObserver(id: string): Promise<void> { this.#tracker().removeObserver(id); }
 
-  async applyAction(action: number): Promise<void> { await applyStoredAction(this.#store(), action); }
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+    return applyConfluenceAction(
+      this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
+    );
+  }
   async rejectAction(action: number) { return rejectStoredAction(this.#store(), action); }
   async revertAction(action: number) { return await revertStoredAction(this.#store(), action); }
 }
@@ -617,7 +649,11 @@ export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekee
 @validateRpc()
 export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatekeeperProps>
     implements Gatekeeper<ConfluenceSpaceSession> {
-  #store() { return new ConfluenceStore(this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props)); }
+  #store() {
+    return new ConfluenceStore(
+      this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props), this.ctx.props.userObjectId,
+    );
+  }
   #tracker() { return new ConfluenceObserverTracker(this.ctx.storage.kv, this.ctx.props.cloudId); }
 
   async describe(): Promise<ResourceDescription> {
@@ -655,7 +691,12 @@ export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatek
 
   async removeObserver(id: string): Promise<void> { this.#tracker().removeObserver(id); }
 
-  async applyAction(action: number): Promise<void> { await applyStoredAction(this.#store(), action); }
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+    return applyConfluenceAction(
+      this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
+    );
+  }
   async rejectAction(action: number) { return rejectStoredAction(this.#store(), action); }
   async revertAction(action: number) { return await revertStoredAction(this.#store(), action); }
 }
@@ -663,7 +704,11 @@ export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatek
 @validateRpc()
 export class ConfluenceContentGatekeeperImpl extends DurableObject<Env, ContentGatekeeperProps>
     implements Gatekeeper<ConfluenceContentSession> {
-  #store() { return new ConfluenceStore(this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props)); }
+  #store() {
+    return new ConfluenceStore(
+      this.ctx.storage.kv, makeApi(this.ctx, this.ctx.props), this.ctx.props.userObjectId,
+    );
+  }
   #tracker() { return new ConfluenceObserverTracker(this.ctx.storage.kv, this.ctx.props.cloudId); }
 
   async describe(): Promise<ResourceDescription> {
@@ -702,7 +747,12 @@ export class ConfluenceContentGatekeeperImpl extends DurableObject<Env, ContentG
 
   async removeObserver(id: string): Promise<void> { this.#tracker().removeObserver(id); }
 
-  async applyAction(action: number): Promise<void> { await applyStoredAction(this.#store(), action); }
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+    return applyConfluenceAction(
+      this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
+    );
+  }
   async rejectAction(action: number) { return rejectStoredAction(this.#store(), action); }
   async revertAction(action: number) { return await revertStoredAction(this.#store(), action); }
 }
@@ -762,6 +812,33 @@ async function authorizeConfluenceObservation(
   check.commit();
 }
 
+async function runConfluenceRead<T>(
+  store: ConfluenceStore,
+  queue: RpcStub<ApprovalQueue>,
+  observe: ObserveHook,
+  method: ConfluenceBillableReadMethod,
+  description: ObservationDescription,
+  read: (store: ConfluenceStore) => Promise<{ value: T; sets: ConfluenceObservedSet[] }>,
+): Promise<T> {
+  let sets: ConfluenceObservedSet[] = [];
+  return runBillableRead(
+    {
+      beginBillableOperation: (methodKey, externalAccountId) =>
+        queue.beginBillableOperation(methodKey, externalAccountId),
+      authorizeObservation: billedDescription =>
+        authorizeConfluenceObservation(queue, observe, sets, billedDescription),
+    },
+    store.externalAccountId,
+    CONFLUENCE_BILLING_METHODS[method].methodKey,
+    async activity => {
+      const result = await read(store.withActivity(activity));
+      sets = result.sets;
+      return result.value;
+    },
+    () => description,
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sessions
 
@@ -796,32 +873,54 @@ class SiteSessionImpl extends RpcTarget implements ConfluenceSiteSession {
   listSpaces(options?: ListSpacesOptions): Promise<Cursor<SpaceSummary>> {
     const limit = clampPageSize(options?.pageSize);
     return Promise.resolve(new PagedCursor<SpaceSummary>(async cursor => {
-      const { results, nextCursor } = await this.#store.api.listSpaces({ type: options?.type, cursor, limit });
-      await authorizeConfluenceObservation(
-        this.#approvalQueue, this.#observe, spaceSets(results.map(s => s.id)),
-        observation("List Confluence spaces", "List the spaces on the Confluence site."));
-      return { items: results.map(s => spaceToMetadata(s, this.#webBase)), nextCursor };
+      return runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.listSpaces.next",
+        observation("List Confluence spaces", "List the spaces on the Confluence site."),
+        async store => {
+          const { results, nextCursor } = await store.api.listSpaces({
+            type: options?.type, cursor, limit,
+          });
+          return {
+            value: { items: results.map(s => spaceToMetadata(s, this.#webBase)), nextCursor },
+            sets: spaceSets(results.map(s => s.id)),
+          };
+        },
+      );
     }));
   }
 
   async getSpace(keyOrIdOrUrl: string): Promise<ConfluenceSpaceSession> {
     const ref = parseSpaceKeyOrId(keyOrIdOrUrl);
     // Resolve to the space's key (the session is keyed by key); numeric IDs and URLs are accepted.
-    const space = "key" in ref
-      ? await this.#store.api.getSpaceByKey(ref.key)
-      : await this.#store.api.getSpaceById(ref.id);
-    await authorizeConfluenceObservation(
-      this.#approvalQueue, this.#observe, spaceSets([space.id]),
-      observation("Open Confluence space", "Open a Confluence space."));
+    const space = await runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.getSpace",
+      observation("Open Confluence space", "Open a Confluence space."),
+      async store => {
+        const value = "key" in ref
+          ? await store.api.getSpaceByKey(ref.key)
+          : await store.api.getSpaceById(ref.id);
+        return { value, sets: spaceSets([value.id]) };
+      },
+    );
     return new SpaceSessionImpl(
       this.#store, this.#approvalQueue.dup(), this.#webBase, space.key, this.#observe);
   }
 
   async getContent(idOrUrl: string): Promise<ConfluenceContentSession> {
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-      observation("Open Confluence content", "Open a Confluence page or blog post."));
     const id = resolveHandle(this.#store, idOrUrl);
-    if (!ConfluenceStore.isProvisional(id)) await this.#store.getContentResponse(id);
+    if (!ConfluenceStore.isProvisional(id)) {
+      await runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, "ConfluenceSite.getContent",
+        observation("Open Confluence content", "Open a Confluence page or blog post."),
+        async store => ({
+          value: await store.getContentResponse(id),
+          sets: contentSets([id]),
+        }),
+      );
+    } else {
+      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
+        observation("Open Confluence content", "Open a pending Confluence page or blog post."));
+    }
     return new ContentSessionImpl(
       this.#store, this.#approvalQueue.dup(), this.#webBase, id, this.#observe);
   }
@@ -865,10 +964,14 @@ class SpaceSessionImpl extends RpcTarget implements ConfluenceSpaceSession {
   [Symbol.dispose]() { disposeQueue(this.#approvalQueue); }
 
   async getMetadata(): Promise<SpaceMetadata> {
-    const space = await this.#store.api.getSpaceByKey(this.#spaceKey);
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-      observation("Read Confluence space", `Read metadata for Confluence space ${this.#spaceKey}.`));
-    return spaceToMetadata(space, this.#webBase);
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceSpace.getMetadata",
+      observation("Read Confluence space", `Read metadata for Confluence space ${this.#spaceKey}.`),
+      async store => {
+        const space = await store.api.getSpaceByKey(this.#spaceKey);
+        return { value: spaceToMetadata(space, this.#webBase), sets: spaceSets([space.id]) };
+      },
+    );
   }
 
   listPages(options?: ListPagesOptions): Promise<Cursor<ContentSummary>> {
@@ -882,29 +985,41 @@ class SpaceSessionImpl extends RpcTarget implements ConfluenceSpaceSession {
   #listContent(type: "page" | "blogpost", depth: "root" | "all" | undefined, pageSize?: number): Cursor<ContentSummary> {
     const limit = clampPageSize(pageSize);
     return new PagedCursor<ContentSummary>(async cursor => {
-      const spaceId = await this.#store.getSpaceId(this.#spaceKey);
-      const { results, nextCursor } = type === "blogpost"
-        ? await this.#store.api.listBlogPostsInSpace({ spaceId, cursor, limit })
-        : await this.#store.api.listPagesInSpace({ spaceId, depth: depth ?? "root", cursor, limit });
-      const items = overlaySpaceContent(
-        results.map(c => contentToSummary(c, this.#webBase)), this.#store, this.#spaceKey, type, !cursor);
-      await authorizeConfluenceObservation(
-        this.#approvalQueue, this.#observe, contentSets(items.map(item => item.id)), observation(
+      const method = type === "blogpost"
+        ? "ConfluenceSpace.listBlogPosts.next" as const
+        : "ConfluenceSpace.listPages.next" as const;
+      return runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, method,
+        observation(
           `List Confluence ${type === "blogpost" ? "blog posts" : "pages"}`,
-          `List the ${type === "blogpost" ? "blog posts" : "pages"} in space ${this.#spaceKey}.`));
-      return { items, nextCursor };
+          `List the ${type === "blogpost" ? "blog posts" : "pages"} in space ${this.#spaceKey}.`),
+        async store => {
+          const spaceId = await store.getSpaceId(this.#spaceKey);
+          const { results, nextCursor } = type === "blogpost"
+            ? await store.api.listBlogPostsInSpace({ spaceId, cursor, limit })
+            : await store.api.listPagesInSpace({ spaceId, depth: depth ?? "root", cursor, limit });
+          const items = overlaySpaceContent(
+            results.map(c => contentToSummary(c, this.#webBase)), store, this.#spaceKey, type, !cursor);
+          return { value: { items, nextCursor }, sets: contentSets(items.map(item => item.id)) };
+        },
+      );
     });
   }
 
   async getContent(idOrUrl: string): Promise<ConfluenceContentSession> {
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
-      observation("Open Confluence content", `Open a page or blog post in space ${this.#spaceKey}.`));
     const id = resolveHandle(this.#store, idOrUrl);
     if (!ConfluenceStore.isProvisional(id)) {
-      const content = await this.#store.getContentResponse(id);
+      const content = await runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, "ConfluenceSpace.getContent",
+        observation("Open Confluence content", `Open a page or blog post in space ${this.#spaceKey}.`),
+        async store => ({ value: await store.getContentResponse(id), sets: contentSets([id]) }),
+      );
       if (spaceKeyFromWebui(content._links?.webui) !== this.#spaceKey) {
         throw new ConfluenceApiError(404, "No such page or blog post in this space.");
       }
+    } else {
+      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, [],
+        observation("Open Confluence content", `Open pending content in space ${this.#spaceKey}.`));
     }
     return new ContentSessionImpl(
       this.#store, this.#approvalQueue.dup(), this.#webBase, id, this.#observe);
@@ -933,7 +1048,7 @@ class SpaceSessionImpl extends RpcTarget implements ConfluenceSpaceSession {
       : { type: "space", spaceKey: this.#spaceKey };
     await stageAction(this.#store, this.#approvalQueue, {
       type: "createContent", provisionalId, kind, parent, title, content, status: status ?? "current",
-    });
+    }, kind === "page" ? "ConfluenceSpace.createPage" : "ConfluenceSpace.createBlogPost");
     return new ContentSessionImpl(
       this.#store, this.#approvalQueue.dup(), this.#webBase, provisionalId, this.#observe);
   }
@@ -962,86 +1077,111 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
   [Symbol.dispose]() { disposeQueue(this.#approvalQueue); }
 
   #isProvisional(): boolean { return ConfluenceStore.isProvisional(this.#store.resolveId(this.#contentId)); }
-  #pending() { return this.#store.pendingForContent(this.#contentId); }
-  #ref(): string { return this.#store.resolveId(this.#contentId); }
-  #sets(): ConfluenceObservedSet[] { return contentSets([this.#ref()]); }
+  #pending(store = this.#store) { return store.pendingForContent(this.#contentId); }
+  #ref(store = this.#store): string { return store.resolveId(this.#contentId); }
+  #sets(store = this.#store): ConfluenceObservedSet[] { return contentSets([this.#ref(store)]); }
 
-  async #base(): Promise<ContentResponse | null> {
-    return this.#isProvisional() ? null : await this.#store.getContentResponse(this.#contentId);
+  async #base(store = this.#store): Promise<ContentResponse | null> {
+    return this.#isProvisional() ? null : await store.getContentResponse(this.#contentId);
   }
 
-  #stage(action: ConfluenceAction): Promise<number> {
-    return stageAction(this.#store, this.#approvalQueue, action);
+  #stage(
+    method: import("./billing-methods").ConfluenceBillableWriteMethod,
+    action: ConfluenceAction,
+  ): Promise<number> {
+    return stageAction(this.#store, this.#approvalQueue, action, method);
   }
 
   async getMetadata(): Promise<ContentMetadata> {
-    const records = this.#pending();
-    const base = await this.#base();
-    let meta: ContentMetadata;
-    if (base) {
-      meta = contentToMetadata(base, this.#webBase);
-    } else {
-      const create = this.#store.createActionFor(this.#contentId)?.action;
-      const kind = create?.type === "createContent" ? create.kind : "page";
-      meta = {
-        id: this.#contentId, type: kind, title: "", spaceKey: create?.type === "createContent" ? create.parent.spaceKey : undefined,
-        url: `${this.#webBase}/pages/${this.#contentId}`, status: "draft", createdAt: new Date(), lastUpdatedAt: new Date(),
-        version: 0, author: null, lastUpdatedBy: null,
-      };
-    }
-    meta.title = simulateTitle(records, meta.title);
-    const trashed = simulateTrashed(records);
-    if (trashed !== undefined) meta.status = trashed ? "trashed" : "current";
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-      observation("Read Confluence content", `Read metadata for “${meta.title || "Untitled"}”.`));
-    return meta;
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.getMetadata",
+      observation("Read Confluence content", `Read metadata for Confluence content ${this.#ref()}.`),
+      async store => {
+        const records = this.#pending(store);
+        const base = await this.#base(store);
+        let meta: ContentMetadata;
+        if (base) {
+          meta = contentToMetadata(base, this.#webBase);
+        } else {
+          const create = store.createActionFor(this.#contentId)?.action;
+          const kind = create?.type === "createContent" ? create.kind : "page";
+          meta = {
+            id: this.#contentId, type: kind, title: "",
+            spaceKey: create?.type === "createContent" ? create.parent.spaceKey : undefined,
+            url: `${this.#webBase}/pages/${this.#contentId}`, status: "draft",
+            createdAt: new Date(), lastUpdatedAt: new Date(), version: 0,
+            author: null, lastUpdatedBy: null,
+          };
+        }
+        meta.title = simulateTitle(records, meta.title);
+        const trashed = simulateTrashed(records);
+        if (trashed !== undefined) meta.status = trashed ? "trashed" : "current";
+        return { value: meta, sets: this.#sets(store) };
+      },
+    );
   }
 
   async getContent(): Promise<string> {
-    const base = await this.#base();
-    const markdown = simulateBody(base ? contentBodyMarkdown(base) : null, this.#pending());
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-      observation("Read Confluence content body", `Read the body of Confluence content ${this.#ref()}.`));
-    return markdown;
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.getContent",
+      observation("Read Confluence content body", `Read the body of Confluence content ${this.#ref()}.`),
+      async store => {
+        const base = await this.#base(store);
+        return {
+          value: simulateBody(base ? contentBodyMarkdown(base) : null, this.#pending(store)),
+          sets: this.#sets(store),
+        };
+      },
+    );
   }
 
   async setContent(markdown: string): Promise<void> {
     const base = await this.#base();
     const previous = simulateBody(base ? contentBodyMarkdown(base) : null, this.#pending());
-    await this.#stage({ type: "setContent", contentId: this.#contentId, markdown, previousMarkdown: previous });
+    await this.#stage("ConfluenceContent.setContent", {
+      type: "setContent", contentId: this.#contentId, markdown, previousMarkdown: previous,
+    });
   }
 
   async appendContent(markdown: string): Promise<void> {
     const base = await this.#base();
     const previous = simulateBody(base ? contentBodyMarkdown(base) : null, this.#pending());
-    await this.#stage({ type: "appendContent", contentId: this.#contentId, markdown, previousMarkdown: previous });
+    await this.#stage("ConfluenceContent.appendContent", {
+      type: "appendContent", contentId: this.#contentId, markdown, previousMarkdown: previous,
+    });
   }
 
   async setTitle(title: string): Promise<void> {
     const records = this.#pending();
     const base = await this.#base();
     const previousTitle = simulateTitle(records, base ? base.title : "");
-    await this.#stage({ type: "setTitle", contentId: this.#contentId, title, previousTitle });
+    await this.#stage("ConfluenceContent.setTitle", {
+      type: "setTitle", contentId: this.#contentId, title, previousTitle,
+    });
   }
 
   listChildPages(options?: ListOptions): Promise<Cursor<ContentSummary>> {
     const limit = clampPageSize(options?.pageSize);
     return Promise.resolve(new PagedCursor<ContentSummary>(async cursor => {
-      let items: ContentSummary[] = [];
-      let nextCursor: string | undefined;
-      // Only pages have children; a provisional or blog-post target just yields pending creations.
-      if (!this.#isProvisional() && await this.#kind() === "page") {
-        const spaceKey = spaceKeyFromWebui((await this.#base())?._links?.webui);
-        const res = await this.#store.api.listChildPages(this.#ref(), { cursor, limit });
-        items = res.results.map(c => childPageToSummary(c, this.#webBase, spaceKey));
-        nextCursor = res.nextCursor;
-      }
-      items = overlayChildPages(items, this.#store, this.#contentId, !cursor);
-      await authorizeConfluenceObservation(
-        this.#approvalQueue, this.#observe,
-        [...this.#sets(), ...contentSets(items.map(item => item.id))],
-        observation("List Confluence child pages", `List the child pages of Confluence content ${this.#ref()}.`));
-      return { items, nextCursor };
+      return runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listChildPages.next",
+        observation("List Confluence child pages", `List the child pages of Confluence content ${this.#ref()}.`),
+        async store => {
+          let items: ContentSummary[] = [];
+          let nextCursor: string | undefined;
+          if (!this.#isProvisional() && await this.#kind(store) === "page") {
+            const spaceKey = spaceKeyFromWebui((await this.#base(store))?._links?.webui);
+            const res = await store.api.listChildPages(this.#ref(store), { cursor, limit });
+            items = res.results.map(c => childPageToSummary(c, this.#webBase, spaceKey));
+            nextCursor = res.nextCursor;
+          }
+          items = overlayChildPages(items, store, this.#contentId, !cursor);
+          return {
+            value: { items, nextCursor },
+            sets: [...this.#sets(store), ...contentSets(items.map(item => item.id))],
+          };
+        },
+      );
     }));
   }
 
@@ -1052,7 +1192,7 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
     const create = this.#store.createActionFor(this.#contentId)?.action;
     const spaceKey = await this.#spaceKey(create);
     const provisionalId = this.#store.nextProvisionalId();
-    await this.#stage({
+    await this.#stage("ConfluenceContent.createChildPage", {
       type: "createContent", provisionalId, kind: "page",
       parent: { type: "page", parentId: this.#contentId, spaceKey },
       title: options.title, content: options.content, status: options.status ?? "current",
@@ -1062,82 +1202,112 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
   }
 
   async listLabels(): Promise<string[]> {
-    const base = this.#isProvisional() ? [] : await this.#store.api.getLabels(this.#ref(), await this.#kind());
-    const labels = simulateLabels(base, this.#pending());
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-      observation("Read Confluence labels", `Read the labels of Confluence content ${this.#ref()}.`));
-    return labels;
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listLabels",
+      observation("Read Confluence labels", `Read the labels of Confluence content ${this.#ref()}.`),
+      async store => {
+        const base = this.#isProvisional()
+          ? []
+          : await store.api.getLabels(this.#ref(store), await this.#kind(store));
+        return { value: simulateLabels(base, this.#pending(store)), sets: this.#sets(store) };
+      },
+    );
   }
 
   async addLabel(name: string): Promise<void> {
-    await this.#stage({ type: "addLabel", contentId: this.#contentId, name });
+    await this.#stage("ConfluenceContent.addLabel", {
+      type: "addLabel", contentId: this.#contentId, name,
+    });
   }
 
   async removeLabel(name: string): Promise<void> {
-    await this.#stage({ type: "removeLabel", contentId: this.#contentId, name });
+    await this.#stage("ConfluenceContent.removeLabel", {
+      type: "removeLabel", contentId: this.#contentId, name,
+    });
   }
 
   listComments(options?: ListOptions): Promise<Cursor<Comment>> {
     const limit = clampPageSize(options?.pageSize);
     return Promise.resolve(new PagedCursor<Comment>(async cursor => {
-      let items: Comment[] = [];
-      let nextCursor: string | undefined;
-      if (!this.#isProvisional()) {
-        const res = await this.#store.api.listComments(this.#ref(), await this.#kind(), { cursor, limit });
-        items = res.results.map(c => commentToComment(c, this.#webBase));
-        nextCursor = res.nextCursor;
-      }
-      if (!cursor) items = simulateComments(items, this.#pending());
-      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-        observation("Read Confluence comments", `Read the comments on Confluence content ${this.#ref()}.`));
-      return { items, nextCursor };
+      return runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listComments.next",
+        observation("Read Confluence comments", `Read the comments on Confluence content ${this.#ref()}.`),
+        async store => {
+          let items: Comment[] = [];
+          let nextCursor: string | undefined;
+          if (!this.#isProvisional()) {
+            const res = await store.api.listComments(
+              this.#ref(store), await this.#kind(store), { cursor, limit });
+            items = res.results.map(c => commentToComment(c, this.#webBase));
+            nextCursor = res.nextCursor;
+          }
+          if (!cursor) items = simulateComments(items, this.#pending(store));
+          return { value: { items, nextCursor }, sets: this.#sets(store) };
+        },
+      );
     }));
   }
 
   async addComment(markdown: string): Promise<void> {
-    await this.#stage({ type: "addComment", contentId: this.#contentId, text: markdown });
+    await this.#stage("ConfluenceContent.addComment", {
+      type: "addComment", contentId: this.#contentId, text: markdown,
+    });
   }
 
   listAttachments(options?: ListOptions): Promise<Cursor<Attachment>> {
     const limit = clampPageSize(options?.pageSize);
     return Promise.resolve(new PagedCursor<Attachment>(async cursor => {
-      const res = this.#isProvisional()
-        ? { results: [], nextCursor: undefined }
-        : await this.#store.api.listAttachments(this.#ref(), await this.#kind(), { cursor, limit });
-      await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-        observation("List Confluence attachments", `List the attachments on Confluence content ${this.#ref()}.`));
-      return { items: res.results.map(attachmentToAttachment), nextCursor: res.nextCursor };
+      return runConfluenceRead(
+        this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.listAttachments.next",
+        observation("List Confluence attachments", `List the attachments on Confluence content ${this.#ref()}.`),
+        async store => {
+          const res = this.#isProvisional()
+            ? { results: [], nextCursor: undefined }
+            : await store.api.listAttachments(
+              this.#ref(store), await this.#kind(store), { cursor, limit });
+          return {
+            value: { items: res.results.map(attachmentToAttachment), nextCursor: res.nextCursor },
+            sets: this.#sets(store),
+          };
+        },
+      );
     }));
   }
 
   async downloadAttachment(id: string): Promise<AttachmentDownload> {
-    const info = await this.#store.api.getAttachmentInfo(id);
-    // Enforce the capability's grant boundary: the attachment must belong to this content. Normalize
-    // a foreign/missing attachment to the same 404 so this can't probe other content's attachments.
-    if (!attachmentBelongsToContent(info, this.#ref())) {
-      throw new ConfluenceApiError(404, "No such attachment on this content.");
-    }
-    const size = info.fileSize;
-    if (size !== undefined && size > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
-      throw new ConfluenceApiError(413,
-        `Attachment is ${size} bytes, exceeding the ${MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte download limit.`);
-    }
-    const downloadPath = info.downloadLink ?? info._links?.download;
-    if (!downloadPath) throw new ConfluenceApiError(404, "Attachment has no downloadable content.");
-    // Confluence-sourced, but guard the "/wiki" prefix concatenation against a non-relative path.
-    if (!downloadPath.startsWith("/")) throw new ConfluenceApiError(502, "Malformed attachment download link.");
-    const { data, mediaType } = await this.#store.api.downloadAttachment(downloadPath);
-    if (data.byteLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
-      throw new ConfluenceApiError(413,
-        `Attachment is ${data.byteLength} bytes, exceeding the ${MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte download limit.`);
-    }
-    await authorizeConfluenceObservation(this.#approvalQueue, this.#observe, this.#sets(),
-      observation("Download Confluence attachment", `Download attachment “${info.title}”.`));
-    return { filename: info.title, mediaType, data };
+    return runConfluenceRead(
+      this.#store, this.#approvalQueue, this.#observe, "ConfluenceContent.downloadAttachment",
+      observation("Download Confluence attachment", `Download attachment ${id}.`),
+      async store => {
+        const info = await store.api.getAttachmentInfo(id);
+        if (!attachmentBelongsToContent(info, this.#ref(store))) {
+          throw new ConfluenceApiError(404, "No such attachment on this content.");
+        }
+        const size = info.fileSize;
+        if (size !== undefined && size > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+          throw new ConfluenceApiError(413,
+            `Attachment is ${size} bytes, exceeding the ${MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte download limit.`);
+        }
+        const downloadPath = info.downloadLink ?? info._links?.download;
+        if (!downloadPath) throw new ConfluenceApiError(404, "Attachment has no downloadable content.");
+        if (!downloadPath.startsWith("/")) {
+          throw new ConfluenceApiError(502, "Malformed attachment download link.");
+        }
+        const { data, mediaType } = await store.api.downloadAttachment(downloadPath);
+        if (data.byteLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+          throw new ConfluenceApiError(413,
+            `Attachment is ${data.byteLength} bytes, exceeding the ${MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte download limit.`);
+        }
+        return {
+          value: { filename: info.title, mediaType, data },
+          sets: this.#sets(store),
+        };
+      },
+    );
   }
 
   async uploadAttachment(options: UploadAttachmentOptions): Promise<Attachment> {
-    await this.#stage({
+    await this.#stage("ConfluenceContent.uploadAttachment", {
       type: "uploadAttachment", contentId: this.#contentId,
       filename: options.filename, mediaType: options.mediaType, data: options.data, comment: options.comment,
     });
@@ -1148,18 +1318,22 @@ class ContentSessionImpl extends RpcTarget implements ConfluenceContentSession {
   }
 
   async trash(): Promise<void> {
-    await this.#stage({ type: "trash", contentId: this.#contentId });
+    await this.#stage("ConfluenceContent.trash", {
+      type: "trash", contentId: this.#contentId,
+    });
   }
 
   async restore(): Promise<void> {
-    await this.#stage({ type: "restore", contentId: this.#contentId });
+    await this.#stage("ConfluenceContent.restore", {
+      type: "restore", contentId: this.#contentId,
+    });
   }
 
   // The content kind (page/blogpost), from a pending creation or the fetched response.
-  async #kind(): Promise<"page" | "blogpost"> {
-    const create = this.#store.createActionFor(this.#contentId)?.action;
+  async #kind(store = this.#store): Promise<"page" | "blogpost"> {
+    const create = store.createActionFor(this.#contentId)?.action;
     if (create?.type === "createContent") return create.kind;
-    const content = await this.#store.getContentResponse(this.#contentId);
+    const content = await store.getContentResponse(this.#contentId);
     return content.type === "blogpost" ? "blogpost" : "page";
   }
 
@@ -1186,11 +1360,18 @@ function searchCursor(
   const limit = clampPageSize(options?.pageSize);
   const cql = buildCql({ text: options?.text, cql: options?.cql, type: options?.type, spaceKey });
   return new PagedCursor<ContentSummary>(async cursor => {
-    const { results, nextCursor } = await store.api.search(cql, { cursor, limit });
-    const items = overlaySearch(results, store, !cursor, options?.type);
-    await authorizeConfluenceObservation(
-      approvalQueue, observe, contentSets(items.map(item => item.id)),
-      observation("Search Confluence", `Search Confluence for “${options?.cql ?? options?.text ?? ""}”.`));
-    return { items, nextCursor };
+    return runConfluenceRead(
+      store, approvalQueue, observe,
+      spaceKey ? "ConfluenceSpace.search.next" : "ConfluenceSite.search.next",
+      observation("Search Confluence", `Search Confluence for “${options?.cql ?? options?.text ?? ""}”.`),
+      async billedStore => {
+        const { results, nextCursor } = await billedStore.api.search(cql, { cursor, limit });
+        const items = overlaySearch(results, billedStore, !cursor, options?.type);
+        return {
+          value: { items, nextCursor },
+          sets: contentSets(items.map(item => item.id)),
+        };
+      },
+    );
   });
 }

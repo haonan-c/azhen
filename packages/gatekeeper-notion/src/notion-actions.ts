@@ -27,7 +27,22 @@ import {
   type NotionPageResponse,
 } from "./notion-api";
 import type { RpcStub } from "cloudflare:workers";
-import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  durableBillableActionStorage,
+  runBillableAction,
+  type BillableOperationActivity,
+} from "@gadgets/backend-utils/gatekeeper-billing";
+import type {
+  ActionDescription,
+  ActionExecution,
+  ActionExecutionResult,
+  ApprovalQueue,
+  ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
+import {
+  notionActionBilling,
+  type NotionBillableWriteMethod,
+} from "./billing-methods";
 import type {
   NotionComment,
   NotionDatabaseSchema,
@@ -79,6 +94,7 @@ export type StoredActionRecord = {
   action: NotionAction;
   state: "pending" | "applied" | "reverted";
   submittedAt: number;
+  billingMethod?: NotionBillableWriteMethod;
   /** For appendContent revert: the IDs of the blocks created on apply. */
   appendedBlockIds?: string[];
   /** For createPage: the real Notion page ID assigned on apply. */
@@ -109,14 +125,24 @@ type DataSourceCache = { fetchedAt: number; dataSource: NotionDataSourceResponse
 export class NotionStore {
   #kv: Kv;
   #api: NotionApi;
+  #externalAccountId: string;
 
-  constructor(kv: Kv, api: NotionApi) {
+  constructor(kv: Kv, api: NotionApi, externalAccountId = "") {
     this.#kv = kv;
     this.#api = api;
+    this.#externalAccountId = externalAccountId;
   }
 
   get api(): NotionApi {
     return this.#api;
+  }
+
+  get externalAccountId(): string {
+    return this.#externalAccountId;
+  }
+
+  withActivity(activity: BillableOperationActivity): NotionStore {
+    return new NotionStore(this.#kv, this.#api.withActivity(activity), this.#externalAccountId);
   }
 
   // --- sequential IDs ---
@@ -1011,11 +1037,15 @@ export async function stageAction(
   store: NotionStore,
   approvalQueue: RpcStub<ApprovalQueue>,
   action: NotionAction,
+  billingMethod: NotionBillableWriteMethod,
 ): Promise<number> {
   const id = store.nextActionId();
-  store.putAction({ id, action, state: "pending", submittedAt: Date.now() });
+  store.putAction({ id, action, state: "pending", submittedAt: Date.now(), billingMethod });
   try {
-    await approvalQueue.submitAction(id, describeAction(action));
+    await approvalQueue.submitAction(id, {
+      ...describeAction(action),
+      billing: notionActionBilling(billingMethod, store.externalAccountId),
+    });
   } catch (err) {
     store.deleteAction(id);
     throw err;
@@ -1030,6 +1060,32 @@ export async function applyStoredAction(store: NotionStore, id: number): Promise
   const record = store.getAction(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
   await applyNotionAction(store, record);
+}
+
+/** Apply or recover one approved Notion Action through a durable billing claim. */
+export function applyBillableStoredAction(
+  store: NotionStore,
+  storage: DurableObjectStorage,
+  id: number,
+  execution: ActionExecution,
+): Promise<ActionExecutionResult> {
+  return runBillableAction({
+    storage: durableBillableActionStorage(storage),
+    actionId: id,
+    execution,
+    getPending: () => store.getAction(id),
+    removePending: outcome => {
+      const record = store.getAction(id);
+      if (record && outcome === "failed-before-execution") {
+        store.deleteAction(id);
+      } else if (record) {
+        record.state = "applied";
+        store.putAction(record);
+      }
+    },
+    prepare: async record => record,
+    execute: (record, activity) => applyNotionAction(store.withActivity(activity), record),
+  });
 }
 
 export function rejectStoredAction(store: NotionStore, id: number): void | { restart?: boolean } {

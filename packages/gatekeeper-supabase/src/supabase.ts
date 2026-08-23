@@ -1,9 +1,16 @@
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
+  durableBillableActionStorage,
+  runBillableAction,
+  runBillableRead,
+} from "@gadgets/backend-utils/gatekeeper-billing";
+import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionExecution,
+  type ActionExecutionResult,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperUser,
@@ -13,7 +20,12 @@ import {
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  type ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  SUPABASE_BILLING_METHODS,
+  supabaseActionBilling,
+} from "./billing-methods";
 import {
   SupabaseApi,
   SupabaseApiError,
@@ -821,6 +833,7 @@ class SupabaseSessionContext {
   #cache: SupabaseCache;
   #pending: PendingActionStore;
   #noteExpired: () => Promise<void>;
+  #externalAccountId: string;
   // Set only for organization bindings (data-set tracking). Given the project ref a project-scoped
   // observation is about to reveal, records it as an observed data set and returns the observer ids
   // that must not see it (those lacking access). Undefined for project bindings (single-unit ACL),
@@ -833,6 +846,7 @@ class SupabaseSessionContext {
     cache: SupabaseCache,
     pending: PendingActionStore,
     noteExpired: () => Promise<void>,
+    externalAccountId: string,
     projectObservationHook?: (ref: string) => Promise<ProjectObservationCheck>,
   ) {
     this.#api = api;
@@ -840,6 +854,7 @@ class SupabaseSessionContext {
     this.#cache = cache;
     this.#pending = pending;
     this.#noteExpired = noteExpired;
+    this.#externalAccountId = externalAccountId;
     this.#projectObservationHook = projectObservationHook;
   }
 
@@ -849,7 +864,7 @@ class SupabaseSessionContext {
   // than approvalQueue.authorizeObservation directly) for every read that exposes project data.
   async authorizeProjectObservation(
     ref: string,
-    description: { title: string; description: string },
+    description: ObservationDescription,
   ): Promise<void> {
     const check = this.#projectObservationHook
       ? await this.#projectObservationHook(ref)
@@ -858,6 +873,44 @@ class SupabaseSessionContext {
       ...description, excludeObservers: check.excludeObservers,
     });
     check.commit();
+  }
+
+  async read<T>(
+    method: keyof typeof SUPABASE_BILLING_METHODS,
+    ref: string | undefined,
+    read: (api: SupabaseApi) => Promise<T>,
+    describe: (result: T) => ObservationDescription,
+  ): Promise<T> {
+    return runBillableRead(
+      {
+        beginBillableOperation: (methodKey, externalAccountId) =>
+          this.approvalQueue.beginBillableOperation(methodKey, externalAccountId),
+        authorizeObservation: description => ref
+          ? this.authorizeProjectObservation(ref, description)
+          : this.approvalQueue.authorizeObservation(description),
+      },
+      this.#externalAccountId,
+      SUPABASE_BILLING_METHODS[method].methodKey,
+      activity => this.run(api => read(api.withActivity(activity))),
+      describe,
+    );
+  }
+
+  async readCached<T>(
+    method: keyof typeof SUPABASE_BILLING_METHODS,
+    ref: string | undefined,
+    key: string,
+    ttlMs: number,
+    loader: (api: SupabaseApi) => Promise<T>,
+    describe: (result: T) => ObservationDescription,
+  ): Promise<T> {
+    return this.read(method, ref, async api => {
+      const hit = this.#cache.get<T>(key, ttlMs);
+      if (hit !== undefined) return hit;
+      const value = await loader(api);
+      this.#cache.put(key, value);
+      return value;
+    }, describe);
   }
 
   async run<T>(fn: (api: SupabaseApi) => Promise<T>): Promise<T> {
@@ -904,6 +957,7 @@ class SupabaseSessionContext {
         // This gatekeeper doesn't simulate writes, so the agent shouldn't continue (and read back
         // un-applied state) until the user decides on this statement.
         awaitDecision: true,
+        billing: supabaseActionBilling(this.#externalAccountId),
       });
     } catch (error) {
       this.#pending.remove(actionId);
@@ -967,6 +1021,7 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
       new SupabaseCache(this.ctx.storage.kv),
       new PendingActionStore(this.ctx.storage.kv),
       async () => { await this.#userAccount().noteCredentialsExpired(); },
+      this.ctx.props.userObjectId,
       projectObservationHook,
     );
   }
@@ -1087,25 +1142,56 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
    * Approved: run the queued SQL statement for real, then drop it and invalidate cached schema
    * metadata (the database may have changed).
    */
-  async applyAction(actionId: number): Promise<void> {
-    const pending = new PendingActionStore(this.ctx.storage.kv);
-    const action = pending.get(actionId);
-    if (!action) {
-      throw new Error(`Unknown pending Supabase action: ${actionId}`);
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This Supabase Action predates billing. Reject it and submit the statement again.",
+      );
     }
-    try {
-      await this.#makeApi().runQuery(action.ref, action.sql, action.params);
-    } catch (error) {
-      // On expired/revoked credentials, signal the account so the user is prompted to reconnect.
-      // The action stays queued (we don't remove it) so it can be retried after reconnecting.
-      if (error instanceof SupabaseApiError && error.isAuthError) {
-        await this.#userAccount().noteCredentialsExpired();
-        throw new Error("Supabase credentials have expired or been revoked. Reconnect the account, then retry.", { cause: error });
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
       }
-      throw error;
-    }
-    pending.remove(actionId);
-    new SupabaseCache(this.ctx.storage.kv).bumpGeneration();
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return work;
+  }
+
+  #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const pending = new PendingActionStore(this.ctx.storage.kv);
+    return runBillableAction({
+      storage: durableBillableActionStorage(this.ctx.storage),
+      actionId,
+      execution,
+      getPending: () => pending.get(actionId),
+      removePending: () => {
+        pending.remove(actionId);
+        new SupabaseCache(this.ctx.storage.kv).bumpGeneration();
+      },
+      prepare: async action => action,
+      execute: async (action, activity) => {
+        try {
+          await this.#makeApi().withActivity(activity).runQuery(
+            action.ref, action.sql, action.params,
+          );
+        } catch (error) {
+          if (error instanceof SupabaseApiError && error.isAuthError) {
+            await this.#userAccount().noteCredentialsExpired();
+          }
+          throw error;
+        }
+      },
+    });
   }
 
   /** Rejected: discard the queued statement. There is no simulation state to roll back. */
@@ -1192,17 +1278,14 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
 
 // Fetches (and caches) full project info. Shared so SupabaseOrganization.getProject() and
 // SupabaseProject.getInfo() hit the same cache entry instead of fetching the project twice.
-async function fetchProjectInfo(ctx: SupabaseSessionContext, ref: string): Promise<SupabaseProjectInfo> {
-  return await ctx.cached(cacheKey("project-info", ref), METADATA_CACHE_TTL_MS, async api => {
-    const project = await api.getProject(ref);
-    return {
-      ...projectSummary(project),
-      database: {
-        host: project.database?.host ?? "",
-        postgresVersion: project.database?.version ?? "",
-      },
-    };
-  });
+function projectInfo(project: ProjectResponse): SupabaseProjectInfo {
+  return {
+    ...projectSummary(project),
+    database: {
+      host: project.database?.host ?? "",
+      postgresVersion: project.database?.version ?? "",
+    },
+  };
 }
 
 @validateRpc()
@@ -1217,46 +1300,57 @@ class SupabaseOrganizationImpl extends RpcTarget implements SupabaseOrganization
   }
 
   async getInfo(): Promise<SupabaseOrganizationInfo> {
-    const info = await this.#ctx.cached(cacheKey("org", this.#slug), METADATA_CACHE_TTL_MS, async api => {
-      const organizations = await api.listOrganizations();
-      const org = organizations.find(o => o.slug === this.#slug);
-      if (!org) {
-        throw new Error(`Organization ${this.#slug} is not accessible with the connected account.`);
-      }
-      return { slug: org.slug, name: org.name, url: organizationUrl(org.slug) };
-    });
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: "Read Supabase organization",
-      description: `Read metadata for the Supabase organization \`${this.#slug}\`.`,
-    });
-    return info;
+    return this.#ctx.readCached(
+      "SupabaseOrganization.getInfo",
+      undefined,
+      cacheKey("org", this.#slug),
+      METADATA_CACHE_TTL_MS,
+      async api => {
+        const organizations = await api.listOrganizations();
+        const org = organizations.find(o => o.slug === this.#slug);
+        if (!org) {
+          throw new Error(
+            `Organization ${this.#slug} is not accessible with the connected account.`,
+          );
+        }
+        return { slug: org.slug, name: org.name, url: organizationUrl(org.slug) };
+      },
+      () => ({
+        title: "Read Supabase organization",
+        description: `Read metadata for the Supabase organization \`${this.#slug}\`.`,
+      }),
+    );
   }
 
   async listProjects(): Promise<SupabaseProjectSummary[]> {
-    const projects = await this.#ctx.cached(cacheKey("org-projects", this.#slug), METADATA_CACHE_TTL_MS, async api => {
-      const all = await api.listProjects();
-      return all.filter(project => project.organization_slug === this.#slug).map(projectSummary);
-    });
-
-    await this.#ctx.approvalQueue.authorizeObservation({
-      title: "List Supabase projects",
-      description:
+    return this.#ctx.readCached(
+      "SupabaseOrganization.listProjects",
+      undefined,
+      cacheKey("org-projects", this.#slug),
+      METADATA_CACHE_TTL_MS,
+      async api => (await api.listProjects())
+        .filter(project => project.organization_slug === this.#slug)
+        .map(projectSummary),
+      projects => ({
+        title: "List Supabase projects",
+        description:
           `List the ${projects.length} project(s) in the Supabase organization \`${this.#slug}\`.`,
-    });
-    return projects;
+      }),
+    );
   }
 
   async getProject(ref: string): Promise<SupabaseProject> {
-    // Authorize first: this performs an external read and would otherwise be an unlogged
-    // existence/membership oracle for arbitrary project refs.
-    await this.#ctx.authorizeProjectObservation(ref, {
-      title: "Open Supabase project",
-      description: `Look up Supabase project \`${ref}\` within organization \`${this.#slug}\`.`,
-    });
-
-    // Verify the project belongs to this organization before handing out a capability for it.
-    const project = await fetchProjectInfo(this.#ctx, ref);
+    const project = await this.#ctx.readCached(
+      "SupabaseOrganization.getProject",
+      ref,
+      cacheKey("project-info", ref),
+      METADATA_CACHE_TTL_MS,
+      async api => projectInfo(await api.getProject(ref)),
+      () => ({
+        title: "Open Supabase project",
+        description: `Look up Supabase project \`${ref}\` within organization \`${this.#slug}\`.`,
+      }),
+    );
     if (project.organizationSlug !== this.#slug) {
       throw new Error(`Project ${ref} is not part of organization ${this.#slug}.`);
     }
@@ -1276,13 +1370,17 @@ class SupabaseProjectImpl extends RpcTarget implements SupabaseProject {
   }
 
   async getInfo(): Promise<SupabaseProjectInfo> {
-    const info = await fetchProjectInfo(this.#ctx, this.#ref);
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "Read Supabase project",
-      description: `Read metadata for the Supabase project \`${this.#ref}\`.`,
-    });
-    return info;
+    return this.#ctx.readCached(
+      "SupabaseProject.getInfo",
+      this.#ref,
+      cacheKey("project-info", this.#ref),
+      METADATA_CACHE_TTL_MS,
+      async api => projectInfo(await api.getProject(this.#ref)),
+      () => ({
+        title: "Read Supabase project",
+        description: `Read metadata for the Supabase project \`${this.#ref}\`.`,
+      }),
+    );
   }
 
   async getDatabase(): Promise<SupabaseDatabase> {
@@ -1292,21 +1390,25 @@ class SupabaseProjectImpl extends RpcTarget implements SupabaseProject {
 
 
   async checkHealth(): Promise<SupabaseServiceHealth[]> {
-    // Not cached: health is a liveness probe where staleness defeats the purpose.
-    const health = await this.#ctx.run(api => api.getServicesHealth(this.#ref, HEALTH_SERVICES));
-    const result = health.map(item => ({ service: item.name, status: item.status, error: item.error }));
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "Check Supabase project health",
-      description: `Check the health of services for the Supabase project \`${this.#ref}\`.`,
-    });
-    return result;
+    return this.#ctx.read(
+      "SupabaseProject.checkHealth",
+      this.#ref,
+      async api => (await api.getServicesHealth(this.#ref, HEALTH_SERVICES))
+        .map(item => ({ service: item.name, status: item.status, error: item.error })),
+      () => ({
+        title: "Check Supabase project health",
+        description: `Check the health of services for the Supabase project \`${this.#ref}\`.`,
+      }),
+    );
   }
 
   async listEdgeFunctions(): Promise<SupabaseEdgeFunction[]> {
-    const functions = await this.#ctx.cached(cacheKey("functions", this.#ref), METADATA_CACHE_TTL_MS, async api => {
-      const list = await api.listFunctions(this.#ref);
-      return list.map(fn => ({
+    return this.#ctx.readCached(
+      "SupabaseProject.listEdgeFunctions",
+      this.#ref,
+      cacheKey("functions", this.#ref),
+      METADATA_CACHE_TTL_MS,
+      async api => (await api.listFunctions(this.#ref)).map(fn => ({
         slug: fn.slug,
         name: fn.name,
         status: fn.status,
@@ -1314,47 +1416,49 @@ class SupabaseProjectImpl extends RpcTarget implements SupabaseProject {
         verifyJwt: fn.verify_jwt ?? false,
         createdAt: new Date(fn.created_at),
         updatedAt: new Date(fn.updated_at),
-      }));
-    });
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "List Supabase edge functions",
-      description: `List the ${functions.length} edge function(s) deployed to project \`${this.#ref}\`.`,
-    });
-    return functions;
+      })),
+      functions => ({
+        title: "List Supabase edge functions",
+        description:
+          `List the ${functions.length} edge function(s) deployed to project \`${this.#ref}\`.`,
+      }),
+    );
   }
 
   async getEdgeFunctionSource(slug: string): Promise<string> {
-    const source = await this.#ctx.cached(
+    return this.#ctx.readCached(
+      "SupabaseProject.getEdgeFunctionSource",
+      this.#ref,
       cacheKey("function-source", this.#ref, slug),
       METADATA_CACHE_TTL_MS,
       api => api.getFunctionBody(this.#ref, slug),
+      () => ({
+        title: "Read Supabase edge function source",
+        description:
+          `Read the deployed source of edge function \`${slug}\` in project \`${this.#ref}\`.`,
+      }),
     );
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "Read Supabase edge function source",
-      description: `Read the deployed source of edge function \`${slug}\` in project \`${this.#ref}\`.`,
-    });
-    return source;
   }
 
   async listStorageBuckets(): Promise<SupabaseStorageBucket[]> {
-    const buckets = await this.#ctx.cached(cacheKey("buckets", this.#ref), METADATA_CACHE_TTL_MS, async api => {
-      const list = await api.listStorageBuckets(this.#ref);
-      return list.map(bucket => ({
+    return this.#ctx.readCached(
+      "SupabaseProject.listStorageBuckets",
+      this.#ref,
+      cacheKey("buckets", this.#ref),
+      METADATA_CACHE_TTL_MS,
+      async api => (await api.listStorageBuckets(this.#ref)).map(bucket => ({
         id: bucket.id,
         name: bucket.name,
         public: bucket.public,
         createdAt: new Date(bucket.created_at),
         updatedAt: new Date(bucket.updated_at),
-      }));
-    });
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "List Supabase storage buckets",
-      description: `List the ${buckets.length} storage bucket(s) in project \`${this.#ref}\`.`,
-    });
-    return buckets;
+      })),
+      buckets => ({
+        title: "List Supabase storage buckets",
+        description:
+          `List the ${buckets.length} storage bucket(s) in project \`${this.#ref}\`.`,
+      }),
+    );
   }
 }
 
@@ -1373,15 +1477,20 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
     assertReadOnlyQuerySafe(sql);
     // Read-only queries are not cached (the SQL and parameters are arbitrary and dynamic). The
     // result size is bounded inside runReadOnlyQuery (it throws before returning an oversized body).
-    const rows = await this.#ctx.run(api => api.runReadOnlyQuery(this.#ref, sql, params));
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "Run read-only SQL on Supabase",
-      description:
+    return this.#ctx.read(
+      "SupabaseDatabase.query",
+      this.#ref,
+      async api => {
+        const rows = await api.runReadOnlyQuery(this.#ref, sql, params);
+        return { rows: rows as SupabaseQueryResult["rows"], rowCount: rows.length };
+      },
+      () => ({
+        title: "Run read-only SQL on Supabase",
+        description:
           `Run a read-only query against Supabase project \`${this.#ref}\`.\n\n` +
           "```sql\n" + sql + "\n```",
-    });
-    return { rows: rows as SupabaseQueryResult["rows"], rowCount: rows.length };
+      }),
+    );
   }
 
   async execute(sql: string, params?: SupabaseValue[]): Promise<void> {
@@ -1396,17 +1505,18 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
   }
 
   async listSchemas(): Promise<string[]> {
-    const schemas = await this.#ctx.cached(
+    return this.#ctx.readCached(
+      "SupabaseDatabase.listSchemas",
+      this.#ref,
       cacheKey("schemas", this.#ref),
       SCHEMA_CACHE_TTL_MS,
       api => listSchemas(api, this.#ref),
+      schemas => ({
+        title: "List Supabase schemas",
+        description:
+          `List the ${schemas.length} schema(s) in the database of project \`${this.#ref}\`.`,
+      }),
     );
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "List Supabase schemas",
-      description: `List the ${schemas.length} schema(s) in the database of project \`${this.#ref}\`.`,
-    });
-    return schemas;
   }
 
   async listTables(options?: SupabaseListTablesOptions): Promise<SupabaseTable[]> {
@@ -1414,31 +1524,33 @@ class SupabaseDatabaseImpl extends RpcTarget implements SupabaseDatabase {
     const includeViews = options?.includeViews ?? true;
     // Pass the resolved values (not raw `options`) to the loader so what's cached always matches
     // the cache key, even if SupabaseListTablesOptions gains fields later.
-    const tables = await this.#ctx.cached(
+    return this.#ctx.readCached(
+      "SupabaseDatabase.listTables",
+      this.#ref,
       cacheKey("tables", this.#ref, schema, includeViews),
       SCHEMA_CACHE_TTL_MS,
       api => listTables(api, this.#ref, { schema, includeViews }),
+      tables => ({
+        title: "List Supabase tables",
+        description:
+          `List the ${tables.length} table(s)/view(s) in schema \`${schema}\` of project ` +
+          `\`${this.#ref}\`.`,
+      }),
     );
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "List Supabase tables",
-      description:
-          `List the ${tables.length} table(s)/view(s) in schema \`${schema}\` of project \`${this.#ref}\`.`,
-    });
-    return tables;
   }
 
   async describeTable(schema: string, name: string): Promise<SupabaseTableDetails> {
-    const details = await this.#ctx.cached(
+    return this.#ctx.readCached(
+      "SupabaseDatabase.describeTable",
+      this.#ref,
       cacheKey("table", this.#ref, schema, name),
       SCHEMA_CACHE_TTL_MS,
       api => describeTable(api, this.#ref, schema, name),
+      () => ({
+        title: "Describe Supabase table",
+        description:
+          `Read the structure of table \`${schema}.${name}\` in project \`${this.#ref}\`.`,
+      }),
     );
-
-    await this.#ctx.authorizeProjectObservation(this.#ref, {
-      title: "Describe Supabase table",
-      description: `Read the structure of table \`${schema}.${name}\` in project \`${this.#ref}\`.`,
-    });
-    return details;
   }
 }

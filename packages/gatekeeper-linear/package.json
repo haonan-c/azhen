@@ -8,6 +8,7 @@
     "build:configurator": "node ../../scripts/build-gatekeeper-configurator.mjs .",
     "deploy": "pnpm run build:configurator && wrangler deploy",
     "build": "pnpm run build:configurator && tsc",
+    "test": "vitest run",
     "clean": "rm -rf dist src/generated"
   },
   "dependencies": {
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "typescript": "catalog:",
+    "vitest": "catalog:",
     "wrangler": "catalog:"
   }
 }

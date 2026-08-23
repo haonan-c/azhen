@@ -10,6 +10,8 @@
 // Notes / wiki databases return no rows from the legacy `databases/{id}/query` endpoint. The
 // database→data-source split is hidden from the Session API.
 
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
+
 import type {
   NotionComment,
   NotionDatabaseSchema,
@@ -1018,10 +1020,21 @@ export class NotionApi {
   #getToken: () => Promise<string>;
   // Optional: rotate credentials when a request hits 401. Returns a fresh access token.
   #refresh?: () => Promise<string>;
+  #activity?: BillableOperationActivity;
 
-  constructor(getToken: () => Promise<string>, refresh?: () => Promise<string>) {
+  constructor(
+    getToken: () => Promise<string>,
+    refresh?: () => Promise<string>,
+    activity?: BillableOperationActivity,
+  ) {
     this.#getToken = getToken;
     this.#refresh = refresh;
+    this.#activity = activity;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: BillableOperationActivity): NotionApi {
+    return new NotionApi(this.#getToken, this.#refresh, activity);
   }
 
   async #request<T>(method: string, path: string, body?: unknown, version?: string): Promise<T> {
@@ -1065,12 +1078,15 @@ export class NotionApi {
       headers.set("Content-Type", "application/json");
       payload = JSON.stringify(body);
     }
-    return await fetch(`${API_BASE_URL}${path}`, {
+    this.#activity?.requestDispatched();
+    const response = await fetch(`${API_BASE_URL}${path}`, {
       method,
       headers,
       body: payload,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
+    this.#activity?.responseReceived(response.status);
+    return response;
   }
 
   // --- Observations ---

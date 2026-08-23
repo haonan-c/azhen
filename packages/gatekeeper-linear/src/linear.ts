@@ -1,6 +1,12 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
+  durableBillableActionStorage,
+  runBillableAction,
+  runBillableRead,
+  type BillableOperationActivity,
+} from "@gadgets/backend-utils/gatekeeper-billing";
+import {
   GatekeeperUser,
   stripTrailingSlashes,
   GatekeeperUserVerifier,
@@ -15,7 +21,14 @@ import {
   AccountDescription,
   SupportedResource,
   ResourceConfiguratorFrame,
+  type ActionExecution,
+  type ActionExecutionResult,
 } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  LINEAR_BILLING_METHODS,
+  linearActionBilling,
+  type LinearBillableWriteMethod,
+} from "./billing-methods";
 import type {
   Cursor,
   LinearWorkspace,
@@ -937,7 +950,12 @@ type StoredActionDraft = StoredAction extends infer T
   ? T extends { id: number } ? Omit<T, "id" | "status"> : never
   : never;
 
-type ActionDescriptionDraft = { title: string; body: string; implementsRevert: boolean };
+type ActionDescriptionDraft = {
+  title: string;
+  body: string;
+  implementsRevert: boolean;
+  billingMethod: LinearBillableWriteMethod;
+};
 
 type LinearGatekeeperImplProps = {
   userObjectId: string;
@@ -1075,6 +1093,43 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     check.commit();
   }
 
+  async billRead<T>(
+    queue: RpcStub<ApprovalQueue>,
+    method: keyof typeof LINEAR_BILLING_METHODS,
+    read: () => Promise<T>,
+    teamIds: (result: T) => string[],
+    describe: (result: T) => ObservationDescription,
+  ): Promise<T> {
+    let lastResult: T | undefined;
+    return runBillableRead(
+      {
+        beginBillableOperation: (methodKey, externalAccountId) =>
+          queue.beginBillableOperation(methodKey, externalAccountId),
+        authorizeObservation: description =>
+          this.authorizeTeamObservation(queue, teamIds(lastResult as T), description),
+      },
+      this.ctx.props.userObjectId,
+      LINEAR_BILLING_METHODS[method].methodKey,
+      async activity => {
+        activity.requestDispatched();
+        try {
+          lastResult = await read();
+          activity.responseReceived(200);
+          return lastResult;
+        } catch (error) {
+          const apiError = error instanceof LinearApiError
+            ? error
+            : error instanceof Error && error.cause instanceof LinearApiError
+              ? error.cause
+              : undefined;
+          if (apiError) activity.responseReceived(apiError.status);
+          throw error;
+        }
+      },
+      describe,
+    );
+  }
+
   /**
    * Resolve an issue reference (real identifier/UUID, or provisional id) to the id usable against
    * Linear. Throws if a provisional issue's create has not actually been applied yet (used by
@@ -1120,6 +1175,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
       title: description.title,
       description: description.body,
       implementsRevert: description.implementsRevert,
+      billing: linearActionBilling(description.billingMethod, this.ctx.props.userObjectId),
     });
   }
 
@@ -1523,11 +1579,61 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
-  async applyAction(actionId: number): Promise<void> {
-    const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
-    if (!action) throw new Error(`Unknown action: ${actionId}`);
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
 
-    await this.#run(async api => {
+  async applyAction(
+    actionId: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This Linear Action predates billing. Reject it and submit the change again.",
+      );
+    }
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return active;
+    const work = this.#applyBillableAction(actionId, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
+      }
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return work;
+  }
+
+  #applyBillableAction(
+    actionId: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    const key = `action:${actionId}`;
+    return runBillableAction({
+      storage: durableBillableActionStorage(this.ctx.storage),
+      actionId,
+      execution,
+      getPending: () => this.ctx.storage.kv.get<StoredAction>(key),
+      removePending: outcome => {
+        const action = this.ctx.storage.kv.get<StoredAction>(key);
+        if (action && outcome === "failed-before-execution") {
+          this.ctx.storage.kv.delete(key);
+        } else if (action) {
+          action.status = "applied";
+          this.ctx.storage.kv.put(key, action);
+        }
+        this.#invalidatePendingActions();
+      },
+      prepare: async action => action,
+      execute: (action, activity) => this.#executeAction(actionId, action, activity),
+    });
+  }
+
+  async #executeAction(
+    actionId: number,
+    action: StoredAction,
+    activity: BillableOperationActivity,
+  ): Promise<void> {
+    activity.requestDispatched();
+    try {
+      await this.#run(async api => {
       switch (action.kind) {
         case "createIssue": {
           // A parent that was itself a pending create may now be real — resolve its provisional id.
@@ -1586,7 +1692,17 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
           await api.setIssueArchived(this.resolveIssueRef(action.issueRef), action.archived);
           break;
       }
-    });
+      });
+      activity.responseReceived(200);
+    } catch (error) {
+      const apiError = error instanceof LinearApiError
+        ? error
+        : error instanceof Error && error.cause instanceof LinearApiError
+          ? error.cause
+          : undefined;
+      if (apiError) activity.responseReceived(apiError.status);
+      throw error;
+    }
 
     // Mark applied and keep the record (so revert can find it). The change is now real, so the
     // simulation overlay (which only considers "pending" actions) stops applying it.
@@ -1705,6 +1821,7 @@ class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
   // The team(s) whose data a given raw page reveals, for workspace-binding observer tracking (see
   // LinearGatekeeperImpl.authorizeTeamObservation). Empty for workspace-level pages any member sees.
   #teamIdsOf: (rawItems: TRaw[]) => string[];
+  #billingMethod: keyof typeof LINEAR_BILLING_METHODS;
   #after: string | undefined = undefined;
   #done = false;
 
@@ -1715,6 +1832,7 @@ class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
     normalize: (raw: TRaw) => TOut,
     describe: (items: TOut[]) => ObservationDescription,
     teamIdsOf: (rawItems: TRaw[]) => string[],
+    billingMethod: keyof typeof LINEAR_BILLING_METHODS,
   ) {
     super();
     this.#gk = gk;
@@ -1723,14 +1841,19 @@ class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
     this.#normalize = normalize;
     this.#describe = describe;
     this.#teamIdsOf = teamIdsOf;
+    this.#billingMethod = billingMethod;
   }
 
   async next(): Promise<TOut[] | null> {
     if (this.#done) return null;
-    const conn = await this.#fetchPage(this.#after);
+    const conn = await this.#gk.billRead(
+      this.#queue,
+      this.#billingMethod,
+      () => this.#fetchPage(this.#after),
+      result => this.#teamIdsOf(result.nodes),
+      result => this.#describe(result.nodes.map(this.#normalize)),
+    );
     const items = conn.nodes.map(this.#normalize);
-    // Authorize before advancing pagination state, so a denied page can be retried.
-    await this.#gk.authorizeTeamObservation(this.#queue, this.#teamIdsOf(conn.nodes), this.#describe(items));
     this.#after = conn.pageInfo.endCursor ?? undefined;
     if (!conn.pageInfo.hasNextPage) this.#done = true;
     return items;
@@ -1762,12 +1885,16 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
   }
 
   async getMetadata(): Promise<LinearWorkspaceMetadata> {
-    const org = await this.#gk.orgRaw();
-    // Workspace-level metadata is visible to any workspace member, so no team attribution is needed.
-    await this.#gk.authorizeTeamObservation(this.#queue, [], {
-      title: "Read workspace info",
-      description: `Read metadata for the Linear workspace **${org.name}**.`,
-    });
+    const org = await this.#gk.billRead(
+      this.#queue,
+      "LinearWorkspace.getMetadata",
+      () => this.#gk.orgRaw(),
+      () => [],
+      result => ({
+        title: "Read workspace info",
+        description: `Read metadata for the Linear workspace **${result.name}**.`,
+      }),
+    );
     return { id: org.id, name: org.name, urlKey: org.urlKey, url: `https://linear.app/${org.urlKey}` };
   }
 
@@ -1782,6 +1909,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
       // Each listed team is itself a data set whose existence/metadata (incl. private teams) the
       // observer must be allowed to see.
       teams => teams.map(t => t.id),
+      "LinearWorkspace.listTeams.next",
     );
   }
 
@@ -1800,6 +1928,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
       // A project's access is gated by the team(s) it belongs to (populated by the workspace-wide
       // query via PROJECT_LIST_FIELDS), so attribute the listing to all of them.
       projects => projects.flatMap(p => (p.teams?.nodes ?? []).map(t => t.id)),
+      "LinearWorkspace.listProjects.next",
     );
   }
 
@@ -1813,6 +1942,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "List issues", description: `Listed ${items.length} issue(s) across the workspace.` }),
       issues => issues.map(i => i.team.id),
+      "LinearWorkspace.listIssues.next",
     );
   }
 
@@ -1826,6 +1956,7 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "Search issues", description: `Searched workspace issues for "${query.text}" (${items.length} result(s)).` }),
       issues => issues.map(i => i.team.id),
+      "LinearWorkspace.searchIssues.next",
     );
   }
 
@@ -1834,16 +1965,25 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
   }
 
   async createIssue(options: LinearCreateIssueOptions): Promise<LinearIssue> {
-    return await createIssueViaQueue(this.#gk, this.#queue, options, { requireTeam: true });
+    return await createIssueViaQueue(
+      this.#gk, this.#queue, options, { requireTeam: true },
+      "LinearWorkspace.createIssue",
+    );
   }
 
   async findMembers(query?: string): Promise<LinearUser[]> {
-    const users = await this.#gk.findMembersRaw(query);
-    // The workspace member directory is visible to any workspace member, so no team attribution.
-    await this.#gk.authorizeTeamObservation(this.#queue, [], {
-      title: "Find members",
-      description: `Looked up ${users.length} workspace member(s)${query ? ` matching "${query}"` : ""}.`,
-    });
+    const users = await this.#gk.billRead(
+      this.#queue,
+      "LinearWorkspace.findMembers",
+      () => this.#gk.findMembersRaw(query),
+      () => [],
+      result => ({
+        title: "Find members",
+        description:
+          `Looked up ${result.length} workspace member(s)` +
+          `${query ? ` matching "${query}"` : ""}.`,
+      }),
+    );
     return users.map(u => normUser(u)!).filter(Boolean);
   }
 }
@@ -1882,11 +2022,16 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
   }
 
   async getMetadata(): Promise<LinearTeamMetadata> {
-    const team = await this.#team();
-    await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
-      title: "Read team info",
-      description: `Read metadata for team **${team.key} · ${team.name}**.`,
-    });
+    const team = await this.#gk.billRead(
+      this.#queue,
+      "LinearTeam.getMetadata",
+      () => this.#team(),
+      result => [result.id],
+      result => ({
+        title: "Read team info",
+        description: `Read metadata for team **${result.key} · ${result.name}**.`,
+      }),
+    );
     return normTeamSummary(team, this.#wsKey);
   }
 
@@ -1901,6 +2046,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "List team issues", description: `Listed ${items.length} issue(s) in team ${team.key}.` }),
       () => [team.id],
+      "LinearTeam.listIssues.next",
     );
   }
 
@@ -1915,36 +2061,59 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
       raw => normIssueSummary(raw, this.#wsKey),
       items => ({ title: "Search team issues", description: `Searched team ${team.key} for "${query.text}" (${items.length} result(s)).` }),
       () => [team.id],
+      "LinearTeam.searchIssues.next",
     );
   }
 
   async getIssue(id: string): Promise<LinearIssue> {
-    const team = await this.#team();
+    const team = await this.#gk.billRead(
+      this.#queue,
+      "LinearTeam.getIssue",
+      () => this.#team(),
+      result => [result.id],
+      result => ({
+        title: "Open team issue",
+        description: `Open an issue in team ${result.key}.`,
+      }),
+    );
     return new LinearIssueImpl(this.#gk, this.#queue.dup(), id, team.id);
   }
 
   async createIssue(options: LinearCreateIssueOptions): Promise<LinearIssue> {
     const team = await this.#team();
-    return await createIssueViaQueue(this.#gk, this.#queue, { ...options, teamId: team.id }, { requireTeam: false }, team.id);
+    return await createIssueViaQueue(
+      this.#gk, this.#queue, { ...options, teamId: team.id }, { requireTeam: false },
+      "LinearTeam.createIssue", team.id,
+    );
   }
 
   async listWorkflowStates(): Promise<LinearWorkflowState[]> {
     const team = await this.#team();
-    const states = await this.#gk.workflowStatesRaw(team.id);
-    await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
-      title: "List workflow states",
-      description: `Listed ${states.length} workflow state(s) for team ${team.key}.`,
-    });
+    const states = await this.#gk.billRead(
+      this.#queue,
+      "LinearTeam.listWorkflowStates",
+      () => this.#gk.workflowStatesRaw(team.id),
+      () => [team.id],
+      result => ({
+        title: "List workflow states",
+        description: `Listed ${result.length} workflow state(s) for team ${team.key}.`,
+      }),
+    );
     return states.map(normState).toSorted((a, b) => (a.position ?? 0) - (b.position ?? 0));
   }
 
   async listLabels(): Promise<LinearLabel[]> {
     const team = await this.#team();
-    const labels = await this.#gk.labelsForDisplay(team.id);
-    await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
-      title: "List labels",
-      description: `Listed ${labels.length} label(s) for team ${team.key}.`,
-    });
+    const labels = await this.#gk.billRead(
+      this.#queue,
+      "LinearTeam.listLabels",
+      () => this.#gk.labelsForDisplay(team.id),
+      () => [team.id],
+      result => ({
+        title: "List labels",
+        description: `Listed ${result.length} label(s) for team ${team.key}.`,
+      }),
+    );
     return labels.map(normLabel);
   }
 
@@ -1965,6 +2134,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
         title: `Create label "${name}" in ${team.key}`,
         body: `Create a new label named **${name}**${options?.color ? ` (color ${options.color})` : ""} in team ${team.key}.`,
         implementsRevert: true,
+        billingMethod: "LinearTeam.createLabel",
       },
     );
     // Pending approval — return the same provisional descriptor that listLabels will show.
@@ -1982,6 +2152,7 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
       items => ({ title: "List team projects", description: `Listed ${items.length} project(s) for team ${team.key}.` }),
       // Team-scoped listing: the projects are reached through this team, so attribute to it.
       () => [team.id],
+      "LinearTeam.listProjects.next",
     );
   }
 
@@ -1995,16 +2166,22 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
       normCycle,
       items => ({ title: "List cycles", description: `Listed ${items.length} cycle(s) for team ${team.key}.` }),
       () => [team.id],
+      "LinearTeam.listCycles.next",
     );
   }
 
   async listMembers(): Promise<LinearUser[]> {
     const team = await this.#team();
-    const members = await this.#gk.teamMembersRaw(team.id);
-    await this.#gk.authorizeTeamObservation(this.#queue, [team.id], {
-      title: "List team members",
-      description: `Listed ${members.length} member(s) of team ${team.key}.`,
-    });
+    const members = await this.#gk.billRead(
+      this.#queue,
+      "LinearTeam.listMembers",
+      () => this.#gk.teamMembersRaw(team.id),
+      () => [team.id],
+      result => ({
+        title: "List team members",
+        description: `Listed ${result.length} member(s) of team ${team.key}.`,
+      }),
+    );
     return members.map(m => normUser(m)!).filter(Boolean);
   }
 }
@@ -2045,11 +2222,16 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
   }
 
   async getDetails(): Promise<LinearIssueDetails> {
-    const issue = await this.#requireIssue();
-    await this.#gk.authorizeTeamObservation(this.#queue, [issue.team.id], {
-      title: `Read issue ${issue.identifier}`,
-      description: `Read details of issue **${issue.identifier} ${issue.title}**.`,
-    });
+    const issue = await this.#gk.billRead(
+      this.#queue,
+      "LinearIssue.getDetails",
+      () => this.#requireIssue(),
+      result => [result.team.id],
+      result => ({
+        title: `Read issue ${result.identifier}`,
+        description: `Read details of issue **${result.identifier} ${result.title}**.`,
+      }),
+    );
     return normIssueDetails(issue, this.#wsKey);
   }
 
@@ -2061,7 +2243,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         previous: { title: issue.title }, patch: { title }, title: `Set title of ${issue.identifier}` },
       { title: `Rename ${issue.identifier}`,
         body: `Change the title of **${issue.identifier}** from "${issue.title}" to "${title}".`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setTitle" },
     );
   }
 
@@ -2074,7 +2256,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         title: `Edit description of ${issue.identifier}` },
       { title: `Edit description of ${issue.identifier}`,
         body: `Replace the description of **${issue.identifier} ${issue.title}**.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setDescription" },
     );
   }
 
@@ -2092,7 +2274,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         title: `Move ${issue.identifier} to ${target.name}` },
       { title: `Move ${issue.identifier} to ${target.name}`,
         body: `Change the state of **${issue.identifier} ${issue.title}** from "${issue.state?.name ?? "Unknown"}" to "${target.name}".`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setState" },
     );
   }
 
@@ -2113,7 +2295,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         title: `${label} (${issue.identifier})` },
       { title: `${label}: ${issue.identifier}`,
         body: `${label} for issue **${issue.identifier} ${issue.title}**.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setAssignee" },
     );
   }
 
@@ -2126,7 +2308,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         title: `Set priority of ${issue.identifier}` },
       { title: `Set priority of ${issue.identifier} to ${priority}`,
         body: `Change the priority of **${issue.identifier} ${issue.title}** to "${priority}".`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setPriority" },
     );
   }
 
@@ -2152,7 +2334,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         title: `Add labels to ${issue.identifier}` },
       { title: `Add labels to ${issue.identifier}`,
         body: `Add label(s) ${labels.map(l => `"${l}"`).join(", ")} to **${issue.identifier} ${issue.title}**.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.addLabels" },
     );
   }
 
@@ -2168,7 +2350,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       { kind: "removeLabels", issueRef: this.#ref, labelIds: removeIds, title: `Remove labels from ${issue.identifier}` },
       { title: `Remove labels from ${issue.identifier}`,
         body: `Remove label(s) ${labels.map(l => `"${l}"`).join(", ")} from **${issue.identifier} ${issue.title}**.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.removeLabels" },
     );
   }
 
@@ -2185,7 +2367,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         body: projectId
           ? `Move **${issue.identifier} ${issue.title}** into project ${projectId}.`
           : `Remove **${issue.identifier} ${issue.title}** from its project.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setProject" },
     );
   }
 
@@ -2200,7 +2382,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         body: date
           ? `Set the due date of **${issue.identifier} ${issue.title}** to ${date}.`
           : `Clear the due date of **${issue.identifier} ${issue.title}**.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setDueDate" },
     );
   }
 
@@ -2225,7 +2407,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
         body: parentId
           ? `Make **${issue.identifier} ${issue.title}** a sub-issue of ${parentId}.`
           : `Detach **${issue.identifier} ${issue.title}** from its parent.`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.setParent" },
     );
   }
 
@@ -2242,6 +2424,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       normComment,
       items => ({ title: `Read comments on ${ref}`, description: `Read ${items.length} comment(s) on issue ${ref}.` }),
       () => [teamId],
+      "LinearIssue.readComments.next",
     );
   }
 
@@ -2259,7 +2442,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       { kind: "postComment", issueRef: this.#ref, body: bodyMarkdown, synthetic, title: `Comment on ${issue.identifier}` },
       { title: `Comment on ${issue.identifier}`,
         body: `Post a comment on **${issue.identifier} ${issue.title}**:\n\n${bodyMarkdown}`,
-        implementsRevert: true },
+        implementsRevert: true, billingMethod: "LinearIssue.postComment" },
     );
   }
 
@@ -2271,6 +2454,7 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#gk, this.#queue,
       { ...options, teamId: issue.team.id, parentId: issue.id },
       { requireTeam: false },
+      "LinearIssue.createSubIssue",
       issue.team.id);
   }
 
@@ -2280,7 +2464,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#queue,
       { kind: "archive", issueRef: this.#ref, archived: true, title: `Archive ${issue.identifier}` },
       { title: `Archive ${issue.identifier}`,
-        body: `Archive issue **${issue.identifier} ${issue.title}**.`, implementsRevert: true },
+        body: `Archive issue **${issue.identifier} ${issue.title}**.`, implementsRevert: true,
+        billingMethod: "LinearIssue.archive" },
     );
   }
 
@@ -2290,7 +2475,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
       this.#queue,
       { kind: "archive", issueRef: this.#ref, archived: false, title: `Unarchive ${issue.identifier}` },
       { title: `Unarchive ${issue.identifier}`,
-        body: `Restore archived issue **${issue.identifier} ${issue.title}**.`, implementsRevert: true },
+        body: `Restore archived issue **${issue.identifier} ${issue.title}**.`, implementsRevert: true,
+        billingMethod: "LinearIssue.unarchive" },
     );
   }
 }
@@ -2315,6 +2501,7 @@ async function createIssueViaQueue(
   queue: RpcStub<ApprovalQueue>,
   options: LinearCreateIssueOptions,
   opts: { requireTeam: boolean },
+  billingMethod: LinearBillableWriteMethod,
   teamScope?: string,
 ): Promise<LinearIssue> {
   if (!options.teamId && !options.teamKey && opts.requireTeam) {
@@ -2398,7 +2585,7 @@ async function createIssueViaQueue(
     { kind: "createIssue", input, provisionalId, synthetic, title: `Create issue "${options.title}"` },
     { title: `Create issue "${options.title}"`,
       body: `Create a new issue titled **${options.title}**${options.assignee ? `, assigned to ${options.assignee}` : ""}.`,
-      implementsRevert: true },
+      implementsRevert: true, billingMethod },
   );
 
   return new LinearIssueImpl(gk, queue.dup(), provisionalId, teamScope);

@@ -12,6 +12,8 @@
 // the removed v1 shapes). Shapes are verified against the v2 reference and OpenAPI spec:
 //   https://dac-static.atlassian.com/cloud/confluence/openapi-v2.v3.json
 
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
+
 import type {
   Attachment,
   Comment,
@@ -508,17 +510,31 @@ export class ConfluenceApi {
   readonly webBase: string;
   #getToken: () => Promise<string>;
   #refresh?: () => Promise<string>;
+  #activity?: BillableOperationActivity;
 
   constructor(opts: {
     cloudId: string;
     webBase: string;
     getToken: () => Promise<string>;
     refresh?: () => Promise<string>;
+    activity?: BillableOperationActivity;
   }) {
     this.cloudId = opts.cloudId;
     this.webBase = opts.webBase;
     this.#getToken = opts.getToken;
     this.#refresh = opts.refresh;
+    this.#activity = opts.activity;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: BillableOperationActivity): ConfluenceApi {
+    return new ConfluenceApi({
+      cloudId: this.cloudId,
+      webBase: this.webBase,
+      getToken: this.#getToken,
+      refresh: this.#refresh,
+      activity,
+    });
   }
 
   #base(): string {
@@ -529,7 +545,12 @@ export class ConfluenceApi {
     const headers = new Headers(init?.headers);
     headers.set("Authorization", `Bearer ${token}`);
     if (!headers.has("Accept")) headers.set("Accept", "application/json");
-    return await fetch(url, { ...init, method, headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    this.#activity?.requestDispatched();
+    const response = await fetch(url, {
+      ...init, method, headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    this.#activity?.responseReceived(response.status);
+    return response;
   }
 
   // Core request: `path` is the gateway-relative path (e.g. "/wiki/api/v2/pages/1"). Refreshes the

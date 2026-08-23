@@ -1,4 +1,5 @@
 import "cloudflare:workers";
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
 import { stripTrailingSlashes } from "@gadgets/workshop-shared/gatekeeper";
 
 // ---------------------------------------------------------------------------
@@ -227,10 +228,21 @@ export type QueryParams = Record<string, string | number | boolean | undefined>;
 export class ZoomInfoApi {
   #getToken: () => Promise<string>;
   #baseUrl: string;
+  #activity?: BillableOperationActivity;
 
-  constructor(getToken: () => Promise<string>, baseUrl: string = DEFAULT_API_BASE_URL) {
+  constructor(
+    getToken: () => Promise<string>,
+    baseUrl: string = DEFAULT_API_BASE_URL,
+    activity?: BillableOperationActivity,
+  ) {
     this.#getToken = getToken;
     this.#baseUrl = stripTrailingSlashes(baseUrl);
+    this.#activity = activity;
+  }
+
+  /** Return an isolated client that reports requests to one caller-visible operation. */
+  withActivity(activity: BillableOperationActivity): ZoomInfoApi {
+    return new ZoomInfoApi(this.#getToken, this.#baseUrl, activity);
   }
 
   async #request(
@@ -260,7 +272,9 @@ export class ZoomInfoApi {
       init.body = JSON.stringify(options.body);
     }
 
+    this.#activity?.requestDispatched();
     const response = await fetch(url.toString(), init);
+    this.#activity?.responseReceived(response.status);
 
     const parsed = await parseBody(response);
     if (!response.ok) {

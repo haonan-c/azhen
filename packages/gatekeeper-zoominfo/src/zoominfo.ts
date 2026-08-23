@@ -1,9 +1,16 @@
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
+  durableBillableActionStorage,
+  runBillableAction,
+  runBillableRead,
+} from "@gadgets/backend-utils/gatekeeper-billing";
+import {
   ApprovalQueue,
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionExecution,
+  type ActionExecutionResult,
   type Gatekeeper,
   type GatekeeperConnectCallback,
   type GatekeeperConnectOptions,
@@ -14,7 +21,12 @@ import {
   type ResourceDescription,
   type SupportedResource,
   type VendorDescription,
+  type ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  ZOOMINFO_BILLING_METHODS,
+  zoomInfoActionBilling,
+} from "./billing-methods";
 import {
   ZoomInfoApi,
   ZoomInfoApiError,
@@ -74,7 +86,6 @@ import type {
   ScoopSearchCriteria,
   SearchPage,
   SimilarCompaniesCriteria,
-  UsageLimit,
   ZoomInfoSession,
 } from "./types";
 import TYPES_CODE from "./types.txt";
@@ -647,7 +658,9 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<ZoomInfoSession> {
     return new ZoomInfoSessionImpl(
-      this.#userAccount(), approvalQueue.dup(), resolveOAuthConfig(this.env).apiBaseUrl, this.ctx.storage.kv);
+      this.#userAccount(), approvalQueue.dup(), resolveOAuthConfig(this.env).apiBaseUrl,
+      this.ctx.storage.kv, this.ctx.props.userObjectId,
+    );
   }
 
   /**
@@ -656,23 +669,57 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
    * outcome rather than re-thrown: the action is considered resolved (we don't want the overseer to
    * retry a paid operation that may have already charged credits), and the Gadget sees the failure.
    */
-  async applyAction(action: number): Promise<void> {
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+
+  async applyAction(
+    action: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This ZoomInfo Action predates billing. Reject it and submit the enrichment again.",
+      );
+    }
+    const active = this.#actionApplications.get(execution.billingOperationId);
+    if (active) return active;
+    const work = this.#applyBillableAction(action, execution).finally(() => {
+      if (this.#actionApplications.get(execution.billingOperationId) === work) {
+        this.#actionApplications.delete(execution.billingOperationId);
+      }
+    });
+    this.#actionApplications.set(execution.billingOperationId, work);
+    return work;
+  }
+
+  async #applyBillableAction(
+    action: number,
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
     const store = new EnrichmentStore(this.ctx.storage.kv);
-    const pending = store.getPending(action);
-    if (!pending) {
-      throw new Error(`Unknown pending ZoomInfo enrichment: ${action}`);
-    }
     const account = this.#userAccount();
-    try {
-      const result = await callZoomInfo(account, () => performEnrichment(this.#makeApi(account), pending));
-      store.putResult(action, { status: "ready", result });
-    } catch (error) {
-      store.putResult(action, {
-        status: "failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-    store.removePending(action);
+    return runBillableAction({
+      storage: durableBillableActionStorage(this.ctx.storage),
+      actionId: action,
+      execution,
+      getPending: () => store.getPending(action),
+      removePending: () => store.removePending(action),
+      prepare: async pending => pending,
+      execute: async (pending, activity) => {
+        try {
+          const result = await callZoomInfo(
+            account,
+            () => performEnrichment(this.#makeApi(account).withActivity(activity), pending),
+          );
+          store.putResult(action, { status: "ready", result });
+        } catch (error) {
+          store.putResult(action, {
+            status: "failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
+      },
+    });
   }
 
   /** Rejected: discard the queued enrichment (no credits spent) and record the outcome. */
@@ -1001,31 +1048,42 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   #approvalQueue: RpcStub<ApprovalQueue>;
   #api: ZoomInfoApi;
   #kv: DurableObjectStorage["kv"];
+  #externalAccountId: string;
 
   constructor(
     account: DurableObjectStub<UserAccount>,
     approvalQueue: RpcStub<ApprovalQueue>,
     apiBaseUrl: string,
     kv: DurableObjectStorage["kv"],
+    externalAccountId: string,
   ) {
     super();
     this.#account = account;
     this.#approvalQueue = approvalQueue;
     this.#api = new ZoomInfoApi(() => account.getAccessToken(), apiBaseUrl);
     this.#kv = kv;
+    this.#externalAccountId = externalAccountId;
   }
 
   [Symbol.dispose]() {
     this.#approvalQueue[Symbol.dispose]();
   }
 
-  // Run an API call, translating auth failures into a reconnect-prompting error.
-  #call<T>(fn: (api: ZoomInfoApi) => Promise<T>): Promise<T> {
-    return callZoomInfo(this.#account, () => fn(this.#api));
-  }
-
-  #observe(title: string, description: string): Promise<void> {
-    return this.#approvalQueue.authorizeObservation({ title, description });
+  #read<T>(
+    method: keyof typeof ZOOMINFO_BILLING_METHODS,
+    read: (api: ZoomInfoApi) => Promise<T>,
+    describe: (result: T) => ObservationDescription,
+  ): Promise<T> {
+    return runBillableRead(
+      this.#approvalQueue,
+      this.#externalAccountId,
+      ZOOMINFO_BILLING_METHODS[method].methodKey,
+      activity => callZoomInfo(
+        this.#account,
+        () => read(this.#api.withActivity(activity)),
+      ),
+      describe,
+    );
   }
 
   // Read a cached value if still fresh, else undefined. Cache lives in the GatekeeperImpl DO's KV,
@@ -1065,6 +1123,7 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
         // No simulation: suspend the agent until the user decides rather than letting it read back
         // un-enriched state.
         awaitDecision: true,
+        billing: zoomInfoActionBilling(kind, this.#externalAccountId),
       });
     } catch (error) {
       store.removePending(id);
@@ -1078,53 +1137,72 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
 
   async lookup(fieldName: LookupFieldName, filters?: LookupFilters): Promise<LookupValue[]> {
     const cacheKey = `lookup:${fieldName}:${JSON.stringify(filters ?? {})}`;
-    let results = this.#cacheGet<LookupValue[]>(cacheKey, LOOKUP_CACHE_TTL_MS);
-    const fromCache = results !== undefined;
-    if (results === undefined) {
-      const query: QueryParams = clean({
-        "filter[category]": filters?.category,
-        "filter[parentCategory]": filters?.parentCategory,
-        "filter[subCategory]": filters?.subCategory,
-        "filter[vendor]": filters?.vendor,
-      });
-      const doc = await this.#call(api => api.get(`/data/v1/lookup/${encodeURIComponent(fieldName)}`, query));
-      results = asResources(doc).map(r => {
-        const a = attrs(r);
-        const { name, ...rest } = a;
-        return { id: r.id ?? "", type: r.type ?? fieldName, name: str(name), attributes: rest } as LookupValue;
-      });
-      this.#cachePut(cacheKey, results);
-    }
-    await this.#observe(
-      `Lookup ${fieldName}`,
-      `Resolved ${results.length} value(s) for the \`${fieldName}\` taxonomy${fromCache ? " (cached)" : ""}.`,
+    let fromCache = false;
+    return this.#read(
+      "ZoomInfoSession.lookup",
+      async api => {
+        let results = this.#cacheGet<LookupValue[]>(cacheKey, LOOKUP_CACHE_TTL_MS);
+        fromCache = results !== undefined;
+        if (results === undefined) {
+          const query: QueryParams = clean({
+            "filter[category]": filters?.category,
+            "filter[parentCategory]": filters?.parentCategory,
+            "filter[subCategory]": filters?.subCategory,
+            "filter[vendor]": filters?.vendor,
+          });
+          const doc = await api.get(`/data/v1/lookup/${encodeURIComponent(fieldName)}`, query);
+          results = asResources(doc).map(r => {
+            const a = attrs(r);
+            const { name, ...rest } = a;
+            return {
+              id: r.id ?? "", type: r.type ?? fieldName, name: str(name), attributes: rest,
+            } as LookupValue;
+          });
+          this.#cachePut(cacheKey, results);
+        }
+        return results;
+      },
+      results => ({
+        title: `Lookup ${fieldName}`,
+        description:
+          `Resolved ${results.length} value(s) for the \`${fieldName}\` taxonomy` +
+          `${fromCache ? " (cached)" : ""}.`,
+      }),
     );
-    return results;
   }
 
   async lookupEnrichFields(entity: EnrichEntity, fieldType: "input" | "output"): Promise<EnrichFieldInfo[]> {
     const cacheKey = `lookupEnrich:${entity}:${fieldType}`;
-    let results = this.#cacheGet<EnrichFieldInfo[]>(cacheKey, LOOKUP_CACHE_TTL_MS);
-    const fromCache = results !== undefined;
-    if (results === undefined) {
-      const doc = await this.#call(api =>
-        api.get("/data/v1/lookup/enrich", { "filter[entity]": entity, "filter[fieldType]": fieldType }));
-      results = asResources(doc).map(r => {
-        const a = attrs(r);
-        return {
-          fieldName: str(a.fieldName) ?? r.id ?? "",
-          description: str(a.description) ?? "",
-          fieldType: str(a.fieldType),
-          accessGranted: bool(a.accessGranted),
-        } satisfies EnrichFieldInfo;
-      });
-      this.#cachePut(cacheKey, results);
-    }
-    await this.#observe(
-      `Lookup ${entity} enrich ${fieldType} fields`,
-      `Returned ${results.length} ${fieldType} field(s) for ${entity} enrichment${fromCache ? " (cached)" : ""}.`,
+    let fromCache = false;
+    return this.#read(
+      "ZoomInfoSession.lookupEnrichFields",
+      async api => {
+        let results = this.#cacheGet<EnrichFieldInfo[]>(cacheKey, LOOKUP_CACHE_TTL_MS);
+        fromCache = results !== undefined;
+        if (results === undefined) {
+          const doc = await api.get("/data/v1/lookup/enrich", {
+            "filter[entity]": entity, "filter[fieldType]": fieldType,
+          });
+          results = asResources(doc).map(r => {
+            const a = attrs(r);
+            return {
+              fieldName: str(a.fieldName) ?? r.id ?? "",
+              description: str(a.description) ?? "",
+              fieldType: str(a.fieldType),
+              accessGranted: bool(a.accessGranted),
+            } satisfies EnrichFieldInfo;
+          });
+          this.#cachePut(cacheKey, results);
+        }
+        return results;
+      },
+      results => ({
+        title: `Lookup ${entity} enrich ${fieldType} fields`,
+        description:
+          `Returned ${results.length} ${fieldType} field(s) for ${entity} enrichment` +
+          `${fromCache ? " (cached)" : ""}.`,
+      }),
     );
-    return results;
   }
 
   // -------------------------------------------------------------------------
@@ -1132,14 +1210,21 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
 
   async searchCompanies(criteria: CompanySearchCriteria, page?: PageRequest): Promise<SearchPage<CompanyMatch>> {
     assertCompatibleLocation(criteria, "searchCompanies");
-    const doc = await this.#call(api =>
-      api.post("/data/v1/companies/search", "CompanySearch", clean({ ...criteria }), pageQuery(page)));
-    const result = toSearchPage(doc, mapCompanyMatch, page);
-    await this.#observe(
-      "Search ZoomInfo companies",
-      `Company search returned ${result.results.length} of ${result.totalResults} match(es).`,
+    return this.#read(
+      "ZoomInfoSession.searchCompanies",
+      async api => toSearchPage(
+        await api.post(
+          "/data/v1/companies/search", "CompanySearch", clean({ ...criteria }), pageQuery(page),
+        ),
+        mapCompanyMatch,
+        page,
+      ),
+      result => ({
+        title: "Search ZoomInfo companies",
+        description:
+          `Company search returned ${result.results.length} of ${result.totalResults} match(es).`,
+      }),
     );
-    return result;
   }
 
   async enrichCompanies(
@@ -1185,14 +1270,19 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     const { company, ...contact } = criteria;
     assertCompatibleLocation(company, "searchContacts");
     const attributes = clean({ ...company, ...contact });
-    const doc = await this.#call(api =>
-      api.post("/data/v1/contacts/search", "ContactSearch", attributes, pageQuery(page)));
-    const result = toSearchPage(doc, mapContactMatch, page);
-    await this.#observe(
-      "Search ZoomInfo contacts",
-      `Contact search returned ${result.results.length} of ${result.totalResults} match(es).`,
+    return this.#read(
+      "ZoomInfoSession.searchContacts",
+      async api => toSearchPage(
+        await api.post("/data/v1/contacts/search", "ContactSearch", attributes, pageQuery(page)),
+        mapContactMatch,
+        page,
+      ),
+      result => ({
+        title: "Search ZoomInfo contacts",
+        description:
+          `Contact search returned ${result.results.length} of ${result.totalResults} match(es).`,
+      }),
     );
-    return result;
   }
 
   async enrichContacts(
@@ -1223,15 +1313,20 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     assertNoCompanyIdentity(company, "searchIntent", "enrichIntent");
     assertCompatibleLocation(company, "searchIntent");
     const attributes = clean({ ...company, ...intent });
-    const doc = await this.#call(api =>
-      api.post("/data/v1/intent/search", "IntentSearch", attributes, pageQuery(page)));
-    const result = toSearchPage(doc, mapIntentSignal, page);
-    await this.#observe(
-      "Search ZoomInfo intent signals",
-      `Intent search for topics [${criteria.topics.join(", ")}] returned ${result.results.length} ` +
-        `of ${result.totalResults} signal(s).`,
+    return this.#read(
+      "ZoomInfoSession.searchIntent",
+      async api => toSearchPage(
+        await api.post("/data/v1/intent/search", "IntentSearch", attributes, pageQuery(page)),
+        mapIntentSignal,
+        page,
+      ),
+      result => ({
+        title: "Search ZoomInfo intent signals",
+        description:
+          `Intent search for topics [${criteria.topics.join(", ")}] returned ` +
+          `${result.results.length} of ${result.totalResults} signal(s).`,
+      }),
     );
-    return result;
   }
 
   async enrichIntent(
@@ -1256,14 +1351,19 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     assertNoCompanyIdentity(company, "searchScoops", "enrichScoops");
     assertCompatibleLocation(company, "searchScoops");
     const attributes = clean({ ...contact, ...company, ...scoop });
-    const doc = await this.#call(api =>
-      api.post("/data/v1/scoops/search", "ScoopSearch", attributes, pageQuery(page)));
-    const result = toSearchPage(doc, mapScoop, page);
-    await this.#observe(
-      "Search ZoomInfo scoops",
-      `Scoop search returned ${result.results.length} of ${result.totalResults} scoop(s).`,
+    return this.#read(
+      "ZoomInfoSession.searchScoops",
+      async api => toSearchPage(
+        await api.post("/data/v1/scoops/search", "ScoopSearch", attributes, pageQuery(page)),
+        mapScoop,
+        page,
+      ),
+      result => ({
+        title: "Search ZoomInfo scoops",
+        description:
+          `Scoop search returned ${result.results.length} of ${result.totalResults} scoop(s).`,
+      }),
     );
-    return result;
   }
 
   async enrichScoops(
@@ -1283,14 +1383,21 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
   // News
 
   async searchNews(criteria: NewsSearchCriteria, page?: PageRequest): Promise<SearchPage<NewsArticle>> {
-    const doc = await this.#call(api =>
-      api.post("/data/v1/news/search", "NewsSearch", clean({ ...criteria }), pageQuery(page)));
-    const result = toSearchPage(doc, mapNewsArticle, page);
-    await this.#observe(
-      "Search ZoomInfo news",
-      `News search returned ${result.results.length} of ${result.totalResults} article(s).`,
+    return this.#read(
+      "ZoomInfoSession.searchNews",
+      async api => toSearchPage(
+        await api.post(
+          "/data/v1/news/search", "NewsSearch", clean({ ...criteria }), pageQuery(page),
+        ),
+        mapNewsArticle,
+        page,
+      ),
+      result => ({
+        title: "Search ZoomInfo news",
+        description:
+          `News search returned ${result.results.length} of ${result.totalResults} article(s).`,
+      }),
     );
-    return result;
   }
 
   async enrichNews(
@@ -1325,10 +1432,10 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
     } else {
       throw new Error(`Unknown ZoomInfo enrichment ticket: ${ticket.id}`);
     }
-    await this.#observe(
-      `Read ZoomInfo enrichment result #${ticket.id}`,
-      `Enrichment \`${ticket.kind}\` (${ticket.summary}): **${outcome.status}**.`,
-    );
+    await this.#approvalQueue.authorizeObservation({
+      title: `Read ZoomInfo enrichment result #${ticket.id}`,
+      description: `Enrichment \`${ticket.kind}\` (${ticket.summary}): **${outcome.status}**.`,
+    });
     return outcome;
   }
 
@@ -1345,22 +1452,26 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
       "filter[sameEmployeeRange]": criteria.sameEmployeeRange,
       "page[size]": criteria.limit,
     });
-    const doc = await this.#call(api => api.get("/copilot/v1/companies/lookalikes", query));
-    const results = asResources(doc).map(r => {
-      const a = attrs(r);
-      return {
-        id: r.id ?? "",
-        companyName: str(a.companyName) ?? "",
-        score: num(a.score) ?? 0,
-        rank: num(a.rank) ?? 0,
-        industry: str(a.industry),
-        revenueRange: str(a.revenueRange),
-        employeeRange: str(a.employeeRange),
-        country: str(a.country),
-      } satisfies CompanyLookalike;
-    });
-    await this.#observe("Find similar ZoomInfo companies", `Returned ${results.length} lookalike compan(ies).`);
-    return results;
+    return this.#read(
+      "ZoomInfoSession.findSimilarCompanies",
+      async api => asResources(await api.get("/copilot/v1/companies/lookalikes", query)).map(r => {
+        const a = attrs(r);
+        return {
+          id: r.id ?? "",
+          companyName: str(a.companyName) ?? "",
+          score: num(a.score) ?? 0,
+          rank: num(a.rank) ?? 0,
+          industry: str(a.industry),
+          revenueRange: str(a.revenueRange),
+          employeeRange: str(a.employeeRange),
+          country: str(a.country),
+        } satisfies CompanyLookalike;
+      }),
+      results => ({
+        title: "Find similar ZoomInfo companies",
+        description: `Returned ${results.length} lookalike compan(ies).`,
+      }),
+    );
   }
 
   async findContactLookalikes(criteria: ContactLookalikesCriteria): Promise<ContactLookalike[]> {
@@ -1369,21 +1480,27 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
       "filter[targetCompanyId]": idValue(criteria.targetCompanyId),
       "page[size]": criteria.limit,
     });
-    const doc = await this.#call(api => api.get("/copilot/v1/contacts/lookalikes", query));
-    const results = asResources(doc).map(r => {
-      const a = attrs(r);
-      const meta = (r.meta ?? {}) as { referencePersonId?: unknown; referencePersonBrief?: unknown };
-      return {
-        id: r.id ?? "",
-        rank: num(a.rank) ?? 0,
-        score: num(a.score) ?? 0,
-        lookalikePersonBrief: str(a.lookalikePersonBrief),
-        referencePersonId: str(meta.referencePersonId),
-        referencePersonBrief: str(meta.referencePersonBrief),
-      } satisfies ContactLookalike;
-    });
-    await this.#observe("Find ZoomInfo contact lookalikes", `Returned ${results.length} lookalike contact(s).`);
-    return results;
+    return this.#read(
+      "ZoomInfoSession.findContactLookalikes",
+      async api => asResources(await api.get("/copilot/v1/contacts/lookalikes", query)).map(r => {
+        const a = attrs(r);
+        const meta = (r.meta ?? {}) as {
+          referencePersonId?: unknown; referencePersonBrief?: unknown;
+        };
+        return {
+          id: r.id ?? "",
+          rank: num(a.rank) ?? 0,
+          score: num(a.score) ?? 0,
+          lookalikePersonBrief: str(a.lookalikePersonBrief),
+          referencePersonId: str(meta.referencePersonId),
+          referencePersonBrief: str(meta.referencePersonBrief),
+        } satisfies ContactLookalike;
+      }),
+      results => ({
+        title: "Find ZoomInfo contact lookalikes",
+        description: `Returned ${results.length} lookalike contact(s).`,
+      }),
+    );
   }
 
   async getContactRecommendations(criteria: ContactRecommendationsCriteria): Promise<ContactRecommendation[]> {
@@ -1392,103 +1509,129 @@ class ZoomInfoSessionImpl extends RpcTarget implements ZoomInfoSession {
       "filter[ziCompanyId]": idValue(criteria.companyId),
       "page[size]": criteria.limit,
     });
-    const doc = await this.#call(api => api.get("/copilot/v1/contacts/recommendations", query));
-    const results = asResources(doc).map(r => {
-      const a = attrs(r);
-      const meta = (r.meta ?? {}) as {
-        sourceType?: unknown; referencePersonId?: unknown; referencePersonBrief?: unknown;
-      };
-      return {
-        id: r.id ?? "",
-        rank: num(a.rank) ?? 0,
-        score: num(a.score) ?? 0,
-        reRankingScore: num(a.reRankingScore),
-        recommendedPersonBrief: str(a.recommendedPersonBrief),
-        sourceType: str(meta.sourceType),
-        referencePersonId: str(meta.referencePersonId),
-        referencePersonBrief: str(meta.referencePersonBrief),
-      } satisfies ContactRecommendation;
-    });
-    await this.#observe(
-      "Get ZoomInfo contact recommendations",
-      `Returned ${results.length} recommended contact(s) for ${criteria.useCaseType} at company ` +
-        `\`${criteria.companyId}\`.`,
+    return this.#read(
+      "ZoomInfoSession.getContactRecommendations",
+      async api => asResources(
+        await api.get("/copilot/v1/contacts/recommendations", query),
+      ).map(r => {
+        const a = attrs(r);
+        const meta = (r.meta ?? {}) as {
+          sourceType?: unknown; referencePersonId?: unknown; referencePersonBrief?: unknown;
+        };
+        return {
+          id: r.id ?? "",
+          rank: num(a.rank) ?? 0,
+          score: num(a.score) ?? 0,
+          reRankingScore: num(a.reRankingScore),
+          recommendedPersonBrief: str(a.recommendedPersonBrief),
+          sourceType: str(meta.sourceType),
+          referencePersonId: str(meta.referencePersonId),
+          referencePersonBrief: str(meta.referencePersonBrief),
+        } satisfies ContactRecommendation;
+      }),
+      results => ({
+        title: "Get ZoomInfo contact recommendations",
+        description:
+          `Returned ${results.length} recommended contact(s) for ${criteria.useCaseType} at ` +
+          `company \`${criteria.companyId}\`.`,
+      }),
     );
-    return results;
   }
 
   // -------------------------------------------------------------------------
   // Account intelligence
 
   async getAccountSummary(companyId: string): Promise<AccountSummary> {
-    const doc = await this.#call(api =>
-      api.get(`/copilot/v1/companies/${encodeURIComponent(companyId)}/account-summary`));
-    const resource = firstResource(doc);
-    const markdown = str(attrs(resource ?? {}).markdown) ?? "";
-    await this.#observe(
-      "Get ZoomInfo account summary",
-      `Retrieved the account summary for company \`${companyId}\` (${markdown.length} chars).`,
+    return this.#read(
+      "ZoomInfoSession.getAccountSummary",
+      async api => {
+        const doc = await api.get(
+          `/copilot/v1/companies/${encodeURIComponent(companyId)}/account-summary`,
+        );
+        return { companyId, markdown: str(attrs(firstResource(doc) ?? {}).markdown) ?? "" };
+      },
+      result => ({
+        title: "Get ZoomInfo account summary",
+        description:
+          `Retrieved the account summary for company \`${companyId}\` ` +
+          `(${result.markdown.length} chars).`,
+      }),
     );
-    return { companyId, markdown };
   }
 
   async askAccountSummary(companyId: string, question: string): Promise<string> {
-    const doc = await this.#call(api =>
-      api.post(
-        `/copilot/v1/companies/${encodeURIComponent(companyId)}/account-summary/actions/ask`,
-        "AccountSummaryQuestionRequest",
-        { question },
-      ));
-    const answer = str(attrs(firstResource(doc) ?? {}).answer) ?? "";
-    await this.#observe(
-      "Ask ZoomInfo account summary",
-      `Asked about company \`${companyId}\`: "${question}".`,
+    return this.#read(
+      "ZoomInfoSession.askAccountSummary",
+      async api => {
+        const doc = await api.post(
+          `/copilot/v1/companies/${encodeURIComponent(companyId)}/account-summary/actions/ask`,
+          "AccountSummaryQuestionRequest",
+          { question },
+        );
+        return str(attrs(firstResource(doc) ?? {}).answer) ?? "";
+      },
+      () => ({
+        title: "Ask ZoomInfo account summary",
+        description: `Asked about company \`${companyId}\`: "${question}".`,
+      }),
     );
-    return answer;
   }
 
   async getCompanyInsights(criteria: CompanyInsightsCriteria): Promise<CompanyInsights[]> {
     const ziCompanyIds = criteria.companyIds.map(id => idValue(id));
-    const doc = await this.#call(api =>
-      api.post("/copilot/v1/companies/insights", "CompanyInsightsSearch",
-        clean({ ziCompanyIds, signalTypes: criteria.signalTypes })));
-    const results = asResources(doc).map(r => {
-      const rawInsights = (attrs(r).insights ?? []) as Record<string, unknown>[];
-      const insights: Insight[] = rawInsights.map(i => ({
-        id: str(i.id) ?? "",
-        ziCompanyId: str(i.ziCompanyId) ?? "",
-        signalId: str(i.signalId) ?? "",
-        signalType: str(i.signalType) ?? "",
-        signalPayload: (i.signalPayload ?? {}) as Record<string, unknown>,
-        insightDate: str(i.insightDate),
-        expiresAt: str(i.expiresAt),
-        createdAt: str(i.createdAt),
-      }));
-      return { companyId: r.id ?? "", insights } satisfies CompanyInsights;
-    });
-    const total = results.reduce((sum, c) => sum + c.insights.length, 0);
-    await this.#observe(
-      "Get ZoomInfo company insights",
-      `Returned ${total} insight signal(s) across ${results.length} compan(ies).`,
+    return this.#read(
+      "ZoomInfoSession.getCompanyInsights",
+      async api => asResources(await api.post(
+        "/copilot/v1/companies/insights",
+        "CompanyInsightsSearch",
+        clean({ ziCompanyIds, signalTypes: criteria.signalTypes }),
+      )).map(r => {
+        const rawInsights = (attrs(r).insights ?? []) as Record<string, unknown>[];
+        const insights: Insight[] = rawInsights.map(i => ({
+          id: str(i.id) ?? "",
+          ziCompanyId: str(i.ziCompanyId) ?? "",
+          signalId: str(i.signalId) ?? "",
+          signalType: str(i.signalType) ?? "",
+          signalPayload: (i.signalPayload ?? {}) as Record<string, unknown>,
+          insightDate: str(i.insightDate),
+          expiresAt: str(i.expiresAt),
+          createdAt: str(i.createdAt),
+        }));
+        return { companyId: r.id ?? "", insights } satisfies CompanyInsights;
+      }),
+      results => ({
+        title: "Get ZoomInfo company insights",
+        description:
+          `Returned ${results.reduce((sum, c) => sum + c.insights.length, 0)} insight ` +
+          `signal(s) across ${results.length} compan(ies).`,
+      }),
     );
-    return results;
   }
 
   // -------------------------------------------------------------------------
   // Usage
 
   async getCreditUsage(): Promise<CreditUsage> {
-    const doc = await this.#call(api => api.get("/data/v1/users/usage"));
-    const usageList = (attrs(firstResource(doc) ?? {}).usage ?? []) as Record<string, unknown>[];
-    const usage: UsageLimit[] = usageList.map(u => ({
-      limitType: str(u.limitType) ?? "",
-      description: str(u.description),
-      totalLimit: num(u.totalLimit),
-      currentUsage: num(u.currentUsage),
-      usageRemaining: num(u.usageRemaining),
-    }));
-    await this.#observe("Get ZoomInfo usage", `Retrieved ${usage.length} usage/limit counter(s).`);
-    return { usage };
+    return this.#read(
+      "ZoomInfoSession.getCreditUsage",
+      async api => {
+        const doc = await api.get("/data/v1/users/usage");
+        const usageList = (attrs(firstResource(doc) ?? {}).usage ?? []) as Record<string, unknown>[];
+        return {
+          usage: usageList.map(u => ({
+            limitType: str(u.limitType) ?? "",
+            description: str(u.description),
+            totalLimit: num(u.totalLimit),
+            currentUsage: num(u.currentUsage),
+            usageRemaining: num(u.usageRemaining),
+          })),
+        };
+      },
+      result => ({
+        title: "Get ZoomInfo usage",
+        description: `Retrieved ${result.usage.length} usage/limit counter(s).`,
+      }),
+    );
   }
 }
 

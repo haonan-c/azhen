@@ -9,7 +9,22 @@
 // without it.
 
 import type { RpcStub } from "cloudflare:workers";
-import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import {
+  durableBillableActionStorage,
+  runBillableAction,
+  type BillableOperationActivity,
+} from "@gadgets/backend-utils/gatekeeper-billing";
+import type {
+  ActionDescription,
+  ActionExecution,
+  ActionExecutionResult,
+  ApprovalQueue,
+  ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
+import {
+  confluenceActionBilling,
+  type ConfluenceBillableWriteMethod,
+} from "./billing-methods";
 import {
   ConfluenceApi,
   contentBodyMarkdown,
@@ -58,6 +73,7 @@ export type StoredActionRecord = {
   action: ConfluenceAction;
   state: "pending" | "applied" | "reverted";
   submittedAt: number;
+  billingMethod?: ConfluenceBillableWriteMethod;
   /** For createContent / addComment: the real content ID assigned on apply. */
   createdContentId?: string;
   /** For uploadAttachment: the attachment ID assigned on apply. */
@@ -80,14 +96,26 @@ type ContentCache = { fetchedAt: number; content: ContentResponse };
 export class ConfluenceStore {
   #kv: Kv;
   #api: ConfluenceApi;
+  #externalAccountId: string;
 
-  constructor(kv: Kv, api: ConfluenceApi) {
+  constructor(kv: Kv, api: ConfluenceApi, externalAccountId = "") {
     this.#kv = kv;
     this.#api = api;
+    this.#externalAccountId = externalAccountId;
   }
 
   get api(): ConfluenceApi {
     return this.#api;
+  }
+
+  withActivity(activity: BillableOperationActivity): ConfluenceStore {
+    return new ConfluenceStore(
+      this.#kv, this.#api.withActivity(activity), this.#externalAccountId,
+    );
+  }
+
+  get externalAccountId(): string {
+    return this.#externalAccountId;
   }
 
   // --- sequential IDs ---
@@ -419,12 +447,18 @@ function truncate(text: string, max = 2000): string {
 
 /** Record a pending action and submit it for approval. Rolls back the record if submit fails. */
 export async function stageAction(
-  store: ConfluenceStore, approvalQueue: RpcStub<ApprovalQueue>, action: ConfluenceAction,
+  store: ConfluenceStore,
+  approvalQueue: RpcStub<ApprovalQueue>,
+  action: ConfluenceAction,
+  billingMethod: ConfluenceBillableWriteMethod,
 ): Promise<number> {
   const id = store.nextActionId();
-  store.putAction({ id, action, state: "pending", submittedAt: Date.now() });
+  store.putAction({ id, action, state: "pending", submittedAt: Date.now(), billingMethod });
   try {
-    await approvalQueue.submitAction(id, describeAction(action));
+    await approvalQueue.submitAction(id, {
+      ...describeAction(action),
+      billing: confluenceActionBilling(billingMethod, store.externalAccountId),
+    });
   } catch (err) {
     store.deleteAction(id);
     throw err;
@@ -566,6 +600,32 @@ export async function applyStoredAction(store: ConfluenceStore, id: number): Pro
   const record = store.getAction(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
   await applyAction(store, record);
+}
+
+/** Apply or recover one approved Confluence Action through a durable billing claim. */
+export function applyBillableStoredAction(
+  store: ConfluenceStore,
+  storage: DurableObjectStorage,
+  id: number,
+  execution: ActionExecution,
+): Promise<ActionExecutionResult> {
+  return runBillableAction({
+    storage: durableBillableActionStorage(storage),
+    actionId: id,
+    execution,
+    getPending: () => store.getAction(id),
+    removePending: outcome => {
+      const record = store.getAction(id);
+      if (record && outcome === "failed-before-execution") {
+        store.deleteAction(id);
+      } else if (record) {
+        record.state = "applied";
+        store.putAction(record);
+      }
+    },
+    prepare: async record => record,
+    execute: (record, activity) => applyAction(store.withActivity(activity), record),
+  });
 }
 
 export function rejectStoredAction(store: ConfluenceStore, id: number): void | { restart?: boolean } {

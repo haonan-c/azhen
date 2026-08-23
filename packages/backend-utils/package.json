@@ -19,6 +19,10 @@
     "./error-reporting": {
       "types": "./src/error-reporting.ts",
       "import": "./src/error-reporting.ts"
+    },
+    "./gatekeeper-billing": {
+      "types": "./src/gatekeeper-billing.ts",
+      "import": "./src/gatekeeper-billing.ts"
     }
   },
   "scripts": {
@@ -28,7 +32,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@gadgets/error-reporting": "workspace:*"
+    "@gadgets/error-reporting": "workspace:*",
+    "@gadgets/workshop-shared": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "catalog:",

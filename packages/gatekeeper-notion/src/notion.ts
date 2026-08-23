@@ -15,9 +15,12 @@
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import { runBillableRead } from "@gadgets/backend-utils/gatekeeper-billing";
 import {
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionExecution,
+  type ActionExecutionResult,
   type ApprovalQueue,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -48,7 +51,7 @@ import {
 } from "./notion-api";
 import {
   NotionStore,
-  applyStoredAction,
+  applyBillableStoredAction,
   defaultPropertiesFromSchema,
   observation,
   overlayChildPages,
@@ -63,6 +66,11 @@ import {
   simulatePageProperties,
   type NotionAction,
 } from "./notion-actions";
+import {
+  NOTION_BILLING_METHODS,
+  type NotionBillableReadMethod,
+  type NotionBillableWriteMethod,
+} from "./billing-methods";
 import type {
   Cursor,
   NotionComment,
@@ -683,6 +691,49 @@ async function authorizeItemObservation(
   check.commit();
 }
 
+function applyNotionAction(
+  active: Map<string, Promise<ActionExecutionResult>>,
+  store: NotionStore,
+  storage: DurableObjectStorage,
+  action: number,
+  execution?: ActionExecution,
+): Promise<ActionExecutionResult> {
+  if (!execution) throw new Error("This Notion Action predates billing and cannot be applied.");
+  const existing = active.get(execution.billingOperationId);
+  if (existing) return existing;
+  const applying = applyBillableStoredAction(store, storage, action, execution);
+  active.set(execution.billingOperationId, applying);
+  void applying.finally(() => active.delete(execution.billingOperationId));
+  return applying;
+}
+
+function runNotionRead<T>(
+  store: NotionStore,
+  queue: RpcStub<ApprovalQueue>,
+  observe: ObserveHook | undefined,
+  method: NotionBillableReadMethod,
+  read: (store: NotionStore) => Promise<{ value: T; itemIds: string[] }>,
+  describe: (value: T) => ObservationDescription,
+): Promise<T> {
+  let itemIds: string[] = [];
+  return runBillableRead(
+    {
+      beginBillableOperation: (methodKey, externalAccountId) =>
+        queue.beginBillableOperation(methodKey, externalAccountId),
+      authorizeObservation: description =>
+        authorizeItemObservation(queue, observe, itemIds, description),
+    },
+    store.externalAccountId,
+    NOTION_BILLING_METHODS[method].methodKey,
+    async activity => {
+      const result = await read(store.withActivity(activity));
+      itemIds = result.itemIds;
+      return result.value;
+    },
+    describe,
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Gatekeeper DO instances.
 
@@ -705,7 +756,7 @@ export class NotionItemGatekeeperImpl extends DurableObject<Env, NotionItemGatek
   }
 
   #store(): NotionStore {
-    return new NotionStore(this.ctx.storage.kv, this.#api());
+    return new NotionStore(this.ctx.storage.kv, this.#api(), this.ctx.props.userObjectId);
   }
 
   async #kind(): Promise<"page" | "database"> {
@@ -778,8 +829,11 @@ export class NotionItemGatekeeperImpl extends DurableObject<Env, NotionItemGatek
 
   async removeObserver(_id: string): Promise<void> {}
 
-  async applyAction(action: number): Promise<void> {
-    await applyStoredAction(this.#store(), action);
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+    return applyNotionAction(
+      this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
+    );
   }
 
   async rejectAction(action: number): Promise<void | { restart?: boolean }> {
@@ -810,7 +864,7 @@ export class NotionWorkspaceGatekeeperImpl
   }
 
   #store(): NotionStore {
-    return new NotionStore(this.ctx.storage.kv, this.#api());
+    return new NotionStore(this.ctx.storage.kv, this.#api(), this.ctx.props.userObjectId);
   }
 
   async describe(): Promise<ResourceDescription> {
@@ -940,8 +994,11 @@ export class NotionWorkspaceGatekeeperImpl
     this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
-  async applyAction(action: number): Promise<void> {
-    await applyStoredAction(this.#store(), action);
+  #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
+  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+    return applyNotionAction(
+      this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
+    );
   }
 
   async rejectAction(action: number): Promise<void | { restart?: boolean }> {
@@ -1058,64 +1115,85 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
     return this.#isProvisional() ? [] : [this.#store.resolveId(this.#pageId)];
   }
 
-  async #baseMetadata(): Promise<NotionPageMetadata | null> {
+  async #baseMetadata(store = this.#store): Promise<NotionPageMetadata | null> {
     if (this.#isProvisional()) return null;
-    return pageToMetadata(await this.#store.getPageResponse(this.#pageId));
+    return pageToMetadata(await store.getPageResponse(this.#pageId));
   }
 
-  async #baseProperties(): Promise<Record<string, NotionPropertyValue> | null> {
+  async #baseProperties(store = this.#store): Promise<Record<string, NotionPropertyValue> | null> {
     if (this.#isProvisional()) return null;
-    return propertiesToValues((await this.#store.getPageResponse(this.#pageId)).properties);
+    return propertiesToValues((await store.getPageResponse(this.#pageId)).properties);
   }
 
-  #stage(action: NotionAction): Promise<number> {
-    return stageAction(this.#store, this.#approvalQueue, action);
+  #stage(method: NotionBillableWriteMethod, action: NotionAction): Promise<number> {
+    return stageAction(this.#store, this.#approvalQueue, action, method);
   }
 
   // Page metadata only carries partial `{id}` users; resolve them to the full NotionUser for parity
   // with getProperties()/listUsers().
-  async #resolveUser(user: NotionUser | null): Promise<NotionUser | null> {
+  async #resolveUser(user: NotionUser | null, store = this.#store): Promise<NotionUser | null> {
     if (!user || user.name !== undefined) return user;
     try {
-      return await this.#store.getUser(user.id);
+      return await store.getUser(user.id);
     } catch {
       return user;
     }
   }
 
   async getMetadata(): Promise<NotionPageMetadata> {
-    const records = this.#store.pendingForPage(this.#pageId);
-    const meta = simulatePageMetadata(await this.#baseMetadata(), this.#pageId, records);
-    meta.createdBy = await this.#resolveUser(meta.createdBy);
-    meta.lastEditedBy = await this.#resolveUser(meta.lastEditedBy);
-    await authorizeItemObservation(this.#approvalQueue, this.#observe, this.#itemIds(),
-      observation("Read Notion page", `Read metadata for Notion page “${meta.title || "Untitled"}”.`));
-    return meta;
+    return runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionPage.getMetadata",
+      async store => {
+        const records = store.pendingForPage(this.#pageId);
+        const meta = simulatePageMetadata(
+          await this.#baseMetadata(store), this.#pageId, records);
+        meta.createdBy = await this.#resolveUser(meta.createdBy, store);
+        meta.lastEditedBy = await this.#resolveUser(meta.lastEditedBy, store);
+        return { value: meta, itemIds: this.#itemIds() };
+      },
+      meta => observation(
+        "Read Notion page", `Read metadata for Notion page “${meta.title || "Untitled"}”.`),
+    );
   }
 
   async getProperties(): Promise<Record<string, NotionPropertyValue>> {
-    const records = this.#store.pendingForPage(this.#pageId);
-    // For a provisional row, seed the full parent-database column set (with defaults) so an
-    // unapproved row has the same shape as it will after approval.
-    let seed: Record<string, NotionPropertyValue> | undefined;
-    if (this.#isProvisional()) {
-      const dbId = await this.#parentDatabaseId();
-      if (dbId) seed = defaultPropertiesFromSchema(await this.#store.getDatabaseSchema(dbId));
-    }
-    const props = simulatePageProperties(await this.#baseProperties(), records, seed);
-    const titleVal = Object.values(props).find(v => v.type === "title");
-    const label = titleVal?.type === "title" && titleVal.text ? `“${titleVal.text}”` : this.#ref();
-    await authorizeItemObservation(this.#approvalQueue, this.#observe, this.#itemIds(),
-      observation("Read Notion page properties", `Read the property values of Notion page ${label}.`));
-    return props;
+    return runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionPage.getProperties",
+      async store => {
+        const records = store.pendingForPage(this.#pageId);
+        let seed: Record<string, NotionPropertyValue> | undefined;
+        if (this.#isProvisional()) {
+          const dbId = await this.#parentDatabaseId(store);
+          if (dbId) seed = defaultPropertiesFromSchema(await store.getDatabaseSchema(dbId));
+        }
+        const value = simulatePageProperties(
+          await this.#baseProperties(store), records, seed);
+        return { value, itemIds: this.#itemIds() };
+      },
+      props => {
+        const titleVal = Object.values(props).find(v => v.type === "title");
+        const label = titleVal?.type === "title" && titleVal.text
+          ? `“${titleVal.text}”`
+          : this.#ref();
+        return observation(
+          "Read Notion page properties", `Read the property values of Notion page ${label}.`);
+      },
+    );
   }
 
   async getContent(): Promise<string> {
-    const base = this.#isProvisional() ? null : await this.#store.getPageContent(this.#pageId);
-    const content = simulatePageContent(base, this.#store.pendingForPage(this.#pageId));
-    await authorizeItemObservation(this.#approvalQueue, this.#observe, this.#itemIds(),
-      observation("Read Notion page content", `Read the body content of Notion page ${this.#ref()}.`));
-    return content;
+    return runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionPage.getContent",
+      async store => {
+        const base = this.#isProvisional() ? null : await store.getPageContent(this.#pageId);
+        return {
+          value: simulatePageContent(base, store.pendingForPage(this.#pageId)),
+          itemIds: this.#itemIds(),
+        };
+      },
+      () => observation(
+        "Read Notion page content", `Read the body content of Notion page ${this.#ref()}.`),
+    );
   }
 
   async listChildPages(options?: NotionPageOptions): Promise<Cursor<NotionItemSummary>> {
@@ -1131,49 +1209,58 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
     let all: NotionItemSummary[] | null = null;
     let offset = 0;
     return new PagedCursor<NotionItemSummary>(async () => {
-      if (all === null) {
-        const collected: NotionItemSummary[] = [];
-        if (!provisional) {
-          const tree = await store.api.fetchBlockTree(store.resolveId(pageId));
-          collectChildPages(tree, collected);
-        }
-        all = overlayChildPages(collected, pageId, store, true);
-        // The listing reveals each (real) child item's existence/title, so attribute it to the parent
-        // page plus the child pages/databases themselves.
-        const itemIds = provisional ? [] : [
-          store.resolveId(pageId),
-          ...all.filter(c => !NotionStore.isProvisional(c.id)).map(c => c.id),
-        ];
-        await authorizeItemObservation(approvalQueue, observe, itemIds,
-          observation("List Notion child pages", `List the sub-pages of Notion page ${store.resolveId(pageId)}.`));
-      }
-      const slice = all.slice(offset, offset + pageSize);
-      offset += slice.length;
-      return { items: slice, nextCursor: offset < all.length ? String(offset) : undefined };
+      return runNotionRead(
+        store, approvalQueue, observe, "NotionPage.listChildPages.next",
+        async billedStore => {
+          if (all === null) {
+            const collected: NotionItemSummary[] = [];
+            if (!provisional) {
+              const tree = await billedStore.api.fetchBlockTree(billedStore.resolveId(pageId));
+              collectChildPages(tree, collected);
+            }
+            all = overlayChildPages(collected, pageId, billedStore, true);
+          }
+          const slice = all.slice(offset, offset + pageSize);
+          offset += slice.length;
+          return {
+            value: { items: slice, nextCursor: offset < all.length ? String(offset) : undefined },
+            itemIds: provisional ? [] : [
+              billedStore.resolveId(pageId),
+              ...all.filter(c => !NotionStore.isProvisional(c.id)).map(c => c.id),
+            ],
+          };
+        },
+        () => observation(
+          "List Notion child pages", `List the sub-pages of Notion page ${store.resolveId(pageId)}.`),
+      );
     });
   }
 
   async appendContent(markdown: string): Promise<void> {
-    await this.#stage({ type: "appendContent", pageId: this.#pageId, markdown });
+    await this.#stage("NotionPage.appendContent", {
+      type: "appendContent", pageId: this.#pageId, markdown,
+    });
   }
 
   async setTitle(title: string): Promise<void> {
     const records = this.#store.pendingForPage(this.#pageId);
     const previousTitle = simulatePageMetadata(await this.#baseMetadata(), this.#pageId, records).title;
-    await this.#stage({ type: "setTitle", pageId: this.#pageId, title, previousTitle });
+    await this.#stage("NotionPage.setTitle", {
+      type: "setTitle", pageId: this.#pageId, title, previousTitle,
+    });
   }
 
   // Resolve the database ID this page belongs to (for property validation), or null for a
   // standalone page. For a still-pending page we read its parent from the queued creation, since
   // the page doesn't exist on the server yet.
-  async #parentDatabaseId(): Promise<string | null | undefined> {
+  async #parentDatabaseId(store = this.#store): Promise<string | null | undefined> {
     if (this.#isProvisional()) {
-      const create = this.#store.pendingForPage(this.#pageId).find(r => r.action.type === "createPage");
+      const create = store.pendingForPage(this.#pageId).find(r => r.action.type === "createPage");
       const action = create?.action;
       if (action?.type !== "createPage") return undefined; // unknown — skip validation
       return action.parent.kind === "database" ? action.parent.databaseId : null;
     }
-    const page = await this.#store.getPageResponse(this.#pageId);
+    const page = await store.getPageResponse(this.#pageId);
     return page.parent?.type === "database_id" ? page.parent.database_id : null;
   }
 
@@ -1198,14 +1285,16 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
       const prev = current[name] ? propertyValueToInput(current[name]) : null;
       if (prev) previousProperties[name] = prev;
     }
-    await this.#stage({ type: "setProperties", pageId: this.#pageId, properties, previousProperties });
+    await this.#stage("NotionPage.setProperties", {
+      type: "setProperties", pageId: this.#pageId, properties, previousProperties,
+    });
   }
 
   async setIcon(icon: NotionIconInput | null): Promise<void> {
     if (icon) assertValidIcon(icon);
     const records = this.#store.pendingForPage(this.#pageId);
     const meta = simulatePageMetadata(await this.#baseMetadata(), this.#pageId, records);
-    await this.#stage({
+    await this.#stage("NotionPage.setIcon", {
       type: "setIcon",
       pageId: this.#pageId,
       icon,
@@ -1224,16 +1313,16 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
       content: options.content,
       icon: options.icon,
     };
-    await this.#stage(action);
+    await this.#stage("NotionPage.createSubPage", action);
     return new NotionPageSessionImpl(this.#store, this.#approvalQueue.dup(), provisionalId, this.#observe);
   }
 
   async archive(): Promise<void> {
-    await this.#stage({ type: "archive", pageId: this.#pageId });
+    await this.#stage("NotionPage.archive", { type: "archive", pageId: this.#pageId });
   }
 
   async restore(): Promise<void> {
-    await this.#stage({ type: "restore", pageId: this.#pageId });
+    await this.#stage("NotionPage.restore", { type: "restore", pageId: this.#pageId });
   }
 
   async listComments(options?: NotionPageOptions): Promise<Cursor<NotionComment>> {
@@ -1245,35 +1334,42 @@ class NotionPageSessionImpl extends RpcTarget implements NotionPageSession {
     const provisional = this.#isProvisional();
     const itemIds = provisional ? [] : [store.resolveId(pageId)];
     return new PagedCursor<NotionComment>(async (cursor, firstPage) => {
-      let items: NotionComment[] = [];
-      let nextCursor: string | undefined;
-      if (!provisional) {
-        let result;
-        try {
-          result = await store.api.listComments(store.resolveId(pageId), cursor, pageSize);
-        } catch (err) {
-          if (err instanceof NotionApiError && (err.status === 403 || err.code === "restricted_resource")) {
-            throw new NotionApiError(
-              403,
-              "Reading comments isn't available: this Notion connection lacks the \"Read comments\" " +
-              "capability. Enable it in the integration's settings, then reconnect.",
-              err.code);
+      return runNotionRead(
+        store, approvalQueue, observe, "NotionPage.listComments.next",
+        async billedStore => {
+          let items: NotionComment[] = [];
+          let nextCursor: string | undefined;
+          if (!provisional) {
+            let result;
+            try {
+              result = await billedStore.api.listComments(
+                billedStore.resolveId(pageId), cursor, pageSize);
+            } catch (err) {
+              if (err instanceof NotionApiError &&
+                  (err.status === 403 || err.code === "restricted_resource")) {
+                throw new NotionApiError(
+                  403,
+                  "Reading comments isn't available: this Notion connection lacks the " +
+                  "\"Read comments\" capability. Enable it in the integration's settings, then reconnect.",
+                  err.code);
+              }
+              throw err;
+            }
+            items = result.results.map(commentToNotion);
+            nextCursor = result.has_more ? result.next_cursor ?? undefined : undefined;
           }
-          throw err;
-        }
-        items = result.results.map(commentToNotion);
-        nextCursor = result.has_more ? result.next_cursor ?? undefined : undefined;
-      }
-      // Pending comments are only surfaced on the first batch to avoid duplication.
-      if (firstPage) items = simulateComments(items, store.pendingForPage(pageId));
-      await authorizeItemObservation(approvalQueue, observe, itemIds,
-        observation("Read Notion page comments", `Read the comment thread on Notion page ${store.resolveId(pageId)}.`));
-      return { items, nextCursor };
+          if (firstPage) items = simulateComments(items, billedStore.pendingForPage(pageId));
+          return { value: { items, nextCursor }, itemIds };
+        },
+        () => observation(
+          "Read Notion page comments",
+          `Read the comment thread on Notion page ${store.resolveId(pageId)}.`),
+      );
     });
   }
 
   async addComment(text: string): Promise<void> {
-    await this.#stage({ type: "addComment", pageId: this.#pageId, text });
+    await this.#stage("NotionPage.addComment", { type: "addComment", pageId: this.#pageId, text });
   }
 }
 
@@ -1301,28 +1397,36 @@ class NotionDatabaseSessionImpl extends RpcTarget implements NotionDatabaseSessi
   }
 
   async getMetadata(): Promise<NotionDatabaseMetadata> {
-    const db = await this.#store.getDatabaseResponse(this.#databaseId);
-    const summary = itemResponseToSummary(db);
-    const metadata: NotionDatabaseMetadata = {
-      id: db.id,
-      title: summary.title || "Untitled database",
-      url: summary.url,
-      createdAt: summary.createdAt,
-      lastEditedAt: summary.lastEditedAt,
-    };
-    const description = (db.description ?? []).map(r => r.plain_text ?? r.text?.content ?? "").join("");
-    if (description) metadata.description = description;
-    if (summary.icon) metadata.icon = summary.icon;
-    await authorizeItemObservation(this.#approvalQueue, this.#observe, [this.#databaseId],
-      observation("Read Notion database", `Read metadata for Notion database “${metadata.title}”.`));
-    return metadata;
+    return runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionDatabase.getMetadata",
+      async store => {
+        const db = await store.getDatabaseResponse(this.#databaseId);
+        const summary = itemResponseToSummary(db);
+        const metadata: NotionDatabaseMetadata = {
+          id: db.id, title: summary.title || "Untitled database", url: summary.url,
+          createdAt: summary.createdAt, lastEditedAt: summary.lastEditedAt,
+        };
+        const description = (db.description ?? [])
+          .map(r => r.plain_text ?? r.text?.content ?? "").join("");
+        if (description) metadata.description = description;
+        if (summary.icon) metadata.icon = summary.icon;
+        return { value: metadata, itemIds: [this.#databaseId] };
+      },
+      metadata => observation(
+        "Read Notion database", `Read metadata for Notion database “${metadata.title}”.`),
+    );
   }
 
   async getSchema(): Promise<NotionDatabaseSchema> {
-    const schema = await this.#store.getDatabaseSchema(this.#databaseId);
-    await authorizeItemObservation(this.#approvalQueue, this.#observe, [this.#databaseId],
-      observation("Read Notion database schema", "Read the property schema of a Notion database."));
-    return schema;
+    return runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionDatabase.getSchema",
+      async store => ({
+        value: await store.getDatabaseSchema(this.#databaseId),
+        itemIds: [this.#databaseId],
+      }),
+      () => observation(
+        "Read Notion database schema", "Read the property schema of a Notion database."),
+    );
   }
 
   async query(options?: NotionQueryOptions): Promise<Cursor<NotionPageSummary>> {
@@ -1334,25 +1438,43 @@ class NotionDatabaseSessionImpl extends RpcTarget implements NotionDatabaseSessi
     // Resolve the schema so filters use each property's real type (not a guess from the condition),
     // and resolve the database's primary data source — rows are queried on the data source, which
     // is required for newer multi-source / Meeting Notes / wiki databases.
-    const schema = await this.#store.getDatabaseSchema(this.#databaseId);
-    const dataSourceId = await this.#store.getDataSourceId(this.#databaseId);
-    const typeOf = (name: string) => schema.properties[name]?.type;
-    const filter = options?.filter ? filterToNotion(options.filter, typeOf) : undefined;
-    const sorts = options?.sorts?.map(sortToNotion);
-    const seed = defaultPropertiesFromSchema(schema);
+    let queryInput: {
+      dataSourceId: string;
+      filter: ReturnType<typeof filterToNotion> | undefined;
+      sorts: ReturnType<typeof sortToNotion>[] | undefined;
+      seed: Record<string, NotionPropertyValue>;
+    } | undefined;
     return new PagedCursor<NotionPageSummary>(async (cursor, firstPage) => {
-      const result = await store.api.queryDataSource(dataSourceId, {
-        filter,
-        sorts,
-        start_cursor: cursor,
-        page_size: pageSize,
-      });
-      const rows = overlayDatabaseRows(result.results.map(pageToSummary), databaseId, store, firstPage, seed);
-      // A query reveals row data, which is gated by access to the database (rows inherit it), so the
-      // database is the data set.
-      await authorizeItemObservation(approvalQueue, observe, [databaseId],
-        observation("Query Notion database", `Query rows from Notion database ${store.resolveId(databaseId)}.`));
-      return { items: rows, nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined };
+      return runNotionRead(
+        store, approvalQueue, observe, "NotionDatabase.query.next",
+        async billedStore => {
+          if (!queryInput) {
+            const schema = await billedStore.getDatabaseSchema(databaseId);
+            const typeOf = (name: string) => schema.properties[name]?.type;
+            queryInput = {
+              dataSourceId: await billedStore.getDataSourceId(databaseId),
+              filter: options?.filter ? filterToNotion(options.filter, typeOf) : undefined,
+              sorts: options?.sorts?.map(sortToNotion),
+              seed: defaultPropertiesFromSchema(schema),
+            };
+          }
+          const result = await billedStore.api.queryDataSource(queryInput.dataSourceId, {
+            filter: queryInput.filter, sorts: queryInput.sorts,
+            start_cursor: cursor, page_size: pageSize,
+          });
+          const rows = overlayDatabaseRows(
+            result.results.map(pageToSummary), databaseId, billedStore, firstPage, queryInput.seed);
+          return {
+            value: {
+              items: rows,
+              nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
+            },
+            itemIds: [databaseId],
+          };
+        },
+        () => observation(
+          "Query Notion database", `Query rows from Notion database ${store.resolveId(databaseId)}.`),
+      );
     });
   }
 
@@ -1375,19 +1497,24 @@ class NotionDatabaseSessionImpl extends RpcTarget implements NotionDatabaseSessi
     }
 
     const id = parseNotionId(idOrUrl);
-    // Normalize "doesn't exist" and "exists but not a row here" to one indistinguishable error so
-    // the caller can't probe arbitrary workspace pages through a database-scoped capability.
-    let page;
-    try {
-      page = await this.#store.getPageResponse(id);
-    } catch {
-      throw new NotionApiError(404, "No such page (row) in this database.");
-    }
-    const parent = page.parent;
-    if (!parent || parent.type !== "database_id" ||
-        normalizeId(parent.database_id) !== normalizeId(this.#databaseId)) {
-      throw new NotionApiError(404, "No such page (row) in this database.");
-    }
+    await runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionDatabase.getPage",
+      async store => {
+        let page;
+        try {
+          page = await store.getPageResponse(id);
+        } catch {
+          throw new NotionApiError(404, "No such page (row) in this database.");
+        }
+        const parent = page.parent;
+        if (!parent || parent.type !== "database_id" ||
+            normalizeId(parent.database_id) !== normalizeId(this.#databaseId)) {
+          throw new NotionApiError(404, "No such page (row) in this database.");
+        }
+        return { value: undefined, itemIds: [this.#databaseId, id] };
+      },
+      () => observation("Open Notion database row", "Open a page in a Notion database."),
+    );
     return new NotionPageSessionImpl(this.#store, this.#approvalQueue.dup(), id, this.#observe);
   }
 
@@ -1408,7 +1535,9 @@ class NotionDatabaseSessionImpl extends RpcTarget implements NotionDatabaseSessi
       icon: options.icon,
       titlePropertyName: titlePropertyNameOf(schema),
     };
-    await stageAction(this.#store, this.#approvalQueue, action);
+    await stageAction(
+      this.#store, this.#approvalQueue, action, "NotionDatabase.createPage",
+    );
     return new NotionPageSessionImpl(this.#store, this.#approvalQueue.dup(), provisionalId, this.#observe);
   }
 }
@@ -1444,14 +1573,17 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
   }
 
   async getMetadata(): Promise<NotionWorkspaceMetadata> {
-    const bot = await this.#store.api.getBotUser();
-    const metadata: NotionWorkspaceMetadata = { authorizedBy: this.#authorizedBy };
-    if (bot.workspaceName) metadata.name = bot.workspaceName;
-    // The workspace's name is visible to any workspace member, so no item attribution is needed (the
-    // baseline workspace-membership check in addObserver covers it).
-    await authorizeItemObservation(this.#approvalQueue, this.#observe, [],
-      observation("Read Notion workspace info", "Read the connected Notion workspace's name."));
-    return metadata;
+    return runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionWorkspace.getMetadata",
+      async store => {
+        const bot = await store.api.getBotUser();
+        const value: NotionWorkspaceMetadata = { authorizedBy: this.#authorizedBy };
+        if (bot.workspaceName) value.name = bot.workspaceName;
+        return { value, itemIds: [] };
+      },
+      () => observation(
+        "Read Notion workspace info", "Read the connected Notion workspace's name."),
+    );
   }
 
   async search(options?: NotionSearchOptions): Promise<Cursor<NotionItemSummary>> {
@@ -1470,23 +1602,26 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
       ? { property: "object" as const, value: options.filter }
       : undefined;
     return new PagedCursor<NotionItemSummary>(async (cursor, firstPage) => {
-      const result = await store.api.search({
-        query: options?.query,
-        filter,
-        sort,
-        start_cursor: cursor,
-        page_size: pageSize,
-      });
-      const items = overlaySearch(
-        result.results.map(itemResponseToSummary), store, firstPage, options?.filter);
-      // Search reveals each matching item's existence/title, so attribute to every (real) result item
-      // and exclude observers who lack access to any of them.
-      const itemIds = result.results
-        .map(r => r.id)
-        .filter(id => !NotionStore.isProvisional(id));
-      await authorizeItemObservation(approvalQueue, observe, itemIds,
-        observation("Search Notion", `Search Notion for “${options?.query ?? ""}”.`));
-      return { items, nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined };
+      return runNotionRead(
+        store, approvalQueue, observe, "NotionWorkspace.search.next",
+        async billedStore => {
+          const result = await billedStore.api.search({
+            query: options?.query, filter, sort, start_cursor: cursor, page_size: pageSize,
+          });
+          const items = overlaySearch(
+            result.results.map(itemResponseToSummary), billedStore, firstPage, options?.filter);
+          return {
+            value: {
+              items,
+              nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
+            },
+            itemIds: result.results
+              .map(r => r.id)
+              .filter(id => !NotionStore.isProvisional(id)),
+          };
+        },
+        () => observation("Search Notion", `Search Notion for “${options?.query ?? ""}”.`),
+      );
     });
   }
 
@@ -1503,7 +1638,11 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
       return new NotionPageSessionImpl(this.#store, this.#approvalQueue.dup(), idOrUrl, this.#observe);
     }
     const id = parseNotionId(idOrUrl);
-    await this.#store.getPageResponse(id);
+    await runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionWorkspace.getPage",
+      async store => ({ value: await store.getPageResponse(id), itemIds: [id] }),
+      () => observation("Open Notion page", "Open a Notion page by ID or URL."),
+    );
     return new NotionPageSessionImpl(this.#store, this.#approvalQueue.dup(), id, this.#observe);
   }
 
@@ -1516,7 +1655,11 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
       throw new NotionApiError(404, "No such database.");
     }
     const id = parseNotionId(idOrUrl);
-    await this.#store.getDatabaseResponse(id);
+    await runNotionRead(
+      this.#store, this.#approvalQueue, this.#observe, "NotionWorkspace.getDatabase",
+      async store => ({ value: await store.getDatabaseResponse(id), itemIds: [id] }),
+      () => observation("Open Notion database", "Open a Notion database by ID or URL."),
+    );
     return new NotionDatabaseSessionImpl(this.#store, this.#approvalQueue.dup(), id, this.#observe);
   }
 
@@ -1531,7 +1674,9 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
       content: options.content,
       icon: options.icon,
     };
-    await stageAction(this.#store, this.#approvalQueue, action);
+    await stageAction(
+      this.#store, this.#approvalQueue, action, "NotionWorkspace.createPage",
+    );
     return new NotionPageSessionImpl(this.#store, this.#approvalQueue.dup(), provisionalId, this.#observe);
   }
 
@@ -1541,15 +1686,20 @@ class NotionWorkspaceSessionImpl extends RpcTarget implements NotionWorkspaceSes
     const approvalQueue = this.#approvalQueue;
     const observe = this.#observe;
     return new PagedCursor<NotionUser>(async cursor => {
-      const result = await store.api.listUsers(cursor, pageSize);
-      // The member directory is visible to any workspace member, so no item attribution (the baseline
-      // workspace-membership check in addObserver covers it).
-      await authorizeItemObservation(approvalQueue, observe, [],
-        observation("List Notion users", "List the members of the Notion workspace."));
-      return {
-        items: result.results.map(userResponseToUser),
-        nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
-      };
+      return runNotionRead(
+        store, approvalQueue, observe, "NotionWorkspace.listUsers.next",
+        async billedStore => {
+          const result = await billedStore.api.listUsers(cursor, pageSize);
+          return {
+            value: {
+              items: result.results.map(userResponseToUser),
+              nextCursor: result.has_more ? result.next_cursor ?? undefined : undefined,
+            },
+            itemIds: [],
+          };
+        },
+        () => observation("List Notion users", "List the members of the Notion workspace."),
+      );
     });
   }
 }
