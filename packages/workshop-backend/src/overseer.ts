@@ -3914,17 +3914,20 @@ class OverseerImpl implements AgentHooks {
         operationId: string;
         chargeSnapshot: GatekeeperChargeSnapshot;
       };
-      const candidate: IdempotencyRecord = {
-        operationId: `gatekeeper-operation:${crypto.randomUUID()}`,
-        chargeSnapshot: await this.ctx.exports.AdminSettings.getByName("")
-            .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey),
-      };
-      const selected = this.ctx.storage.transactionSync(() => {
-        const existing = this.ctx.storage.kv.get<IdempotencyRecord>(key);
-        if (existing) return existing;
-        this.ctx.storage.kv.put(key, candidate);
-        return candidate;
-      });
+      let selected = this.ctx.storage.kv.get<IdempotencyRecord>(key);
+      if (!selected) {
+        const candidate: IdempotencyRecord = {
+          operationId: `gatekeeper-operation:${crypto.randomUUID()}`,
+          chargeSnapshot: await this.ctx.exports.AdminSettings.getByName("")
+              .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey),
+        };
+        selected = this.ctx.storage.transactionSync(() => {
+          const existing = this.ctx.storage.kv.get<IdempotencyRecord>(key);
+          if (existing) return existing;
+          this.ctx.storage.kv.put(key, candidate);
+          return candidate;
+        });
+      }
       operationId = selected.operationId;
       chargeSnapshot = selected.chargeSnapshot;
       await this.ctx.storage.sync();
@@ -7824,6 +7827,26 @@ type OverseerRestoreParams = {
   codeId?: string;
 };
 
+async function requireDeliverableHook(
+    impl: OverseerImpl, env: Cloudflare.Env, hookId: number): Promise<{
+      record: BoundHookRecord;
+      vendorId: string;
+    }> {
+  let record = impl.storage.boundHooks.get(hookId);
+  if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
+
+  let vendorId = record.vendorId ??
+      gatekeeperVendorId(impl.storage.gatekeepers.get(record.gatekeeperId));
+  if (!vendorId) throw new Error("Hook vendor is unavailable.");
+
+  let config = await readAdminConfig(env);
+  if (config.disabledGatekeepers.includes(vendorId) ||
+      ambientGatekeeperMode(config, vendorId) === "disabled") {
+    throw new Error("Gatekeeper is disabled.");
+  }
+  return {record, vendorId};
+}
+
 export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   private impl: OverseerImpl;
 
@@ -8250,18 +8273,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   async startHook(hookId: number, run?: HookRunMetadata): Promise<{
     callback: NativeRpcStub<RpcTarget>, approvalQueue: ApprovalQueue
   }> {
-    let record = this.impl.storage.boundHooks.get(hookId);
-    if (!record?.enabled) throw new Error("Hook has been deleted or disabled.");
-
-    let vendorId = record.vendorId ??
-        gatekeeperVendorId(this.impl.storage.gatekeepers.get(record.gatekeeperId));
-    if (!vendorId) throw new Error("Hook vendor is unavailable.");
-
-    let config = await readAdminConfig(this.env);
-    if (config.disabledGatekeepers.includes(vendorId) ||
-        ambientGatekeeperMode(config, vendorId) === "disabled") {
-      throw new Error("Gatekeeper is disabled.");
-    }
+    let {record, vendorId} = await requireDeliverableHook(this.impl, this.env, hookId);
 
     let attribution = normalizeUsageAttribution(record.attribution);
     if (vendorId === "scheduler") {
@@ -8296,6 +8308,38 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         attribution,
       }),
     };
+  }
+
+  /** Begin one unattended Hook operation from its persisted owner and stable run identity. */
+  async beginHookBillableOperation(
+      hookId: number, run: HookRunMetadata, billingMethodKey: string,
+      externalAccountId: string, idempotencyKey: string): Promise<BillableOperation> {
+    let {record, vendorId} = await requireDeliverableHook(this.impl, this.env, hookId);
+
+    let attribution = normalizeUsageAttribution(record.attribution);
+    if (vendorId === "scheduler") {
+      if (!("automationId" in run)) throw new Error("Scheduled run attribution is required.");
+      if (idempotencyKey !== run.automationRunId) {
+        throw new Error("Scheduled billing identity must match the automation run.");
+      }
+      attribution = normalizeUsageAttribution({
+        ...attribution,
+        source: "scheduled",
+        automationId: run.automationId,
+        automationRunId: run.automationRunId,
+      });
+    } else {
+      if (!("deliveryId" in run)) {
+        throw new Error("Automation dimensions are only valid for scheduled hooks.");
+      }
+      if (idempotencyKey !== run.deliveryId) {
+        throw new Error("Hook billing identity must match the delivery identity.");
+      }
+    }
+
+    return this.impl.beginBillableOperation(
+        record.gatekeeperId, billingMethodKey, externalAccountId,
+        {from: "hook", hookId, attribution}, idempotencyKey);
   }
 
   async deliverGadgetLogs(chatId: number | null, logs: ConsoleLogEvent[]) {
@@ -8557,6 +8601,17 @@ type GatekeeperHookLoopbackProps = {
 export class GatekeeperHookLoopback
     extends WorkerEntrypoint<Cloudflare.Env, GatekeeperHookLoopbackProps>
     implements HookInitiator<RpcTarget> {
+  beginBillableOperation(
+      run: HookRunMetadata, billingMethodKey: string, externalAccountId: string,
+      idempotencyKey: string): Promise<BillableOperation> {
+    let ns = this.ctx.exports.OverseerDurableObject;
+    let overseer: DurableObjectStub<OverseerDurableObject> =
+        ns.get(ns.idFromString(this.ctx.props.overseerId));
+
+    return overseer.beginHookBillableOperation(
+        this.ctx.props.hookId, run, billingMethodKey, externalAccountId, idempotencyKey);
+  }
+
   startHook(run?: HookRunMetadata): Promise<
       {callback: NativeRpcStub<RpcTarget>, approvalQueue: NativeRpcStub<ApprovalQueue>}> {
     let ns = this.ctx.exports.OverseerDurableObject;
@@ -8567,7 +8622,6 @@ export class GatekeeperHookLoopback
     // @ts-ignore seems the RPC types aren't working here
     return overseer.startHook(this.ctx.props.hookId, run);
   }
-
 }
 
 type AgentSelfLoopbackProps = {

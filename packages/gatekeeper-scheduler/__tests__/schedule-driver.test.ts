@@ -18,7 +18,8 @@ type ScheduleHookTarget = RpcTarget & ScheduledTaskHook;
 
 type TestHooks = HookInitiator<ScheduleHookTarget> & {
   configure(
-    mode: "success" | "start-reject" | "authorization-reject" | "callback-reject",
+    mode: "success" | "start-reject" | "billing-reject" |
+      "authorization-reject" | "callback-reject",
   ): Promise<void>;
   blockAt(point: "start" | "authorization" | "callback"): Promise<void>;
   read(): Promise<{
@@ -258,7 +259,7 @@ describe("ScheduleDriver", () => {
     expect(new Set(begunRuns).size).toBe(2);
   });
 
-  it("expires a one-shot on any startHook rejection without authorization or attempt consumption", async () => {
+  it("expires a one-shot and releases billing when startHook rejects", async () => {
     const driver = testEnv.SCHEDULE_DRIVER.getByName("admission-rejection");
     const activationTime = Date.now();
     await testEnv.TEST_HOOKS.configure("start-reject");
@@ -283,7 +284,10 @@ describe("ScheduleDriver", () => {
     });
     const rejected = await testEnv.TEST_HOOKS.read();
     expect(rejected.events).toEqual(["start"]);
-    expect(rejected.billingEvents).toEqual([]);
+    expect(rejected.billingEvents).toEqual([
+      expect.stringMatching("^begin:scheduler\\.schedule\\.delivery\\.v1:.+:.+$"),
+      expect.stringMatching("^complete:failed-before-execution:.+$"),
+    ]);
     expect(reportIssue).not.toHaveBeenCalled();
   });
 
@@ -312,7 +316,7 @@ describe("ScheduleDriver", () => {
       stage: "admission",
     });
     const rejected = await testEnv.TEST_HOOKS.read();
-    expect(rejected.events).toEqual(["start"]);
+    expect(rejected.events).toEqual([]);
     expect(rejected.billingEvents).toEqual([
       expect.stringMatching("^begin:scheduler\\.schedule\\.delivery\\.v1:.+:.+$"),
     ]);

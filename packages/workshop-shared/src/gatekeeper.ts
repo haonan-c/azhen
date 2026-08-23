@@ -1412,6 +1412,17 @@ export interface HookController<Hook extends RpcTarget> extends WorkerEntrypoint
  */
 export interface HookInitiator<Hook extends RpcTarget> extends WorkerEntrypoint {
   /**
+   * Begins metering one unattended Hook operation from the Hook's persisted owner attribution.
+   * The stable run metadata and idempotency key let a retried delivery recover the same operation.
+   */
+  beginBillableOperation(
+    run: HookRunMetadata,
+    billingMethodKey: string,
+    externalAccountId: string,
+    idempotencyKey: string,
+  ): Promise<BillableOperation>;
+
+  /**
    * Indicates that the hook is about to be invoked.
    *
    * This returns an ApprovalQueue which the gatekeeper may use to register observations and

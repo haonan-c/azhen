@@ -136,4 +136,16 @@ describe("UGC Ads Session billing", () => {
     expect(trace).not.toContain("complete:failed-before-execution");
     vi.unstubAllGlobals();
   });
+
+  it("holds an invalid TikHub JSON response after request dispatch", async () => {
+    const trace: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not-json", { status: 200 })));
+    using target = session(trace);
+
+    await expect(target.searchXiaohongshuNotes("billing")).rejects.toThrow();
+
+    expect(trace).toContain("complete:unknown");
+    expect(trace).not.toContain("complete:executed");
+    vi.unstubAllGlobals();
+  });
 });

@@ -420,6 +420,20 @@ export class ScheduleDriver extends DurableObject {
         automationRunId: prepared.runId,
       };
       // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
+      using operationCall = capabilities.initiator.beginBillableOperation(
+        run,
+        SCHEDULER_BILLING_METHODS["ScheduledTaskHook.onSchedule"].methodKey,
+        this.ctx.id.toString(),
+        prepared.runId,
+      );
+      let operationResult: RpcStub<BillableOperation>;
+      try {
+        operationResult = await operationCall;
+      } catch {
+        return false;
+      }
+      using operation = operationResult;
+      // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
       using hookCall = capabilities.initiator.startHook(run);
       try {
         // Await admission rather than pipeline: its rejection must skip this occurrence before the
@@ -428,19 +442,17 @@ export class ScheduleDriver extends DurableObject {
         hookResult = await hookCall;
       } catch {
         if (prepared.recoveredDelivery) {
-          this.#failPending(prepared, "callback_failed", Date.now());
+          const state = this.#failPending(prepared, "callback_failed", Date.now());
+          if (state?.status === "dead") {
+            await this.#completeBillingQuietly(operation, "unknown");
+          }
         } else {
           this.#rejectPending(prepared, Date.now());
+          await this.#completeBillingQuietly(operation, "failed-before-execution");
         }
         return true;
       }
       if (!hookResult) return false;
-
-      using operation = await hookResult.approvalQueue.beginBillableOperation(
-        SCHEDULER_BILLING_METHODS["ScheduledTaskHook.onSchedule"].methodKey,
-        this.ctx.id.toString(),
-        prepared.runId,
-      );
 
       if (prepared.recoveredDelivery) {
         const state = this.#failPending(prepared, "callback_failed", Date.now());
@@ -494,7 +506,7 @@ export class ScheduleDriver extends DurableObject {
         }
         return false;
       }
-      await operation.complete("executed");
+      await this.#completeBillingQuietly(operation, "executed");
       this.#completePending(prepared, Date.now());
       return false;
     } finally {
@@ -593,18 +605,33 @@ export class ScheduleDriver extends DurableObject {
     operation: RpcStub<BillableOperation>,
     outcome: BillableOperationOutcome,
   ): Promise<void> {
-    try {
-      await operation.complete(outcome);
-    } catch (error) {
-      logger.error("scheduler billing completion failed", {
-        event: "scheduler.billing.complete.failed",
-        error,
-      });
-      reportIssue("scheduler.billing.complete", error, {
-        handled: true,
-        attributes: obsContext.get(),
-      });
+    let error: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await operation.complete(outcome);
+        return;
+      } catch (caught) {
+        error = caught;
+      }
     }
+    if (outcome !== "unknown") {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await operation.complete("unknown");
+          return;
+        } catch (caught) {
+          error = caught;
+        }
+      }
+    }
+    logger.error("scheduler billing completion failed", {
+      event: "scheduler.billing.complete.failed",
+      error,
+    });
+    reportIssue("scheduler.billing.complete", error, {
+      handled: true,
+      attributes: obsContext.get(),
+    });
   }
 
   #completePending(prepared: PreparedRun, completedAt: number): void {

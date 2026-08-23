@@ -26,13 +26,6 @@ const SORT_TYPES = [
 ] as const;
 const TIME_FILTERS = ["不限", "一天内", "一周内", "半年内"] as const;
 
-type TikHubEnvelope<T> = {
-  code: number;
-  message?: string;
-  message_zh?: string;
-  data: T;
-};
-
 type TikHubResult = {
   code?: number;
   msg?: string;
@@ -263,14 +256,26 @@ async function callTikHub<T>(
       Authorization: `Bearer ${apiKey}`,
     },
   });
-  activity?.responseReceived(response.ok ? response.status : 500);
-  if (!response.ok) throw new Error(`TikHub request failed with status ${response.status}.`);
-
-  let envelope = await response.json() as TikHubEnvelope<T>;
-  if (envelope.code !== 200) {
-    throw new Error(envelope.message_zh || envelope.message || "TikHub request failed.");
+  if (!response.ok) {
+    activity?.responseReceived(500);
+    throw new Error(`TikHub request failed with status ${response.status}.`);
   }
-  return envelope.data;
+
+  let envelope = asRecord(await response.json());
+  if (!envelope || typeof envelope.code !== "number" ||
+      !Object.hasOwn(envelope, "data")) {
+    throw new Error("TikHub returned an invalid response.");
+  }
+  if (envelope.code !== 200) {
+    activity?.responseReceived(500);
+    throw new Error(
+      typeof envelope.message_zh === "string" ? envelope.message_zh
+        : typeof envelope.message === "string" ? envelope.message
+        : "TikHub request failed.",
+    );
+  }
+  activity?.responseReceived(response.status);
+  return envelope.data as T;
 }
 
 function requestFailureForStatus(status: number): TikHubRequestFailure {
@@ -310,14 +315,16 @@ async function postTikHubAttempt<T>(
       body: JSON.stringify(body),
       signal: deadline.signal,
     }));
-    activity?.responseReceived(response.ok ? response.status : 500);
   } catch (error) {
     if (deadline.signal.aborted || isAbortError(error)) {
       throw new TikHubRequestFailure("timeout");
     }
     throw asTikHubRequestFailure(error);
   }
-  if (!response.ok) throw requestFailureForStatus(response.status);
+  if (!response.ok) {
+    activity?.responseReceived(500);
+    throw requestFailureForStatus(response.status);
+  }
 
   let envelope: Record<string, unknown> | undefined;
   try {
@@ -332,8 +339,12 @@ async function postTikHubAttempt<T>(
   if (!envelope) throw new TikHubRequestFailure("invalid_response");
   let code = envelope.code;
   if (typeof code !== "number") throw new TikHubRequestFailure("invalid_response");
-  if (code !== 200) throw requestFailureForStatus(code);
+  if (code !== 200) {
+    activity?.responseReceived(500);
+    throw requestFailureForStatus(code);
+  }
   if (!Object.hasOwn(envelope, "data")) throw new TikHubRequestFailure("invalid_response");
+  activity?.responseReceived(response.status);
   return envelope.data as T;
 }
 

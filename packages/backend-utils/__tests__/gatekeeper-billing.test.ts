@@ -116,6 +116,50 @@ describe("Gatekeeper read billing", () => {
       );
     }
   });
+
+  it("holds a partial success when another dispatched request has no response", async () => {
+    const trace: string[] = [];
+    await expect(runBillableRead(
+      makeAuthorizer(trace),
+      "account-1",
+      "vendor.records.list",
+      async activity => {
+        activity.requestDispatched();
+        activity.responseReceived(200);
+        activity.requestDispatched();
+        throw new Error("lost");
+      },
+      () => ({ title: "List records", description: "List records" }),
+    )).rejects.toThrow("lost");
+
+    expect(trace).toContain("complete:unknown");
+  });
+
+  it("falls back to unknown when executed completion cannot be confirmed", async () => {
+    const trace: string[] = [];
+    const authorizer = makeAuthorizer(trace);
+    const originalBegin = authorizer.beginBillableOperation;
+    authorizer.beginBillableOperation = async (methodKey, externalAccountId) => {
+      const operation = await originalBegin(methodKey, externalAccountId);
+      const complete = operation.complete;
+      operation.complete = async outcome => {
+        await complete(outcome);
+        if (outcome === "executed") throw new Error("completion response lost");
+      };
+      return operation;
+    };
+
+    await expect(runBillableRead(
+      authorizer,
+      "account-1",
+      "vendor.records.list",
+      async () => "result",
+      () => ({ title: "Read", description: "Read" }),
+    )).rejects.toThrow("completion response lost");
+
+    expect(trace).toContain("complete:executed");
+    expect(trace).toContain("complete:unknown");
+  });
 });
 
 describe("Gatekeeper direct operation billing", () => {
@@ -145,6 +189,30 @@ describe("Gatekeeper direct operation billing", () => {
     )).rejects.toThrow("lost");
 
     expect(outcomes).toEqual(["failed-before-execution", "unknown"]);
+  });
+
+  it("retries the same terminal outcome after an unconfirmed completion", async () => {
+    const outcomes: BillableOperationOutcome[] = [];
+    const authorizer = {
+      async beginBillableOperation() {
+        return {
+          async getOperationId() { return "direct-retry"; },
+          async markStarted() {},
+          async complete(outcome: BillableOperationOutcome) {
+            outcomes.push(outcome);
+            if (outcomes.length === 1) throw new Error("response lost");
+          },
+          [Symbol.dispose]() {},
+        };
+      },
+    };
+
+    await expect(runBillableOperation(
+      authorizer, "account-1", "vendor.direct.v1",
+      async () => { throw new Error("invalid"); },
+    )).rejects.toThrow("invalid");
+
+    expect(outcomes).toEqual(["failed-before-execution", "failed-before-execution"]);
   });
 });
 

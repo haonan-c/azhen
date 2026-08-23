@@ -62,8 +62,8 @@ export class BillableOperationActivityTracker implements BillableOperationActivi
 
   /** Classify a failed read from the provider responses observed so far. */
   failureOutcome(): BillableOperationOutcome {
-    if (this.#acceptedResponse) return "executed";
     if (this.#outstandingRequests > 0 || this.#ambiguousResponse) return "unknown";
+    if (this.#acceptedResponse) return "executed";
     return "failed-before-execution";
   }
 
@@ -79,14 +79,46 @@ async function completeQuietly(
   operation: DisposableBillableOperation,
   outcome: BillableOperationOutcome,
 ): Promise<void> {
+  let error: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await operation.complete(outcome);
+      return;
+    } catch (caught) {
+      error = caught;
+    }
+  }
+  if (outcome !== "unknown") {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await operation.complete("unknown");
+        return;
+      } catch (caught) {
+        error = caught;
+      }
+    }
+  }
+  logger.error("failed to complete Gatekeeper read billing", {
+    event: "billing.complete.failed",
+    outcome,
+    error,
+  });
+}
+
+async function completeExecuted(
+  operation: DisposableBillableOperation,
+): Promise<void> {
   try {
-    await operation.complete(outcome);
+    await operation.complete("executed");
   } catch (error) {
-    logger.error("failed to complete Gatekeeper read billing", {
-      event: "billing.complete.failed",
-      outcome,
-      error,
-    });
+    try {
+      await operation.complete("executed");
+      return;
+    } catch {
+      // Fall through to a conservative terminal outcome after two unconfirmed executions.
+    }
+    await completeQuietly(operation, "unknown");
+    throw error;
   }
 }
 
@@ -121,7 +153,7 @@ export async function runBillableRead<T>(
     throw error;
   }
 
-  await operation.complete("executed");
+  await completeExecuted(operation);
   await authorizer.authorizeObservation({
     ...describe(result),
     billingOperationId: operationId,
@@ -154,7 +186,7 @@ export async function runBillableOperation<T>(
     await completeQuietly(operation, activity.failureOutcome());
     throw error;
   }
-  await operation.complete("executed");
+  await completeExecuted(operation);
   return result;
 }
 

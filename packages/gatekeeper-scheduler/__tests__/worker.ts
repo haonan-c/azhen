@@ -113,6 +113,16 @@ class TestCallback extends RpcTarget {
 
 /** Test-only persistent hook initiator. */
 export class TestHooks extends WorkerEntrypoint {
+  async beginBillableOperation(
+    _run: HookRunMetadata,
+    methodKey: string,
+    externalAccountId: string,
+    idempotencyKey: string,
+  ) {
+    return await new TestApprovalQueue().beginBillableOperation(
+      methodKey, externalAccountId, idempotencyKey);
+  }
+
   async startHook(_run?: HookRunMetadata):
       Promise<{ callback: TestCallback; approvalQueue: TestApprovalQueue }> {
     events.push("start");

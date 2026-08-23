@@ -94,6 +94,41 @@ describe("OverseerDurableObject.startHook", () => {
     })});
   });
 
+  it("begins scheduled billing from the persisted owner before delivery admission", async () => {
+    let overseer = makeOverseer(
+        async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
+        {enabled: true, vendorId: "scheduler", callback: {}});
+    const beginBillableOperation = vi.fn(async () => ({operation: true}));
+    Object.assign((overseer as unknown as {impl: object}).impl, {beginBillableOperation});
+
+    await expect(overseer.beginHookBillableOperation(
+        1,
+        {automationId: "schedule-1", automationRunId: "run-1"},
+        "scheduler.schedule.delivery.v1",
+        "scheduler-account",
+        "run-1",
+    )).resolves.toEqual({operation: true});
+
+    expect(beginBillableOperation).toHaveBeenCalledWith(
+      1,
+      "scheduler.schedule.delivery.v1",
+      "scheduler-account",
+      {
+        from: "hook",
+        hookId: 1,
+        attribution: {
+          principal: {version: 1, kind: "user", userId: "a".repeat(64)},
+          source: "scheduled",
+          workspaceId: "b".repeat(64),
+          gadgetId: 7,
+          automationId: "schedule-1",
+          automationRunId: "run-1",
+        },
+      },
+      "run-1",
+    );
+  });
+
   it("attaches an opaque delivery ID to an ordinary Hook callback", async () => {
     let overseer = makeOverseer(
         async () => serializeAdminConfig(DEFAULT_ADMIN_CONFIG),
@@ -112,6 +147,43 @@ describe("OverseerDurableObject.startHook", () => {
     let overseer = makeOverseer(async () => serializeAdminConfig(config));
 
     await expect(overseer.startHook(1)).rejects.toThrow("Gatekeeper is disabled.");
+  });
+
+  it.each([
+    ["ordinary", { ...DEFAULT_ADMIN_CONFIG, disabledGatekeepers: ["email"] }, "email"],
+    ["ambient", {
+      ...DEFAULT_ADMIN_CONFIG,
+      ambientGatekeeperModes: { scheduler: "disabled" as const },
+    }, "scheduler"],
+  ])("rejects billing begin for an administratively disabled %s vendor",
+      async (_kind, config, vendorId) => {
+        let overseer = makeOverseer(
+            async () => serializeAdminConfig(config), {enabled: true, vendorId});
+        const run = vendorId === "scheduler"
+          ? {automationId: "schedule-1", automationRunId: "run-1"} as const
+          : {deliveryId: "delivery-1"} as const;
+
+        await expect(overseer.beginHookBillableOperation(
+            1,
+            run,
+            `${vendorId}.delivery.v1`,
+            `${vendorId}-account`,
+            vendorId === "scheduler" ? "run-1" : "delivery-1",
+        )).rejects.toThrow("Gatekeeper is disabled.");
+      });
+
+  it("rejects billing begin when admin-config KV access fails", async () => {
+    let overseer = makeOverseer(
+        async () => { throw new Error("KV unavailable"); },
+        {enabled: true, vendorId: "scheduler"});
+
+    await expect(overseer.beginHookBillableOperation(
+        1,
+        {automationId: "schedule-1", automationRunId: "run-1"},
+        "scheduler.schedule.delivery.v1",
+        "scheduler-account",
+        "run-1",
+    )).rejects.toThrow("KV unavailable");
   });
 
   it("rejects delivery for an administratively disabled ambient vendor", async () => {

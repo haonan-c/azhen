@@ -9,14 +9,14 @@
 // case must run before any test configures a rate for its business-method key, so the
 // describe-block order here is load-bearing.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { USAGE_CREDIT_SUBUNITS_PER_CREDIT } from "@gadgets/workshop-shared/api";
 import type {
   BillableOperation, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import type { AdminSettings } from "../src/admin-settings.js";
+import { AdminSettings } from "../src/admin-settings.js";
 import type { OverseerDurableObject } from "../src/overseer.js";
 import type { UserDurableObject } from "../src/user.js";
 import type { UsageAttribution } from "../src/usage-attribution.js";
@@ -317,16 +317,49 @@ describe("Gatekeeper billing tracer: priced two-stage lifecycle", () => {
       .toBe(before.availableSubunits - CHARGE);
   });
 
-  it("restores one operation when a trusted ingress repeats its idempotency key", async () => {
+  it("restores one operation without reading a new rate snapshot", async () => {
+    await configurePricedRate(PRICED_METHOD_KEY, CHARGE);
+    const user = await newUser();
+    const before = await user.stub.getUsageCreditBalance();
+    const productionIssue = AdminSettings.prototype.issueGatekeeperChargeSnapshot;
+    const issueSnapshot = vi.spyOn(
+      AdminSettings.prototype,
+      "issueGatekeeperChargeSnapshot",
+    ).mockImplementation(async function(vendorId, billingMethodKey) {
+      if (issueSnapshot.mock.calls.length > 1) throw new Error("rate registry unavailable");
+      return productionIssue.call(this, vendorId, billingMethodKey);
+    });
+
+    try {
+      const { trace, operationId } = await traceRead({
+        overseerName: `tracer-ingress-retry-${crypto.randomUUID()}`,
+        principalUserId: user.id,
+        billingMethodKey: PRICED_METHOD_KEY,
+        idempotencyKey: "opaque-delivery-1",
+        upstream: async () => "delivery",
+      });
+
+      expect(trace).toContain("workshop:resumed-same-operation");
+      expect(issueSnapshot).toHaveBeenCalledOnce();
+      expect((await user.stub.completeGatekeeperUsage(operationId, "executed")).outcome)
+        .toBe("settled");
+      expect((await user.stub.getUsageCreditBalance()).availableSubunits)
+        .toBe(before.availableSubunits - CHARGE);
+    } finally {
+      issueSnapshot.mockRestore();
+    }
+  });
+
+  it("shares one operation when trusted ingress retries race", async () => {
     await configurePricedRate(PRICED_METHOD_KEY, CHARGE);
     const user = await newUser();
     const before = await user.stub.getUsageCreditBalance();
 
     const { trace, operationId } = await traceRead({
-      overseerName: `tracer-ingress-retry-${crypto.randomUUID()}`,
+      overseerName: `tracer-ingress-race-${crypto.randomUUID()}`,
       principalUserId: user.id,
       billingMethodKey: PRICED_METHOD_KEY,
-      idempotencyKey: "opaque-delivery-1",
+      idempotencyKey: "opaque-delivery-race",
       concurrentBegins: 2,
       upstream: async () => "delivery",
     });
