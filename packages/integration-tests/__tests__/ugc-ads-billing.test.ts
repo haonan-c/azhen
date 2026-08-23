@@ -39,6 +39,39 @@ const OFFICIAL_ACCOUNT_BILLING_METHOD =
 const OFFICIAL_ACCOUNT_CHARGE_SUBUNITS = 41n;
 const RENDER_BILLING_METHOD = UGC_ADS_BILLING_METHODS["UgcAdsSession.renderImage"];
 const RENDER_CHARGE_SUBUNITS = 43n;
+const BROWSER_PHYSICAL_SEQUENCE = [
+  "browser.acquire",
+  "browser.connect",
+  "Browser.getVersion",
+  "Target.getBrowserContexts",
+  "Target.setDiscoverTargets",
+  "Target.setAutoAttach",
+  "Target.createTarget",
+  "Target.setAutoAttach",
+  "Runtime.runIfWaitingForDebugger",
+  "Network.enable",
+  "Network.setCacheDisabled",
+  "Fetch.disable",
+  "Page.enable",
+  "Page.getFrameTree",
+  "Page.setLifecycleEventsEnabled",
+  "Runtime.enable",
+  "Performance.enable",
+  "Log.enable",
+  "Page.addScriptToEvaluateOnNewDocument",
+  "Page.createIsolatedWorld",
+  "Emulation.setDeviceMetricsOverride",
+  "Emulation.setTouchEmulationEnabled",
+  "Emulation.setDeviceMetricsOverride",
+  "Emulation.setTouchEmulationEnabled",
+  "Emulation.setScriptExecutionDisabled",
+  "Network.setCacheDisabled",
+  "Fetch.enable",
+  "Runtime.callFunctionOn",
+  "Page.bringToFront",
+  "Page.captureScreenshot",
+  "Browser.close",
+] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const QUERY_TERMS = Array.from({length: 5}, (_, index) => `private-query-${index + 1}`);
 // The production Official Account client has no GET operation. Both upstream calls are POSTs.
@@ -124,6 +157,9 @@ type XiaohongshuScenario =
   "invalidJson";
 
 let harness: Harness;
+type HarnessWebSocket = NonNullable<
+  Awaited<ReturnType<Harness["fetchWorker"]>>["webSocket"]
+>;
 let interceptor: NetworkInterceptor;
 let adminPublicApi: ReturnType<typeof connect>;
 let authenticatedAdmin: RpcStub<AuthenticatedApi>;
@@ -142,6 +178,11 @@ let creatorRequestsStarted: Promise<void>;
 let signalCreatorRequestsStarted: () => void;
 let releaseCreatorRequests: Promise<void>;
 let allowCreatorRequests: () => void;
+let blockFirstXhsRequest = false;
+let firstXhsRequestStarted: Promise<void>;
+let signalFirstXhsRequestStarted: () => void;
+let firstXhsRequestRelease: Promise<void>;
+let releaseFirstXhsRequest: () => void;
 
 function resetTikHub(nextScenario: TikHubScenarioName): void {
   tikHubScenario = TIKHUB_SCENARIOS[nextScenario];
@@ -154,6 +195,9 @@ function resetTikHub(nextScenario: TikHubScenarioName): void {
   xhsPathAttempts = new Map();
   creatorRequestsStarted = new Promise(done => { signalCreatorRequestsStarted = done; });
   releaseCreatorRequests = new Promise(done => { allowCreatorRequests = done; });
+  blockFirstXhsRequest = false;
+  firstXhsRequestStarted = new Promise(done => { signalFirstXhsRequestStarted = done; });
+  firstXhsRequestRelease = new Promise(done => { releaseFirstXhsRequest = done; });
 }
 
 function resetXiaohongshu(nextScenario: XiaohongshuScenario): void {
@@ -246,6 +290,10 @@ const tikHubHandler: Handler = async (url, method, headers, request) => {
     });
     const attempt = (xhsPathAttempts.get(url.pathname) ?? 0) + 1;
     xhsPathAttempts.set(url.pathname, attempt);
+    if (physicalCalls.length === 1) {
+      signalFirstXhsRequestStarted();
+      if (blockFirstXhsRequest) await firstXhsRequestRelease;
+    }
     if (xhsScenario === "retry" && url.pathname === XHS_SEARCH_PATH && attempt === 1) {
       return new Response("private-xhs-retry", {status: 503});
     }
@@ -378,18 +426,6 @@ const tikHubHandler: Handler = async (url, method, headers, request) => {
   return providerEnvelope({read_num: 100 + statsAttempts.size, like_count: 7});
 };
 
-async function updateOfficialAccountRate(
-  amountSubunits: bigint | null,
-  reason: string,
-): Promise<void> {
-  await admin.updateUsageRates([{
-    kind: "gatekeeper-operation-rate",
-    vendorId: VENDOR_ID,
-    billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
-    amountSubunits,
-  }], reason);
-}
-
 async function updateRate(
   billingMethodKey: string,
   amountSubunits: bigint | null,
@@ -442,13 +478,6 @@ function disposeUser(context: Awaited<ReturnType<typeof newUgcAdsUser>>): void {
   context.publicApi[Symbol.dispose]();
 }
 
-async function officialAccountUsageRecords(user: RpcStub<AuthenticatedApi>) {
-  return (await user.listOwnUsageRecords({limit: 100})).records.filter(
-    record => record.kind === "gatekeeper" && record.vendorId === VENDOR_ID &&
-      record.billingMethodKey === OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
-  ) as UserGatekeeperUsageRecord[];
-}
-
 async function usageRecordsFor(
   user: RpcStub<AuthenticatedApi>,
   billingMethodKey: string,
@@ -459,16 +488,76 @@ async function usageRecordsFor(
   ) as UserGatekeeperUsageRecord[];
 }
 
+type MeteringInspection = {
+  attempts: Array<{
+    operationId: string;
+    attribution: {billingMethodKey: string};
+    chargeSnapshot: {
+      billingMethodKey: string;
+      pricing: "priced" | "unpriced";
+      chargeSubunits: string;
+    };
+    state: "settled" | "failed-before-execution" | "usage-unknown";
+    usageRecordId: string | null;
+  }>;
+  usageRecords: Array<{
+    id: string;
+    operationId: string;
+    attribution: {billingMethodKey: string};
+    outcome: "settled" | "failed-before-execution" | "usage-unknown";
+    chargeSubunits: string | null;
+  }>;
+  chronologyValid: boolean;
+  reservationMatchesOperation: boolean;
+  terminalRecordLinked: boolean;
+};
+
 async function inspectGatekeeperMetering(
   username: string,
   replay = false,
-): Promise<unknown> {
+): Promise<MeteringInspection> {
   const url = new URL(METERING_INSPECTION_PATH, harness.url);
   url.searchParams.set("username", username);
   if (replay) url.searchParams.set("replay", "true");
   const response = await harness.server.fetch(url.toString());
   expect(response.status).toBe(200);
-  return response.json();
+  return response.json() as Promise<MeteringInspection>;
+}
+
+function expectOneLifecycle(
+  inspection: MeteringInspection,
+  billingMethodKey: string,
+  expected: {
+    state: MeteringInspection["attempts"][number]["state"];
+    pricing: "priced" | "unpriced";
+    snapshotChargeSubunits: bigint;
+    recordChargeSubunits: bigint | null;
+  },
+): void {
+  const attempts = inspection.attempts.filter(
+    attempt => attempt.attribution.billingMethodKey === billingMethodKey,
+  );
+  const records = inspection.usageRecords.filter(
+    record => record.attribution.billingMethodKey === billingMethodKey,
+  );
+  expect(attempts).toHaveLength(1);
+  expect(records).toHaveLength(1);
+  const [attempt] = attempts;
+  const [record] = records;
+  expect(attempt).toMatchObject({
+    state: expected.state,
+    chargeSnapshot: {
+      billingMethodKey,
+      pricing: expected.pricing,
+      chargeSubunits: expected.snapshotChargeSubunits.toString(),
+    },
+  });
+  expect(record).toMatchObject({
+    operationId: attempt!.operationId,
+    outcome: expected.state,
+    chargeSubunits: expected.recordChargeSubunits?.toString() ?? null,
+  });
+  expect(attempt!.usageRecordId).toBe(record!.id);
 }
 
 const PRIVATE_DIAGNOSTIC_MARKERS = [
@@ -492,10 +581,30 @@ const PRIVATE_DIAGNOSTIC_MARKERS = [
   "private-profile-token",
   "private-note-title",
   "private-note-detail-title",
+  "private-note-",
+  "private-page-token-",
+  "private-search-id",
+  "private-search-session-id",
   "private-comment-content",
-  "private-creator-name",
+  "private-comment",
+  "private-creator",
+  "private-xhs-retry",
+  "private-xhs-response-loss",
+  "private-xhs-timeout",
+  "private-xhs-provider-failure",
+  "private-xhs-invalid-json",
+  "private-browser-response-loss",
+  "private-not-a-url",
+  "api.tikhub.io",
+  "xiaohongshu.com",
+  XHS_SEARCH_PATH,
+  XHS_DETAIL_PATH,
+  XHS_COMMENTS_PATH,
+  XHS_PROFILE_PATH,
+  XHS_CREATOR_NOTES_PATH,
   "private-rendered-html",
   "Zml4dHVyZS1wbmc=",
+  "fixture-browser-",
   API_KEY,
   `Bearer ${API_KEY}`,
   "authorization",
@@ -521,6 +630,45 @@ async function administratorUsageRecordsForUser(username: string) {
     registeredUserRef: registered.registeredUserRef,
     limit: 100,
   })).records;
+}
+
+async function openBrowserMockSocket(): Promise<HarnessWebSocket> {
+  await harness.fetchWorker(BROWSER_RUN_MOCK_WORKER, "https://fixture/__control", {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({scenario: "success"}),
+  });
+  const acquired = await harness.fetchWorker(
+    BROWSER_RUN_MOCK_WORKER,
+    "https://fake.host/v1/devtools/browser",
+    {method: "POST"},
+  );
+  const {sessionId} = await acquired.json() as {sessionId: string};
+  const connected = await harness.fetchWorker(
+    BROWSER_RUN_MOCK_WORKER,
+    `https://fake.host/v1/devtools/browser/${sessionId}`,
+    {headers: {Upgrade: "websocket", "cf-brapi-client": "@cloudflare/puppeteer@test"}},
+  );
+  const socket = connected.webSocket;
+  if (!socket) throw new Error("Browser mock did not return a WebSocket.");
+  socket.accept();
+  return socket;
+}
+
+function exchangeCdp(
+  socket: HarnessWebSocket,
+  request: unknown,
+): Promise<Record<string, unknown>> {
+  return new Promise((complete, reject) => {
+    socket.addEventListener("message", event => {
+      try {
+        complete(JSON.parse(String(event.data)) as Record<string, unknown>);
+      } catch (error) {
+        reject(error);
+      }
+    }, {once: true});
+    socket.send(JSON.stringify(request));
+  });
 }
 
 beforeAll(async () => {
@@ -555,7 +703,8 @@ beforeAll(async () => {
   const capability = await authenticatedAdmin.getAdminApi();
   if (!capability) throw new Error("Expected the deployment administrator capability.");
   admin = capability;
-  await updateOfficialAccountRate(
+  await updateRate(
+    OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
     OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
     "Price the UGC Ads Official Account operation",
   );
@@ -574,12 +723,46 @@ beforeAll(async () => {
 });
 
 describe.sequential("UGC Ads Browser production Worker billing", () => {
+  it.each([
+    ["unknown", {id: 1, method: "Unknown.command"}],
+    ["out-of-order", {id: 1, method: "Target.getBrowserContexts"}],
+    ["wrong-parameter", {id: 1, method: "Browser.getVersion", params: {unexpected: true}}],
+  ] as const)("makes an %s Browser CDP request fail closed", async (_label, request) => {
+    const socket = await openBrowserMockSocket();
+    try {
+      await expect(exchangeCdp(socket, request)).resolves.toMatchObject({
+        id: 1,
+        error: {code: -32601},
+      });
+    } finally {
+      socket.close();
+    }
+  });
+
+  it("makes a duplicate Browser CDP request fail closed", async () => {
+    const socket = await openBrowserMockSocket();
+    try {
+      const request = {id: 1, method: "Browser.getVersion"};
+      await expect(exchangeCdp(socket, request)).resolves.toMatchObject({
+        id: 1,
+        result: {protocolVersion: "1.3"},
+      });
+      await expect(exchangeCdp(socket, request)).resolves.toMatchObject({
+        id: 1,
+        error: {code: -32601},
+      });
+    } finally {
+      socket.close();
+    }
+  });
+
   it("crosses the production session and Browser binding as one priced operation", async () => {
     await harness.fetchWorker(BROWSER_RUN_MOCK_WORKER, "https://fixture/__control", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify({scenario: "success"}),
     });
+    const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsbrowser");
     try {
       const before = await context.user.getUsageCreditBalance();
@@ -592,37 +775,35 @@ describe.sequential("UGC Ads Browser production Worker billing", () => {
         BROWSER_RUN_MOCK_WORKER,
         "https://fixture/__operations",
       );
-      await expect(response.json()).resolves.toEqual(expect.objectContaining({
-        operations: expect.arrayContaining([
-          "browser.acquire",
-          "browser.connect",
-          "Target.createTarget",
-          "Emulation.setDeviceMetricsOverride",
-          "Emulation.setScriptExecutionDisabled",
-          "Fetch.enable",
-          "Runtime.callFunctionOn",
-          "Page.captureScreenshot",
-          "Browser.close",
-        ]),
-      }));
+      await expect(response.json()).resolves.toEqual({
+        scenario: "success",
+        operations: BROWSER_PHYSICAL_SEQUENCE,
+        protocolComplete: true,
+      });
       expect(await context.user.getUsageCreditBalance()).toEqual({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - RENDER_CHARGE_SUBUNITS,
       });
-      const records = (await context.user.listOwnUsageRecords({limit: 100})).records.filter(
-        record => record.kind === "gatekeeper" &&
-          record.billingMethodKey === RENDER_BILLING_METHOD.methodKey,
-      );
+      const records = await usageRecordsFor(context.user, RENDER_BILLING_METHOD.methodKey);
       expect(records).toEqual([expect.objectContaining({
         pricing: "priced",
         outcome: "settled",
         chargeSubunits: RENDER_CHARGE_SUBUNITS,
       })]);
+      const inspection = await inspectGatekeeperMetering(context.username);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, RENDER_BILLING_METHOD.methodKey, {
+        state: "settled",
+        pricing: "priced",
+        snapshotChargeSubunits: RENDER_CHARGE_SUBUNITS,
+        recordChargeSubunits: RENDER_CHARGE_SUBUNITS,
+      });
       expectPrivateDiagnosticsAbsent({
         records,
-        metering: await inspectGatekeeperMetering(context.username),
+        inspection,
         administratorUsageRecords: await administratorUsageRecordsForUser(context.username),
-        workerLogs: harness.server.getLogs(),
+        workerLogs: harness.server.getLogs().slice(logStart),
       });
     } finally {
       disposeUser(context);
@@ -649,6 +830,7 @@ describe.sequential("UGC Ads Browser production Worker billing", () => {
       await expect(response.json()).resolves.toEqual({
         scenario: "ambiguous",
         operations: ["browser.acquire"],
+        protocolComplete: true,
       });
       expect(await context.user.getUsageCreditBalance()).toEqual({
         reservedSubunits: RENDER_CHARGE_SUBUNITS,
@@ -656,16 +838,19 @@ describe.sequential("UGC Ads Browser production Worker billing", () => {
       });
       expect(await usageRecordsFor(context.user, RENDER_BILLING_METHOD.methodKey))
         .toEqual([expect.objectContaining({outcome: "usage-unknown", chargeSubunits: null})]);
-      expect(await inspectGatekeeperMetering(context.username)).toEqual(expect.objectContaining({
-        attempts: [expect.objectContaining({
-          state: "usage-unknown",
-          reservationAmountSubunits: RENDER_CHARGE_SUBUNITS.toString(),
-        })],
-        chronologyValid: true,
-        reservationMatchesOperation: true,
-        terminalRecordLinked: true,
-      }));
-      expectPrivateDiagnosticsAbsent(harness.server.getLogs().slice(logStart));
+      const inspection = await inspectGatekeeperMetering(context.username);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, RENDER_BILLING_METHOD.methodKey, {
+        state: "usage-unknown",
+        pricing: "priced",
+        snapshotChargeSubunits: RENDER_CHARGE_SUBUNITS,
+        recordChargeSubunits: null,
+      });
+      expectPrivateDiagnosticsAbsent({
+        inspection,
+        workerLogs: harness.server.getLogs().slice(logStart),
+      });
     } finally {
       disposeUser(context);
     }
@@ -675,10 +860,24 @@ describe.sequential("UGC Ads Browser production Worker billing", () => {
 describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
   it("keeps retry and pagination inside one priced operation and immutable snapshot", async () => {
     resetXiaohongshu("retry");
+    blockFirstXhsRequest = true;
+    const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsxhssearch");
     try {
       const before = await context.user.getUsageCreditBalance();
-      const result = await context.session.searchXiaohongshuNotes(XHS_KEYWORD, {limit: 2});
+      const resultPromise = context.session.searchXiaohongshuNotes(XHS_KEYWORD, {limit: 2});
+      await firstXhsRequestStarted;
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: XHS_CHARGE_SUBUNITS,
+        availableSubunits: before.availableSubunits - XHS_CHARGE_SUBUNITS,
+      });
+      await updateRate(
+        XHS_BILLING_METHODS.search.methodKey,
+        XHS_CHARGE_SUBUNITS + 13n,
+        "Change the Xiaohongshu rate after its Charge Snapshot",
+      );
+      releaseFirstXhsRequest();
+      const result = await resultPromise;
 
       expect(result).toHaveLength(2);
       expect(physicalCalls).toEqual([
@@ -699,6 +898,14 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         chargeSubunits: XHS_CHARGE_SUBUNITS,
       })]);
       const inspection = await inspectGatekeeperMetering(context.username, true);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.search.methodKey, {
+        state: "settled",
+        pricing: "priced",
+        snapshotChargeSubunits: XHS_CHARGE_SUBUNITS,
+        recordChargeSubunits: XHS_CHARGE_SUBUNITS,
+      });
       expect(inspection).toEqual(expect.objectContaining({
         attempts: [expect.objectContaining({
           state: "settled",
@@ -717,15 +924,22 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         records,
         inspection,
         administratorUsageRecords: await administratorUsageRecordsForUser(context.username),
-        workerLogs: harness.server.getLogs(),
+        workerLogs: harness.server.getLogs().slice(logStart),
       });
     } finally {
+      releaseFirstXhsRequest();
+      await updateRate(
+        XHS_BILLING_METHODS.search.methodKey,
+        XHS_CHARGE_SUBUNITS,
+        "Restore the priced Xiaohongshu operation",
+      );
       disposeUser(context);
     }
   });
 
   it("keeps detail plus comments and parallel creator fan-out as two operations", async () => {
     resetXiaohongshu("success");
+    const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsxhsmethods");
     try {
       const before = await context.user.getUsageCreditBalance();
@@ -764,41 +978,24 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         availableSubunits: before.availableSubunits - 2n * XHS_CHARGE_SUBUNITS,
       });
       const inspection = await inspectGatekeeperMetering(context.username);
-      expect(inspection).toEqual(expect.objectContaining({
-        attempts: expect.arrayContaining([
-          expect.objectContaining({
-            state: "settled",
-            attribution: expect.objectContaining({
-              billingMethodKey: XHS_BILLING_METHODS.detail.methodKey,
-            }),
-          }),
-          expect.objectContaining({
-            state: "settled",
-            attribution: expect.objectContaining({
-              billingMethodKey: XHS_BILLING_METHODS.creator.methodKey,
-            }),
-          }),
-        ]),
-        usageRecords: expect.arrayContaining([
-          expect.objectContaining({
-            attribution: expect.objectContaining({
-              billingMethodKey: XHS_BILLING_METHODS.detail.methodKey,
-            }),
-            outcome: "settled",
-            chargeSubunits: XHS_CHARGE_SUBUNITS.toString(),
-          }),
-          expect.objectContaining({
-            attribution: expect.objectContaining({
-              billingMethodKey: XHS_BILLING_METHODS.creator.methodKey,
-            }),
-            outcome: "settled",
-            chargeSubunits: XHS_CHARGE_SUBUNITS.toString(),
-          }),
-        ]),
-      }));
+      expect(inspection.attempts).toHaveLength(2);
+      expect(inspection.usageRecords).toHaveLength(2);
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.detail.methodKey, {
+        state: "settled",
+        pricing: "priced",
+        snapshotChargeSubunits: XHS_CHARGE_SUBUNITS,
+        recordChargeSubunits: XHS_CHARGE_SUBUNITS,
+      });
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.creator.methodKey, {
+        state: "settled",
+        pricing: "priced",
+        snapshotChargeSubunits: XHS_CHARGE_SUBUNITS,
+        recordChargeSubunits: XHS_CHARGE_SUBUNITS,
+      });
       expectPrivateDiagnosticsAbsent({
         inspection,
         administratorUsageRecords: await administratorUsageRecordsForUser(context.username),
+        workerLogs: harness.server.getLogs().slice(logStart),
       });
     } finally {
       allowCreatorRequests();
@@ -813,6 +1010,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
       "Exercise visible Xiaohongshu Unpriced Use",
     );
     resetXiaohongshu("empty");
+    const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsxhsempty");
     try {
       const before = await context.user.getUsageCreditBalance();
@@ -820,12 +1018,27 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
 
       expect(physicalCalls).toEqual([{path: XHS_SEARCH_PATH, method: "GET", page: 1}]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      expect(await usageRecordsFor(context.user, XHS_BILLING_METHODS.search.methodKey))
+      const records = await usageRecordsFor(context.user, XHS_BILLING_METHODS.search.methodKey);
+      expect(records)
         .toEqual([expect.objectContaining({
           pricing: "unpriced",
           outcome: "settled",
           chargeSubunits: 0n,
         })]);
+      const inspection = await inspectGatekeeperMetering(context.username);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.search.methodKey, {
+        state: "settled",
+        pricing: "unpriced",
+        snapshotChargeSubunits: 0n,
+        recordChargeSubunits: 0n,
+      });
+      expectPrivateDiagnosticsAbsent({
+        records,
+        inspection,
+        workerLogs: harness.server.getLogs().slice(logStart),
+      });
     } finally {
       await updateRate(
         XHS_BILLING_METHODS.search.methodKey,
@@ -838,6 +1051,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
 
   it("releases a local validation failure before any TikHub request", async () => {
     resetXiaohongshu("success");
+    const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsxhspreexec");
     try {
       const before = await context.user.getUsageCreditBalance();
@@ -846,11 +1060,26 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
 
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      expect(await usageRecordsFor(context.user, XHS_BILLING_METHODS.detail.methodKey))
+      const records = await usageRecordsFor(context.user, XHS_BILLING_METHODS.detail.methodKey);
+      expect(records)
         .toEqual([expect.objectContaining({
           outcome: "failed-before-execution",
           chargeSubunits: null,
         })]);
+      const inspection = await inspectGatekeeperMetering(context.username);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.detail.methodKey, {
+        state: "failed-before-execution",
+        pricing: "priced",
+        snapshotChargeSubunits: XHS_CHARGE_SUBUNITS,
+        recordChargeSubunits: null,
+      });
+      expectPrivateDiagnosticsAbsent({
+        records,
+        inspection,
+        workerLogs: harness.server.getLogs().slice(logStart),
+      });
     } finally {
       disposeUser(context);
     }
@@ -880,16 +1109,19 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
           outcome: "usage-unknown",
           chargeSubunits: null,
         })]);
-      expect(await inspectGatekeeperMetering(context.username)).toEqual(expect.objectContaining({
-        attempts: [expect.objectContaining({
-          state: "usage-unknown",
-          reservationAmountSubunits: XHS_CHARGE_SUBUNITS.toString(),
-        })],
-        chronologyValid: true,
-        reservationMatchesOperation: true,
-        terminalRecordLinked: true,
-      }));
-      expectPrivateDiagnosticsAbsent(harness.server.getLogs().slice(logStart));
+      const inspection = await inspectGatekeeperMetering(context.username);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.search.methodKey, {
+        state: "usage-unknown",
+        pricing: "priced",
+        snapshotChargeSubunits: XHS_CHARGE_SUBUNITS,
+        recordChargeSubunits: null,
+      });
+      expectPrivateDiagnosticsAbsent({
+        inspection,
+        workerLogs: harness.server.getLogs().slice(logStart),
+      });
     } finally {
       disposeUser(context);
     }
@@ -897,6 +1129,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
 
   it("does not call TikHub when the authoritative reservation fails", async () => {
     resetXiaohongshu("success");
+    const logStart = harness.server.getLogs().length;
     const context = await newUgcAdsUser("ugcadsxhsreservation");
     const before = await context.user.getUsageCreditBalance();
     await updateRate(
@@ -909,6 +1142,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
       expect(await usageRecordsFor(context.user, XHS_BILLING_METHODS.search.methodKey)).toEqual([]);
+      expectPrivateDiagnosticsAbsent(harness.server.getLogs().slice(logStart));
     } finally {
       await updateRate(
         XHS_BILLING_METHODS.search.methodKey,
@@ -921,6 +1155,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
 
   it("keeps production Xiaohongshu observations shareable with workspace collaborators", async () => {
     resetXiaohongshu("empty");
+    const logStart = harness.server.getLogs().length;
     const ownerContext = await newUgcAdsUser("ugcadsxhsowner");
     const collaboratorPublicApi = connect(harness.url);
     const laterPublicApi = connect(harness.url);
@@ -945,20 +1180,36 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
       collaboratorSession = await openUgcAdsSession(collaboratorWorkspace);
 
       await expect(collaboratorSession.searchXiaohongshuNotes(XHS_KEYWORD)).resolves.toEqual([]);
-      expect(await usageRecordsFor(
+      const records = await usageRecordsFor(
         collaborator,
         XHS_BILLING_METHODS.search.methodKey,
-      )).toEqual([expect.objectContaining({
+      );
+      expect(records).toEqual([expect.objectContaining({
         source: "direct-user",
         outcome: "settled",
         chargeSubunits: XHS_CHARGE_SUBUNITS,
       })]);
+      expect(physicalCalls).toEqual([{path: XHS_SEARCH_PATH, method: "GET", page: 1}]);
+      const inspection = await inspectGatekeeperMetering(collaboratorName);
+      expect(inspection.attempts).toHaveLength(1);
+      expect(inspection.usageRecords).toHaveLength(1);
+      expectOneLifecycle(inspection, XHS_BILLING_METHODS.search.methodKey, {
+        state: "settled",
+        pricing: "priced",
+        snapshotChargeSubunits: XHS_CHARGE_SUBUNITS,
+        recordChargeSubunits: XHS_CHARGE_SUBUNITS,
+      });
       expect(await usageRecordsFor(
         ownerContext.user,
         XHS_BILLING_METHODS.search.methodKey,
       )).toEqual([]);
       // A shipping observation that requested withholding would make this later share fail.
       expect(await ownerContext.workspace.addCollaborator(laterName, "use")).not.toBeNull();
+      expectPrivateDiagnosticsAbsent({
+        records,
+        inspection,
+        workerLogs: harness.server.getLogs().slice(logStart),
+      });
     } finally {
       collaboratorSession?.[Symbol.dispose]();
       collaboratorWorkspace?.[Symbol.dispose]();
@@ -995,7 +1246,8 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         reservedSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
-      await updateOfficialAccountRate(
+      await updateRate(
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
         OFFICIAL_ACCOUNT_CHARGE_SUBUNITS + 11n,
         "Change the rate after the UGC Ads Charge Snapshot",
       );
@@ -1034,7 +1286,10 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
-      const usageRecords = await officialAccountUsageRecords(context.user);
+      const usageRecords = await usageRecordsFor(
+        context.user,
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      );
       expect(usageRecords).toEqual([expect.objectContaining({
         source: "direct-user",
         vendorId: VENDOR_ID,
@@ -1079,7 +1334,10 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         reservationMatchesOperation: true,
         terminalRecordLinked: true,
       });
-      expect(await officialAccountUsageRecords(context.user)).toEqual(usageRecords);
+      expect(await usageRecordsFor(
+        context.user,
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      )).toEqual(usageRecords);
       expect(await context.user.getUsageCreditBalance()).toEqual({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
@@ -1095,7 +1353,8 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
       });
     } finally {
       releaseFirstRequest();
-      await updateOfficialAccountRate(
+      await updateRate(
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
         OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         "Restore the UGC Ads priced rate",
       );
@@ -1115,7 +1374,10 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      const usageRecords = await officialAccountUsageRecords(context.user);
+      const usageRecords = await usageRecordsFor(
+        context.user,
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      );
       expect(usageRecords).toEqual([expect.objectContaining({
         outcome: "failed-before-execution",
         chargeSubunits: null,
@@ -1154,7 +1416,10 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         reservedSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
-      const usageRecords = await officialAccountUsageRecords(context.user);
+      const usageRecords = await usageRecordsFor(
+        context.user,
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      );
       expect(usageRecords).toEqual([expect.objectContaining({
         outcome: "usage-unknown",
         chargeSubunits: null,
@@ -1177,7 +1442,11 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
   });
 
   it("records visible Unpriced Use without changing the balance", async () => {
-    await updateOfficialAccountRate(null, "Exercise visible UGC Ads Unpriced Use");
+    await updateRate(
+      OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      null,
+      "Exercise visible UGC Ads Unpriced Use",
+    );
     resetTikHub("routineSuccess");
     const context = await newUgcAdsUser("ugcadsunpriced");
     try {
@@ -1186,7 +1455,10 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toHaveLength(2);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      const usageRecords = await officialAccountUsageRecords(context.user);
+      const usageRecords = await usageRecordsFor(
+        context.user,
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      );
       expect(usageRecords).toEqual([expect.objectContaining({
         pricing: "unpriced",
         outcome: "settled",
@@ -1209,7 +1481,8 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         terminalRecordLinked: true,
       }));
     } finally {
-      await updateOfficialAccountRate(
+      await updateRate(
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
         OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         "Restore the UGC Ads priced rate",
       );
@@ -1221,7 +1494,8 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
     resetTikHub("routineSuccess");
     const context = await newUgcAdsUser("ugcadsreservation");
     const before = await context.user.getUsageCreditBalance();
-    await updateOfficialAccountRate(
+    await updateRate(
+      OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
       before.availableSubunits + 1n,
       "Force a UGC Ads authoritative reservation failure",
     );
@@ -1231,9 +1505,13 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      expect(await officialAccountUsageRecords(context.user)).toEqual([]);
+      expect(await usageRecordsFor(
+        context.user,
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+      )).toEqual([]);
     } finally {
-      await updateOfficialAccountRate(
+      await updateRate(
+        OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
         OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         "Restore the UGC Ads priced rate",
       );
