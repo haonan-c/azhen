@@ -26,15 +26,14 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const UGC_ADS_DIR = resolve(HERE, "../../gatekeeper-ugc-ads");
 const VENDOR_ID = "ugc_ads";
 const API_KEY = "fixture-tikhub-credential";
-const METHOD = UGC_ADS_BILLING_METHODS["UgcAdsSession.searchOfficialAccountArticles"];
-const XHS_METHOD = UGC_ADS_BILLING_METHODS["UgcAdsSession.searchXiaohongshuNotes"];
-const CHARGE = 41n;
-const XHS_CHARGE = 43n;
+const OFFICIAL_ACCOUNT_BILLING_METHOD =
+  UGC_ADS_BILLING_METHODS["UgcAdsSession.searchOfficialAccountArticles"];
+const OFFICIAL_ACCOUNT_CHARGE_SUBUNITS = 41n;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const QUERY_TERMS = Array.from({length: 5}, (_, index) => `private-query-${index + 1}`);
+// The production Official Account client has no GET operation. Both upstream calls are POSTs.
 const SEARCH_PATH = "/api/v1/wechat_search/v2/fetch_search";
 const STATS_PATH = "/api/v1/wechat_mp/v2/fetch_article_stats";
-const XHS_SEARCH_PATH = "/api/v1/xiaohongshu/app_v2/search_notes";
 
 type TikHubMode =
   "maximum" | "simple" | "response-loss" | "timeout" | "provider-failure";
@@ -57,7 +56,16 @@ type OfficialAccountArticleSearchResult = {
   rawArticleCount: number;
   validArticleCount: number;
   successfulInteractionArticleCount: number;
-  warnings: unknown[];
+  articles: Array<{
+    title: string;
+    url: string;
+    accountName: string;
+    publishedAt: string;
+    matchedQueryTerms: string[];
+    summary?: string;
+    interactions?: {reads?: number; likes?: number};
+  }>;
+  warnings: Array<{code: string; articleUrl: string; message: string}>;
 };
 
 type UgcAdsSessionApi = {
@@ -65,16 +73,44 @@ type UgcAdsSessionApi = {
     queryTerms: string[],
     requestedWindowDays?: 7 | 30,
   ): Promise<OfficialAccountArticleSearchResult>;
-  searchXiaohongshuNotes(
-    keyword: string,
-    options?: {limit?: number},
-  ): Promise<unknown[]>;
 };
 
 type SafePhysicalCall = {
-  path: typeof SEARCH_PATH | typeof STATS_PATH | typeof XHS_SEARCH_PATH;
+  path: typeof SEARCH_PATH | typeof STATS_PATH;
   method: string;
   window?: "week" | "half_year";
+};
+
+type GatekeeperMeteringAttemptSnapshot = {
+  operationId: string;
+  attribution: {
+    vendorId: string;
+    billingMethodKey: string;
+    externalAccountId: string;
+  };
+  chargeSnapshot: {
+    kind: "gatekeeper";
+    pricing: "priced" | "unpriced";
+    vendorId: string;
+    billingMethodKey: string;
+    chargeSubunits: bigint;
+  };
+  reservationAmountSubunits: bigint;
+  reservationId: string | null;
+  state: "ready" | "started" | "settled" | "failed-before-execution" | "usage-unknown";
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  usageRecordId?: string;
+};
+
+type UserUsageAttemptReader = {
+  beginGatekeeperUsage(
+    operationId: string,
+    attribution: GatekeeperMeteringAttemptSnapshot["attribution"],
+    chargeSnapshot: GatekeeperMeteringAttemptSnapshot["chargeSnapshot"],
+  ): Promise<GatekeeperMeteringAttemptSnapshot>;
+  resumeGatekeeperUsage(operationId: string): Promise<GatekeeperMeteringAttemptSnapshot | null>;
 };
 
 let harness: Harness;
@@ -82,6 +118,7 @@ let interceptor: NetworkInterceptor;
 let adminPublicApi: ReturnType<typeof connect>;
 let authenticatedAdmin: RpcStub<AuthenticatedApi>;
 let admin: RpcStub<AdminApi>;
+let userUsageInspection: DurableObjectNamespace;
 let mode: TikHubMode = "simple";
 let physicalCalls: SafePhysicalCall[] = [];
 let statsAttempts = new Map<string, number>();
@@ -115,19 +152,6 @@ function assertProtocol(
   if (headers.get("content-type") !== "application/json" ||
       headers.get("accept") !== "application/json") {
     throw new Error("TikHub requests must use the documented JSON media types.");
-  }
-}
-
-function assertGetProtocol(method: string, headers: Headers, request: Request): void {
-  if (method !== "GET" || request.method !== "GET" || request.body !== null) {
-    throw new Error("TikHub Xiaohongshu search requests must use GET without a body.");
-  }
-  if (headers.get("authorization") !== `Bearer ${API_KEY}` ||
-      request.headers.get("authorization") !== `Bearer ${API_KEY}`) {
-    throw new Error("TikHub authorization is missing or invalid.");
-  }
-  if (headers.get("accept") !== "application/json") {
-    throw new Error("TikHub GET requests must accept JSON.");
   }
 }
 
@@ -176,20 +200,6 @@ function article(id: string) {
 
 const tikHubHandler: Handler = async (url, method, headers, request) => {
   if (url.hostname !== "api.tikhub.io") return null;
-  if (url.pathname === XHS_SEARCH_PATH) {
-    assertGetProtocol(method, headers, request);
-    const expectedKeys = [
-      "ai_mode", "keyword", "note_type", "page", "sort_type", "source", "time_filter",
-    ];
-    if (url.searchParams.get("keyword") !== "private-xhs-query" ||
-        url.searchParams.get("page") !== "1" ||
-        url.searchParams.size !== expectedKeys.length ||
-        !expectedKeys.every(key => url.searchParams.has(key))) {
-      throw new Error("TikHub Xiaohongshu search query does not match the protocol.");
-    }
-    physicalCalls.push({path: XHS_SEARCH_PATH, method});
-    return providerEnvelope({data: {items: []}, next_page: false});
-  }
   if (url.pathname !== SEARCH_PATH && url.pathname !== STATS_PATH) return null;
   assertProtocol(method, headers, request);
   const body: unknown = await request.json();
@@ -225,22 +235,16 @@ const tikHubHandler: Handler = async (url, method, headers, request) => {
   return providerEnvelope({read_num: 100 + statsAttempts.size, like_count: 7});
 };
 
-async function updateRate(amountSubunits: bigint | null, reason: string): Promise<void> {
+async function updateOfficialAccountRate(
+  amountSubunits: bigint | null,
+  reason: string,
+): Promise<void> {
   await admin.updateUsageRates([{
     kind: "gatekeeper-operation-rate",
     vendorId: VENDOR_ID,
-    billingMethodKey: METHOD.methodKey,
+    billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
     amountSubunits,
   }], reason);
-}
-
-async function priceXiaohongshuSearch(): Promise<void> {
-  await admin.updateUsageRates([{
-    kind: "gatekeeper-operation-rate",
-    vendorId: VENDOR_ID,
-    billingMethodKey: XHS_METHOD.methodKey,
-    amountSubunits: XHS_CHARGE,
-  }], "Price the UGC Ads Xiaohongshu GET tracer");
 }
 
 async function newUgcAdsUser(prefix: string): Promise<{
@@ -278,21 +282,29 @@ function disposeUser(context: Awaited<ReturnType<typeof newUgcAdsUser>>): void {
   context.publicApi[Symbol.dispose]();
 }
 
-async function operationRecords(user: RpcStub<AuthenticatedApi>) {
+async function officialAccountUsageRecords(user: RpcStub<AuthenticatedApi>) {
   return (await user.listOwnUsageRecords({limit: 100})).records.filter(
     record => record.kind === "gatekeeper" && record.vendorId === VENDOR_ID &&
-      record.billingMethodKey === METHOD.methodKey,
+      record.billingMethodKey === OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
   ) as UserGatekeeperUsageRecord[];
 }
 
-async function recordsForMethod(user: RpcStub<AuthenticatedApi>, billingMethodKey: string) {
-  return (await user.listOwnUsageRecords({limit: 100})).records.filter(
-    record => record.kind === "gatekeeper" && record.vendorId === VENDOR_ID &&
-      record.billingMethodKey === billingMethodKey,
-  ) as UserGatekeeperUsageRecord[];
+function userUsageAttemptReader(username: string): UserUsageAttemptReader {
+  return userUsageInspection.get(userUsageInspection.idFromName(username)) as unknown as
+    UserUsageAttemptReader;
 }
 
-async function administratorRecords(username: string) {
+async function exactMeteringAttempt(
+  username: string,
+  usageRecord: UserGatekeeperUsageRecord,
+): Promise<GatekeeperMeteringAttemptSnapshot> {
+  const operationId = usageRecord.id.slice("usage-record:".length);
+  const attempt = await userUsageAttemptReader(username).resumeGatekeeperUsage(operationId);
+  if (!attempt) throw new Error("Expected the production User DO Metering Attempt.");
+  return attempt;
+}
+
+async function administratorUsageRecordsForUser(username: string) {
   using usage = await admin.getUsageApi();
   const registered = await waitFor("the UGC Ads User Registry entry", async () => {
     const result = await usage.searchUsers({query: username, limit: 2});
@@ -316,14 +328,30 @@ beforeAll(async () => {
         config.vars = {...config.vars, TIKHUB_API_KEY: API_KEY};
       },
     }],
+    patchWorkshop(config) {
+      Object.assign(config, {
+        // TestHarness exposes this existing public DO RPC only to this in-memory test deployment.
+        // Production configuration remains unchanged and no diagnostic endpoint is added.
+        durable_objects: {bindings: [{
+          name: "USAGE_TEST_USERS",
+          class_name: "UserDurableObject",
+        }]},
+      });
+    },
   });
+  const workshopEnv = await harness.server
+    .getWorker<{USAGE_TEST_USERS: DurableObjectNamespace}>()
+    .getEnv();
+  userUsageInspection = workshopEnv.USAGE_TEST_USERS;
   adminPublicApi = connect(harness.url);
   authenticatedAdmin = await signUp(adminPublicApi, ADMIN_USERNAME);
   const capability = await authenticatedAdmin.getAdminApi();
   if (!capability) throw new Error("Expected the deployment administrator capability.");
   admin = capability;
-  await updateRate(CHARGE, "Price the UGC Ads Official Account operation");
-  await priceXiaohongshuSearch();
+  await updateOfficialAccountRate(
+    OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+    "Price the UGC Ads Official Account operation",
+  );
 });
 
 afterAll(async () => {
@@ -347,15 +375,16 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
       const resultPromise = context.session.searchOfficialAccountArticles(QUERY_TERMS);
       await firstRequestStarted;
       expect(await context.user.getUsageCreditBalance()).toEqual({
-        reservedSubunits: CHARGE,
-        availableSubunits: before.availableSubunits - CHARGE,
+        reservedSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
-      await updateRate(CHARGE + 11n, "Change the rate after the UGC Ads Charge Snapshot");
+      await updateOfficialAccountRate(
+        OFFICIAL_ACCOUNT_CHARGE_SUBUNITS + 11n,
+        "Change the rate after the UGC Ads Charge Snapshot",
+      );
       releaseFirstRequest();
-      const [firstResult, duplicateDelivery] = await Promise.all([resultPromise, resultPromise]);
-      const result = firstResult as OfficialAccountArticleSearchResult;
+      const result = await resultPromise as OfficialAccountArticleSearchResult;
 
-      expect(duplicateDelivery).toEqual(firstResult);
       expect(result).toMatchObject({
         requestedWindowDays: 7,
         actualWindowDays: 30,
@@ -364,27 +393,83 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         validArticleCount: 15,
         successfulInteractionArticleCount: 14,
       });
-      expect(result.warnings).toHaveLength(1);
+      const partiallyEnrichedArticleUrl = "https://mp.weixin.qq.com/s/month-1-1";
+      expect(result.articles).toHaveLength(15);
+      expect(result.articles.find(
+        candidate => candidate.url === partiallyEnrichedArticleUrl,
+      )).toEqual({
+        url: partiallyEnrichedArticleUrl,
+        matchedQueryTerms: [QUERY_TERMS[0]],
+        title: "private-title-month-1-1",
+        accountName: "private-account-month-1-1",
+        publishedAt: expect.any(String),
+        summary: "private-summary-month-1-1",
+      });
+      expect(result.warnings).toEqual([{
+        code: "interaction_service_unavailable",
+        articleUrl: partiallyEnrichedArticleUrl,
+        message: "Interaction data remained unavailable after a temporary-service retry.",
+      }]);
       expect(physicalCalls.filter(call => call.path === SEARCH_PATH)).toHaveLength(10);
       expect(physicalCalls.filter(call => call.path === STATS_PATH)).toHaveLength(16);
       expect(physicalCalls.every(call => call.method === "POST")).toBe(true);
       expect(await context.user.getUsageCreditBalance()).toEqual({
         reservedSubunits: 0n,
-        availableSubunits: before.availableSubunits - CHARGE,
+        availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
-      expect(await operationRecords(context.user)).toEqual([expect.objectContaining({
+      const usageRecords = await officialAccountUsageRecords(context.user);
+      expect(usageRecords).toEqual([expect.objectContaining({
         source: "direct-user",
         vendorId: VENDOR_ID,
-        billingMethodKey: METHOD.methodKey,
+        billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
         externalAccountId: "ugc-ads-deployment",
         pricing: "priced",
         outcome: "settled",
-        chargeSubunits: CHARGE,
+        chargeSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       })]);
+      const operationId = usageRecords[0].id.slice("usage-record:".length);
+      const attempt = await exactMeteringAttempt(context.username, usageRecords[0]);
+      expect(attempt).toEqual(expect.objectContaining({
+        operationId,
+        attribution: expect.objectContaining({
+          vendorId: VENDOR_ID,
+          billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+          externalAccountId: "ugc-ads-deployment",
+        }),
+        chargeSnapshot: expect.objectContaining({
+          kind: "gatekeeper",
+          pricing: "priced",
+          vendorId: VENDOR_ID,
+          billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
+          chargeSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        }),
+        reservationAmountSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        reservationId: operationId,
+        state: "settled",
+        startedAt: expect.any(String),
+        completedAt: usageRecords[0].createdAt,
+        usageRecordId: `gatekeeper-usage:${operationId}`,
+      }));
+      expect(attempt.createdAt <= attempt.startedAt!).toBe(true);
+      expect(attempt.startedAt! <= attempt.completedAt!).toBe(true);
+      expect(await userUsageAttemptReader(context.username).beginGatekeeperUsage(
+        attempt.operationId,
+        attempt.attribution,
+        attempt.chargeSnapshot,
+      )).toEqual(attempt);
+      expect(await officialAccountUsageRecords(context.user)).toEqual(usageRecords);
+      expect(await context.user.getUsageCreditBalance()).toEqual({
+        reservedSubunits: 0n,
+        availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+      });
+      expect(physicalCalls.filter(call => call.path === SEARCH_PATH)).toHaveLength(10);
+      expect(physicalCalls.filter(call => call.path === STATS_PATH)).toHaveLength(16);
 
-      const usageJson = JSON.stringify({
-        user: await operationRecords(context.user),
-        administrator: await administratorRecords(context.username),
+      const diagnosticJson = JSON.stringify({
+        userUsageRecords: usageRecords,
+        exactMeteringAttempt: attempt,
+        administratorUsageRecords: await administratorUsageRecordsForUser(context.username),
+        workerLogs: harness.server.getLogs(),
       }, (_key, value) => typeof value === "bigint" ? value.toString() : value);
       for (const forbidden of [
         ...QUERY_TERMS,
@@ -397,11 +482,14 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         API_KEY,
         "authorization",
       ]) {
-        expect(usageJson).not.toContain(forbidden);
+        expect(diagnosticJson).not.toContain(forbidden);
       }
     } finally {
       releaseFirstRequest();
-      await updateRate(CHARGE, "Restore the UGC Ads priced rate");
+      await updateOfficialAccountRate(
+        OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        "Restore the UGC Ads priced rate",
+      );
       disposeUser(context);
     }
   }, 30_000);
@@ -418,10 +506,18 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      expect(await operationRecords(context.user)).toEqual([expect.objectContaining({
+      const usageRecords = await officialAccountUsageRecords(context.user);
+      expect(usageRecords).toEqual([expect.objectContaining({
         outcome: "failed-before-execution",
         chargeSubunits: null,
       })]);
+      const attempt = await exactMeteringAttempt(context.username, usageRecords[0]);
+      expect(attempt).toEqual(expect.objectContaining({
+        state: "failed-before-execution",
+        reservationAmountSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        startedAt: expect.any(String),
+        completedAt: usageRecords[0].createdAt,
+      }));
     } finally {
       disposeUser(context);
     }
@@ -441,20 +537,29 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toHaveLength(expectedCalls);
       expect(await context.user.getUsageCreditBalance()).toEqual({
-        reservedSubunits: CHARGE,
-        availableSubunits: before.availableSubunits - CHARGE,
+        reservedSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
-      expect(await operationRecords(context.user)).toEqual([expect.objectContaining({
+      const usageRecords = await officialAccountUsageRecords(context.user);
+      expect(usageRecords).toEqual([expect.objectContaining({
         outcome: "usage-unknown",
         chargeSubunits: null,
       })]);
+      expect(await exactMeteringAttempt(context.username, usageRecords[0])).toEqual(
+        expect.objectContaining({
+          state: "usage-unknown",
+          reservationAmountSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+          startedAt: expect.any(String),
+          completedAt: usageRecords[0].createdAt,
+        }),
+      );
     } finally {
       disposeUser(context);
     }
   });
 
   it("records visible Unpriced Use without changing the balance", async () => {
-    await updateRate(null, "Exercise visible UGC Ads Unpriced Use");
+    await updateOfficialAccountRate(null, "Exercise visible UGC Ads Unpriced Use");
     resetTikHub("simple");
     const context = await newUgcAdsUser("ugcadsunpriced");
     try {
@@ -463,13 +568,30 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toHaveLength(2);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      expect(await operationRecords(context.user)).toEqual([expect.objectContaining({
+      const usageRecords = await officialAccountUsageRecords(context.user);
+      expect(usageRecords).toEqual([expect.objectContaining({
         pricing: "unpriced",
         outcome: "settled",
         chargeSubunits: 0n,
       })]);
+      expect(await exactMeteringAttempt(context.username, usageRecords[0])).toEqual(
+        expect.objectContaining({
+          chargeSnapshot: expect.objectContaining({
+            pricing: "unpriced",
+            chargeSubunits: 0n,
+          }),
+          reservationAmountSubunits: 0n,
+          reservationId: null,
+          state: "settled",
+          startedAt: expect.any(String),
+          completedAt: usageRecords[0].createdAt,
+        }),
+      );
     } finally {
-      await updateRate(CHARGE, "Restore the UGC Ads priced rate");
+      await updateOfficialAccountRate(
+        OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        "Restore the UGC Ads priced rate",
+      );
       disposeUser(context);
     }
   });
@@ -478,7 +600,7 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
     resetTikHub("simple");
     const context = await newUgcAdsUser("ugcadsreservation");
     const before = await context.user.getUsageCreditBalance();
-    await updateRate(
+    await updateOfficialAccountRate(
       before.availableSubunits + 1n,
       "Force a UGC Ads authoritative reservation failure",
     );
@@ -488,41 +610,12 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
 
       expect(physicalCalls).toEqual([]);
       expect(await context.user.getUsageCreditBalance()).toEqual(before);
-      expect(await operationRecords(context.user)).toEqual([]);
+      expect(await officialAccountUsageRecords(context.user)).toEqual([]);
     } finally {
-      await updateRate(CHARGE, "Restore the UGC Ads priced rate");
-      disposeUser(context);
-    }
-  });
-
-  it("validates the nearest real UGC Ads GET path without inventing an Official Account GET", async () => {
-    resetTikHub("simple");
-    const context = await newUgcAdsUser("ugcadsgetprotocol");
-    try {
-      const before = await context.user.getUsageCreditBalance();
-      await expect(context.session.searchXiaohongshuNotes(
-        "private-xhs-query",
-        {limit: 1},
-      )).resolves.toEqual([]);
-
-      expect(physicalCalls).toEqual([{path: XHS_SEARCH_PATH, method: "GET"}]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
-        reservedSubunits: 0n,
-        availableSubunits: before.availableSubunits - XHS_CHARGE,
-      });
-      expect(await recordsForMethod(context.user, XHS_METHOD.methodKey)).toEqual([
-        expect.objectContaining({
-          pricing: "priced",
-          outcome: "settled",
-          chargeSubunits: XHS_CHARGE,
-        }),
-      ]);
-      const usageJson = JSON.stringify(
-        await recordsForMethod(context.user, XHS_METHOD.methodKey),
-        (_key, value) => typeof value === "bigint" ? value.toString() : value,
+      await updateOfficialAccountRate(
+        OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
+        "Restore the UGC Ads priced rate",
       );
-      expect(usageJson).not.toContain("private-xhs-query");
-    } finally {
       disposeUser(context);
     }
   });

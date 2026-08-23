@@ -126,6 +126,9 @@ describe("UGC Ads Session billing", () => {
   });
 
   it("settles Official Account use before observation authorization is withheld", async () => {
+    // Shipping UGC Ads observations do not prohibit sharing or exclude an observer, so the real
+    // host authorizer has no supported configuration that withholds them. This public Session seam
+    // verifies that a host rejection still happens only after the Metering Attempt is terminal.
     const trace: string[] = [];
     const authorizationError = new Error("authorization withheld");
     vi.stubGlobal("fetch", vi.fn(async input => {
