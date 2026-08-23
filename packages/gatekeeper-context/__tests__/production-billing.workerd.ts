@@ -199,6 +199,32 @@ function snapshotText(snapshot: UsageAccountSnapshot): string {
     typeof value === "bigint" ? value.toString() : value);
 }
 
+function captureConsoleCalls(): () => string {
+  const log = vi.spyOn(console, "log");
+  const info = vi.spyOn(console, "info");
+  const warn = vi.spyOn(console, "warn");
+  const error = vi.spyOn(console, "error");
+  return () => JSON.stringify([
+    ...log.mock.calls,
+    ...info.mock.calls,
+    ...warn.mock.calls,
+    ...error.mock.calls,
+  ]);
+}
+
+function expectUsagePrivacy(
+  snapshot: UsageAccountSnapshot,
+  sentinels: Record<string, string>,
+  consoleCalls: () => string,
+): void {
+  const facts = snapshotText(snapshot);
+  const billingLogs = consoleCalls();
+  for (const sentinel of Object.values(sentinels)) {
+    expect(facts).not.toContain(sentinel);
+    expect(billingLogs).not.toContain(sentinel);
+  }
+}
+
 async function rejectionMessage(run: () => Promise<unknown>): Promise<string> {
   try {
     await run();
@@ -352,10 +378,7 @@ describe("production Context billing runtime", () => {
   });
 
   it("meters Slash Command invoke once without billing its delegated read", async () => {
-    const log = vi.spyOn(console, "log");
-    const info = vi.spyOn(console, "info");
-    const warn = vi.spyOn(console, "warn");
-    const error = vi.spyOn(console, "error");
+    const consoleCalls = captureConsoleCalls();
     const user = await newUser();
     const sharingDomain = `skill-domain-${crypto.randomUUID()}`;
     const accountId = `skill-account-${crypto.randomUUID()}`;
@@ -432,17 +455,7 @@ describe("production Context billing runtime", () => {
     expect(attempt.usageRecordId).toBe(usageRecord.id);
     expect(usageRecord.ledgerEntryId).toBe(usageCharges[0]?.id);
 
-    const facts = snapshotText(invocation.snapshot);
-    const billingLogs = JSON.stringify([
-      ...log.mock.calls,
-      ...info.mock.calls,
-      ...warn.mock.calls,
-      ...error.mock.calls,
-    ]);
-    for (const sentinel of Object.values(sentinels)) {
-      expect(facts).not.toContain(sentinel);
-      expect(billingLogs).not.toContain(sentinel);
-    }
+    expectUsagePrivacy(invocation.snapshot, sentinels, consoleCalls);
   });
 
   it("settles before authorization withholding and rejects before business execution", async () => {
@@ -497,10 +510,7 @@ describe("production Context billing runtime", () => {
   });
 
   it("keeps host attribution, idempotent finance, and observed content out of Usage facts and logs", async () => {
-    const log = vi.spyOn(console, "log");
-    const info = vi.spyOn(console, "info");
-    const warn = vi.spyOn(console, "warn");
-    const error = vi.spyOn(console, "error");
+    const consoleCalls = captureConsoleCalls();
     const sentinels = {
       sharingDomain: `private-sharing-domain-${crypto.randomUUID()}`,
       query: `private-query-${crypto.randomUUID()}`,
@@ -577,16 +587,6 @@ describe("production Context billing runtime", () => {
     expect(first.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
     expect(second.snapshot.gatekeeperMeteringAttempts).toHaveLength(2);
 
-    const facts = snapshotText(queried.snapshot);
-    const billingLogs = JSON.stringify([
-      ...log.mock.calls,
-      ...info.mock.calls,
-      ...warn.mock.calls,
-      ...error.mock.calls,
-    ]);
-    for (const sentinel of Object.values(sentinels)) {
-      expect(facts).not.toContain(sentinel);
-      expect(billingLogs).not.toContain(sentinel);
-    }
+    expectUsagePrivacy(queried.snapshot, sentinels, consoleCalls);
   });
 });
