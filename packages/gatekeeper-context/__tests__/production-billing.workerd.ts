@@ -10,17 +10,25 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { UsageAccountSnapshot } from "../../workshop-backend/src/usage-account.js";
-import type { UserDurableObject } from "../../workshop-backend/src/user.js";
+import { UserDurableObject } from "../../workshop-backend/src/user.js";
 import { CONTEXT_BILLING_METHODS } from "../src/billing-methods.js";
-import type { ContextCollectionDurableObject } from "../src/context-collection.js";
-import type { ContextApi, ContextListingEntry } from "../src/context-types.js";
+import { ContextCollectionDurableObject } from "../src/context-collection.js";
+import type {
+  ContextApi,
+  ContextCollectionMetadata,
+  ContextListingEntry,
+} from "../src/context-types.js";
+import { MAX_DOCUMENT_BODY_BYTES } from "../src/context-types.js";
 import { domainName } from "../src/domain.js";
 import type { ContextGatekeeper } from "../src/library-gatekeeper.js";
-import type { ContextAccount } from "../src/library-gatekeeper.js";
 import type { LibraryRegistryDurableObject } from "../src/registry-do.js";
 import type { LibraryReadSession } from "../src/library-read.js";
 import { UserLibraryDurableObject } from "../src/user-library.js";
-import type { AdminSettings } from "./production-worker.js";
+import type {
+  AdminSettings,
+  ArtifactRepoMock,
+  ArtifactsTrace,
+} from "./production-worker.js";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv {
@@ -30,6 +38,8 @@ declare module "cloudflare:test" {
     TEST_CONTEXT_GATEKEEPER: DurableObjectNamespace<ContextGatekeeper>;
     TEST_USER: DurableObjectNamespace<UserDurableObject>;
     TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
+    TEST_ARTIFACTS_TRACE: Fetcher<ArtifactsTrace>;
+    TEST_ARTIFACT_REPO: DurableObjectNamespace<ArtifactRepoMock>;
   }
 }
 
@@ -50,16 +60,6 @@ const PRICED_METHODS = [
     CONTEXT_BILLING_METHODS[method].methodKey),
 ];
 
-type ContextExports = {
-  ContextAccount: (options: {
-    props: { sharingDomain: string; accountId: string };
-  }) => Fetcher<ContextAccount>;
-  ContextGatekeeper: (options: {
-    props: { sharingDomain: string; accountId: string };
-  }) => DurableObjectClass<ContextGatekeeper>;
-  ObserverVerifier: (options: object) => Fetcher<GatekeeperUserVerifier>;
-};
-
 async function runManagement<T>(options: {
   user: DurableObjectStub<UserDurableObject>;
   sharingDomain: string;
@@ -67,11 +67,9 @@ async function runManagement<T>(options: {
   isAdmin?: boolean;
   run: (ui: ContextApi, iframeHtml: string) => Promise<T>;
 }) {
-  return runInDurableObject(options.user, async user => {
-    const state = (user as unknown as { ctx: DurableObjectState }).ctx;
-    const exports = state.exports as unknown as ContextExports;
+  return runInDurableObject(options.user, async (user, state) => {
     if (await user.describeConnectedAccount(1) === null) {
-      const account = exports.ContextAccount({
+      const account = state.exports.ContextAccount({
         props: { sharingDomain: options.sharingDomain, accountId: options.accountId },
       });
       const description = await account.describe();
@@ -182,11 +180,13 @@ async function addCollection(options: {
   collectionId: string;
   title: string;
   documents: Array<{ path: string; description: string; body: string }>;
+  source?: "web" | "git";
+  created?: Date;
 }) {
   const collection = env.TEST_CONTEXT_COLLECTION.getByName(
     domainName(options.sharingDomain, options.collectionId),
   );
-  const now = new Date();
+  const now = options.created ?? new Date();
   await collection.initialize({
     id: options.collectionId,
     title: options.title,
@@ -195,7 +195,9 @@ async function addCollection(options: {
     created: now,
     lastUpdated: now,
     documentCount: 0,
-    content: { source: "web" },
+    content: options.source === "git"
+      ? { source: "git", remote: "", branch: "main", lastRefreshedAt: now }
+      : { source: "web" },
   }, options.sharingDomain, options.accountId);
   await env.TEST_USER_LIBRARY.getByName(
     domainName(options.sharingDomain, options.accountId),
@@ -215,11 +217,9 @@ async function runSession<T>(options: {
   withholdObservation?: boolean;
   run: (context: SessionContext) => Promise<T>;
 }) {
-  return runInDurableObject(options.user, async (user) => {
-    const state = (user as unknown as { ctx: DurableObjectState }).ctx;
-    const exports = state.exports as unknown as ContextExports;
+  return runInDurableObject(options.user, async (user, state) => {
     const gatekeeper = state.facets.get<ContextGatekeeper>(crypto.randomUUID(), () => ({
-      class: exports.ContextGatekeeper({
+      class: state.exports.ContextGatekeeper({
         props: {
           sharingDomain: options.sharingDomain,
           accountId: options.accountId,
@@ -231,7 +231,12 @@ async function runSession<T>(options: {
     using session = await gatekeeper.startSession(authorizerStub);
     const result = await options.run({
       gatekeeper,
-      createObserverVerifier: () => exports.ObserverVerifier({}),
+      createObserverVerifier: () => state.exports.ContextVerifier({
+        props: {
+          sharingDomain: options.sharingDomain,
+          accountId: `observer-account-${crypto.randomUUID()}`,
+        },
+      }),
       session,
       authorizer,
     });
@@ -279,6 +284,21 @@ async function rejectionMessage(run: () => Promise<unknown>): Promise<string> {
   }
 }
 
+function createCollectionWithUntrustedIframeData(
+  ui: ContextApi,
+  visibility: "private" | "public",
+  iframeData: Record<string, unknown>,
+): Promise<ContextCollectionMetadata> {
+  return Reflect.apply(ui.createContextCollection, ui, [
+    "Adversarial collection",
+    "Adversarial description",
+    visibility,
+    undefined,
+    "web",
+    iframeData,
+  ]);
+}
+
 beforeAll(async () => {
   await env.TEST_ADMIN_SETTINGS.getByName("").configure(PRICED_METHODS.map(billingMethodKey => ({
     kind: "gatekeeper-operation-rate" as const,
@@ -309,7 +329,7 @@ describe("production Context billing runtime", () => {
     expect(opened.result.iframeHtml).not.toBe("");
     expect(opened.result.viewer).toEqual({
       isAdmin: false,
-      supportsGitCollections: false,
+      supportsGitCollections: true,
     });
     expect(opened.result.canWrite).toBe(false);
     expect(opened.snapshot.gatekeeperMeteringAttempts).toEqual([]);
@@ -473,18 +493,8 @@ describe("production Context billing runtime", () => {
           isAdmin: true,
           billingAuthorizer: {},
         };
-        const createWithExtraIframeData = ui.createContextCollection as unknown as (
-          title: string,
-          description: string,
-          visibility: "private",
-          icon: undefined,
-          source: "web",
-          iframeData: typeof forgedAuthority,
-        ) => Promise<{ id: string }>;
-        const collection = await createWithExtraIframeData(
-          "Shared collection", "Shared description", "private", undefined, "web",
-          forgedAuthority,
-        );
+        const collection = await createCollectionWithUntrustedIframeData(
+          ui, "private", forgedAuthority);
         await ui.getContextCollectionMetadata(collection.id);
         return collection.id;
       },
@@ -517,20 +527,8 @@ describe("production Context billing runtime", () => {
       user: nonAdmin,
       sharingDomain,
       accountId: crypto.randomUUID(),
-      run: async ui => {
-        const createWithExtraIframeData = ui.createContextCollection as unknown as (
-          title: string,
-          description: string,
-          visibility: "public",
-          icon: undefined,
-          source: "web",
-          iframeData: { isAdmin: true },
-        ) => Promise<unknown>;
-        return rejectionMessage(() => createWithExtraIframeData(
-          "Forged public collection", "Must remain denied", "public", undefined, "web",
-          { isAdmin: true },
-        ));
-      },
+      run: ui => rejectionMessage(() =>
+        createCollectionWithUntrustedIframeData(ui, "public", { isAdmin: true })),
     });
     expect(denied.result).toBe("Admin access required.");
     expect(denied.snapshot.gatekeeperMeteringAttempts).toEqual([]);
@@ -586,6 +584,67 @@ describe("production Context billing runtime", () => {
     });
   });
 
+  it("keeps a committed mutation settled when completion responses are lost", async () => {
+    const user = await newUser();
+    const sharingDomain = `delivery-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const collectionId = crypto.randomUUID();
+    const path = `delivered-${crypto.randomUUID()}.md`;
+    const body = `delivered-body-${crypto.randomUUID()}`;
+    await addCollection({
+      sharingDomain,
+      accountId,
+      collectionId,
+      title: "Delivery collection",
+      documents: [],
+    });
+    const before = await user.getUsageCreditBalance();
+    const completeGatekeeperUsage = UserDurableObject.prototype.completeGatekeeperUsage;
+    let completionCalls = 0;
+    const completionTransport = vi.spyOn(
+      UserDurableObject.prototype, "completeGatekeeperUsage")
+      .mockImplementation(async function(operationId, completion) {
+        const record = await completeGatekeeperUsage.call(this, operationId, completion);
+        completionCalls++;
+        if (completionCalls <= 2) {
+          throw new Error("Simulated completion response loss.");
+        }
+        return record;
+      });
+
+    const dropped = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      // The test-only host transport seam accepts completion durably, then loses its first two
+      // replies. ContextApi and the Collection DO stay on their shipping paths.
+      run: ui => rejectionMessage(() => ui.putContextDocument(collectionId, path, {
+          description: "Committed before result serialization",
+          body,
+        })),
+    });
+    expect(dropped.result).toBe("Simulated completion response loss.");
+    expect(completionCalls).toBe(2);
+    expect(completionTransport).toHaveBeenCalledTimes(4);
+
+    const snapshot = dropped.snapshot;
+    expect(await env.TEST_CONTEXT_COLLECTION.getByName(
+      domainName(sharingDomain, collectionId),
+    ).getContextDocument(path)).toMatchObject({ body });
+    const [attempt] = snapshot.gatekeeperMeteringAttempts;
+    expect(attempt).toMatchObject({
+      state: "settled",
+      attribution: {
+        billingMethodKey: CONTEXT_BILLING_METHODS["ContextApi.putContextDocument"].methodKey,
+      },
+    });
+    expect(snapshot.gatekeeperUsageRecords).toEqual([
+      expect.objectContaining({ operationId: attempt?.operationId, outcome: "settled" }),
+    ]);
+    expect(snapshot.reservedSubunits).toBe(0n);
+    expect(snapshot.availableSubunits).toBe(before.availableSubunits - PRICED_CHARGE);
+  });
+
   it("rejects authoritative billing before local management execution", async () => {
     const user = await newUser();
     const sharingDomain = `preexecution-domain-${crypto.randomUUID()}`;
@@ -615,7 +674,51 @@ describe("production Context billing runtime", () => {
     ).listOwnedCollections()).toEqual([]);
   });
 
-  it("keeps background artifact refresh outside local management billing", async () => {
+  it("validates document writes before billing or Collection DO dispatch", async () => {
+    const user = await newUser();
+    const sharingDomain = `validation-domain-${crypto.randomUUID()}`;
+    const accountId = crypto.randomUUID();
+    const collectionId = crypto.randomUUID();
+    await addCollection({
+      sharingDomain,
+      accountId,
+      collectionId,
+      title: "Validation collection",
+      documents: [],
+    });
+    const put = vi.spyOn(ContextCollectionDurableObject.prototype, "putContextDocument");
+
+    const rejected = await runManagement({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ui => ({
+        invalidPath: await rejectionMessage(() => ui.putContextDocument(
+          collectionId,
+          "/absolute.md",
+          { description: "Invalid path", body: "Must not be stored" },
+        )),
+        oversized: await rejectionMessage(() => ui.putContextDocument(
+          collectionId,
+          "oversized.md",
+          { description: "Oversized", body: "x".repeat(MAX_DOCUMENT_BODY_BYTES + 1) },
+        )),
+      }),
+    });
+
+    expect(rejected.result.invalidPath)
+      .toBe("Document path must be relative (no leading '/').");
+    expect(rejected.result.oversized).toContain("Document is too large");
+    expect(put).not.toHaveBeenCalled();
+    expect(rejected.snapshot.gatekeeperMeteringAttempts).toEqual([]);
+    expect(rejected.snapshot.gatekeeperUsageRecords).toEqual([]);
+    expect(rejected.snapshot.reservations).toEqual([]);
+    expect(await env.TEST_CONTEXT_COLLECTION.getByName(
+      domainName(sharingDomain, collectionId),
+    ).getMetadata()).toMatchObject({ documentCount: 0 });
+  });
+
+  it("runs stale Git background refresh without a second management operation", async () => {
     const user = await newUser();
     const sharingDomain = `background-domain-${crypto.randomUUID()}`;
     const accountId = crypto.randomUUID();
@@ -624,13 +727,12 @@ describe("production Context billing runtime", () => {
       sharingDomain,
       accountId,
       collectionId,
-      title: "Local collection",
-      documents: [{
-        path: "cached.md",
-        description: "Cached document",
-        body: "Cached content",
-      }],
+      title: "Stale Git collection",
+      source: "git",
+      created: new Date(0),
+      documents: [],
     });
+    await env.TEST_ARTIFACTS_TRACE.reset();
 
     const listed = await runManagement({
       user,
@@ -638,16 +740,19 @@ describe("production Context billing runtime", () => {
       accountId,
       run: ui => ui.listContextDocuments(collectionId),
     });
-    expect(listed.result).toEqual([expect.objectContaining({ path: "cached.md" })]);
+    expect(listed.result).toEqual([]);
     expect(listed.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
     expect(listed.snapshot.gatekeeperMeteringAttempts[0]?.attribution.billingMethodKey)
       .toBe(CONTEXT_BILLING_METHODS["ContextApi.listContextDocuments"].methodKey);
     expect(listed.snapshot.gatekeeperMeteringAttempts[0]?.chargeSnapshot.pricing)
       .toBe("unpriced");
-    expect(Object.keys(CONTEXT_BILLING_METHODS).some(method =>
-      method.toLowerCase().includes("background"))).toBe(false);
+    await vi.waitFor(async () => {
+      expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([
+        `artifacts.get:${collectionId}`,
+        "repo.createToken:read",
+      ]);
+    });
 
-    await Promise.resolve();
     const afterBackground = await runInDurableObject(user, instance => userSnapshot(instance));
     expect(afterBackground.gatekeeperMeteringAttempts)
       .toEqual(listed.snapshot.gatekeeperMeteringAttempts);

@@ -7,7 +7,7 @@ import {
   ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
   ContextDocument, ContextDocumentSummary,
   ContextGitTokenCreateResult, ContextGitTokenList,
-  DEFAULT_DOCUMENT_CONTENT_TYPE, DEFAULT_GIT_BRANCH, MAX_DOCUMENT_BODY_BYTES,
+  DEFAULT_DOCUMENT_CONTENT_TYPE, DEFAULT_GIT_BRANCH,
   contentTypeFromPath, isTextContentType, VENDOR_ID,
 } from "./context-types.js";
 import { metadataToSummary } from "./collection-kv.js";
@@ -17,12 +17,15 @@ import {
   isSkillManifestPath, parseSkillManifest, type SkillIndexEntry,
 } from "./agent-skill.js";
 import { obsContext } from "./observability.js";
+import {
+  validateContextDocumentPath,
+  validateContextDocumentWrite,
+} from "./context-document-validation.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.context", vendorId: VENDOR_ID,
 });
 
-const MAX_DOCUMENT_PATH_LENGTH = 1024;
 // Git tokens created through the web UI are valid for one year,
 // the maximum TTL supported by Artifacts.
 const GIT_TOKEN_TTL_SECONDS = 31_536_000;
@@ -33,28 +36,6 @@ const GIT_BRANCH_RE = /^(?!\/)(?!.*\/$)[A-Za-z0-9/._-]{1,255}$/;
 // Older collections build this path list on first use. Increase the version when parsing rules
 // change.
 const SKILL_INDEX_VERSION = 1;
-
-// Validate a document path before using it as a storage key.
-function validateDocumentPath(path: string): void {
-  if (typeof path !== "string" || path.length === 0) {
-    throw new Error("Document path is required.");
-  }
-  if (path.length > MAX_DOCUMENT_PATH_LENGTH) {
-    throw new Error(`Document path is too long (max ${MAX_DOCUMENT_PATH_LENGTH} characters).`);
-  }
-  if (path.startsWith("/")) {
-    throw new Error("Document path must be relative (no leading '/').");
-  }
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(path)) {
-    throw new Error("Document path must not contain control characters.");
-  }
-  for (let segment of path.split("/")) {
-    if (segment === "" || segment === "." || segment === "..") {
-      throw new Error("Document path must not contain empty, '.', or '..' segments.");
-    }
-  }
-}
 
 // Last path segment; document names derive from paths.
 function baseName(path: string): string {
@@ -355,12 +336,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       path: string,
       doc: { description: string; body: string; contentType?: string }): Promise<void> {
     this.#assertWebWritable();
-    validateDocumentPath(path);
-    // Enforce real UTF-8 bytes, not UTF-16 code units.
-    let byteLength = new TextEncoder().encode(doc.body).length;
-    if (byteLength > MAX_DOCUMENT_BODY_BYTES) {
-      throw new Error(`Document is too large (${byteLength} bytes; max ${MAX_DOCUMENT_BODY_BYTES}).`);
-    }
+    validateContextDocumentWrite(path, doc.body);
 
     let contentType = doc.contentType || contentTypeFromPath(path);
     let record: ContextRecord = {
@@ -383,7 +359,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   async deleteContextDocument(path: string): Promise<void> {
     this.#assertWebWritable();
     // Mutations reject invalid paths; reads stay lenient.
-    validateDocumentPath(path);
+    validateContextDocumentPath(path);
     let existing = this.storage.documents.get(path);
     if (!existing) throw new Error(`Document not found: ${path}`);
 
@@ -400,8 +376,8 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
 
   async moveContextDocument(from: string, to: string): Promise<void> {
     this.#assertWebWritable();
-    validateDocumentPath(from);
-    validateDocumentPath(to);
+    validateContextDocumentPath(from);
+    validateContextDocumentPath(to);
     if (from === to) return;
 
     // Reject moving a folder into one of its own descendants.

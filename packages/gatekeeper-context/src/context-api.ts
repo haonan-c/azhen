@@ -22,6 +22,10 @@ import {
 } from "./collection-kv.js";
 import { domainName } from "./domain.js";
 import { CONTEXT_BILLING_METHODS, type ContextBillingMethod } from "./billing-methods.js";
+import {
+  validateContextDocumentPath,
+  validateContextDocumentWrite,
+} from "./context-document-validation.js";
 
 /** Collections visible to this account's agents. */
 export async function loadEnabledContextCollections(
@@ -309,6 +313,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   async putContextDocument(collectionId: string, path: string, doc: {
     description: string; body: string; contentType?: string;
   }): Promise<void> {
+    validateContextDocumentWrite(path, doc.body);
     await this.#assertCanWrite(collectionId);
     await this.#bill("ContextApi.putContextDocument", async activity => {
       activity.requestDispatched();
@@ -318,6 +323,7 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }
 
   async deleteContextDocument(collectionId: string, path: string): Promise<void> {
+    validateContextDocumentPath(path);
     await this.#assertCanWrite(collectionId);
     await this.#bill("ContextApi.deleteContextDocument", async activity => {
       activity.requestDispatched();
@@ -327,6 +333,8 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }
 
   async moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void> {
+    validateContextDocumentPath(fromPath);
+    validateContextDocumentPath(toPath);
     await this.#assertCanWrite(collectionId);
     await this.#bill("ContextApi.moveContextDocument", async activity => {
       activity.requestDispatched();

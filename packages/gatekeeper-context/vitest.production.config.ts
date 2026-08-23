@@ -2,12 +2,16 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
 import { defineConfig } from "vitest/config";
 import tsconfigPaths from "vite-tsconfig-paths";
+import { kCurrentWorker } from "miniflare";
 
 const EXPECTED_BILLING_REJECTIONS = new Set([
   "Insufficient Usage Credit.",
   "Observation withheld by the host.",
   "Admin access required.",
   "Simulated propagation failure.",
+  "Simulated completion response loss.",
+  "Gatekeeper Metering completion conflicts with its Usage Record.",
+  "Simulated background artifact refresh failure.",
 ]);
 
 export default defineConfig({
@@ -29,8 +33,13 @@ export default defineConfig({
           TEST_CONTEXT_GATEKEEPER: { className: "ContextGatekeeper", useSQLite: true },
           TEST_USER: { className: "UserDurableObject", useSQLite: true },
           TEST_ADMIN_SETTINGS: { className: "AdminSettings", useSQLite: true },
+          TEST_ARTIFACT_REPO: { className: "ArtifactRepoMock", useSQLite: true },
         },
         kvNamespaces: ["CONTEXT_COLLECTIONS"],
+        serviceBindings: {
+          ARTIFACTS: { name: kCurrentWorker, entrypoint: "ArtifactsMock" },
+          TEST_ARTIFACTS_TRACE: { name: kCurrentWorker, entrypoint: "ArtifactsTrace" },
+        },
       },
     }),
   ],

@@ -4,7 +4,6 @@ import type { UsageRateChange } from "@gadgets/workshop-shared/api";
 import type { UsageUserRegistrationFact } from "../../workshop-backend/src/usage-account.js";
 import { UsageRateRegistry } from "../../workshop-backend/src/usage-rates.js";
 import { UsageUserRegistry } from "../../workshop-backend/src/usage-user-registry.js";
-import type { ContextVerifierApi } from "../src/context-observers.js";
 
 export default worker;
 export {
@@ -12,15 +11,65 @@ export {
   UserLibraryDurableObject,
   LibraryRegistryDurableObject,
   ContextAccount,
+  ContextVerifier,
   ContextGatekeeper,
 } from "../src/index.js";
 export { UserDurableObject } from "../../workshop-backend/src/user.js";
 
-/** Test collaborator verifier that denies every Context collection observation. */
-export class ObserverVerifier extends WorkerEntrypoint implements ContextVerifierApi {
-  /** Make the production observer tracker exclude this collaborator. */
-  async hasCollectionAccess(_sharingDomain: string, _collectionId: string): Promise<boolean> {
-    return false;
+const artifactTrace: string[] = [];
+
+/** Durable Artifacts repository handle for the production Context tracer. */
+export class ArtifactRepoMock extends DurableObject {
+  async createToken(scope: "write" | "read" = "write") {
+    artifactTrace.push(`repo.createToken:${scope}`);
+    if (scope === "read") throw new Error("Simulated background artifact refresh failure.");
+    return {
+      id: "test-token",
+      plaintext: "test-plaintext",
+      scope,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+  }
+
+  async revokeToken(tokenOrId: string): Promise<boolean> {
+    artifactTrace.push(`repo.revokeToken:${tokenOrId}`);
+    return true;
+  }
+}
+
+type ArtifactsMockEnv = Cloudflare.Env & {
+  TEST_ARTIFACT_REPO: DurableObjectNamespace<ArtifactRepoMock>;
+};
+
+/** Fail-closed Artifacts double used only by the production Context tracer. */
+export class ArtifactsMock extends WorkerEntrypoint<ArtifactsMockEnv> {
+  async create(name: string, options?: { setDefaultBranch?: string }) {
+    artifactTrace.push(`artifacts.create:${name}`);
+    return {
+      id: name,
+      name,
+      description: null,
+      defaultBranch: options?.setDefaultBranch ?? "main",
+      remote: `https://artifacts.invalid/${name}.git`,
+      token: `initial-${name}`,
+      tokenExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+  }
+
+  async get(name: string): Promise<ArtifactRepoMock> {
+    artifactTrace.push(`artifacts.get:${name}`);
+    return this.env.TEST_ARTIFACT_REPO.getByName(name);
+  }
+}
+
+/** Read/reset control plane for the fail-closed Artifacts test double. */
+export class ArtifactsTrace extends WorkerEntrypoint {
+  async reset(): Promise<void> {
+    artifactTrace.length = 0;
+  }
+
+  async get(): Promise<string[]> {
+    return [...artifactTrace];
   }
 }
 
