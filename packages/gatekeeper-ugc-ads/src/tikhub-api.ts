@@ -249,33 +249,51 @@ async function callTikHub<T>(
     if (value !== undefined) url.searchParams.set(key, String(value));
   }
 
-  activity?.requestDispatched();
-  let response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-  });
-  if (!response.ok) {
-    activity?.responseReceived(500);
-    throw new Error(`TikHub request failed with status ${response.status}.`);
-  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    activity?.requestDispatched();
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+      });
+    } catch (error) {
+      if (attempt === 0) continue;
+      throw error;
+    }
+    if (!response.ok) {
+      activity?.responseReceived(500);
+      if (attempt === 0 && response.status >= 500) continue;
+      throw new Error(`TikHub request failed with status ${response.status}.`);
+    }
 
-  let envelope = asRecord(await response.json());
-  if (!envelope || typeof envelope.code !== "number" ||
-      !Object.hasOwn(envelope, "data")) {
-    throw new Error("TikHub returned an invalid response.");
+    let envelope: Record<string, unknown> | undefined;
+    try {
+      envelope = asRecord(await response.json());
+    } catch (error) {
+      if (attempt === 0) continue;
+      throw error;
+    }
+    if (!envelope || typeof envelope.code !== "number" ||
+        !Object.hasOwn(envelope, "data")) {
+      if (attempt === 0) continue;
+      throw new Error("TikHub returned an invalid response.");
+    }
+    if (envelope.code !== 200) {
+      activity?.responseReceived(500);
+      if (attempt === 0 && envelope.code >= 500) continue;
+      throw new Error(
+        typeof envelope.message_zh === "string" ? envelope.message_zh
+          : typeof envelope.message === "string" ? envelope.message
+          : "TikHub request failed.",
+      );
+    }
+    activity?.responseReceived(response.status);
+    return envelope.data as T;
   }
-  if (envelope.code !== 200) {
-    activity?.responseReceived(500);
-    throw new Error(
-      typeof envelope.message_zh === "string" ? envelope.message_zh
-        : typeof envelope.message === "string" ? envelope.message
-        : "TikHub request failed.",
-    );
-  }
-  activity?.responseReceived(response.status);
-  return envelope.data as T;
+  throw new Error("TikHub request failed.");
 }
 
 function requestFailureForStatus(status: number): TikHubRequestFailure {
