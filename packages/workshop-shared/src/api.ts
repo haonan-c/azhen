@@ -523,8 +523,8 @@ export type UserGatekeeperUsageRecord = {
   id: string;
   /** Origin of this Gatekeeper operation. */
   source: UsageSource;
-  /** Workspace that ran the operation. */
-  workspaceId: string;
+  /** Workspace that ran the operation, absent for direct account-management use. */
+  workspaceId?: string;
   /** Conversation that ran the operation, when applicable. */
   chatId?: number;
   /** App that ran the operation, when applicable. */

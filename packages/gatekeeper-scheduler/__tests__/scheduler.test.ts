@@ -28,14 +28,93 @@ function activeSummary(scheduleId: string): ScheduleSummary {
   };
 }
 
+function billableApprovalQueue(bindHook: () => Promise<void>): RpcStub<ApprovalQueue> {
+  return {
+    bindHook,
+    async beginBillableOperation() {
+      return {
+        async getOperationId() { return "registration-1"; },
+        async markStarted() {},
+        async complete() {},
+        [Symbol.dispose]() {},
+      };
+    },
+  } as unknown as RpcStub<ApprovalQueue>;
+}
+
 describe("ScheduleSessionImpl", () => {
+  it("does not bind a Hook when authoritative billing begin fails", async () => {
+    const bindHook = vi.fn(async () => {});
+    const session = new ScheduleSessionImpl({
+      accountId: "account-a",
+      workspaceId: "workspace-a",
+      approvalQueue: {
+        async beginBillableOperation() { throw new Error("billing unavailable"); },
+        bindHook,
+      } as unknown as RpcStub<ApprovalQueue>,
+      controllerFactory: vi.fn(() => ({})),
+      driver: { listWorkspace: vi.fn(async () => []) },
+      now: () => 1_000,
+    });
+
+    await expect(session.every(
+      60_000,
+      callback,
+      {title: "Heartbeat", description: "Run the heartbeat callback."},
+    )).rejects.toThrow("billing unavailable");
+    expect(bindHook).not.toHaveBeenCalled();
+  });
+
+  it("meters each registration at the successful bindHook boundary", async () => {
+    const trace: string[] = [];
+    const approvalQueue = {
+      async beginBillableOperation(methodKey: string, externalAccountId: string) {
+        trace.push(`begin:${methodKey}:${externalAccountId}`);
+        return {
+          async getOperationId() { return "registration"; },
+          async markStarted() { trace.push("markStarted"); },
+          async complete(outcome: string) { trace.push(`complete:${outcome}`); },
+          [Symbol.dispose]() { trace.push("dispose"); },
+        };
+      },
+      async bindHook() { trace.push("bindHook"); },
+    } as unknown as RpcStub<ApprovalQueue>;
+    let nextId = 0;
+    const session = new ScheduleSessionImpl({
+      accountId: "account-a",
+      workspaceId: "workspace-a",
+      approvalQueue,
+      controllerFactory: vi.fn(() => ({})),
+      driver: { listWorkspace: vi.fn(async () => []) },
+      now: () => 1_000,
+      randomId: () => `schedule-${++nextId}`,
+    });
+
+    await session.every(60_000, callback, { title: "Every", description: "Every." });
+    await session.calendarAt(
+      { timeZone: "UTC", freq: "daily", hour: 9, minute: 0 },
+      callback,
+      { title: "Calendar", description: "Calendar." },
+    );
+    await session.runAt(2_000, callback, { title: "Once", description: "Once." });
+
+    expect(trace).toEqual([
+      "begin:scheduler.schedule.register.interval.v1:account-a",
+      "markStarted", "bindHook", "complete:executed", "dispose",
+      "begin:scheduler.schedule.register.calendar.v1:account-a",
+      "markStarted", "bindHook", "complete:executed", "dispose",
+      "begin:scheduler.schedule.register.once.v1:account-a",
+      "markStarted", "bindHook", "complete:executed", "dispose",
+    ]);
+  });
+
   it("creates a UUID with the workerd crypto implementation by default", async () => {
     const bindHook = vi.fn(async () => {});
     const controllerFactory = vi.fn(() => ({}));
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(bindHook),
       controllerFactory,
       driver: { listWorkspace: vi.fn(async () => []) },
       now: () => 1_000,
@@ -60,7 +139,7 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(bindHook),
       controllerFactory,
       driver,
       now: () => 1_000,
@@ -92,7 +171,7 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook: vi.fn(async () => {}) } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(vi.fn(async () => {})),
       controllerFactory,
       driver: { listWorkspace: vi.fn(async () => []) },
       now: () => 1_000,
@@ -116,7 +195,7 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook: vi.fn(async () => {}) } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(vi.fn(async () => {})),
       controllerFactory,
       driver: { listWorkspace: vi.fn(async () => []) },
       now: () => registeredAt,
@@ -148,7 +227,7 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(bindHook),
       controllerFactory,
       driver: { listWorkspace: vi.fn(async () => []) },
       now: () => 1_000,
@@ -166,6 +245,7 @@ describe("ScheduleSessionImpl", () => {
   });
 
   it("authorizes workspace-scoped listing before returning schedules", async () => {
+    const trace: string[] = [];
     const authorizeObservation = vi.fn(async () => {});
     const driver = {
       listWorkspace: vi.fn(async () => [activeSummary("schedule-a")]),
@@ -173,7 +253,21 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: {
+        async beginBillableOperation(methodKey: string, externalAccountId: string) {
+          trace.push(`begin:${methodKey}:${externalAccountId}`);
+          return {
+            async getOperationId() { return "operation-1"; },
+            async markStarted() { trace.push("markStarted"); },
+            async complete(outcome: string) { trace.push(`complete:${outcome}`); },
+            [Symbol.dispose]() { trace.push("dispose"); },
+          };
+        },
+        authorizeObservation: async (description: { billingOperationId?: string }) => {
+          trace.push(`authorize:${description.billingOperationId}`);
+          await authorizeObservation();
+        },
+      } as unknown as RpcStub<ApprovalQueue>,
       controllerFactory: vi.fn(),
       driver,
     });
@@ -181,6 +275,13 @@ describe("ScheduleSessionImpl", () => {
     await expect(session.list()).resolves.toEqual([activeSummary("schedule-a")]);
     expect(driver.listWorkspace).toHaveBeenCalledWith("workspace-a");
     expect(authorizeObservation).toHaveBeenCalledOnce();
+    expect(trace).toEqual([
+      "begin:scheduler.schedule.list.workspace.v1:account-a",
+      "markStarted",
+      "complete:executed",
+      "authorize:operation-1",
+      "dispose",
+    ]);
   });
 
   it("does not bind a hook when schedule validation fails", async () => {
@@ -189,7 +290,7 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(bindHook),
       controllerFactory,
       driver: { listWorkspace: vi.fn(async () => []) },
     });
@@ -210,7 +311,7 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { bindHook } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: billableApprovalQueue(bindHook),
       controllerFactory,
       driver: { listWorkspace: vi.fn(async () => []) },
       now: () => 1_000,
@@ -234,7 +335,17 @@ describe("ScheduleSessionImpl", () => {
     const session = new ScheduleSessionImpl({
       accountId: "account-a",
       workspaceId: "workspace-a",
-      approvalQueue: { authorizeObservation } as unknown as RpcStub<ApprovalQueue>,
+      approvalQueue: {
+        async beginBillableOperation() {
+          return {
+            async getOperationId() { return "operation-1"; },
+            async markStarted() {},
+            async complete() {},
+            [Symbol.dispose]() {},
+          };
+        },
+        authorizeObservation,
+      } as unknown as RpcStub<ApprovalQueue>,
       controllerFactory: vi.fn(),
       driver: { listWorkspace: vi.fn(async () => [activeSummary("schedule-a")]) },
     });
@@ -312,13 +423,30 @@ describe("schedule hook controller", () => {
 
 describe("ScheduleManagementApi", () => {
   it("forwards only read-only list filters to the account driver", async () => {
+    const trace: string[] = [];
     const page = { schedules: [activeSummary("schedule-a")] };
     const listAccount = vi.fn(async () => page);
-    const api = new ScheduleManagementApi({ listAccount });
+    const api = new ScheduleManagementApi({ listAccount }, "account-a", {
+      async beginBillableOperation(methodKey: string, externalAccountId: string) {
+        trace.push(`begin:${methodKey}:${externalAccountId}`);
+        return {
+          async getOperationId() { return "operation-1"; },
+          async markStarted() { trace.push("markStarted"); },
+          async complete(outcome: string) { trace.push(`complete:${outcome}`); },
+          [Symbol.dispose]() { trace.push("dispose"); },
+        };
+      },
+    } as never);
     const options = { query: "brief", statuses: ["active" as const] };
 
     await expect(api.list(options)).resolves.toBe(page);
     expect(listAccount).toHaveBeenCalledWith(options);
+    expect(trace).toEqual([
+      "begin:scheduler.schedule.list.account.v1:account-a",
+      "markStarted",
+      "complete:executed",
+      "dispose",
+    ]);
   });
 });
 

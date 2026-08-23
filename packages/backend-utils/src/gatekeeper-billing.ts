@@ -32,6 +32,12 @@ export type BillableReadAuthorizer = {
   authorizeObservation(description: ObservationDescription): Promise<void>;
 };
 
+/** The authorizer method needed by direct management operations without observation audit. */
+export type BillableOperationAuthorizer = Pick<
+  BillableReadAuthorizer,
+  "beginBillableOperation"
+>;
+
 /** Transport facts for all requests within one caller-visible business operation. */
 export interface BillableOperationActivity {
   requestDispatched(): void;
@@ -120,6 +126,35 @@ export async function runBillableRead<T>(
     ...describe(result),
     billingOperationId: operationId,
   });
+  return result;
+}
+
+/** Run one direct caller-visible operation through billing without an observation record. */
+export async function runBillableOperation<T>(
+  authorizer: BillableOperationAuthorizer,
+  externalAccountId: string,
+  billingMethodKey: string,
+  run: (activity: BillableOperationActivity) => Promise<T>,
+): Promise<T> {
+  using operation = await authorizer.beginBillableOperation(
+    billingMethodKey,
+    externalAccountId,
+  );
+  try {
+    await operation.markStarted();
+  } catch (error) {
+    await completeQuietly(operation, "failed-before-execution");
+    throw error;
+  }
+  const activity = new BillableOperationActivityTracker();
+  let result: T;
+  try {
+    result = await run(activity);
+  } catch (error) {
+    await completeQuietly(operation, activity.failureOutcome());
+    throw error;
+  }
+  await operation.complete("executed");
   return result;
 }
 

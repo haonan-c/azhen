@@ -1015,16 +1015,19 @@ describe("DeepSeek Agent billing", () => {
       runId: string;
     };
     expect(firing.scheduleId).toBe(scheduleId);
-    const [ownerRecords, builderRecords] = await waitFor(
+    const [ownerRecords, builderRecords, deliveryRecord] = await waitFor(
       "the disconnected scheduled alarm Usage",
       async () => {
         const ownerPage = await reopenedOwner.listOwnUsageRecords({limit: 10});
         const builderPage = await reopenedBuilder.listOwnUsageRecords({limit: 10});
         const currentOwnerRecords = recordsForDeploymentModel(ownerPage.records);
         const currentBuilderRecords = recordsForDeploymentModel(builderPage.records);
+        const currentDeliveryRecord = ownerPage.records.find(record =>
+          record.kind === "gatekeeper" &&
+          record.billingMethodKey === "scheduler.schedule.delivery.v1");
         return agentProviderCalls === 3 && currentOwnerRecords.length === 1 &&
-          currentBuilderRecords.length === 2
-          ? [currentOwnerRecords, currentBuilderRecords] as const
+          currentBuilderRecords.length === 2 && currentDeliveryRecord
+          ? [currentOwnerRecords, currentBuilderRecords, currentDeliveryRecord] as const
           : null;
       },
       40_000,
@@ -1041,6 +1044,19 @@ describe("DeepSeek Agent billing", () => {
       automationId: scheduleId,
       automationRunId: firing.runId,
     })]);
+    expect(deliveryRecord).toEqual(expect.objectContaining({
+      kind: "gatekeeper",
+      source: "scheduled",
+      workspaceId,
+      gadgetId,
+      automationId: scheduleId,
+      automationRunId: firing.runId,
+      vendorId: "scheduler",
+      billingMethodKey: "scheduler.schedule.delivery.v1",
+      pricing: "unpriced",
+      outcome: "settled",
+      chargeSubunits: 0n,
+    }));
     expect(builderRecords).toHaveLength(2);
     expect(builderRecords.every(record =>
       record.source === "agent" && record.workspaceId === workspaceId &&

@@ -7,6 +7,7 @@ import type {
 import {
   BillableCursorBilling,
   runBillableAction,
+  runBillableOperation,
   runBillableRead,
   type BillableActionStorage,
 } from "../src/gatekeeper-billing.js";
@@ -114,6 +115,36 @@ describe("Gatekeeper read billing", () => {
         `complete:${status === 400 ? "failed-before-execution" : "unknown"}`,
       );
     }
+  });
+});
+
+describe("Gatekeeper direct operation billing", () => {
+  it("classifies failures before dispatch and after an ambiguous dispatch", async () => {
+    const outcomes: string[] = [];
+    const authorizer = {
+      async beginBillableOperation() {
+        return {
+          async getOperationId() { return "direct-1"; },
+          async markStarted() {},
+          async complete(outcome: BillableOperationOutcome) { outcomes.push(outcome); },
+          [Symbol.dispose]() {},
+        };
+      },
+    };
+
+    await expect(runBillableOperation(
+      authorizer, "account-1", "vendor.direct.v1",
+      async () => { throw new Error("invalid"); },
+    )).rejects.toThrow("invalid");
+    await expect(runBillableOperation(
+      authorizer, "account-1", "vendor.direct.v1",
+      async activity => {
+        activity.requestDispatched();
+        throw new Error("lost");
+      },
+    )).rejects.toThrow("lost");
+
+    expect(outcomes).toEqual(["failed-before-execution", "unknown"]);
   });
 });
 

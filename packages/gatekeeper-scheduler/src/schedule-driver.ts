@@ -1,7 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import type { RpcStub, RpcTarget } from "cloudflare:workers";
 import { reportIssue } from "@gadgets/backend-utils/error-reporting";
-import type { ApprovalQueue, HookInitiator } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ApprovalQueue,
+  BillableOperation,
+  BillableOperationOutcome,
+  HookInitiator,
+} from "@gadgets/workshop-shared/gatekeeper";
 import {
   admitRun,
   beginDueRun,
@@ -20,6 +25,7 @@ import {
   type ManagementListOptions,
   type ManagementSchedulePage,
 } from "./management.js";
+import { SCHEDULER_BILLING_METHODS } from "./billing-methods.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.scheduler.driver",
@@ -74,6 +80,7 @@ type PreparedRun = {
   scheduleId: string;
   runId: string;
   scheduledTime: number;
+  recoveredDelivery?: true;
 };
 
 type PendingState = Extract<EnabledSchedule, { status: "pending" }>;
@@ -350,9 +357,9 @@ export class ScheduleDriver extends DurableObject {
     prepared: PreparedRun,
     stage: PendingStage | undefined,
     transition: (state: PendingState) => EnabledSchedule,
-  ): void {
+  ): EnabledSchedule | undefined {
     let orphaned: StoredCapabilities | undefined;
-    this.ctx.storage.transactionSync(() => {
+    const result = this.ctx.storage.transactionSync(() => {
       if (this.#requireMetadata().revoked) return;
       const key = scheduleKey(prepared.workspaceId, prepared.scheduleId);
       const stored = this.#readSchedule(key);
@@ -361,8 +368,10 @@ export class ScheduleDriver extends DurableObject {
       const state = transition(stored.state);
       this.ctx.storage.kv.put<StoredSchedule>(key, { ...stored, state });
       if (isTerminal(state)) orphaned = this.#takeCapabilities(state);
+      return state;
     });
     disposeCapabilities(orphaned);
+    return result;
   }
 
   /** Removes a schedule's stored capability row, handing the stub back to the caller to dispose. */
@@ -406,23 +415,43 @@ export class ScheduleDriver extends DurableObject {
 
     let hookResult: HookResult | undefined;
     try {
-      // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
-      using hookCall = capabilities.initiator.startHook({
+      const run = {
         automationId: prepared.scheduleId,
         automationRunId: prepared.runId,
-      });
+      };
+      // @ts-expect-error Worker RPC promises are disposable even though the mapped type omits it.
+      using hookCall = capabilities.initiator.startHook(run);
       try {
         // Await admission rather than pipeline: its rejection must skip this occurrence before the
         // callback attempt is counted or either returned capability is used.
         // @ts-expect-error Worker RPC's mapped return type wraps the already-stubbed hook result.
         hookResult = await hookCall;
       } catch {
-        this.#rejectPending(prepared, Date.now());
+        if (prepared.recoveredDelivery) {
+          this.#failPending(prepared, "callback_failed", Date.now());
+        } else {
+          this.#rejectPending(prepared, Date.now());
+        }
         return true;
+      }
+      if (!hookResult) return false;
+
+      using operation = await hookResult.approvalQueue.beginBillableOperation(
+        SCHEDULER_BILLING_METHODS["ScheduledTaskHook.onSchedule"].methodKey,
+        this.ctx.id.toString(),
+        prepared.runId,
+      );
+
+      if (prepared.recoveredDelivery) {
+        const state = this.#failPending(prepared, "callback_failed", Date.now());
+        if (state?.status === "dead") {
+          await this.#completeBillingQuietly(operation, "unknown");
+        }
+        return false;
       }
 
       const admitted = this.#markAdmitted(prepared, Date.now());
-      if (!admitted || !hookResult) return false;
+      if (!admitted) return false;
 
       const firing: ScheduledFiring = {
         scheduleId: prepared.scheduleId,
@@ -431,23 +460,41 @@ export class ScheduleDriver extends DurableObject {
         actualTime: Date.now(),
         timeZone: timeZoneOf(admitted.state),
       };
+      const billingOperationId = await operation.getOperationId();
       try {
         await hookResult.approvalQueue.authorizeObservation({
+          billingOperationId,
           title: `Run scheduled task: ${admitted.title}`,
           description: `Deliver scheduled task ${prepared.scheduleId} for its planned occurrence at ${prepared.scheduledTime}.`,
         });
       } catch {
-        this.#failPending(prepared, "authorization_failed", Date.now());
+        const state = this.#failPending(prepared, "authorization_failed", Date.now());
+        if (state?.status === "dead") {
+          await this.#completeBillingQuietly(operation, "failed-before-execution");
+        }
         return false;
       }
 
       if (!this.#isPendingDelivery(prepared)) return false;
       try {
-        await hookResult.callback.onSchedule(firing);
+        await operation.markStarted();
       } catch {
-        this.#failPending(prepared, "callback_failed", Date.now());
+        const state = this.#failPending(prepared, "callback_failed", Date.now());
+        if (state?.status === "dead") {
+          await this.#completeBillingQuietly(operation, "failed-before-execution");
+        }
         return false;
       }
+      try {
+        await hookResult.callback.onSchedule(firing);
+      } catch {
+        const state = this.#failPending(prepared, "callback_failed", Date.now());
+        if (state?.status === "dead") {
+          await this.#completeBillingQuietly(operation, "unknown");
+        }
+        return false;
+      }
+      await operation.complete("executed");
       this.#completePending(prepared, Date.now());
       return false;
     } finally {
@@ -486,9 +533,13 @@ export class ScheduleDriver extends DurableObject {
 
       let state = stored.state;
       if (state.status === "pending" && state.stage === "delivery") {
-        state = failRun(state, state.runId, "callback_failed", now);
-        this.ctx.storage.kv.put<StoredSchedule>(key, { ...stored, state });
-        return undefined;
+        return {
+          workspaceId: state.workspaceId,
+          scheduleId: state.scheduleId,
+          runId: state.runId,
+          scheduledTime: state.scheduledTime,
+          recoveredDelivery: true,
+        };
       }
       const leaseExpiresAt = checkedAdd(now, RECOVERY_DELAY_MS);
       if (state.status === "active" || state.status === "retrying") {
@@ -533,9 +584,27 @@ export class ScheduleDriver extends DurableObject {
     prepared: PreparedRun,
     failureCode: "authorization_failed" | "callback_failed",
     failedAt: number,
-  ): void {
-    this.#settle(prepared, "delivery", (state) =>
+  ): EnabledSchedule | undefined {
+    return this.#settle(prepared, "delivery", (state) =>
       failRun(state, prepared.runId, failureCode, failedAt));
+  }
+
+  async #completeBillingQuietly(
+    operation: RpcStub<BillableOperation>,
+    outcome: BillableOperationOutcome,
+  ): Promise<void> {
+    try {
+      await operation.complete(outcome);
+    } catch (error) {
+      logger.error("scheduler billing completion failed", {
+        event: "scheduler.billing.complete.failed",
+        error,
+      });
+      reportIssue("scheduler.billing.complete", error, {
+        handled: true,
+        attributes: obsContext.get(),
+      });
+    }
   }
 
   #completePending(prepared: PreparedRun, completedAt: number): void {

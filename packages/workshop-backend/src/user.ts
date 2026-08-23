@@ -1,8 +1,8 @@
 import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
-import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
+import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, type BillableOperation, type BillableOperationAuthorizer, type BillableOperationOutcome } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
 import type { AdminSettings, DeploymentModelRecord } from "./admin-settings.js";
@@ -75,6 +75,50 @@ export type ProvidedAccountInfo = {
 // usable directly, the way the runtime stub actually behaves.
 type AccountCreatorStub = Required<Pick<GatekeeperVendor, "createAccount">>;
 type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeeperClass" | "startAppUi">>;
+
+class DirectUserBillableOperation extends NativeRpcTarget implements BillableOperation {
+  constructor(
+    private readonly user: UserDurableObject,
+    private readonly operationId: string,
+  ) {
+    super();
+  }
+
+  async getOperationId(): Promise<string> {
+    return this.operationId;
+  }
+
+  async markStarted(): Promise<void> {
+    await this.user.markGatekeeperUsageStarted(this.operationId);
+  }
+
+  async complete(outcome: BillableOperationOutcome): Promise<void> {
+    await this.user.completeGatekeeperUsage(this.operationId, outcome);
+  }
+}
+
+class DirectUserBillingAuthorizer extends NativeRpcTarget
+    implements BillableOperationAuthorizer {
+  constructor(
+    private readonly user: UserDurableObject,
+    private readonly vendorId: string,
+  ) {
+    super();
+  }
+
+  beginBillableOperation(
+    billingMethodKey: string,
+    externalAccountId: string,
+    idempotencyKey?: string,
+  ): Promise<BillableOperation> {
+    return this.user.beginDirectGatekeeperOperation(
+      this.vendorId,
+      billingMethodKey,
+      externalAccountId,
+      idempotencyKey,
+    );
+  }
+}
 
 function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   if (record.credentialsExpired) return false;
@@ -553,6 +597,28 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     await this.activateUsageAccount();
     return this.usageAccount.beginGatekeeperUsage(operationId, attribution, chargeSnapshot);
+  }
+
+  /** Begin one direct account-management operation under this initiating User's authority. */
+  async beginDirectGatekeeperOperation(
+      vendorId: string,
+      billingMethodKey: string,
+      externalAccountId: string,
+      idempotencyKey?: string): Promise<BillableOperation> {
+    if (idempotencyKey !== undefined) {
+      throw new TypeError("Direct Gatekeeper management operations do not accept retry identities.");
+    }
+    const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+    const chargeSnapshot = await this.adminSettings.getByName("")
+        .issueGatekeeperChargeSnapshot(vendorId, billingMethodKey);
+    await this.beginGatekeeperUsage(operationId, {
+      principal: {version: 1, kind: "user", userId: this.ctx.id.toString()},
+      source: "direct-user",
+      vendorId,
+      billingMethodKey,
+      externalAccountId,
+    }, chargeSnapshot);
+    return new DirectUserBillableOperation(this, operationId);
   }
 
   /** Begin a delayed Action and return a stable pre-execution denial without hiding RPC failure. */
@@ -1428,10 +1494,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * Open the full-page management UI for an account that declares one. `context.isAdmin` is supplied
    * fresh by the caller so admin-gated features reflect the user's current status.
    */
-  async startAccountAppUi(accountId: number, context: AppUiContext): Promise<GatekeeperUiFrame> {
+  async startAccountAppUi(
+      accountId: number,
+      context: Pick<AppUiContext, "isAdmin">): Promise<GatekeeperUiFrame> {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record?.description.providesUi) throw new Error("No such app.");
-    return (record.account as unknown as SingletonAccountStub).startAppUi(context);
+    using billingAuthorizer = new NativeRpcStub(
+      new DirectUserBillingAuthorizer(this, record.vendorId),
+    );
+    return await (record.account as unknown as SingletonAccountStub).startAppUi({
+      ...context,
+      billingAuthorizer,
+    });
   }
 
   async ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {

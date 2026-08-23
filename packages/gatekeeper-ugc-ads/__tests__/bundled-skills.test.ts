@@ -39,6 +39,14 @@ describe("UGC Ads bundled skill discovery", () => {
       description: string;
     }) => Promise<void>>(async () => {});
     let approvalQueue = {
+      async beginBillableOperation() {
+        return {
+          async getOperationId() { return "test-operation"; },
+          async markStarted() {},
+          async complete() {},
+          [Symbol.dispose]() {},
+        };
+      },
       authorizeObservation,
       [Symbol.dispose]: vi.fn<() => void>(),
     } as unknown as RpcStub<ApprovalQueue>;

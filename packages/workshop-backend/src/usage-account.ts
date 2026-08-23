@@ -21,7 +21,9 @@ import {
   type ModelTokenUsage,
 } from "./usage-rates.js";
 import {
+  normalizeDirectUserUsageAttribution,
   normalizeUsageAttribution,
+  type DirectUserUsageAttribution,
   type UsageAttribution,
 } from "./usage-attribution.js";
 
@@ -118,7 +120,9 @@ export type ModelUsageRecord = {
 };
 
 /** Content-free, host-attested dimensions for one Gatekeeper Billable API Operation. */
-export type GatekeeperUsageAttribution = UsageAttribution & {
+export type GatekeeperUsageAttribution = (
+  UsageAttribution | DirectUserUsageAttribution
+) & {
   /** Stable Gatekeeper vendor identifier that owns the upstream business call. */
   vendorId: string;
   /** Stable caller-visible business-method key priced by the Usage Rate version. */
@@ -2183,7 +2187,9 @@ function userGatekeeperUsageRecord(
     kind: "gatekeeper",
     id: `usage-record:${record.operationId}`,
     source: record.attribution.source,
-    workspaceId: record.attribution.workspaceId,
+    ...(record.attribution.workspaceId !== undefined
+      ? {workspaceId: record.attribution.workspaceId}
+      : {}),
     ...(record.attribution.chatId !== undefined
       ? {chatId: record.attribution.chatId}
       : {}),
@@ -2455,8 +2461,11 @@ function normalizeGatekeeperUsageAttribution(
     throw new TypeError("Gatekeeper Usage attribution is invalid.");
   }
   const {vendorId, billingMethodKey, externalAccountId, ...attribution} = value;
+  const normalizedAttribution = attribution.workspaceId === undefined
+    ? normalizeDirectUserUsageAttribution(attribution)
+    : normalizeUsageAttribution(attribution);
   return {
-    ...normalizeUsageAttribution(attribution),
+    ...normalizedAttribution,
     vendorId,
     billingMethodKey,
     externalAccountId,

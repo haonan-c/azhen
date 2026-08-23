@@ -27,6 +27,7 @@ type TestHooks = HookInitiator<ScheduleHookTarget> & {
     maxActiveCallbacks: number;
     disposedApprovalQueues: number;
     disposedCallbacks: number;
+    billingEvents: string[];
   }>;
   release(): Promise<void>;
   reset(): Promise<void>;
@@ -192,6 +193,16 @@ describe("ScheduleDriver", () => {
       "authorize",
       "callback",
     ]);
+    const billingEvents = (await testEnv.TEST_HOOKS.read()).billingEvents;
+    const runId = billingEvents.find(event => event.startsWith("markStarted:"))?.split(":")[1];
+    expect(runId).toBeTruthy();
+    expect(billingEvents).toEqual([
+      expect.stringMatching(new RegExp(
+        `^begin:scheduler\\.schedule\\.delivery\\.v1:.+:${runId}$`,
+      )),
+      `markStarted:${runId}`,
+      `complete:executed:${runId}`,
+    ]);
   });
 
   it("completes consecutive Sunday and Wednesday deliveries for a weekly schedule", async () => {
@@ -239,6 +250,12 @@ describe("ScheduleDriver", () => {
     expect(
       (await testEnv.TEST_HOOKS.read()).events.filter((event) => event.startsWith("callback:")),
     ).toHaveLength(2);
+    const billingEvents = (await testEnv.TEST_HOOKS.read()).billingEvents;
+    const begunRuns = billingEvents
+      .filter(event => event.startsWith("begin:"))
+      .map(event => event.split(":").at(-1));
+    expect(begunRuns).toHaveLength(2);
+    expect(new Set(begunRuns).size).toBe(2);
   });
 
   it("expires a one-shot on any startHook rejection without authorization or attempt consumption", async () => {
@@ -264,8 +281,41 @@ describe("ScheduleDriver", () => {
     expect((await driver.getSchedule("workspace-a", "one-shot"))?.state).toMatchObject({
       status: "expired",
     });
-    expect((await testEnv.TEST_HOOKS.read()).events).toEqual(["start"]);
+    const rejected = await testEnv.TEST_HOOKS.read();
+    expect(rejected.events).toEqual(["start"]);
+    expect(rejected.billingEvents).toEqual([]);
     expect(reportIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch the callback when authoritative metering rejects begin", async () => {
+    const driver = testEnv.SCHEDULE_DRIVER.getByName("billing-rejection");
+    const activationTime = Date.now();
+    await testEnv.TEST_HOOKS.configure("billing-reject");
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "one-shot",
+        spec: { kind: "once", fireAt: activationTime + 60_000, timeZone: "UTC" },
+        title: "One shot",
+        description: "Do not dispatch without authoritative metering.",
+        gadgetId,
+      },
+      activationTime,
+    );
+
+    await makeActiveScheduleDue(driver, "workspace-a", "one-shot");
+    await runDurableObjectAlarm(driver);
+
+    expect((await driver.getSchedule("workspace-a", "one-shot"))?.state).toMatchObject({
+      status: "pending",
+      stage: "admission",
+    });
+    const rejected = await testEnv.TEST_HOOKS.read();
+    expect(rejected.events).toEqual(["start"]);
+    expect(rejected.billingEvents).toEqual([
+      expect.stringMatching("^begin:scheduler\\.schedule\\.delivery\\.v1:.+:.+$"),
+    ]);
   });
 
   it("replaces and removes stored activation capabilities", async () => {
@@ -547,6 +597,61 @@ describe("ScheduleDriver", () => {
       });
     }, { timeout: 5_000 });
     expect(reportIssue).not.toHaveBeenCalled();
+    expect((await testEnv.TEST_HOOKS.read()).billingEvents).toEqual([
+      expect.stringMatching(`^begin:scheduler\\.schedule\\.delivery\\.v1:.+:${runId}$`),
+      expect.stringMatching(`^begin:scheduler\\.schedule\\.delivery\\.v1:.+:${runId}$`),
+      `markStarted:${runId}`,
+      `complete:executed:${runId}`,
+    ]);
+  });
+
+  it.each([
+    ["authorization-reject", "failed-before-execution"],
+    ["callback-reject", "unknown"],
+  ] as const)("records %s on the exhausted delivery as %s", async (mode, outcome) => {
+    const driver = testEnv.SCHEDULE_DRIVER.getByName(`terminal-${mode}`);
+    const activationTime = Date.now();
+    await testEnv.TEST_HOOKS.configure(mode);
+    await enableSchedule(
+      driver,
+      {
+        workspaceId: "workspace-a",
+        scheduleId: "schedule-a",
+        spec: { kind: "interval", everyMs: 60_000, anchorMs: activationTime },
+        title: "Terminal delivery",
+        description: "Classify the final delivery attempt.",
+        gadgetId,
+      },
+      activationTime,
+    );
+    await updateSchedule(driver, "workspace-a", "schedule-a", stored => ({
+      ...stored,
+      state: {
+        workspaceId: "workspace-a",
+        scheduleId: "schedule-a",
+        spec: stored.state.spec,
+        status: "retrying",
+        runId: "stable-run",
+        scheduledTime: activationTime,
+        attempts: 7,
+        nextAttempt: 1,
+        nextFire: activationTime + 60_000,
+      },
+    }));
+
+    await runDurableObjectAlarm(driver);
+
+    expect((await driver.getSchedule("workspace-a", "schedule-a"))?.state).toMatchObject({
+      status: "dead",
+      runId: "stable-run",
+      attempts: 8,
+    });
+    const billingEvents = (await testEnv.TEST_HOOKS.read()).billingEvents;
+    expect(billingEvents).toContain(`complete:${outcome}:stable-run`);
+    expect(billingEvents.filter(event => event.startsWith("begin:"))).toHaveLength(1);
+    expect(billingEvents.filter(event => event.startsWith("markStarted:"))).toHaveLength(
+      mode === "callback-reject" ? 1 : 0,
+    );
   });
 
   it("recovers admission with the persisted run ID", async () => {
@@ -628,7 +733,7 @@ describe("ScheduleDriver", () => {
       runId: "recovered-delivery",
       attempts: 1,
     });
-    expect((await testEnv.TEST_HOOKS.read()).events).toEqual([]);
+    expect((await testEnv.TEST_HOOKS.read()).events).toEqual(["start"]);
   });
 
   it("marks an abandoned eighth delivery attempt dead", async () => {
@@ -671,7 +776,14 @@ describe("ScheduleDriver", () => {
       attempts: 8,
       failureCode: "callback_failed",
     });
-    expect((await testEnv.TEST_HOOKS.read()).events).toEqual([]);
+    const recovered = await testEnv.TEST_HOOKS.read();
+    expect(recovered.events).toEqual(["start"]);
+    expect(recovered.billingEvents).toEqual([
+      expect.stringMatching(
+        "^begin:scheduler\\.schedule\\.delivery\\.v1:.+:exhausted-delivery$",
+      ),
+      "complete:unknown:exhausted-delivery",
+    ]);
   });
 
   // These input-gate interruption tests can deadlock vitest-pool-workers during teardown.

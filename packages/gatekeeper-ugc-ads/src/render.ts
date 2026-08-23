@@ -6,6 +6,7 @@
 // Gadget UI here, just a static HTML string in and image bytes out.
 
 import { launch } from "@cloudflare/puppeteer";
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
 
 /** Wall-clock budget covering launch, rendering, and screenshot capture. */
 const MAX_RENDER_DURATION_MS = 20_000;
@@ -35,17 +36,19 @@ function withDeadline<T>(work: Promise<T>, ms: number, message: string): Promise
  */
 export async function renderImage(
     browserBinding: BrowserRun, html: string,
-    opts: { width?: number; height?: number } = {}): Promise<{ dataUri: string }> {
+    opts: { width?: number; height?: number } = {},
+    activity?: BillableOperationActivity): Promise<{ dataUri: string }> {
   if (new TextEncoder().encode(html).byteLength > MAX_HTML_BYTES) {
     throw new Error(`renderImage HTML exceeds the ${MAX_HTML_BYTES}-byte limit.`);
   }
   let width = clampDimension(opts.width, DEFAULT_WIDTH);
   let height = clampDimension(opts.height, DEFAULT_HEIGHT);
 
+  activity?.requestDispatched();
   let browser = await withDeadline(
       launch(browserBinding), MAX_RENDER_DURATION_MS, "Browser launch timed out.");
   try {
-    return await withDeadline((async () => {
+    let result = await withDeadline((async () => {
       let page = await browser.newPage();
       await page.setViewport({ width, height });
       // The input is static markup. Disabling JavaScript closes active network channels such as
@@ -68,6 +71,8 @@ export async function renderImage(
       });
       return { dataUri: `data:image/png;base64,${base64}` };
     })(), MAX_RENDER_DURATION_MS, "Rendering timed out.");
+    activity?.responseReceived(200);
+    return result;
   } finally {
     await browser.close().catch(() => {});
   }

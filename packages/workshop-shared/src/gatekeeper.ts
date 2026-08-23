@@ -84,6 +84,8 @@ export type VendorDescription = {
  */
 export type AppUiContext = {
   isAdmin: boolean;
+  /** Host-minted direct-User billing authority for this account's management operations. */
+  billingAuthorizer: RpcStub<BillableOperationAuthorizer>;
 }
 
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
@@ -928,12 +930,13 @@ export interface BillableOperation extends RpcTarget {
   complete(outcome: BillableOperationOutcome): Promise<void>;
 }
 
-export interface ObservationAuthorizer extends RpcTarget {
+/** Host-minted authority to meter one Gatekeeper business operation. */
+export interface BillableOperationAuthorizer extends RpcTarget {
   /**
    * Begin metering one Gatekeeper Billable API Operation, before the first upstream business call.
    *
    * `billingMethodKey` is the stable caller-visible business-method key the deployment prices (for
-   * example `context.read.v1`); it must stay stable across releases, because the Usage Rate
+   * example `context.library.read.v1`); it must stay stable across releases, because the Usage Rate
    * catalog is keyed on it. `externalAccountId` is the connected external account whose quota the
    * call consumes — the external-account dimension retained for attribution.
    *
@@ -953,6 +956,10 @@ export interface ObservationAuthorizer extends RpcTarget {
     externalAccountId: string,
     idempotencyKey?: string,
   ): Promise<BillableOperation>;
+}
+
+/** Observation authority for one host-attested Gatekeeper caller. */
+export interface ObservationAuthorizer extends BillableOperationAuthorizer {
 
   /**
    * Check whether the gadget should be permitted to make an observation (that is, to read some

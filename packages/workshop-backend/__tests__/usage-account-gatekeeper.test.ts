@@ -151,6 +151,35 @@ describe("Gatekeeper two-stage billing state machine", () => {
     });
   });
 
+  it("persists direct User management Usage without a Workspace", async () => {
+    await withAccount(account => {
+      const attribution: GatekeeperUsageAttribution = {
+        principal: { version: 1, kind: "user", userId: "a".repeat(64) },
+        source: "direct-user",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        externalAccountId: "context-account-1",
+      };
+      const operationId = "gatekeeper-operation:direct-user";
+      account.beginGatekeeperUsage(operationId, attribution, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      const record = account.completeGatekeeperUsage(operationId, "executed");
+
+      expect(account.listUserUsageRecords({limit: 10}).records).toEqual([{
+        kind: "gatekeeper",
+        id: `usage-record:${operationId}`,
+        source: "direct-user",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        externalAccountId: "context-account-1",
+        pricing: "unpriced",
+        outcome: "settled",
+        chargeSubunits: 0n,
+        createdAt: record.createdAt,
+      }]);
+    });
+  });
+
   it("paginates user-visible Gatekeeper Usage Records", async () => {
     await withAccount(account => {
       for (const suffix of ["page-a", "page-b"]) {

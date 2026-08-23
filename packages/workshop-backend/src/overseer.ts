@@ -8567,6 +8567,7 @@ export class GatekeeperHookLoopback
     // @ts-ignore seems the RPC types aren't working here
     return overseer.startHook(this.ctx.props.hookId, run);
   }
+
 }
 
 type AgentSelfLoopbackProps = {

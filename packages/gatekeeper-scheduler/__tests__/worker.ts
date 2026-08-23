@@ -13,7 +13,12 @@ type TestExports = {
   SchedulerScopeTestFacet: DurableObjectClass<SchedulerScopeTestFacet>;
 };
 
-type TestMode = "success" | "start-reject" | "authorization-reject" | "callback-reject";
+type TestMode =
+  | "success"
+  | "start-reject"
+  | "billing-reject"
+  | "authorization-reject"
+  | "callback-reject";
 type BlockPoint = "start" | "authorization" | "callback";
 
 let mode: TestMode = "success";
@@ -23,6 +28,8 @@ let activeCallbacks = 0;
 let maxActiveCallbacks = 0;
 let disposedApprovalQueues = 0;
 let disposedCallbacks = 0;
+let billingEvents: string[] = [];
+let billingOperations = new Map<string, { id: string; outcome?: string }>();
 let blockPoint: BlockPoint | null = null;
 let blockedPoint: BlockPoint | null = null;
 
@@ -35,6 +42,22 @@ async function pauseIfBlocked(point: BlockPoint): Promise<void> {
 }
 
 class TestApprovalQueue extends RpcTarget {
+  async beginBillableOperation(
+    methodKey: string,
+    externalAccountId: string,
+    idempotencyKey?: string,
+  ) {
+    const key = `${methodKey}:${externalAccountId}:${idempotencyKey ?? ""}`;
+    let operation = billingOperations.get(key);
+    if (!operation) {
+      operation = { id: `billing-${billingOperations.size + 1}` };
+      billingOperations.set(key, operation);
+    }
+    billingEvents.push(`begin:${methodKey}:${externalAccountId}:${idempotencyKey}`);
+    if (mode === "billing-reject") throw new Error("billing rejected");
+    return new TestBillableOperation(operation, idempotencyKey ?? "");
+  }
+
   async authorizeObservation(): Promise<void> {
     events.push("authorize");
     await pauseIfBlocked("authorization");
@@ -43,6 +66,28 @@ class TestApprovalQueue extends RpcTarget {
 
   [Symbol.dispose](): void {
     disposedApprovalQueues++;
+  }
+}
+
+class TestBillableOperation extends RpcTarget {
+  constructor(
+    private readonly operation: { id: string; outcome?: string },
+    private readonly runId: string,
+  ) {
+    super();
+  }
+
+  async getOperationId(): Promise<string> {
+    return this.operation.id;
+  }
+
+  async markStarted(): Promise<void> {
+    billingEvents.push(`markStarted:${this.runId}`);
+  }
+
+  async complete(outcome: string): Promise<void> {
+    this.operation.outcome ??= outcome;
+    billingEvents.push(`complete:${outcome}:${this.runId}`);
   }
 }
 
@@ -101,6 +146,7 @@ export class TestHooks extends WorkerEntrypoint {
       maxActiveCallbacks,
       disposedApprovalQueues,
       disposedCallbacks,
+      billingEvents: [...billingEvents],
     };
   }
 
@@ -113,6 +159,8 @@ export class TestHooks extends WorkerEntrypoint {
     maxActiveCallbacks = 0;
     disposedApprovalQueues = 0;
     disposedCallbacks = 0;
+    billingEvents = [];
+    billingOperations = new Map();
     blockedPoint = null;
   }
 }

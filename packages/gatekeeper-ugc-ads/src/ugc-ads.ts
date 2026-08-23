@@ -14,6 +14,7 @@ import {
 import { RpcTarget } from "capnweb";
 import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import { boundAgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
+import { runBillableRead } from "@gadgets/backend-utils/gatekeeper-billing";
 import type {
   VendorDescription, AccountDescription, AgentCatalog, AgentCatalogRequest,
   GatekeeperUser, ApprovalQueue, ObservationAuthorizer,
@@ -31,6 +32,10 @@ import {
   type OfficialAccountArticleWindowDays, type XiaohongshuSearchOptions,
 } from "./tikhub-api.js";
 import { renderImage } from "./render.js";
+import {
+  UGC_ADS_BILLING_METHODS,
+  UGC_ADS_EXTERNAL_ACCOUNT_ID,
+} from "./billing-methods.js";
 
 // The initial #37 scope excludes shared storage. This module-local limiter coordinates every
 // UgcAdsGatekeeper facet in one Worker isolate without persisting data or caching query results.
@@ -419,7 +424,7 @@ export class UgcAdsGatekeeper
 // vendor source). `id` is the skill's validated frontmatter name, already checked unique by
 // scripts/build-skills.mjs.
 
-class UgcAdsSlashCommandProvider extends NativeRpcTarget implements SlashCommandProvider {
+export class UgcAdsSlashCommandProvider extends NativeRpcTarget implements SlashCommandProvider {
   async list(): Promise<SlashCommandDescriptor[]> {
     return UGC_ADS_SKILLS.map(skill => ({
       id: skill.name,
@@ -435,10 +440,16 @@ class UgcAdsSlashCommandProvider extends NativeRpcTarget implements SlashCommand
     let skill = UGC_ADS_SKILLS.find(entry => entry.name === id);
     if (!skill) throw new Error("The selected UGC Ads skill is no longer available.");
     let manifest = parseSkillManifest("SKILL.md", skill.content);
-    await authorizer.authorizeObservation({
-      title: "UGC Ads skill",
-      description: `Invoked the "${manifest.name}" skill.`,
-    });
+    await runBillableRead(
+      authorizer,
+      UGC_ADS_EXTERNAL_ACCOUNT_ID,
+      UGC_ADS_BILLING_METHODS["UgcAdsSlashCommandProvider.invoke"].methodKey,
+      async () => skill,
+      () => ({
+        title: "UGC Ads skill",
+        description: `Invoked the "${manifest.name}" skill.`,
+      }),
+    );
     return {
       skillName: manifest.name,
       message: buildAgentSkillMessage(skill.content, args),
@@ -474,35 +485,60 @@ export class UgcAdsSession extends RpcTarget {
   }
 
   async read(docId: string) {
-    let content = resolveBundledContent(docId);
-    if (!content) return null;
-    await this.#approvalQueue.authorizeObservation({
-      title: "UGC Ads bundled content",
-      description: `Read bundled content: ${docId}`,
-    });
-    return content;
+    let found = false;
+    return runBillableRead(
+      {
+        beginBillableOperation: (...args) =>
+          this.#approvalQueue.beginBillableOperation(...args),
+        authorizeObservation: description => found
+          ? this.#approvalQueue.authorizeObservation(description)
+          : Promise.resolve(),
+      },
+      UGC_ADS_EXTERNAL_ACCOUNT_ID,
+      UGC_ADS_BILLING_METHODS["UgcAdsSession.read"].methodKey,
+      async () => {
+        let content = resolveBundledContent(docId);
+        found = content !== null;
+        return content;
+      },
+      () => ({
+        title: "UGC Ads bundled content",
+        description: `Read bundled content: ${docId}`,
+      }),
+    );
   }
 
   async searchOfficialAccountArticles(
       queryTerms: string[], requestedWindowDays?: OfficialAccountArticleWindowDays) {
     let deadline = new OfficialAccountResearchDeadline(Date.now());
     try {
-      let result = await searchOfficialAccountArticles(
-        this.#tikhubApiKey, queryTerms, requestedWindowDays,
-        this.#officialAccountInteractionRateLimiter, deadline);
-      let expansion = result.automaticExpansionOccurred ? " after automatic expansion" : "";
-      let failedQueries = result.failedQueryTerms.length === 0 ? "" :
-        `; ${result.failedQueryTerms.length} query term search(es) failed`;
-      await deadline.race(() => this.#approvalQueue.authorizeObservation({
-        title: "Official-account article search",
-        description:
-          `Searched official-account articles for ${JSON.stringify(result.queryTerms)}; ` +
-          `returned ${result.validArticleCount} article(s) from the ` +
-          `${result.actualWindowDays}-day window${expansion}, with ` +
-          `${result.successfulInteractionArticleCount} interaction-validated article(s) and ` +
-          `${result.warnings.length} warning(s)${failedQueries}.`,
-      }));
-      return result;
+      return await runBillableRead(
+        {
+          beginBillableOperation: (...args) =>
+            this.#approvalQueue.beginBillableOperation(...args),
+          authorizeObservation: description => deadline.race(
+            () => this.#approvalQueue.authorizeObservation(description)),
+        },
+        UGC_ADS_EXTERNAL_ACCOUNT_ID,
+        UGC_ADS_BILLING_METHODS["UgcAdsSession.searchOfficialAccountArticles"].methodKey,
+        activity => searchOfficialAccountArticles(
+          this.#tikhubApiKey, queryTerms, requestedWindowDays,
+          this.#officialAccountInteractionRateLimiter, deadline, activity),
+        result => {
+          let expansion = result.automaticExpansionOccurred ? " after automatic expansion" : "";
+          let failedQueries = result.failedQueryTerms.length === 0 ? "" :
+            `; ${result.failedQueryTerms.length} query term search(es) failed`;
+          return {
+            title: "Official-account article search",
+            description:
+              `Searched official-account articles for ${JSON.stringify(result.queryTerms)}; ` +
+              `returned ${result.validArticleCount} article(s) from the ` +
+              `${result.actualWindowDays}-day window${expansion}, with ` +
+              `${result.successfulInteractionArticleCount} interaction-validated article(s) and ` +
+              `${result.warnings.length} warning(s)${failedQueries}.`,
+          };
+        },
+      );
     } catch (error) {
       if (!deadline.timedOut) throw error;
     } finally {
@@ -514,38 +550,54 @@ export class UgcAdsSession extends RpcTarget {
   }
 
   async searchXiaohongshuNotes(keyword: string, opts?: XiaohongshuSearchOptions) {
-    let notes = await searchXiaohongshuNotes(this.#tikhubApiKey, keyword, opts);
-    await this.#approvalQueue.authorizeObservation({
-      title: "Xiaohongshu search",
-      description: `Searched Xiaohongshu for "${keyword}"; found ${notes.length} note(s).`,
-    });
-    return notes;
+    return runBillableRead(
+      this.#approvalQueue,
+      UGC_ADS_EXTERNAL_ACCOUNT_ID,
+      UGC_ADS_BILLING_METHODS["UgcAdsSession.searchXiaohongshuNotes"].methodKey,
+      activity => searchXiaohongshuNotes(this.#tikhubApiKey, keyword, opts, activity),
+      notes => ({
+        title: "Xiaohongshu search",
+        description: `Searched Xiaohongshu for "${keyword}"; found ${notes.length} note(s).`,
+      }),
+    );
   }
 
   async getXiaohongshuNoteDetail(url: string, opts?: { limit?: number }) {
-    let note = await getXiaohongshuNoteDetail(this.#tikhubApiKey, url, opts);
-    await this.#approvalQueue.authorizeObservation({
-      title: "Xiaohongshu note detail",
-      description: `Fetched detail for Xiaohongshu note: ${url}`,
-    });
-    return note;
+    return runBillableRead(
+      this.#approvalQueue,
+      UGC_ADS_EXTERNAL_ACCOUNT_ID,
+      UGC_ADS_BILLING_METHODS["UgcAdsSession.getXiaohongshuNoteDetail"].methodKey,
+      activity => getXiaohongshuNoteDetail(this.#tikhubApiKey, url, opts, activity),
+      () => ({
+        title: "Xiaohongshu note detail",
+        description: `Fetched detail for Xiaohongshu note: ${url}`,
+      }),
+    );
   }
 
   async getXiaohongshuCreatorProfile(url: string, opts?: { limit?: number }) {
-    let profile = await getXiaohongshuCreatorProfile(this.#tikhubApiKey, url, opts);
-    await this.#approvalQueue.authorizeObservation({
-      title: "Xiaohongshu creator profile",
-      description: `Fetched creator profile and recent notes: ${url}`,
-    });
-    return profile;
+    return runBillableRead(
+      this.#approvalQueue,
+      UGC_ADS_EXTERNAL_ACCOUNT_ID,
+      UGC_ADS_BILLING_METHODS["UgcAdsSession.getXiaohongshuCreatorProfile"].methodKey,
+      activity => getXiaohongshuCreatorProfile(this.#tikhubApiKey, url, opts, activity),
+      () => ({
+        title: "Xiaohongshu creator profile",
+        description: `Fetched creator profile and recent notes: ${url}`,
+      }),
+    );
   }
 
   async renderImage(html: string, opts?: { width?: number; height?: number }) {
-    let result = await renderImage(this.#browser, html, opts);
-    await this.#approvalQueue.authorizeObservation({
-      title: "Rendered image",
-      description: `Rendered a ${(opts?.width ?? 1080)}x${(opts?.height ?? 1440)} image from HTML.`,
-    });
-    return result;
+    return runBillableRead(
+      this.#approvalQueue,
+      UGC_ADS_EXTERNAL_ACCOUNT_ID,
+      UGC_ADS_BILLING_METHODS["UgcAdsSession.renderImage"].methodKey,
+      activity => renderImage(this.#browser, html, opts, activity),
+      () => ({
+        title: "Rendered image",
+        description: `Rendered a ${(opts?.width ?? 1080)}x${(opts?.height ?? 1440)} image from HTML.`,
+      }),
+    );
   }
 }

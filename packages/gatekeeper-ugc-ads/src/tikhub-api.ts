@@ -2,6 +2,8 @@
 // this module maps TikHub's WeChat Official Account and Xiaohongshu response shapes into stable
 // UGC Ads summaries.
 
+import type { BillableOperationActivity } from "@gadgets/backend-utils/gatekeeper-billing";
+
 const TIKHUB_BASE_URL = "https://api.tikhub.io";
 const MAX_SEARCH_RESULTS = 100;
 const MAX_OFFICIAL_ACCOUNT_QUERY_TERMS = 5;
@@ -246,19 +248,22 @@ function assertResult(result: TikHubResult, operation: string): void {
 
 async function callTikHub<T>(
     path: string, apiKey: string,
-    query: Record<string, string | number | boolean | undefined>): Promise<T> {
+    query: Record<string, string | number | boolean | undefined>,
+    activity?: BillableOperationActivity): Promise<T> {
   assertApiKey(apiKey);
   let url = new URL(path, TIKHUB_BASE_URL);
   for (let [key, value] of Object.entries(query)) {
     if (value !== undefined) url.searchParams.set(key, String(value));
   }
 
+  activity?.requestDispatched();
   let response = await fetch(url, {
     headers: {
       Accept: "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
   });
+  activity?.responseReceived(response.ok ? response.status : 500);
   if (!response.ok) throw new Error(`TikHub request failed with status ${response.status}.`);
 
   let envelope = await response.json() as TikHubEnvelope<T>;
@@ -289,10 +294,12 @@ function isAbortError(value: unknown): boolean {
 
 async function postTikHubAttempt<T>(
     path: string, apiKey: string, body: Record<string, unknown>,
-    deadline: OfficialAccountResearchDeadline): Promise<T> {
+    deadline: OfficialAccountResearchDeadline,
+    activity?: BillableOperationActivity): Promise<T> {
   deadline.assertActive();
   let response: Response;
   try {
+    activity?.requestDispatched();
     response = await deadline.race(() => fetch(new URL(path, TIKHUB_BASE_URL), {
       method: "POST",
       headers: {
@@ -303,6 +310,7 @@ async function postTikHubAttempt<T>(
       body: JSON.stringify(body),
       signal: deadline.signal,
     }));
+    activity?.responseReceived(response.ok ? response.status : 500);
   } catch (error) {
     if (deadline.signal.aborted || isAbortError(error)) {
       throw new TikHubRequestFailure("timeout");
@@ -332,12 +340,13 @@ async function postTikHubAttempt<T>(
 async function postTikHub<T>(
     path: string, apiKey: string, body: Record<string, unknown>,
     deadline: OfficialAccountResearchDeadline,
-    rateLimiter?: OfficialAccountInteractionRateLimiter): Promise<T> {
+    rateLimiter?: OfficialAccountInteractionRateLimiter,
+    activity?: BillableOperationActivity): Promise<T> {
   assertApiKey(apiKey);
   for (let attempt = 0; attempt < 2; attempt++) {
     if (rateLimiter) await rateLimiter.wait(deadline);
     try {
-      return await postTikHubAttempt<T>(path, apiKey, body, deadline);
+      return await postTikHubAttempt<T>(path, apiKey, body, deadline, activity);
     } catch (error) {
       let failure = asTikHubRequestFailure(error);
       if (deadline.signal.aborted) throw new TikHubRequestFailure("timeout");
@@ -745,7 +754,8 @@ function missingInteractionWarning(articleUrl: string): OfficialAccountResearchW
 async function searchOfficialAccountArticleBatch(
     apiKey: string, queryTerms: string[], windowDays: OfficialAccountArticleWindowDays,
     queryTimeMs: number,
-    deadline: OfficialAccountResearchDeadline): Promise<OfficialAccountArticleBatchResult> {
+    deadline: OfficialAccountResearchDeadline,
+    activity?: BillableOperationActivity): Promise<OfficialAccountArticleBatchResult> {
   let fatalFailure: TikHubRequestFailure | undefined;
   let outcomes = await Promise.all(queryTerms.map(
     async (queryTerm): Promise<OfficialAccountArticleBatchOutcome> => {
@@ -758,7 +768,7 @@ async function searchOfficialAccountArticleBatch(
             publish_time: windowDays === 30 ? "half_year" : "week",
             offset: 0,
             raw: false,
-          }, deadline);
+          }, deadline, undefined, activity);
         let searchRecord = asRecord(search);
         if (!searchRecord || !Array.isArray(searchRecord.items)) {
           throw new TikHubRequestFailure("invalid_response");
@@ -856,7 +866,8 @@ export async function searchOfficialAccountArticles(
     apiKey: string, queryTerms: string[],
     requestedWindowDays: OfficialAccountArticleWindowDays | undefined,
     rateLimiter: OfficialAccountInteractionRateLimiter,
-    deadline: OfficialAccountResearchDeadline): Promise<OfficialAccountArticleSearchResult> {
+    deadline: OfficialAccountResearchDeadline,
+    activity?: BillableOperationActivity): Promise<OfficialAccountArticleSearchResult> {
   assertApiKey(apiKey);
   let normalizedQueryTerms = normalizeOfficialAccountQueryTerms(queryTerms);
   let normalizedRequestedWindowDays = normalizeOfficialAccountWindow(requestedWindowDays);
@@ -869,7 +880,7 @@ export async function searchOfficialAccountArticles(
   let batchResult: OfficialAccountArticleBatchResult;
   try {
     batchResult = await searchOfficialAccountArticleBatch(
-      apiKey, normalizedQueryTerms, actualWindowDays, queryTimeMs, deadline);
+      apiKey, normalizedQueryTerms, actualWindowDays, queryTimeMs, deadline, activity);
   } catch (error) {
     throw officialAccountUnavailableError(asTikHubRequestFailure(error));
   }
@@ -880,7 +891,7 @@ export async function searchOfficialAccountArticles(
     automaticExpansionOccurred = true;
     try {
       batchResult = await searchOfficialAccountArticleBatch(
-        apiKey, normalizedQueryTerms, actualWindowDays, queryTimeMs, deadline);
+        apiKey, normalizedQueryTerms, actualWindowDays, queryTimeMs, deadline, activity);
     } catch (error) {
       throw officialAccountUnavailableError(asTikHubRequestFailure(error));
     }
@@ -895,7 +906,7 @@ export async function searchOfficialAccountArticles(
     try {
       let stats = await postTikHub<TikHubOfficialAccountArticleStats>(
         "/api/v1/wechat_mp/v2/fetch_article_stats", apiKey,
-        { url: article.url, raw: false }, deadline, rateLimiter);
+        { url: article.url, raw: false }, deadline, rateLimiter, activity);
       if (!asRecord(stats)) throw new TikHubRequestFailure("invalid_response");
       let interactions = normalizeOfficialAccountInteractions(stats);
       return {
@@ -1137,7 +1148,8 @@ export type XiaohongshuSearchOptions = { type?: number; sort?: number; time?: nu
 
 export async function searchXiaohongshuNotes(
     apiKey: string, keyword: string,
-    opts: XiaohongshuSearchOptions = {}): Promise<XiaohongshuNoteSummary[]> {
+    opts: XiaohongshuSearchOptions = {},
+    activity?: BillableOperationActivity): Promise<XiaohongshuNoteSummary[]> {
   if (!keyword.trim()) throw new Error("TikHub Xiaohongshu search requires a keyword.");
   let limit = boundedLimit(opts.limit, 20);
   if (limit === 0) return [];
@@ -1162,7 +1174,7 @@ export async function searchXiaohongshuNotes(
         search_session_id: searchSessionId,
         source: "explore_feed",
         ai_mode: 0,
-      });
+      }, activity);
     assertResult(result, "Xiaohongshu search");
     let pageNotes = (result.data?.items ?? [])
         .flatMap(item => item.note ? [toNoteSummary(item.note, {
@@ -1197,11 +1209,12 @@ function parseNoteUrl(value: string): { id: string; xsecToken: string } {
 
 export async function getXiaohongshuNoteDetail(
     apiKey: string, url: string,
-    opts: { limit?: number } = {}): Promise<XiaohongshuNoteSummary> {
+    opts: { limit?: number } = {},
+    activity?: BillableOperationActivity): Promise<XiaohongshuNoteSummary> {
   let { id, xsecToken } = parseNoteUrl(url);
   let result = await callTikHub<TikHubDetailResult>(
     "/api/v1/xiaohongshu/web_v3/fetch_note_detail", apiKey,
-    { note_id: id, xsec_token: xsecToken });
+    { note_id: id, xsec_token: xsecToken }, activity);
   assertResult(result, "Xiaohongshu note detail");
   let raw = result.data?.items?.[0]?.note_card;
   if (!raw) throw new Error("TikHub returned no Xiaohongshu note detail.");
@@ -1217,7 +1230,7 @@ export async function getXiaohongshuNoteDetail(
       index: 0,
       pageArea: "UNFOLDED",
       sort_strategy: "like_count",
-    });
+    }, activity);
   assertResult(commentsResult, "Xiaohongshu note comments");
   return {
     ...note,
@@ -1234,14 +1247,15 @@ export async function getXiaohongshuNoteDetail(
 }
 
 export async function getXiaohongshuCreatorProfile(
-    apiKey: string, url: string, opts: { limit?: number } = {}): Promise<unknown> {
+    apiKey: string, url: string, opts: { limit?: number } = {},
+    activity?: BillableOperationActivity): Promise<unknown> {
   let limit = boundedLimit(opts.limit, 20);
   let [profileResult, notesResult] = await Promise.all([
     callTikHub<TikHubUserResult>(
-      "/api/v1/xiaohongshu/app_v2/get_user_info", apiKey, { share_text: url }),
+      "/api/v1/xiaohongshu/app_v2/get_user_info", apiKey, { share_text: url }, activity),
     callTikHub<TikHubUserNotesResult>(
       "/api/v1/xiaohongshu/app_v2/get_user_posted_notes", apiKey,
-      { share_text: url, cursor: "" }),
+      { share_text: url, cursor: "" }, activity),
   ]);
   assertResult(profileResult, "Xiaohongshu creator profile");
   assertResult(notesResult, "Xiaohongshu creator notes");

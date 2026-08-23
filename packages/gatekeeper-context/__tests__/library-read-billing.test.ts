@@ -7,8 +7,8 @@ vi.mock("capnweb-validate", () => ({ validateRpc: () => () => undefined }));
 vi.mock("capnweb", () => ({ RpcTarget: class {} }));
 vi.mock("cloudflare:workers", () => ({ RpcStub: class {} }));
 
-const { CONTEXT_READ_BILLING_METHOD_KEY, LibraryReadSession } =
-  await import("../src/library-read.js");
+const { LibraryReadSession } = await import("../src/library-read.js");
+const { CONTEXT_BILLING_METHODS } = await import("../src/billing-methods.js");
 const { encodeDocId } = await import("../src/context-types.js");
 
 const ACCOUNT_ID = "context-account-1";
@@ -21,8 +21,13 @@ type Trace = string[];
 function makeSession(options: {
   trace: Trace;
   getContextDocument: () => Promise<unknown>;
+  search?: () => Promise<unknown[]>;
+  getMetadata?: () => Promise<unknown>;
+  listContextDocuments?: () => Promise<unknown[]>;
   authorizeObservation?: () => Promise<void>;
   enabled?: Map<string, string>;
+  readBillingMethodKey?: string;
+  beginError?: Error;
 }) {
   const { trace } = options;
 
@@ -44,6 +49,7 @@ function makeSession(options: {
   const authorizer = {
     async beginBillableOperation(billingMethodKey: string, externalAccountId: string) {
       trace.push(`begin:${billingMethodKey}:${externalAccountId}`);
+      if (options.beginError) throw options.beginError;
       return operation;
     },
     async authorizeObservation(description: { billingOperationId?: string }) {
@@ -60,6 +66,20 @@ function makeSession(options: {
         trace.push("upstream");
         return options.getContextDocument();
       },
+      search: async () => {
+        trace.push("upstream:search");
+        return options.search?.() ?? [];
+      },
+      getMetadata: async () => {
+        trace.push("upstream:metadata");
+        return options.getMetadata?.() ?? {
+          title: "Collection", description: "Notes", documentCount: 1,
+        };
+      },
+      listContextDocuments: async () => {
+        trace.push("upstream:list");
+        return options.listContextDocuments?.() ?? [];
+      },
     }),
   };
 
@@ -73,6 +93,8 @@ function makeSession(options: {
 
   return new (LibraryReadSession as unknown as new (...args: unknown[]) => {
     read(docId: string): Promise<unknown>;
+    search(query: string): Promise<unknown>;
+    list(options?: { collectionId?: string }): Promise<unknown>;
   })(
     collections,
     userLibraries,
@@ -80,6 +102,7 @@ function makeSession(options: {
     ACCOUNT_ID,
     authorizer,
     async () => ({ pendingCollections: [], commit() {} }),
+    options.readBillingMethodKey,
   );
 }
 
@@ -93,6 +116,36 @@ const DOCUMENT = {
 };
 
 describe("Context Library read billing", () => {
+  it("does not read Context storage when authoritative begin fails", async () => {
+    const trace: Trace = [];
+    const session = makeSession({
+      trace,
+      getContextDocument: async () => DOCUMENT,
+      beginError: new Error("billing unavailable"),
+    });
+
+    await expect(session.read(encodeDocId(COLLECTION_ID, DOC_PATH)))
+      .rejects.toThrow("billing unavailable");
+    expect(trace).not.toContain("upstream");
+  });
+
+  it("uses the slash invocation key instead of nesting a document-read charge", async () => {
+    const trace: Trace = [];
+    const session = makeSession({
+      trace,
+      getContextDocument: async () => DOCUMENT,
+      readBillingMethodKey:
+        CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
+    });
+
+    await session.read(encodeDocId(COLLECTION_ID, DOC_PATH));
+
+    expect(trace.filter(event => event.startsWith("begin:"))).toEqual([
+      `begin:${CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey}:` +
+        ACCOUNT_ID,
+    ]);
+  });
+
   it("begins, marks started, calls upstream, settles, then authorizes", async () => {
     const trace: Trace = [];
     const session = makeSession({ trace, getContextDocument: async () => DOCUMENT });
@@ -103,7 +156,7 @@ describe("Context Library read billing", () => {
     // The attempt is marked started immediately before the upstream call, and the charge is
     // completed as soon as the store answers -- before the observation is authorized.
     expect(trace).toEqual([
-      `begin:${CONTEXT_READ_BILLING_METHOD_KEY}:${ACCOUNT_ID}`,
+      `begin:${CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey}:${ACCOUNT_ID}`,
       "markStarted",
       "upstream",
       "complete:executed",
@@ -135,10 +188,62 @@ describe("Context Library read billing", () => {
 
     await expect(session.read(encodeDocId(COLLECTION_ID, DOC_PATH))).resolves.toBeNull();
     expect(trace).toEqual([
-      `begin:${CONTEXT_READ_BILLING_METHOD_KEY}:${ACCOUNT_ID}`,
+      `begin:${CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey}:${ACCOUNT_ID}`,
       "markStarted",
       "upstream",
       "complete:executed",
+      "dispose",
+    ]);
+  });
+
+  it("meters one whole-library search once before its collection fanout", async () => {
+    const trace: Trace = [];
+    const session = makeSession({
+      trace,
+      getContextDocument: async () => DOCUMENT,
+      search: async () => [{
+        path: DOC_PATH,
+        name: "readme.md",
+        description: "A note.",
+        snippet: "hello",
+        score: 1,
+      }],
+    });
+
+    await expect(session.search("hello")).resolves.toHaveLength(1);
+    expect(trace).toEqual([
+      `begin:${CONTEXT_BILLING_METHODS["LibraryReadSession.search"].methodKey}:${ACCOUNT_ID}`,
+      "markStarted",
+      "upstream:search",
+      "complete:executed",
+      `authorize:${OPERATION_ID}`,
+      "dispose",
+    ]);
+  });
+
+  it("meters one collection listing and links its observation", async () => {
+    const trace: Trace = [];
+    const session = makeSession({
+      trace,
+      getContextDocument: async () => DOCUMENT,
+      listContextDocuments: async () => [{
+        path: DOC_PATH,
+        name: "readme.md",
+        description: "A note.",
+        contentType: "text/markdown",
+      }],
+    });
+
+    await expect(session.list({ collectionId: COLLECTION_ID })).resolves.toMatchObject({
+      collectionId: COLLECTION_ID,
+      entries: [expect.objectContaining({ type: "directory" })],
+    });
+    expect(trace).toEqual([
+      `begin:${CONTEXT_BILLING_METHODS["LibraryReadSession.list"].methodKey}:${ACCOUNT_ID}`,
+      "markStarted",
+      "upstream:list",
+      "complete:executed",
+      `authorize:${OPERATION_ID}`,
       "dispose",
     ]);
   });

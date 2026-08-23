@@ -85,7 +85,9 @@ describe("OverseerDurableObject.startHook", () => {
     expect(result.callback).toEqual({props: expect.objectContaining({
       hookId: 1,
       attribution: expect.objectContaining({
+        principal: {version: 1, kind: "user", userId: "a".repeat(64)},
         source: "scheduled",
+        workspaceId: "b".repeat(64),
         automationId: "schedule-1",
         automationRunId: "run-1",
       }),

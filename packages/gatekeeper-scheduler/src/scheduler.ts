@@ -5,6 +5,10 @@ import {
   WorkerEntrypoint,
 } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
+import {
+  runBillableOperation,
+  runBillableRead,
+} from "@gadgets/backend-utils/gatekeeper-billing";
 import type {
   AccountDescription,
   ActionKind,
@@ -12,6 +16,7 @@ import type {
   AgentCatalogRequest,
   AppUiContext,
   ApprovalQueue,
+  BillableOperationAuthorizer,
   Gatekeeper,
   GatekeeperConnectCallback,
   GatekeeperConnectOptions,
@@ -48,6 +53,7 @@ import type {
 } from "./types.js";
 import TYPES_CODE from "./types.txt";
 import APP_HTML from "./generated/app.txt";
+import { SCHEDULER_BILLING_METHODS } from "./billing-methods.js";
 
 const SCHEDULER_ICON = {
   url:
@@ -115,7 +121,10 @@ export class ScheduleSessionImpl extends RpcTarget implements ScheduleSession {
     options: RecurringScheduleOptions,
   ): Promise<string> {
     const registeredAt = this.#now();
-    return this.#register(normalizeInterval(everyMs, registeredAt), callback, options, registeredAt);
+    return this.#register(
+      normalizeInterval(everyMs, registeredAt), callback, options, registeredAt,
+      SCHEDULER_BILLING_METHODS["ScheduleSession.every"].methodKey,
+    );
   }
 
   /** Registers a timezone-aware calendar recurrence. */
@@ -127,6 +136,7 @@ export class ScheduleSessionImpl extends RpcTarget implements ScheduleSession {
     const registeredAt = this.#now();
     return this.#register(
       normalizeCalendarRule(rule, registeredAt), callback, options, registeredAt,
+      SCHEDULER_BILLING_METHODS["ScheduleSession.calendarAt"].methodKey,
     );
   }
 
@@ -137,17 +147,29 @@ export class ScheduleSessionImpl extends RpcTarget implements ScheduleSession {
     options: ScheduleOptions,
   ): Promise<string> {
     const registeredAt = this.#now();
-    return this.#register(normalizeOneShot(when, registeredAt), callback, options, registeredAt);
+    return this.#register(
+      normalizeOneShot(when, registeredAt), callback, options, registeredAt,
+      SCHEDULER_BILLING_METHODS["ScheduleSession.runAt"].methodKey,
+    );
   }
 
   /** Lists this workspace's enabled schedules after observation authorization. */
   async list(): Promise<ScheduleSummary[]> {
-    const schedules = await this.#driver.listWorkspace(this.#workspaceId);
-    await this.#approvalQueue.authorizeObservation({
-      title: "List scheduled tasks",
-      description: "List enabled schedules for this workspace.",
-    });
-    return schedules;
+    return runBillableRead(
+      this.#approvalQueue,
+      this.#accountId,
+      SCHEDULER_BILLING_METHODS["ScheduleSession.list"].methodKey,
+      async activity => {
+        activity.requestDispatched();
+        const schedules = await this.#driver.listWorkspace(this.#workspaceId);
+        activity.responseReceived(200);
+        return schedules;
+      },
+      () => ({
+        title: "List scheduled tasks",
+        description: "List enabled schedules for this workspace.",
+      }),
+    );
   }
 
   [Symbol.dispose](): void {
@@ -159,6 +181,7 @@ export class ScheduleSessionImpl extends RpcTarget implements ScheduleSession {
     callback: NativeRpcStub<ScheduleHookTarget>,
     options: RecurringScheduleOptions,
     registeredAt: number,
+    billingMethodKey: string,
   ): Promise<string> {
     if (spec.kind === "once" && options?.occurrences !== undefined) {
       throw new TypeError("Occurrence limits apply only to recurring schedules.");
@@ -172,14 +195,26 @@ export class ScheduleSessionImpl extends RpcTarget implements ScheduleSession {
       spec,
       ...normalized,
     });
-    await this.#approvalQueue.bindHook(
-      // @ts-expect-error Workers currently widens the controller's hook type across bindHook RPC.
-      controller,
-      callback,
-      // bindHook takes only the display metadata; the bound itself stays in the controller.
-      { title: normalized.title, description: normalized.description },
+    return runBillableOperation(
+      {
+        beginBillableOperation: (...args) =>
+          this.#approvalQueue.beginBillableOperation(...args),
+      },
+      this.#accountId,
+      billingMethodKey,
+      async activity => {
+        activity.requestDispatched();
+        await this.#approvalQueue.bindHook(
+          // @ts-expect-error Workers currently widens the controller's hook type across bindHook RPC.
+          controller,
+          callback,
+          // bindHook takes only the display metadata; the bound itself stays in the controller.
+          { title: normalized.title, description: normalized.description },
+        );
+        activity.responseReceived(200);
+        return scheduleId;
+      },
     );
-    return scheduleId;
   }
 }
 
@@ -303,13 +338,34 @@ export class SchedulerGatekeeper
 
 @validateRpc()
 export class ScheduleManagementApi extends RpcTarget {
-  constructor(private readonly driver: Pick<ScheduleDriver, "listAccount">) {
+  constructor(
+    private readonly driver: Pick<ScheduleDriver, "listAccount">,
+    private readonly accountId: string,
+    private readonly billingAuthorizer: NativeRpcStub<BillableOperationAuthorizer>,
+  ) {
     super();
+  }
+
+  [Symbol.dispose](): void {
+    this.billingAuthorizer[Symbol.dispose]?.();
   }
 
   /** Lists schedules across this account without mutation authority. */
   list(options?: ManagementListOptions): Promise<ManagementSchedulePage> {
-    return this.driver.listAccount(options);
+    return runBillableOperation(
+      {
+        beginBillableOperation: (...args) =>
+          this.billingAuthorizer.beginBillableOperation(...args),
+      },
+      this.accountId,
+      SCHEDULER_BILLING_METHODS["ScheduleManagementApi.list"].methodKey,
+      async activity => {
+        activity.requestDispatched();
+        const result = await this.driver.listAccount(options);
+        activity.responseReceived(200);
+        return result;
+      },
+    );
   }
 }
 
@@ -341,8 +397,16 @@ export class ScheduleAccount
   }
 
   /** Opens the account's read-only management frame. */
-  async startAppUi(_context: AppUiContext): Promise<GatekeeperUiFrame> {
-    const ui = new NativeRpcStub(new ScheduleManagementApi(this.#driver()));
+  async startAppUi(context: AppUiContext): Promise<GatekeeperUiFrame> {
+    const billingAuthorizer = context.billingAuthorizer.dup();
+    let ui: NativeRpcStub<ScheduleManagementApi>;
+    try {
+      ui = new NativeRpcStub(new ScheduleManagementApi(
+        this.#driver(), this.ctx.props.accountId, billingAuthorizer));
+    } catch (error) {
+      billingAuthorizer[Symbol.dispose]?.();
+      throw error;
+    }
     return { iframeHtml: APP_HTML, ui };
   }
 

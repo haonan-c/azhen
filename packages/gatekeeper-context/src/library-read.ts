@@ -4,6 +4,10 @@
 import { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
+import {
+  runBillableRead,
+  type BillableOperationActivity,
+} from "@gadgets/backend-utils/gatekeeper-billing";
 import type {
   BillableOperation, BillableOperationOutcome, ObservationAuthorizer, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -15,6 +19,7 @@ import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import { domainName } from "./domain.js";
 import { obsContext } from "./observability.js";
+import { CONTEXT_BILLING_METHODS } from "./billing-methods.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.context", vendorId: VENDOR_ID,
@@ -27,7 +32,8 @@ const MAX_COLLECTION_FANOUT = 8;
  * Stable priced business-method key for one Context Library document read. The deployment Usage
  * Rate catalog is keyed on it, so it must never change once a deployment has priced it.
  */
-export const CONTEXT_READ_BILLING_METHOD_KEY = "context.read.v1";
+export const CONTEXT_READ_BILLING_METHOD_KEY =
+  CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey;
 
 type ObserveCollections = (collectionIds: string[]) => Promise<{
   excludeObservers?: string[];
@@ -48,6 +54,7 @@ export class LibraryReadSession extends RpcTarget {
     private accountId: string,
     private authorizer: NativeRpcStub<ObservationAuthorizer>,
     private observeCollections: ObserveCollections,
+    private readBillingMethodKey = CONTEXT_READ_BILLING_METHOD_KEY,
   ) {
     super();
   }
@@ -96,66 +103,102 @@ export class LibraryReadSession extends RpcTarget {
       targetIds = [...enabled.keys()];
     }
 
-    let perCollection = await mapWithConcurrency(targetIds, MAX_COLLECTION_FANOUT, async (collectionId) => {
-      try {
-        let hits = await this.#collection(collectionId).search(query, limit);
-        return hits.map((r): ContextSearchResult => ({
-          docId: encodeDocId(collectionId, r.path),
-          collectionId,
-          title: r.name,
-          path: r.path,
-          description: r.description,
-          snippet: r.snippet,
-          score: r.score,
-        }));
-      } catch (err) {
-        logger.warn("failed to search collection", {
-          event: "collection.search.failed", collectionId, error: err,
-        });
-        return [];
-      }
-    });
-
-    let results = perCollection.flat();
-    results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-    results = results.slice(0, limit);
-
-    // Nothing matched → nothing was observed, so don't record an observation (mirrors read()).
-    if (results.length === 0) return results;
-    let collectionIds = [...new Set(results.map(r => r.collectionId).filter((id): id is string => !!id))];
-    // Authorize after fetching, before returning data.
-    await this.#authorize(collectionIds, {
-      title: `Context search: ${query}`,
-      description:
-        `Searched the Context Library for \`${query}\`. Returned ${results.length} result(s)` +
-        (collectionIds.length ? ` across ${collectionIds.length} collection(s).` : "."),
-    });
-    return results;
+    let collectionIds: string[] = [];
+    return runBillableRead(
+      {
+        beginBillableOperation: (...args) => this.authorizer.beginBillableOperation(...args),
+        authorizeObservation: description => collectionIds.length === 0
+          ? Promise.resolve()
+          : this.#authorize(collectionIds, description),
+      },
+      this.accountId,
+      CONTEXT_BILLING_METHODS["LibraryReadSession.search"].methodKey,
+      async activity => {
+        let perCollection = await mapWithConcurrency(
+          targetIds,
+          MAX_COLLECTION_FANOUT,
+          async (collectionId) => this.#searchCollection(activity, collectionId, query, limit),
+        );
+        let results = perCollection.flat();
+        results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        results = results.slice(0, limit);
+        collectionIds = [...new Set(results
+          .map(result => result.collectionId)
+          .filter((id): id is string => !!id))];
+        return results;
+      },
+      results => ({
+        title: `Context search: ${query}`,
+        description:
+          `Searched the Context Library for \`${query}\`. Returned ${results.length} result(s)` +
+          (collectionIds.length ? ` across ${collectionIds.length} collection(s).` : "."),
+      }),
+    );
   }
 
   async list(opts?: {
     collectionId?: string;
     path?: string;
   }): Promise<ContextListing> {
-    let listing = await this.#fetchListing(opts);
-    // Nothing listed → nothing was observed, so don't record an observation (mirrors read()).
-    if (listing.entries.length === 0) return listing;
-    // Both collection contents and top-level collection titles/descriptions reveal collection data.
-    let collectionIds = opts?.collectionId
-      ? [opts.collectionId]
-      : listing.entries
-          .filter((entry): entry is Extract<ContextListingEntry, { type: "collection" }> =>
-            entry.type === "collection")
-          .map(entry => entry.id);
-    await this.#authorize(collectionIds, {
-      title: opts?.collectionId
-        ? `Context listing: ${opts.collectionId}${opts.path ? "/" + opts.path : ""}`
-        : "Context listing: collections",
-      description: opts?.collectionId
-        ? `Listed contents of Context Library collection \`${opts.collectionId}\`.`
-        : "Listed the user's Context Library collections.",
-    });
-    return listing;
+    let enabled = await this.#enabled();
+    if (opts?.collectionId && !enabled.has(opts.collectionId)) {
+      return { collectionId: opts.collectionId, entries: [] };
+    }
+    let collectionIds: string[] = [];
+    return runBillableRead(
+      {
+        beginBillableOperation: (...args) => this.authorizer.beginBillableOperation(...args),
+        authorizeObservation: description => collectionIds.length === 0
+          ? Promise.resolve()
+          : this.#authorize(collectionIds, description),
+      },
+      this.accountId,
+      CONTEXT_BILLING_METHODS["LibraryReadSession.list"].methodKey,
+      async activity => {
+        let listing = await this.#fetchListing(activity, enabled, opts);
+        collectionIds = opts?.collectionId
+          ? listing.entries.length === 0 ? [] : [opts.collectionId]
+          : listing.entries
+              .filter((entry): entry is Extract<ContextListingEntry, { type: "collection" }> =>
+                entry.type === "collection")
+              .map(entry => entry.id);
+        return listing;
+      },
+      () => ({
+        title: opts?.collectionId
+          ? `Context listing: ${opts.collectionId}${opts.path ? "/" + opts.path : ""}`
+          : "Context listing: collections",
+        description: opts?.collectionId
+          ? `Listed contents of Context Library collection \`${opts.collectionId}\`.`
+          : "Listed the user's Context Library collections.",
+      }),
+    );
+  }
+
+  async #searchCollection(
+      activity: BillableOperationActivity,
+      collectionId: string,
+      query: string,
+      limit: number): Promise<ContextSearchResult[]> {
+    try {
+      activity.requestDispatched();
+      let hits = await this.#collection(collectionId).search(query, limit);
+      activity.responseReceived(200);
+      return hits.map((result): ContextSearchResult => ({
+        docId: encodeDocId(collectionId, result.path),
+        collectionId,
+        title: result.name,
+        path: result.path,
+        description: result.description,
+        snippet: result.snippet,
+        score: result.score,
+      }));
+    } catch (error) {
+      logger.warn("failed to search collection", {
+        event: "collection.search.failed", collectionId, error,
+      });
+      return [];
+    }
   }
 
   async read(docId: string): Promise<ContextReadResult | null> {
@@ -170,7 +213,7 @@ export class LibraryReadSession extends RpcTarget {
     // One Billable API Operation covers this whole read. Nothing above this line reaches the
     // document store, so a rejected id or a disabled collection is never charged.
     using operation = await this.authorizer.beginBillableOperation(
-      CONTEXT_READ_BILLING_METHOD_KEY, this.accountId);
+      this.readBillingMethodKey, this.accountId);
     let doc = await this.#readDocument(operation, collectionId, path);
     // No document found (missing or inaccessible) → nothing was observed, so don't record one.
     // The store was still asked, so the fixed API charge stands.
@@ -233,14 +276,17 @@ export class LibraryReadSession extends RpcTarget {
   }
 
   // Fetch without recording; list() authorizes.
-  async #fetchListing(opts?: { collectionId?: string; path?: string }): Promise<ContextListing> {
-    let enabled = await this.#enabled();
-
+  async #fetchListing(
+      activity: BillableOperationActivity,
+      enabled: Map<string, ContextCollectionVisibility>,
+      opts?: { collectionId?: string; path?: string }): Promise<ContextListing> {
     if (!opts?.collectionId) {
       let collectionEntries = await mapWithConcurrency([...enabled.keys()], MAX_COLLECTION_FANOUT,
         async (collectionId): Promise<ContextListingEntry | null> => {
           try {
+            activity.requestDispatched();
             let meta = await this.#collection(collectionId).getMetadata();
+            activity.responseReceived(200);
             return {
               type: "collection",
               id: collectionId,
@@ -258,12 +304,10 @@ export class LibraryReadSession extends RpcTarget {
       return { entries: collectionEntries.filter((e): e is ContextListingEntry => e !== null) };
     }
 
-    if (!enabled.has(opts.collectionId)) {
-      return { collectionId: opts.collectionId, entries: [] };
-    }
-
     let pathPrefix = opts.path ? opts.path + "/" : "";
+    activity.requestDispatched();
     let docs = await this.#collection(opts.collectionId).listContextDocuments(pathPrefix || undefined);
+    activity.responseReceived(200);
 
     let entries: ContextListingEntry[] = [];
     let seenDirs = new Set<string>();

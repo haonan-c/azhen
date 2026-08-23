@@ -2,7 +2,13 @@
 // collections; admins also manage public collections. Everything is sharing-domain scoped.
 
 import { RpcTarget } from "capnweb";
+import type { RpcStub as NativeRpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import {
+  runBillableOperation,
+  type BillableOperationActivity,
+} from "@gadgets/backend-utils/gatekeeper-billing";
+import type { BillableOperationAuthorizer } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ContextApi, ContextCollectionContent, ContextCollectionMetadata, ContextCollectionVisibility,
   ContextDocument, ContextDocumentSummary, ContextGitTokenCreateResult, ContextGitTokenList,
@@ -15,6 +21,7 @@ import {
   listPublicCollectionsFromKv, metadataToSummary,
 } from "./collection-kv.js";
 import { domainName } from "./domain.js";
+import { CONTEXT_BILLING_METHODS, type ContextBillingMethod } from "./billing-methods.js";
 
 /** Collections visible to this account's agents. */
 export async function loadEnabledContextCollections(
@@ -64,8 +71,22 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     private collections: DurableObjectNamespace<ContextCollectionDurableObject>,
     private userLibraries: DurableObjectNamespace<UserLibraryDurableObject>,
     private registries: DurableObjectNamespace<LibraryRegistryDurableObject>,
+    private billingAuthorizer: NativeRpcStub<BillableOperationAuthorizer>,
   ) {
     super();
+  }
+
+  [Symbol.dispose](): void {
+    this.billingAuthorizer[Symbol.dispose]?.();
+  }
+
+  #bill<T>(method: ContextBillingMethod, run: (activity: BillableOperationActivity) => Promise<T>) {
+    return runBillableOperation(
+      this.billingAuthorizer,
+      this.accountId,
+      CONTEXT_BILLING_METHODS[method].methodKey,
+      run,
+    );
   }
 
   #collection(id: string) {
@@ -153,22 +174,27 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
         : { source },
     };
 
-    // Initialize before indexing; if this fails, nothing is reachable yet.
-    metadata = await this.#collection(id).initialize(metadata, this.domain, visibility === "private" ? this.accountId : "");
+    return this.#bill("ContextApi.createContextCollection", async activity => {
+      // Initialize before indexing; if this fails, nothing is reachable yet.
+      activity.requestDispatched();
+      metadata = await this.#collection(id).initialize(
+        metadata, this.domain, visibility === "private" ? this.accountId : "");
 
-    // Private collections live in the owner's library; public ones live in the domain registry.
-    try {
-      if (visibility === "public") {
-        await this.#registry().addPublic(this.domain, metadataToSummary(metadata));
-      } else {
-        await this.#userLib().createOwnedCollection(id, title, description, icon);
+      // Private collections live in the owner's library; public ones live in the domain registry.
+      try {
+        if (visibility === "public") {
+          await this.#registry().addPublic(this.domain, metadataToSummary(metadata));
+        } else {
+          await this.#userLib().createOwnedCollection(id, title, description, icon);
+        }
+      } catch (err) {
+        // Indexing failed; delete the now-unreachable collection.
+        await this.#collection(id).deleteSelf().catch(() => {});
+        throw err;
       }
-    } catch (err) {
-      // Indexing failed; delete the now-unreachable collection.
-      await this.#collection(id).deleteSelf().catch(() => {});
-      throw err;
-    }
-    return metadata;
+      activity.responseReceived(200);
+      return metadata;
+    });
   }
 
   async updateContextCollection(collectionId: string, options: {
@@ -176,7 +202,11 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
   }): Promise<void> {
     await this.#assertCanWrite(collectionId);
     if (options.branch !== undefined) this.#assertArtifactsAvailable();
-    await this.#collection(collectionId).updateMetadata(options);
+    await this.#bill("ContextApi.updateContextCollection", async activity => {
+      activity.requestDispatched();
+      await this.#collection(collectionId).updateMetadata(options);
+      activity.responseReceived(200);
+    });
   }
 
   async syncContextCollectionArtifactSource(collectionId: string): Promise<void> {
@@ -186,79 +216,134 @@ export class ContextApiImpl extends RpcTarget implements ContextApi {
     // have direct control over this.
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
-    await this.#collection(collectionId).syncArtifactSource();
+    await this.#bill("ContextApi.syncContextCollectionArtifactSource", async activity => {
+      activity.requestDispatched();
+      await this.#collection(collectionId).syncArtifactSource();
+      activity.responseReceived(200);
+    });
   }
 
   async createContextCollectionGitToken(collectionId: string): Promise<ContextGitTokenCreateResult> {
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
-    return this.#collection(collectionId).createGitToken();
+    return this.#bill("ContextApi.createContextCollectionGitToken", async activity => {
+      activity.requestDispatched();
+      let result = await this.#collection(collectionId).createGitToken();
+      activity.responseReceived(200);
+      return result;
+    });
   }
 
   async listContextCollectionGitTokens(collectionId: string): Promise<ContextGitTokenList> {
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
-    return this.#collection(collectionId).listGitTokens();
+    return this.#bill("ContextApi.listContextCollectionGitTokens", async activity => {
+      activity.requestDispatched();
+      let result = await this.#collection(collectionId).listGitTokens();
+      activity.responseReceived(200);
+      return result;
+    });
   }
 
   async revokeContextCollectionGitToken(collectionId: string, tokenId: string): Promise<boolean> {
     await this.#assertCanWrite(collectionId);
     this.#assertArtifactsAvailable();
-    return this.#collection(collectionId).revokeGitToken(tokenId);
+    return this.#bill("ContextApi.revokeContextCollectionGitToken", async activity => {
+      activity.requestDispatched();
+      let result = await this.#collection(collectionId).revokeGitToken(tokenId);
+      activity.responseReceived(200);
+      return result;
+    });
   }
 
   async deleteContextCollection(collectionId: string): Promise<void> {
     await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).deleteSelf();
+    await this.#bill("ContextApi.deleteContextCollection", async activity => {
+      activity.requestDispatched();
+      await this.#collection(collectionId).deleteSelf();
+      activity.responseReceived(200);
+    });
   }
 
   async getContextCollectionMetadata(collectionId: string): Promise<ContextCollectionMetadata | null> {
-    try {
-      let [meta, owns, isPublic] = await Promise.all([
-        this.#collection(collectionId).getMetadata(),
-        this.#ownsPrivate(collectionId),
-        this.#registry().isPublic(collectionId),
-      ]);
-      if (!meta.id || (!owns && !isPublic)) return null;
-      return meta;
-    } catch {
-      return null;
-    }
+    return this.#bill("ContextApi.getContextCollectionMetadata", async activity => {
+      activity.requestDispatched();
+      try {
+        let [meta, owns, isPublic] = await Promise.all([
+          this.#collection(collectionId).getMetadata(),
+          this.#ownsPrivate(collectionId),
+          this.#registry().isPublic(collectionId),
+        ]);
+        activity.responseReceived(200);
+        if (!meta.id || (!owns && !isPublic)) return null;
+        return meta;
+      } catch {
+        activity.responseReceived(200);
+        return null;
+      }
+    });
   }
 
   // --- Document editing ---
 
   async listContextDocuments(collectionId: string, prefix?: string): Promise<ContextDocumentSummary[]> {
     await this.#assertCanRead(collectionId);
-    return this.#collection(collectionId).listContextDocuments(prefix);
+    return this.#bill("ContextApi.listContextDocuments", async activity => {
+      activity.requestDispatched();
+      let result = await this.#collection(collectionId).listContextDocuments(prefix);
+      activity.responseReceived(200);
+      return result;
+    });
   }
 
   async getContextDocument(collectionId: string, path: string): Promise<ContextDocument | null> {
     await this.#assertCanRead(collectionId);
-    return this.#collection(collectionId).getContextDocument(path);
+    return this.#bill("ContextApi.getContextDocument", async activity => {
+      activity.requestDispatched();
+      let result = await this.#collection(collectionId).getContextDocument(path);
+      activity.responseReceived(200);
+      return result;
+    });
   }
 
   async putContextDocument(collectionId: string, path: string, doc: {
     description: string; body: string; contentType?: string;
   }): Promise<void> {
     await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).putContextDocument(path, doc);
+    await this.#bill("ContextApi.putContextDocument", async activity => {
+      activity.requestDispatched();
+      await this.#collection(collectionId).putContextDocument(path, doc);
+      activity.responseReceived(200);
+    });
   }
 
   async deleteContextDocument(collectionId: string, path: string): Promise<void> {
     await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).deleteContextDocument(path);
+    await this.#bill("ContextApi.deleteContextDocument", async activity => {
+      activity.requestDispatched();
+      await this.#collection(collectionId).deleteContextDocument(path);
+      activity.responseReceived(200);
+    });
   }
 
   async moveContextDocument(collectionId: string, fromPath: string, toPath: string): Promise<void> {
     await this.#assertCanWrite(collectionId);
-    await this.#collection(collectionId).moveContextDocument(fromPath, toPath);
+    await this.#bill("ContextApi.moveContextDocument", async activity => {
+      activity.requestDispatched();
+      await this.#collection(collectionId).moveContextDocument(fromPath, toPath);
+      activity.responseReceived(200);
+    });
   }
 
   // --- Listing & access ---
 
   async listEnabledContextCollections(): Promise<EnabledCollectionInfo[]> {
-    return loadEnabledContextCollections(this.env, this.domain, this.#userLib());
+    return this.#bill("ContextApi.listEnabledContextCollections", async activity => {
+      activity.requestDispatched();
+      let result = await loadEnabledContextCollections(this.env, this.domain, this.#userLib());
+      activity.responseReceived(200);
+      return result;
+    });
   }
 
   async canWriteContextCollection(collectionId: string): Promise<boolean> {

@@ -109,6 +109,14 @@ function requestBody<T = Record<string, unknown>>(init: RequestInit | undefined)
 function createApprovalQueue(
     authorizeObservation: AuthorizeObservation): RpcStub<ApprovalQueue> {
   let approvalQueue = {
+    async beginBillableOperation() {
+      return {
+        async getOperationId() { return "test-operation"; },
+        async markStarted() {},
+        async complete() {},
+        [Symbol.dispose]() {},
+      };
+    },
     authorizeObservation,
     dup: () => approvalQueue,
     [Symbol.dispose]: vi.fn<() => void>(),
@@ -423,6 +431,7 @@ describe("UgcAdsSession official-account article research", () => {
     expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(20);
     expect(authorizeObservation).toHaveBeenCalledOnce();
     expect(authorizeObservation).toHaveBeenCalledWith({
+      billingOperationId: "test-operation",
       title: "Official-account article search",
       description:
         'Searched official-account articles for ["软件著作权","软著登记"]; ' +
@@ -835,6 +844,7 @@ describe("UgcAdsSession official-account article research", () => {
     expect(statsBodies(fetchMock)).toHaveLength(2);
     expect(authorizeObservation).toHaveBeenCalledOnce();
     expect(authorizeObservation).toHaveBeenCalledWith({
+      billingOperationId: "test-operation",
       title: "Official-account article search",
       description:
         'Searched official-account articles for ["term-a","term-b","term-c"]; ' +
@@ -906,9 +916,7 @@ describe("UgcAdsSession official-account article research", () => {
 
     let resultPromise = session.searchOfficialAccountArticles(queryTerms, 30);
     await Promise.resolve();
-    await Promise.resolve();
-
-    expect(searchStarts).toEqual(queryTerms);
+    await vi.waitFor(() => expect(searchStarts).toEqual(queryTerms));
     pendingSearches.get("term-e")!.resolve(response({ items: [article("term-e")] }));
     pendingSearches.get("term-c")!.resolve(response({ items: [article("term-c")] }));
     pendingSearches.get("term-a")!.resolve(response({ items: [article("term-a")] }));
@@ -1214,6 +1222,7 @@ describe("UgcAdsSession official-account article research", () => {
     expect(attempts.get("https://mp.weixin.qq.com/s/limited")).toBe(2);
     expect(authorizeObservation).toHaveBeenCalledOnce();
     expect(authorizeObservation).toHaveBeenCalledWith({
+      billingOperationId: "test-operation",
       title: "Official-account article search",
       description:
         'Searched official-account articles for ["term"]; returned 4 article(s) from the ' +
@@ -1317,6 +1326,7 @@ describe("UgcAdsSession official-account article research", () => {
     expect([...attempts.values()]).toEqual([1, 1, 1, 1, 1, 1, 1]);
     expect(authorizeObservation).toHaveBeenCalledOnce();
     expect(authorizeObservation).toHaveBeenCalledWith({
+      billingOperationId: "test-operation",
       title: "Official-account article search",
       description:
         'Searched official-account articles for ["term-a","term-b"]; returned 7 article(s) ' +

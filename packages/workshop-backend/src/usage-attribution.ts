@@ -21,6 +21,12 @@ export type UsageAttribution = {
   automationRunId?: string;
 };
 
+/** Direct User attribution for account-management work that has no Workspace. */
+export type DirectUserUsageAttribution = Omit<UsageAttribution, "workspaceId"> & {
+  source: "direct-user";
+  workspaceId?: never;
+};
+
 const ATTRIBUTION_KEYS = new Set([
   "principal",
   "source",
@@ -41,7 +47,19 @@ const USAGE_SOURCES = new Set<UsageSource>([
 ]);
 
 /** Validate and copy one persisted Usage attribution value. */
-export function normalizeUsageAttribution(value: UsageAttribution): UsageAttribution {
+export function normalizeUsageAttribution<T extends UsageAttribution>(value: T): T {
+  return normalizeUsageAttributionValue(value, true);
+}
+
+/** Validate and copy direct User attribution that has no Workspace dimension. */
+export function normalizeDirectUserUsageAttribution<T extends DirectUserUsageAttribution>(
+    value: T): T {
+  return normalizeUsageAttributionValue(value, false);
+}
+
+function normalizeUsageAttributionValue<
+  T extends UsageAttribution | DirectUserUsageAttribution,
+>(value: T, requireWorkspace: boolean): T {
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
       Object.keys(value).some(key => !ATTRIBUTION_KEYS.has(key)) ||
       typeof value.principal !== "object" || value.principal === null ||
@@ -54,7 +72,11 @@ export function normalizeUsageAttribution(value: UsageAttribution): UsageAttribu
       typeof value.principal.userId !== "string" ||
       !/^[0-9a-f]{64}$/.test(value.principal.userId) ||
       !USAGE_SOURCES.has(value.source) ||
-      typeof value.workspaceId !== "string" || !/^[0-9a-f]{64}$/.test(value.workspaceId) ||
+      (!requireWorkspace && value.source !== "direct-user") ||
+      (requireWorkspace
+        ? typeof (value as UsageAttribution).workspaceId !== "string" ||
+          !/^[0-9a-f]{64}$/.test((value as UsageAttribution).workspaceId)
+        : "workspaceId" in value) ||
       (value.chatId !== undefined &&
        (!Number.isSafeInteger(value.chatId) || value.chatId < 0)) ||
       (value.gadgetId !== undefined &&
