@@ -3,16 +3,16 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
 import { ActionStore } from "../src/action-store.js";
 import { McpProtocolError, McpSessionExpiredError } from "../src/client.js";
+import type { ActionExecution } from "@gadgets/workshop-shared/gatekeeper";
 
 type TestSql = ConstructorParameters<typeof ActionStore>[0];
 
-function fakeSql(): TestSql {
-  const db = new DatabaseSync(":memory:");
+function fakeSql(db = new DatabaseSync(":memory:")): TestSql {
   return {
     exec<T>(query: string, ...bindings: SQLInputValue[]) {
       const rows = bindings.length > 0
         ? db.prepare(query).all(...bindings)
-        : /^\s*(?:SELECT|INSERT.*RETURNING)/is.test(query)
+        : /^\s*(?:SELECT|PRAGMA|INSERT.*RETURNING)/is.test(query)
           ? db.prepare(query).all()
           : (db.exec(query), []);
       return {
@@ -28,8 +28,146 @@ function fakeSql(): TestSql {
 
 const log = { debug() {}, info() {}, warn() {}, error() {}, with() { return log; } };
 const ok = async () => ({ content: [{ type: "text" as const, text: "done" }] });
+const definitelyDeclined = async () => {
+  throw new McpProtocolError("MCP server rejected: unknown tool", -32601, "declined");
+};
+const execution = (mode: ActionExecution["mode"] = "execute"): ActionExecution => ({
+  billingOperationId: "operation-1",
+  mode,
+});
 
 describe("ActionStore", () => {
+  it("adds billing outcome columns to an existing action table", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`CREATE TABLE mcp_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tool_name TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      state TEXT NOT NULL,
+      submitted_at INTEGER NOT NULL,
+      claimed_at INTEGER,
+      retryable INTEGER,
+      result_json TEXT,
+      error TEXT
+    ) STRICT`);
+    const store = new ActionStore(fakeSql(db));
+    const staged = store.stage("send", {});
+
+    await expect(store.applyBillable(
+      staged.id, execution(), fn => fn({ callTool: ok } as never), log,
+    )).resolves.toEqual({ outcome: "accepted" });
+    expect(store.get(staged.id)?.billingOperationId).toBe("operation-1");
+  });
+
+  it("returns one accepted billing outcome across duplicate delivery and recovery", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", { to: "a@b.c" });
+    let calls = 0;
+    const counting = async () => { calls++; return ok(); };
+
+    await expect(store.applyBillable(
+      staged.id, execution(), fn => fn({ callTool: counting } as never), log,
+    )).resolves.toEqual({ outcome: "accepted" });
+    await expect(store.applyBillable(
+      staged.id, execution("recover"), fn => fn({ callTool: counting } as never), log,
+    )).resolves.toEqual({ outcome: "accepted" });
+
+    expect(calls).toBe(1);
+    expect(store.get(staged.id)).toMatchObject({
+      state: "applied",
+      executionOutcome: "accepted",
+      billingOperationId: "operation-1",
+    });
+  });
+
+  it("shares a live approved call with a concurrent recovery delivery", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0;
+    const slow = async () => {
+      calls++;
+      await blocked;
+      return { content: [] };
+    };
+
+    const applying = store.applyBillable(
+      staged.id, execution(), fn => fn({ callTool: slow } as never), log,
+    );
+    expect(store.get(staged.id)?.state).toBe("applying");
+    const recovering = store.applyBillable(
+      staged.id, execution("recover"), fn => fn({ callTool: slow } as never), log,
+    );
+    release();
+
+    await expect(Promise.all([applying, recovering])).resolves.toEqual([
+      { outcome: "accepted" },
+      { outcome: "accepted" },
+    ]);
+    expect(calls).toBe(1);
+  });
+
+  it("reports a definite server refusal as failed before execution", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    await expect(store.applyBillable(
+      staged.id, execution(), fn => fn({ callTool: definitelyDeclined } as never), log,
+    )).resolves.toEqual({ outcome: "failed-before-execution" });
+    expect(store.get(staged.id)?.executionOutcome).toBe("failed-before-execution");
+  });
+
+  it("holds an unknown provider outcome and never retries it during recovery", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    let calls = 0;
+    const dropped = async () => {
+      calls++;
+      throw new McpProtocolError("response lost");
+    };
+
+    await expect(store.applyBillable(
+      staged.id, execution(), fn => fn({ callTool: dropped } as never), log,
+    )).resolves.toEqual({ outcome: "unknown" });
+    await expect(store.applyBillable(
+      staged.id, execution("recover"), fn => fn({ callTool: dropped } as never), log,
+    )).resolves.toEqual({ outcome: "unknown" });
+
+    expect(calls).toBe(1);
+    expect(store.get(staged.id)?.executionOutcome).toBe("unknown");
+  });
+
+  it("releases recovery that reached no durable MCP dispatch claim", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    let calls = 0;
+
+    await expect(store.applyBillable(
+      staged.id,
+      execution("recover"),
+      async () => { calls++; return { content: [] }; },
+      log,
+    )).resolves.toEqual({ outcome: "failed-before-execution" });
+
+    expect(calls).toBe(0);
+    expect(store.get(staged.id)?.executionOutcome).toBe("failed-before-execution");
+  });
+
+  it("rejects a conflicting billing operation identity", async () => {
+    const store = new ActionStore(fakeSql());
+    const staged = store.stage("send", {});
+    await store.applyBillable(
+      staged.id, execution(), fn => fn({ callTool: ok } as never), log,
+    );
+
+    await expect(store.applyBillable(
+      staged.id,
+      { billingOperationId: "operation-2", mode: "recover" },
+      fn => fn({ callTool: ok } as never),
+      log,
+    )).rejects.toThrow(/billing operation conflicts/);
+  });
+
   it("keeps a decided action available until the Gadget collects it", async () => {
     const store = new ActionStore(fakeSql());
     const staged = store.stage("send", { to: "a@b.c" });

@@ -16,6 +16,7 @@ const log = {
 class TestSession extends McpSessionBase {}
 
 class TestFacet extends McpFacetBase<object, {
+  accountObjectId: string;
   endpoint: string;
   scope: {};
 }, TestSession> {
@@ -37,7 +38,7 @@ class TestFacet extends McpFacetBase<object, {
 
 function facet() {
   const ctx = {
-    props: { endpoint: "https://example.com/mcp", scope: {} },
+    props: { accountObjectId: "account-1", endpoint: "https://example.com/mcp", scope: {} },
     storage: { kv: {} },
   };
   return new TestFacet(ctx as never, {});

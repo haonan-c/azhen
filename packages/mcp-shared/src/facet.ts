@@ -4,15 +4,19 @@
 import { DurableObject, type RpcStub } from "cloudflare:workers";
 import type {
   ActionKind,
+  ActionExecution,
+  ActionExecutionResult,
   ApprovalQueue,
+  BillableOperationOutcome,
   Gatekeeper,
   GatekeeperUserVerifier,
   ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
 import { ActionStore, REVERT_UNSUPPORTED_MESSAGE } from "./action-store.js";
+import { mcpToolBillingMethodKey } from "./billing.js";
 import { CATALOG_TTL_MS, scopedTools } from "./catalog.js";
-import type { McpClient } from "./client.js";
+import type { McpClient, McpToolCallResult } from "./client.js";
 import {
   withClient,
   type ConnectionAccount,
@@ -27,6 +31,7 @@ import { observerRefusalMessage } from "./sharing-policy.js";
 import { actionKindFor, type ClassifiedTool, type ServerTrust } from "./tools.js";
 
 type FacetProps = {
+  accountObjectId: string;
   endpoint: string;
   scope: ToolScope;
 };
@@ -83,6 +88,11 @@ export abstract class McpFacetBase<
     return this.ctx.props.endpoint;
   }
 
+  /** Connected account whose upstream quota this facet consumes. */
+  get externalAccountId(): string {
+    return this.ctx.props.accountObjectId;
+  }
+
   /** The tool scope this facet is authorized to expose. */
   get scope(): ToolScope {
     return this.ctx.props.scope;
@@ -114,6 +124,24 @@ export abstract class McpFacetBase<
       });
     }
     return this.#toolsPromise;
+  }
+
+  /** Derives one dynamic tool's stable endpoint-bound Usage Rate key. */
+  billingMethodKey(toolName: string): Promise<string> {
+    return mcpToolBillingMethodKey({
+      endpoint: this.endpoint,
+      portalServerId: this.scope.serverId,
+      toolName,
+    });
+  }
+
+  /** Logs a best-effort billing completion failure for a read call. */
+  billingCompletionFailed(outcome: BillableOperationOutcome, error: unknown): void {
+    this.log.error("failed to complete MCP read billing", {
+      event: "billing.complete.failed",
+      billingOutcome: outcome,
+      error,
+    });
   }
 
   /** Returns action kinds that this facet's current catalog permits auto-approving. */
@@ -159,10 +187,17 @@ export abstract class McpFacetBase<
     return this.#actions().get(id);
   }
 
-  /** Applies an approved action without retrying an outcome-unknown write. */
-  async applyAction(action: number): Promise<void> {
-    await this.#actions().apply(
-      action, fn => this.call(fn, { retryOnExpiry: false }), this.log);
+  /** Applies or recovers an approved action without retrying an outcome-unknown write. */
+  async applyAction(
+    action: number,
+    execution?: ActionExecution,
+  ): Promise<ActionExecutionResult | void> {
+    const call = (fn: (client: McpClient) => Promise<McpToolCallResult>) =>
+      this.call(fn, { retryOnExpiry: false });
+    if (execution !== undefined) {
+      return this.#actions().applyBillable(action, execution, call, this.log);
+    }
+    await this.#actions().apply(action, call, this.log);
   }
 
   /** Rejects a pending action. */

@@ -5,10 +5,16 @@
 // supplies. The base never touches the Durable Object, the account, or the endpoint's credentials.
 
 import { RpcTarget, type RpcStub } from "cloudflare:workers";
-import type { ActionDescription, ActionKind, ApprovalQueue }
+import type {
+  ActionDescription,
+  ActionKind,
+  ApprovalQueue,
+  BillableOperation,
+  BillableOperationOutcome,
+}
   from "@gadgets/workshop-shared/gatekeeper";
 
-import type { McpClient } from "./client.js";
+import { callMayHaveTakenEffect, type McpClient } from "./client.js";
 import type { WithClientOptions } from "./connection.js";
 import { isWholeEndpoint, type ToolScope } from "./scope.js";
 import { describeCall, toCallResult, toolInfo, type ClassifiedTool } from "./tools.js";
@@ -38,6 +44,10 @@ export type StoredAction = {
    * gives no way to undo. See `ActionStore.apply`.
    */
   retryable?: boolean;
+  /** Workshop-minted Billable API Operation bound to this durable provider claim. */
+  billingOperationId?: string;
+  /** Content-free provider outcome returned to the Workshop billing coordinator. */
+  executionOutcome?: "accepted" | "failed-before-execution" | "unknown";
   /** Populated once applied; delivered to the Gadget as an observation. */
   result?: Extract<McpCallResult, { status: "ok" }>;
   error?: string;
@@ -50,10 +60,18 @@ export type StoredAction = {
 export interface McpSessionHost {
   readonly serverName: string;
   readonly endpoint: string;
+  /** Connected account whose provider quota each tool call consumes. */
+  readonly externalAccountId: string;
   /** How much of the endpoint this binding may call. Only used to word the "no such tool" error. */
   readonly scope: ToolScope;
 
   tools(): Promise<ClassifiedTool[]>;
+
+  /** Stable Usage Rate key for one tool on this trusted endpoint and portal scope. */
+  billingMethodKey(toolName: string): Promise<string>;
+
+  /** Records a best-effort billing completion failure without hiding the tool-call error. */
+  billingCompletionFailed(outcome: BillableOperationOutcome, error: unknown): void;
 
   /** Runs `fn` against an initialized client for this binding's endpoint. */
   call<T>(fn: (client: McpClient) => Promise<T>, options?: WithClientOptions): Promise<T>;
@@ -125,11 +143,35 @@ export class McpSessionBase extends RpcTarget {
       mode: entry.mode,
       classifiedBy: entry.classifiedBy,
     });
+    const billingMethodKey = await host.billingMethodKey(name);
 
     if (entry.mode === "read") {
-      const result = await host.call(client => client.callTool(name, toolArgs));
+      using operation = await this.#queue.beginBillableOperation(
+        billingMethodKey,
+        host.externalAccountId,
+      );
+      let operationId: string;
+      try {
+        operationId = await operation.getOperationId();
+        await operation.markStarted();
+      } catch (error) {
+        await this.#completeQuietly(operation, "failed-before-execution");
+        throw error;
+      }
+
+      let result;
+      try {
+        result = await host.call(client => client.callTool(name, toolArgs));
+      } catch (error) {
+        await this.#completeQuietly(
+          operation,
+          callMayHaveTakenEffect(error) ? "unknown" : "failed-before-execution",
+        );
+        throw error;
+      }
+      await operation.complete("executed");
       // Authorize before the data is handed back, per the gatekeeper contract.
-      await this.#queue.authorizeObservation(described);
+      await this.#queue.authorizeObservation({ ...described, billingOperationId: operationId });
       return toCallResult(result);
     }
 
@@ -143,6 +185,12 @@ export class McpSessionBase extends RpcTarget {
       awaitDecision: true,
       autoApprovable: entry.autoApprovable,
       actionKind: host.actionKindFor(name),
+      billing: {
+        methodKey: billingMethodKey,
+        externalAccountId: host.externalAccountId,
+        // MCP has no provider idempotency-key facility.
+        providerIdempotency: "unsupported",
+      },
     };
 
     try {
@@ -160,6 +208,17 @@ export class McpSessionBase extends RpcTarget {
         `agent's executeCode call, return from this executeCode call now so the approval can ` +
         `appear in chat. After approval, call getActionResult(${staged.id}) for the outcome.`,
     };
+  }
+
+  async #completeQuietly(
+    operation: Pick<BillableOperation, "complete">,
+    outcome: BillableOperationOutcome,
+  ): Promise<void> {
+    try {
+      await operation.complete(outcome);
+    } catch (error) {
+      this.#host.billingCompletionFailed(outcome, error);
+    }
   }
 
   async getActionResult(actionId: number): Promise<McpCallResult> {

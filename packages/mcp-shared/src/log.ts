@@ -3,6 +3,7 @@
 // `token`, `secret`, and `prompt` unloggable in a package that holds OAuth tokens.
 
 import type { Logger } from "@gadgets/backend-utils/logger";
+import type { BillableOperationOutcome } from "@gadgets/workshop-shared/gatekeeper";
 import type { ServerTrust } from "./tools.js";
 
 /** Fields an MCP connector may attach to a log line, beyond the reserved ones every logger has. */
@@ -21,6 +22,8 @@ export type McpLogFields = {
   trust: ServerTrust;
   /** Who chose the endpoint. Distinguishes a user-supplied server from a deployment's own gateway. */
   provenance: "user" | "deployment";
+  /** Terminal result whose best-effort billing completion failed. */
+  billingOutcome: BillableOperationOutcome;
 };
 
 /** The logger this package expects to be handed. */

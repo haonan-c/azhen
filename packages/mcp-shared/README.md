@@ -19,6 +19,7 @@ does so through a named hook (`staticToken`, `mintAccount`), not a private copy.
 | Module | Purpose |
 | --- | --- |
 | `client` | Bounded Streamable HTTP transport (`initialize`, `tools/list`, `tools/call`) using official MCP wire types |
+| `billing` | Stable endpoint-, portal-server-, and tool-bound method keys for dynamic Usage Rates |
 | `oauth` | Small adapter around the official MCP client's OAuth errors and token revocation gap |
 | `tools` | The trust boundary: read/action classification, auto-approval eligibility, approval prompts, catalog fingerprinting |
 | `schema-to-ts` | JSON Schema to TypeScript, one typed method per tool plus `callTool` overloads |
@@ -78,6 +79,12 @@ label in an approval prompt, which is a question that should not move when an an
 does.
 
 ## Applying an approved call
+
+Every tool call is one Billable API Operation. Its method key is a SHA-256 identity over the
+canonical connected endpoint, the selected portal server when present, and the exact wire tool
+name. Catalog order, descriptions, schemas, and annotations do not affect the key, so rediscovery
+does not change its Usage Rate. A missing rate therefore records Unpriced Use through the normal
+Workshop metering seam.
 
 The guarantee is *at most once*, not exactly once. MCP has no idempotency key that would make a
 repeated call harmless and no inverse operation that would undo one, so where the two conflict the
