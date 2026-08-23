@@ -352,18 +352,27 @@ describe("production Context billing runtime", () => {
   });
 
   it("meters Slash Command invoke once without billing its delegated read", async () => {
+    const log = vi.spyOn(console, "log");
+    const info = vi.spyOn(console, "info");
+    const warn = vi.spyOn(console, "warn");
+    const error = vi.spyOn(console, "error");
     const user = await newUser();
     const sharingDomain = `skill-domain-${crypto.randomUUID()}`;
     const accountId = `skill-account-${crypto.randomUUID()}`;
+    const sentinels = {
+      query: `private-slash-query-${crypto.randomUUID()}`,
+      path: `private-slash-path-${crypto.randomUUID()}/SKILL.md`,
+      content: `private-slash-content-${crypto.randomUUID()}`,
+    };
     await addCollection({
       sharingDomain,
       accountId,
       collectionId: "skills",
       title: "Skills",
       documents: [{
-        path: "draft/SKILL.md",
+        path: sentinels.path,
         description: "Draft skill",
-        body: "---\nname: draft-helper\ndescription: Draft a note\n---\nUse the Context text.",
+        body: `---\nname: draft-helper\ndescription: Draft a note\n---\n${sentinels.content}`,
       }],
     });
 
@@ -376,17 +385,64 @@ describe("production Context billing runtime", () => {
         const command = (await provider.list())[0];
         if (!command) throw new Error("Expected one Context Slash Command.");
         using authorizerStub = new RpcStub(authorizer);
-        return await provider.invoke(command.id, "fixture arguments", authorizerStub);
+        return {
+          commandId: command.id,
+          slashResult: await provider.invoke(command.id, sentinels.query, authorizerStub),
+        };
       },
     });
 
-    expect(invocation.result.skillName).toBe("draft-helper");
+    expect(invocation.result.commandId).toContain(sentinels.path);
+    expect(invocation.result.slashResult.skillName).toBe("draft-helper");
+    expect(invocation.result.slashResult.message).toContain(sentinels.query);
+    expect(invocation.result.slashResult.message).toContain(sentinels.content);
+
+    const [attempt] = invocation.snapshot.gatekeeperMeteringAttempts;
     expect(invocation.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
-    expect(invocation.snapshot.gatekeeperMeteringAttempts[0]?.attribution.billingMethodKey)
+    if (!attempt) throw new Error("Expected one Slash Command Metering Attempt.");
+    expect(attempt.attribution.billingMethodKey)
       .toBe(CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey);
-    expect(invocation.snapshot.gatekeeperMeteringAttempts.some(attempt =>
-      attempt.attribution.billingMethodKey ===
+    expect(attempt.chargeSnapshot).toMatchObject({
+      pricing: "priced",
+      chargeSubunits: PRICED_CHARGE,
+    });
+    expect(invocation.snapshot.gatekeeperMeteringAttempts.some(candidate =>
+      candidate.attribution.billingMethodKey ===
         CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey)).toBe(false);
+
+    const [usageRecord] = invocation.snapshot.gatekeeperUsageRecords;
+    expect(invocation.snapshot.gatekeeperUsageRecords).toHaveLength(1);
+    if (!usageRecord) throw new Error("Expected one Slash Command Usage Record.");
+    expect(usageRecord).toMatchObject({
+      operationId: attempt.operationId,
+      attribution: {
+        billingMethodKey:
+          CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
+      },
+      chargeSnapshot: attempt.chargeSnapshot,
+      chargeSubunits: PRICED_CHARGE,
+      outcome: "settled",
+    });
+    const usageCharges = invocation.snapshot.ledgerEntries.filter(entry =>
+      entry.kind === "usage-charge");
+    expect(usageCharges).toEqual([expect.objectContaining({
+      operationId: attempt.operationId,
+      deltaSubunits: -PRICED_CHARGE,
+    })]);
+    expect(attempt.usageRecordId).toBe(usageRecord.id);
+    expect(usageRecord.ledgerEntryId).toBe(usageCharges[0]?.id);
+
+    const facts = snapshotText(invocation.snapshot);
+    const billingLogs = JSON.stringify([
+      ...log.mock.calls,
+      ...info.mock.calls,
+      ...warn.mock.calls,
+      ...error.mock.calls,
+    ]);
+    for (const sentinel of Object.values(sentinels)) {
+      expect(facts).not.toContain(sentinel);
+      expect(billingLogs).not.toContain(sentinel);
+    }
   });
 
   it("settles before authorization withholding and rejects before business execution", async () => {
