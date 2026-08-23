@@ -12,6 +12,9 @@ import type {
   UserGatekeeperUsageRecord,
 } from "@gadgets/workshop-shared/api";
 import {UGC_ADS_BILLING_METHODS} from "../../gatekeeper-ugc-ads/src/billing-methods.js";
+import type {OfficialAccountArticleSearchResult} from
+  "../../gatekeeper-ugc-ads/src/tikhub-api.js";
+import type {UgcAdsSession} from "../../gatekeeper-ugc-ads/src/ugc-ads.js";
 import {ADMIN_USERNAME, startHarness, type Harness} from "../src/harness.js";
 import {NetworkInterceptor, type Handler} from "../src/network-interceptor.js";
 import {
@@ -87,32 +90,6 @@ type SearchBody = {
 };
 
 type StatsBody = {url: string; raw: boolean};
-
-type OfficialAccountArticleSearchResult = {
-  requestedWindowDays: 7 | 30;
-  actualWindowDays: 7 | 30;
-  automaticExpansionOccurred: boolean;
-  rawArticleCount: number;
-  validArticleCount: number;
-  successfulInteractionArticleCount: number;
-  articles: Array<{
-    title: string;
-    url: string;
-    accountName: string;
-    publishedAt: string;
-    matchedQueryTerms: string[];
-    summary?: string;
-    interactions?: {reads?: number; likes?: number};
-  }>;
-  warnings: Array<{code: string; articleUrl: string; message: string}>;
-};
-
-type UgcAdsSessionApi = {
-  searchOfficialAccountArticles(
-    queryTerms: string[],
-    requestedWindowDays?: 7 | 30,
-  ): Promise<OfficialAccountArticleSearchResult>;
-};
 
 type SafePhysicalCall = {
   path: typeof SEARCH_PATH | typeof STATS_PATH;
@@ -261,7 +238,7 @@ async function newUgcAdsUser(prefix: string): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
   workspace: RpcStub<Overseer>;
-  session: RpcStub<UgcAdsSessionApi>;
+  session: RpcStub<Pick<UgcAdsSession, "searchOfficialAccountArticles">>;
 }> {
   const publicApi = connect(harness.url);
   const [username] = nextUsernames(prefix);
@@ -280,7 +257,8 @@ async function newUgcAdsUser(prefix: string): Promise<{
     throw new Error("Expected the production UGC Ads ambient Gatekeeper.");
   }
   using gatekeeper = await workspace.getGatekeeperById(command.selection.gatekeeperId);
-  const session = await gatekeeper.openSession() as RpcStub<UgcAdsSessionApi>;
+  const session = await gatekeeper.openSession() as
+    RpcStub<Pick<UgcAdsSession, "searchOfficialAccountArticles">>;
   return {username, publicApi, user, workspace, session};
 }
 
@@ -415,7 +393,7 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         "Change the rate after the UGC Ads Charge Snapshot",
       );
       releaseFirstRequest();
-      const result = await resultPromise as OfficialAccountArticleSearchResult;
+      const result: OfficialAccountArticleSearchResult = await resultPromise;
 
       expect(result).toMatchObject({
         requestedWindowDays: 7,

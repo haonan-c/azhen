@@ -15,6 +15,11 @@
   },
   "include": ["src", "__tests__", "fixtures"],
   // The runtime-only wrapper imports the generated Workshop module under its own production
-  // tsconfig. Pulling that generated tree into this narrower integration-test program is invalid.
-  "exclude": ["node_modules", "fixtures/workshop-usage-inspection.mjs"]
+  // tsconfig. The UGC Ads tracer uses that Worker's generated environment through its dedicated
+  // tsconfig. Pulling either Worker tree into this shared fixture program mixes main modules.
+  "exclude": [
+    "node_modules",
+    "fixtures/workshop-usage-inspection.mjs",
+    "__tests__/ugc-ads-billing.test.ts"
+  ]
 }
