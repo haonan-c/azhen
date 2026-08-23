@@ -181,7 +181,8 @@ export class GitHubBillingTestParent extends DurableObject {
   }
 
   async recoverCreateIssueAfterFault(name: string) {
-    const { gatekeeper } = await this.#session(name, "repo");
+    const { gatekeeper, session } = await this.#session(name, "repo");
+    using _session = session;
     return await gatekeeper.applyAction(1, {
       billingOperationId: `create-${name}`,
       mode: "recover",
@@ -324,9 +325,8 @@ export class GitHubBillingTestParent extends DurableObject {
         },
       }),
     }));
-    const queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
+    using queueStub = new RpcStub(queue) as unknown as RpcStub<ApprovalQueue>;
     const session = await gatekeeper.startSession(queueStub);
-    queueStub[Symbol.dispose]();
     return { gatekeeper, queue, session };
   }
 }
