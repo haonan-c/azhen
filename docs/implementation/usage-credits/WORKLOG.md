@@ -485,3 +485,27 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   workspace packages.
 - No deployment, upload, promotion, production configuration, charging change, or worktree deletion
   occurred.
+
+### 2026-08-24 — Issue #64 fixed-point review corrections
+
+- Reviewed candidate `06dd15d736cf4dedcab21ba5f0983552adabc214` on both specification and
+  code-quality axes. Reproduced the reported API-switch data leak, missing subscription recovery,
+  unsafe dynamic MCP publication, late acknowledgement overwrite, callback-throw coupling,
+  incomplete operation counts, cross-page reversal gap, unbounded rate-source read, and link-role
+  regression with focused canaries before applying the corrections.
+- Bound all frontend page state and asynchronous activation results to the current authenticated
+  API. Added a bounded full-subscription retry and complete capability disposal on failure,
+  replacement, late resolution, cancellation, and unmount.
+- Isolated subscriber callback failures from committed financial results. Added safe linked Ledger
+  summaries and bounded configured/discovered rate-owner keyset pages. Dynamic MCP publication now
+  accepts only `mcp.tool.v1.<64 lowercase hex>` and reports durable discovered-inventory truncation.
+- Added settled, failed-before-execution, and usage-unknown API operation counts; preserved native
+  link semantics inside the low-balance live region; and reduced four repeated list loaders to one
+  API-keyed hook.
+- Focused verification passed under the pinned workspace toolchain: frontend review canaries 19/19,
+  frontend package 353/353 plus first-party copy 1/1, backend workerd group 79/79, and real Cap'n Web
+  integration 4/4. Direct backend/frontend `tsc`, `corepack pnpm lint:check`, and
+  `git diff --check` exited 0.
+- The correction is not rebased over #62 and no final root test, Wrangler command, release build,
+  upload, promotion, deployment, push, Issue closure, or worktree deletion was performed. Final
+  root and release gates remain pending until the coordinated post-#62 rebase.

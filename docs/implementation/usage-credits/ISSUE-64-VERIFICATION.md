@@ -26,9 +26,11 @@ external mocks. It is not production deployment validation.
   browser-safe Ledger projection excludes administrator actor, reason, audit data, and internal
   Charge Snapshots.
 - Public connector rates combine the build-time `billing-methods.ts` inventory, current
-  strong-consistency configured rates, and this User's bounded discovered dynamic methods. Missing
-  rate and explicit priced-zero remain distinct. Dynamic MCP identifiers are stable hashed method
-  keys; endpoints, credentials, arguments, and response content are not returned.
+  strong-consistency configured rates, and this User's bounded discovered dynamic methods. Each
+  owner returns a bounded keyset page, and a durable truncation signal keeps an oversized discovered
+  inventory usable. Missing rate and explicit priced-zero remain distinct. Dynamic MCP identifiers
+  are published only when they match `mcp.tool.v1.<64 lowercase hex>`; raw tool names, endpoints,
+  credentials, arguments, and response content are not returned.
 - `/profile#usage` contains the full Usage Credit view: live balance, legacy notice, source groups,
   model token categories, API operations, Reservations, Ledger links, and current public API rates.
   Each list has independent loading, empty, error, retry, and bounded load-more behavior.
@@ -36,7 +38,8 @@ external mocks. It is not production deployment validation.
   Usage Credit section. The frontend never recomputes the threshold.
 - The React provider wraps callable RPC stubs before state use, ignores stale revisions, and
   releases callback and subscription stubs on success, failure, late resolution, API replacement,
-  cancellation, and unmount paths.
+  cancellation, and unmount paths. A bounded retry rebuilds the complete subscription after a
+  transient failure. API-keyed page state cannot render data from a previous authenticated API.
 
 ## Focused evidence
 
@@ -59,6 +62,35 @@ fields. The balance assertions were updated to preserve their financial intent w
 new revision and server decision fields. The missing existing generated UI artifacts are produced
 by the normal root build before the final integration run.
 
+## Second review corrections
+
+The fixed-point review of candidate `06dd15d736cf4dedcab21ba5f0983552adabc214` found frontend
+ownership, retry, accessibility, and bounded-pagination gaps. The correction keeps User data
+authority in the User Durable Object and adds these regression boundaries:
+
+- API-keyed page state and activation acknowledgement reject late results from a replaced API.
+- A failed initial balance subscription retries with bounded backoff and disposes every failed or
+  replaced callback and subscription capability.
+- Synchronous callback throws and asynchronous callback rejection cannot change the success result
+  of an already committed financial operation.
+- API operation counts distinguish settled, failed-before-execution, and usage-unknown records.
+- A Ledger page carries only a safe linked-entry summary, so a reversal remains inspectable when its
+  related entry is on another page. The summary excludes administrator actor, reason, and audit data.
+- Configured and discovered rate owners expose bounded keyset pages. The User owner caps discovered
+  methods durably and reports truncation instead of making the first public page fail.
+- The low-balance live region contains a native link; it does not replace the link role with an
+  alert role.
+
+| Second-review check | Result |
+| --- | --- |
+| Frontend review canaries | Passed: 3 files, 19/19 |
+| Workshop frontend package | Passed: 76 files, 353/353; first-party copy 1/1 |
+| Backend User, rate, and view workerd group | Passed: 3 files, 79/79 |
+| Real Cap'n Web Usage Account integration | Passed: 1 file, 4/4 |
+| Direct backend and frontend `tsc` | Passed |
+| `corepack pnpm lint:check` | Passed; repository warnings only |
+| `git diff --check` | Passed before and after this evidence update |
+
 ## Precision and privacy checks
 
 - Cap'n Web round-trips an exact balance beyond `Number.MAX_SAFE_INTEGER` and preserves `bigint`
@@ -73,17 +105,19 @@ by the normal root build before the final integration run.
 - English and Simplified Chinese catalogs contain the same Usage Credit message keys. Statuses and
   warnings use readable text in addition to color.
 
-## Final gates
+## Candidate and pending final gates
 
-The final command results are recorded after the candidate rebases onto the latest `dev` baseline.
-No Durable Object class, binding, Wrangler migration, or release manifest entry changed, so
-`types:generate` and a production-shape release dry-run are not triggered by #64.
+The table below records the gates that passed for candidate
+`06dd15d736cf4dedcab21ba5f0983552adabc214` before the second review. The second-review corrections
+have the focused evidence above. They have not yet been rebased over the pending #62 integration, so
+the final root build, test, lint, manifest golden, and release dry-run remain pending and are not
+claimed for the corrected tree. No Durable Object class, binding, or Wrangler migration changed.
 
 | Command | Result |
 | --- | --- |
-| `corepack pnpm build` | Passed on the rebased candidate |
-| `corepack pnpm test` | Passed on the converged rebased candidate; root command exited 0 |
-| `corepack pnpm lint` | Passed on the converged rebased candidate, including `types:check` |
-| `git diff --check` | Passed after the final verification-document update |
-| `node --test scripts/release-manifest.test.js` | Passed: 4/4 |
-| `corepack pnpm --filter @gadgets/integration-tests test` | Passed in the root gate: 13 files, 115/115 |
+| `corepack pnpm build` | Candidate passed; corrected tree pending post-#62 rebase rerun |
+| `corepack pnpm test` | Candidate passed; corrected tree pending post-#62 rebase rerun |
+| `corepack pnpm lint` | Candidate passed; corrected tree pending post-#62 rebase rerun |
+| `git diff --check` | Corrected tree passed after the evidence update |
+| `node --test scripts/release-manifest.test.js` | Candidate passed 4/4; corrected tree pending rerun |
+| `corepack pnpm --filter @gadgets/integration-tests test` | Candidate passed 13 files, 115/115; corrected tree pending root gate |
