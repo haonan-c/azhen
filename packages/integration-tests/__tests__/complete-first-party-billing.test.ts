@@ -747,9 +747,13 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     expect((await gadget.listBindings(chatId)).map(binding => binding.name).toSorted())
       .toEqual(["SCHEDULER", "UGC_ADS"]);
     const beforeReadOnlyCatalog = await inspectGatekeeperMetering(ownerName);
+    const collaboratorBeforeReadOnlyCatalog =
+      await inspectGatekeeperMetering(collaboratorName);
     const physicalBeforeReadOnlyCatalog = [...physicalCalls];
     expect(await collaboratorWorkspace.listPreApprovableActions()).toEqual([]);
     expect(await inspectGatekeeperMetering(ownerName)).toEqual(beforeReadOnlyCatalog);
+    expect(await inspectGatekeeperMetering(collaboratorName))
+      .toEqual(collaboratorBeforeReadOnlyCatalog);
     expect(physicalCalls).toEqual(physicalBeforeReadOnlyCatalog);
 
     gadget[Symbol.dispose]();
@@ -1074,6 +1078,10 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     for (const forbidden of [
       DIRECT_KEYWORD,
       SCHEDULED_KEYWORD,
+      "Issue 72 tracer",
+      "Register the persisted scheduled callback.",
+      "First-party billing tracer",
+      "Run the persisted UGC callback after restart.",
       "private-context-title",
       "private-context-description",
       "private/document.md",
@@ -1081,6 +1089,11 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       "private-document-body",
       "private-note-title",
       "private-note-token",
+      "private-note-id",
+      "private-search-id",
+      "private-search-session-id",
+      "private-title-model-token",
+      "private-registration-model-token",
       TIKHUB_API_KEY,
       "authorization",
     ]) {
@@ -1283,6 +1296,11 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       "Run the persisted UGC callback after restart.",
       "private-note-title",
       "private-note-token",
+      "private-note-id",
+      "private-search-id",
+      "private-search-session-id",
+      "private-title-model-token",
+      "private-registration-model-token",
       TIKHUB_API_KEY,
       "authorization",
     ]) {
@@ -1299,6 +1317,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
 
   it("preserves pre-execution release and response-loss hold across restart", async () => {
     resetPhysicalTrace();
+    const logStart = harness.server.getLogs().length;
     const publicApi = connect(harness.url);
     const [username] = nextUsernames("issueunknown");
     const user = await signUp(publicApi, username);
@@ -1367,9 +1386,21 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
         }),
       ]),
     });
-    const privateText = JSON.stringify({records, inspection});
-    expect(privateText).not.toContain(UNKNOWN_KEYWORD);
-    expect(privateText).not.toContain("private-invalid-note-url");
+    const privateText = JSON.stringify({
+      records,
+      inspection,
+      logs: harness.server.getLogs().slice(logStart),
+    }, (_key, value) => typeof value === "bigint" ? value.toString() : value);
+    for (const forbidden of [
+      UNKNOWN_KEYWORD,
+      "private-invalid-note-url",
+      "private-title-model-token",
+      "private-registration-model-token",
+      TIKHUB_API_KEY,
+      "authorization",
+    ]) {
+      expect(privateText).not.toContain(forbidden);
+    }
 
     reopened.user[Symbol.dispose]();
     reopened.publicApi[Symbol.dispose]();

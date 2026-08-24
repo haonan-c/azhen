@@ -41,12 +41,17 @@ The test `crosses direct, management, and restarted unattended production Worker
 - the strict DeepSeek doubles record exactly three Agent POSTs and one title POST. Each physical
   call matches one public model Usage Record and one internal Attempt/Record pair with the real
   source, Deployment Model, token usage, immutable Charge Snapshot, and exact charge;
+- direct/scheduled keywords, chat/Gadget/schedule text, Context content, returned TikHub content,
+  both DeepSeek tokens, the TikHub token, and authorization markers are absent from real Usage
+  snapshots and incremental Worker logs;
 - physical TikHub calls are exactly one direct call and one call for each recurrence;
 - owner and collaborator host principals are distinct, direct source is `gadget`, registration
   source is `agent`, and unattended source is `scheduled`, with Workspace, Gadget, schedule, and run
   dimensions present;
-- the Agent binds the shipping Scheduler and UGC singletons to the Gadget, and the production
-  Workshop `listPreApprovableActions()` aggregation returns exactly no Action kind;
+- the Agent binds the shipping Scheduler singleton, while the test uses the real
+  `GadgetClient.bind()` capability to bind UGC. The production Workshop
+  `listPreApprovableActions()` aggregation returns exactly no Action kind and leaves both the
+  caller and owner Metering snapshots, plus the physical-call trace, unchanged;
 - observations and `bindHook` records may exist, but the three first-party paths create no approved
   `type: "action"` record.
 
@@ -62,8 +67,9 @@ The test `retries one restored scheduled run without a second callback or financ
 - the schedule completes while Gadget firing count, TikHub physical call count, scheduled Attempt
   IDs, and available Credit remain unchanged. The held delivery reservation settles into the one
   expected Scheduler Record; no second reservation, operation, or charge is created;
-- `DUPLICATE_KEYWORD`, schedule/chat/Gadget text, note content, tokens, and authorization markers
-  are absent from both real pre/post-retry Usage snapshots and incremental Worker logs.
+- `DUPLICATE_KEYWORD`, schedule/chat/Gadget text, note content, TikHub/DeepSeek tokens, and
+  authorization markers are absent from both real pre/post-retry Usage snapshots and incremental
+  Worker logs.
 
 The test `preserves pre-execution release and response-loss hold across restart` proves:
 
@@ -72,7 +78,9 @@ The test `preserves pre-execution release and response-loss hold across restart`
 - two response-loss attempts remain one caller-visible search operation and one Attempt/Record with
   `usage-unknown`;
 - after all Workers restart, the exact UGC reservation remains held and the unknown Attempt/Record
-  remains linked.
+  remains linked;
+- invalid input, the search keyword, TikHub/DeepSeek tokens, and authorization markers are absent
+  from the real Usage snapshot and incremental Worker logs.
 
 Focused command and result:
 
@@ -81,7 +89,7 @@ pnpm --filter @gadgets/integration-tests exec vitest run \
   __tests__/complete-first-party-billing.test.ts
 Test Files  1 passed (1)
 Tests       3 passed (3)
-Duration    283.25s
+Duration    279.53s
 ```
 
 ## Oracle mapping
@@ -111,7 +119,7 @@ Duration    283.25s
 | Admission/pre-callback failure | `expires a one-shot and releases billing when startHook rejects`; `does not dispatch the callback when authoritative metering rejects begin` | `pnpm --filter @gadgets/gatekeeper-scheduler test` | Passed |
 | Started ambiguity | `persists a stable logical run and retry deadline after callback failure`; `retries one restored scheduled run without a second callback or financial effect` | `pnpm --filter @gadgets/gatekeeper-scheduler test`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 | Downstream inheritance | `crosses direct, management, and restarted unattended production Worker paths`; `retries one restored scheduled run without a second callback or financial effect` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
-| Read-only Action capability | `rejects every defensive Action callback without billing or delivery`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-scheduler exec vitest run -t 'rejects every defensive Action'`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: shipping DO list empty; callbacks reject with zero billing/delivery trace; production Workshop aggregation empty |
+| Read-only Action capability | `rejects every defensive Action callback without billing or delivery`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-scheduler exec vitest run -t 'rejects every defensive Action'`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: shipping DO list empty; callbacks reject with zero billing/delivery trace; production Workshop aggregation leaves caller and owner snapshots unchanged |
 
 The initial complete tracer exposed a production gap: Scheduler supplied a stable delivery ID, but a
 Worker Loader `[restore]` target did not implement `__workshopInvokeHookDelivery`. The production
@@ -137,7 +145,7 @@ TypeError: The RPC receiver does not implement the method
 | Pre-execution and authoritative failure | `releases a local validation failure before any TikHub request`; `does not call TikHub when the authoritative reservation fails`; `preserves pre-execution release and response-loss hold across restart` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 | Timeout, response loss, 5xx and invalid JSON | `holds the reservation after an ambiguous Xiaohongshu %s`; `holds the reservation for an ambiguous %s`; `preserves pre-execution release and response-loss hold across restart` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 | Sharing policy and post-execution authorization | `keeps production Xiaohongshu observations shareable with workspace collaborators` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts` | Passed |
-| Read-only Action capability | `rejects every defensive Action callback without billing or upstream dispatch`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-ugc-ads exec vitest run --config vitest.production.config.ts -t 'rejects every defensive Action'`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: shipping DO list empty; callbacks reject with fail-closed outbound count zero; production Workshop aggregation empty |
+| Read-only Action capability | `rejects every defensive Action callback without billing or upstream dispatch`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-ugc-ads exec vitest run --config vitest.production.config.ts -t 'rejects every defensive Action'`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: shipping DO list empty; callbacks reject with fail-closed outbound count zero; production Workshop aggregation leaves caller and owner snapshots and physical trace unchanged |
 | Privacy and fail-closed network | `expectPrivateDiagnosticsAbsent` production cases; all three complete-tracer tests | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 
 ### Model Usage separation
