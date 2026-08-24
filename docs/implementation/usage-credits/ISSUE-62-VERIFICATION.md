@@ -25,11 +25,20 @@ It does not modify `main` and does not create a pull request.
 - Each terminal model or Gatekeeper Usage transaction appends one immutable, content-free
   `UsageProjectionFact` and retained outbox entry beside the authoritative Usage Record and any
   Credit Ledger change. Idempotent terminal replay does not append another fact.
-- A User DO schedules a one-second persistent alarm after commit and also starts a low-latency
-  `waitUntil` delivery. Delivery batches are limited to 32 facts. Remote failure does not change the
-  already-committed terminal RPC result; retry alarms are bounded to ten seconds.
+- A User DO persists a one-second alarm before it enters any terminal Usage Account transaction,
+  then starts a low-latency `waitUntil` delivery after the transaction returns. An empty alarm after
+  a failed transaction is safe. A restart after the authoritative commit cannot lose the last
+  outbox entry. Delivery and health-report batches are limited to 32 facts. Remote failure does not
+  change the already-committed terminal RPC result; retry alarms are bounded to ten seconds.
 - Permanent payload or invariant rejection remains in the retained outbox with only a bounded
   machine code. It is not retried forever and it remains available for diagnosis and rebuild.
+- Pending outbox work has an ordered source-sequence index and exact counter. Page reads use
+  `startAfter` and a limit, and ACK/rejection updates read their exact source-sequence keys. Delivered
+  lifetime history is not materialized for delivery, paging, ACK, or rejection.
+- Existing Model and Gatekeeper Usage Records are converted to the same immutable facts by a
+  persistent three-stage, 32-record backfill. Source markers make live writes and repeated or
+  interrupted backfill converge without double counting, including unknown Gatekeeper operations
+  and their later reconciliation contribution.
 - The independent SQLite `UsageProjection` DO stores exact decimal text, fact hashes, safe
   dimensions, per-User high-water marks, active-User membership, generation totals, and health.
   Its schema has no balance, Reservation, or Credit Ledger column.
@@ -37,8 +46,17 @@ It does not modify `main` and does not create a pull request.
   conflict fail closed. N+1 remains unapplied until N arrives; one User gap does not stop another
   User.
 - Rebuild reads stable Registry pages and retained User facts. It builds a separate generation,
-  dual-writes live facts, rechecks the Registry insertion revision, persists cursors, resumes by
-  alarm, and switches generations only after no sequence gap remains.
+  dual-writes live facts, rechecks the exact Registry insertion revision, persists cursors, resumes
+  by alarm, and switches generations only after no sequence gap remains. Rebuild failure is exposed
+  by one bounded code. Inactive generations are removed in 64-row, table-by-table alarm steps; the
+  cleanup cursor survives restart and never targets the active generation.
+- Projection facts are a strict `detail | aggregate` union. Detail stores only canonical event time;
+  aggregate stores only a canonical 15-minute UTC bucket. Cross-field kind, pricing, outcome,
+  active-User, token, API, and Unpriced invariants fail closed before storage.
+- Each User publishes content-free pending count, oldest pending time, and delivery failure state to
+  the Registry owner. The administrator overview merges those deployment watermarks without waking
+  or scanning User Durable Objects. Recovery clearing is itself alarm-retried if the health RPC is
+  temporarily unavailable.
 - `AdminUsageApi.getOverview()` reads projection totals and the authoritative Registry count.
   `getBalance(registeredUserRef)` always resolves Registry to the User DO and reads the Usage
   Account directly. Projection failure returns `metrics: null`, never a fabricated zero balance or
@@ -51,14 +69,17 @@ It does not modify `main` and does not create a pull request.
 
 | Issue #62 acceptance criterion | Production path and evidence |
 | --- | --- |
-| Post-commit idempotent projection events | `UsageAccount` transaction tests compare the terminal record, retained fact, outbox, and duplicate replay; User delivery starts only after the transaction returns. |
+| Post-commit idempotent projection events | `UsageAccount` transaction tests compare the terminal record, retained fact, outbox, and duplicate replay. A real User DO test commits a terminal result, interrupts immediate delivery, restarts the isolate, and delivers the retained final entry from the pre-transaction alarm. |
 | Duplicate and out-of-order tolerance | Real workerd tests resend one >MAX_SAFE fact 20 times, close N+1/N gaps, and prove a second User advances independently. |
-| Non-authoritative and rebuildable projection | SQLite privacy/schema dump contains no balances; generation rebuild preserves User balance and exact totals. |
+| Non-authoritative and rebuildable projection | SQLite privacy/schema dump contains no balances; generation rebuild preserves User balance and exact totals. Tests cover live facts and a newly registered User during rebuild, alarm restart, failed rebuild health, repeated rebuild, and bounded inactive-generation cleanup. |
 | Complete admin overview | English and Chinese frontend tests cover the six metric cards, Unpriced alert, active/registered split, health, pending/gap detail, safe errors, and retry. |
 | Immediate authoritative admin balance | Real Cap’n Web test keeps projection `lagging`, applies an exact >MAX_SAFE grant, and reads the new balance from the User Usage Account. |
 | Seconds/minute visibility | The production constants are 10 seconds for a User fact and 60 seconds for overview; the persistent alarm is one second and the UI refresh is 30 seconds. Focused tests use real local alarms without long sleeps. |
-| Lag/failure visible without charging blockage | Sequence gaps return `lagging`; invalid/conflicting facts return bounded `failed` health; settlement owns only the local transaction and projection scheduling is non-fatal. |
-| Content privacy | Strict exact-key validation rejects an extra prompt sentinel. Full projection table dumps contain no prompt/header/credential sentinel and no balance fields. |
+| Lag/failure visible without charging blockage | Sequence gaps return `lagging`; invalid/conflicting facts and long User delivery outages return bounded `failed` health. Projection and health-RPC failure do not roll back settlement, and successful recovery clears deployment failure state. |
+| Existing authoritative history | A bounded, resumable test creates settled, unknown, and reconciled records without Projection keys, rebuilds, repeats backfill and ingestion, and proves exact authority-equivalent totals without duplication. |
+| Bounded lifetime operations | A 200-record delivered history test corrupts an old delivered value, then proves pending reads and a late keyset page touch only their bounded indexed batch. ACK response loss is replayed against the real Projection and counted once. |
+| Exact and forward-compatible facts | Tests retain an ingestion watermark above `Number.MAX_SAFE_INTEGER`, retain a Registry revision above it, distinguish detail time from a 15-minute aggregate bucket, and reject inconsistent priced/Unpriced, model/API, failed/active facts. |
+| Content privacy | Strict exact-key validation rejects separate prompt, header, credential, and response-body sentinels. A full dump of every Projection table contains none of them and no balance fields. |
 
 ## Focused and package verification
 
@@ -66,21 +87,33 @@ All commands below ran from the isolated worktree.
 
 | Command | Result |
 | --- | --- |
-| `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts __tests__/usage-account-gatekeeper.test.ts` | GREEN: 2 files, 25 tests. |
-| `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.usage-admin.config.ts` | GREEN: 14 tests. |
+| `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts __tests__/usage-account-gatekeeper.test.ts` | GREEN: 2 files, 37 tests. |
+| `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.usage-admin.config.ts` | GREEN: 15 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.metered-model.config.ts` | GREEN: 35 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.integration.config.ts __integration__/usage-projection-rpc.test.ts` | GREEN: one real WebSocket/Cap’n Web test with promise pipelining and stub disposal. |
 | `corepack pnpm --dir packages/workshop-frontend exec vitest run src/components/usage/AdminUsageOverview.test.tsx src/AdminPage.localization.test.tsx` | GREEN before final rebase; repeated in the final gate below. |
-| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN: 533 pass, 4 expected skip, 0 fail across workerd, Browser Run, and RPC suites. |
+| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after review fixes: Browser Fonts 1; default workerd 465; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; 0 fail. |
 | `corepack pnpm --filter @gadgets/workshop-frontend test` | GREEN: 351 pass across the main and first-party-copy runs. |
 | `corepack pnpm --dir packages/gatekeeper-context exec vitest run --config vitest.production.config.ts` | GREEN: 25 tests through the real User DO and newly bound Usage Projection DO. |
 
 The first TDD run was RED because the fixed `UsageProjection` seam and `AdminUsageApi` methods did
-not exist. The implementation then made the same focused tests GREEN. No test was skipped or changed
-to accept a fabricated value. One existing Context replay assertion was narrowed to compare the
-complete authoritative snapshot, including immutable Projection facts, while excluding only the
-asynchronous outbox `deliveredAt` transport state. With a real Projection test binding, that state
-can correctly advance between two otherwise idempotent snapshots.
+not exist. Fixed-point review then produced a second RED phase. It caught a transaction-to-alarm
+loss window, missing deployment transport health, lifetime outbox scans, missing legacy history,
+failed rebuild health, unbounded old generations, a loose detail/aggregate shape, unsafe SQL numeric
+conversion, and incomplete fact invariants. The first correction run was 35/37: one test had aborted
+the same event that contained both writes, and one inactive generation remained. The corrected
+restart boundary passed; the generation failure exposed two real races: duplicate rebuild finish and
+schema initialization recreating generation 1 after cleanup. A later RED test proved a transient
+health-RPC failure could clear the retry alarm; the final implementation retains it until the
+deployment watermark is updated. The same focused tests are now GREEN. No test was skipped or
+changed to accept a fabricated value.
+
+One existing Context replay assertion was narrowed in the original candidate to compare the complete
+authoritative snapshot, including immutable Projection facts, while excluding only the asynchronous
+outbox `deliveredAt` transport state. With a real Projection test binding, that state can correctly
+advance between two otherwise idempotent snapshots. The review correction also extended the Context
+test host with the real Registry delivery-health delegate; its final 25-test run has no missing-RPC
+background error.
 
 ## Generated types, migration, and release shape
 

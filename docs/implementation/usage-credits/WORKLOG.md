@@ -330,3 +330,25 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   dry-runs had passed; the exact limitation is retained in `ISSUE-62-VERIFICATION.md`.
 - No push, merge, pull request, Issue closure, upload, promotion, deployment, production charging,
   production configuration change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #62 fixed-point review corrections
+
+- Re-entered the `implement` and `tdd` gates after independent specification and standards review.
+  Added failing tests before each correction at the fixed User terminal/alarm, Usage Account outbox,
+  `UsageProjection`, Registry health, and administrator overview seams.
+- Closed the commit-to-alarm window with a persisted pre-transaction alarm. Added exact deployment
+  outbox health in the Registry owner, including alarm-retried recovery reporting, without waking
+  all User Durable Objects or coupling authoritative settlement to Projection availability.
+- Replaced lifetime outbox scans with ordered pending keys, exact counters, keyset pages, and direct
+  ACK/rejection lookup. Added persistent, bounded legacy Model/Gatekeeper/Reconciliation fact
+  backfill with source markers, so rebuild includes pre-#62 authority without duplicating live facts.
+- Made rebuild failure visible through a bounded public code. Added persistent 64-row inactive
+  generation cleanup, guarded duplicate finish, and prevented schema initialization from recreating
+  a deleted generation 1 after restart.
+- Froze facts as a strict detail-event-time or aggregate-15-minute-UTC-bucket union. All required
+  SQL counts and Registry watermarks now cross the JavaScript boundary as canonical text before
+  `bigint` conversion. Kind/pricing/outcome contribution invariants reject inconsistent facts.
+- Focused correction verification is GREEN: core Projection/Usage Account 37, Usage Admin 15,
+  metered-model 35, real Cap'n Web 1, Frontend package 351, Context production tracer 25, and the
+  complete Backend package matrix. Root build/test/lint and final release checks remain the next
+  coordinated gate; no remote or production mutation occurred.
