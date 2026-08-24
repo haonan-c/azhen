@@ -35,6 +35,7 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       latestAppliedSourceAt: "2026-08-24T12:00:00.000Z",
       oldestPendingAt: null,
       pendingEventCount: 0n,
+      deliveryPendingEventCount: 0n,
       sequenceGapCount: 0n,
       failedIngestionCount: 0n,
       failureCode: null,
@@ -107,6 +108,42 @@ describe("administrator Usage and Credits overview", () => {
     expect(container?.textContent).not.toContain("Provider cost\n0");
   });
 
+  it("shows real rebuilding progress as an English status while totals are unverified", async () => {
+    await renderWith(overview({
+      metrics: null,
+      health: {
+        ...overview().health,
+        state: "rebuilding",
+        rebuildRequestId: "bootstrap-v1",
+        rebuildUsersProcessed: 12n,
+      },
+    }));
+
+    await vi.waitFor(() => expect(container?.textContent).toContain("Rebuilding"));
+    expect(container?.querySelector('[role="status"]')?.textContent)
+      .toContain("Users scanned: 12");
+    expect(container?.textContent).not.toContain("Unavailable");
+  });
+
+  it("shows a failed bootstrap as a Chinese alert instead of unavailable", async () => {
+    window.history.replaceState({}, "", "/zh/admin");
+    await renderWith(overview({
+      metrics: null,
+      health: {
+        ...overview().health,
+        state: "failed",
+        rebuildRequestId: "bootstrap-v1",
+        rebuildUsersProcessed: 7n,
+        rebuildFailureCode: "registry-read-failed",
+      },
+    }));
+
+    await vi.waitFor(() => expect(container?.textContent).toContain("失败"));
+    expect(container?.querySelector('[role="alert"]')?.textContent)
+      .toContain("已扫描用户：7");
+    expect(container?.textContent).not.toContain("不可用");
+  });
+
   it("shows bounded lag diagnostics without exposing payload details", async () => {
     await renderWith(overview({
       health: {
@@ -114,12 +151,14 @@ describe("administrator Usage and Credits overview", () => {
         state: "lagging",
         oldestPendingAt: "2026-08-24T11:59:00.000Z",
         pendingEventCount: 4n,
+        deliveryPendingEventCount: 3n,
         sequenceGapCount: 2n,
       },
     }));
 
     await vi.waitFor(() => expect(container?.textContent).toContain("Lagging"));
     expect(container?.textContent).toContain("Pending facts: 4");
+    expect(container?.textContent).toContain("User delivery backlog: 3");
     expect(container?.textContent).toContain("Sequence gaps: 2");
     expect(container?.textContent).toContain("Oldest pending fact:");
   });

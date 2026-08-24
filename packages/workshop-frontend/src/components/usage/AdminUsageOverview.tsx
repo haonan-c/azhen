@@ -109,14 +109,28 @@ export default function AdminUsageOverview({adminApi}: Props) {
 
   const health = view.health;
   if (view.metrics === null) {
+    const isUnavailable = health.state === "unavailable";
+    const isFailed = health.state === "failed";
     return (
       <section aria-labelledby="admin-usage-heading" className="space-y-4">
         <UsageHeading />
-        <div role="alert" className="rounded-xl border border-kumo-line bg-kumo-elevated p-6">
-          <p className="font-medium text-kumo-danger">
-            {messages.admin_usage_health_unavailable()}
+        <div role={isFailed || isUnavailable ? "alert" : "status"}
+          className="rounded-xl border border-kumo-line bg-kumo-elevated p-6">
+          <p className={`font-medium ${isFailed || isUnavailable
+            ? "text-kumo-danger" : "text-kumo-default"}`}>
+            {HEALTH_LABELS[health.state]()}
           </p>
-          <p className="mt-1 text-sm text-kumo-subtle">{messages.admin_usage_load_error()}</p>
+          <p className="mt-1 text-sm text-kumo-subtle">
+            {isUnavailable
+              ? messages.admin_usage_load_error() : messages.admin_usage_metrics_pending()}
+          </p>
+          {!isUnavailable && (
+            <p className="mt-2 text-sm text-kumo-subtle">
+              {messages.admin_usage_rebuild_progress({
+                count: formatInteger(health.rebuildUsersProcessed),
+              })}
+            </p>
+          )}
         </div>
       </section>
     );
@@ -177,6 +191,11 @@ export default function AdminUsageOverview({adminApi}: Props) {
         {health.pendingEventCount > 0n && (
           <span>{messages.admin_usage_pending_events({
             count: formatInteger(health.pendingEventCount),
+          })}</span>
+        )}
+        {health.deliveryPendingEventCount > 0n && (
+          <span>{messages.admin_usage_delivery_pending_events({
+            count: formatInteger(health.deliveryPendingEventCount),
           })}</span>
         )}
         {health.sequenceGapCount > 0n && (

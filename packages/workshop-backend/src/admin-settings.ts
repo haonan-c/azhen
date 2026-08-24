@@ -985,6 +985,7 @@ function unavailableUsageOverview(registeredUsers: bigint, asOf: string): AdminU
       latestAppliedSourceAt: null,
       oldestPendingAt: null,
       pendingEventCount: 0n,
+      deliveryPendingEventCount: 0n,
       sequenceGapCount: 0n,
       failedIngestionCount: 0n,
       failureCode: null,
@@ -1006,7 +1007,6 @@ function mergeProjectionDeliveryHealth(
       ? overview.health.oldestPendingAt
       : overview.health.oldestPendingAt < delivery.oldestPendingAt
         ? overview.health.oldestPendingAt : delivery.oldestPendingAt;
-  const pendingEventCount = overview.health.pendingEventCount + delivery.pendingEventCount;
   const failureCode = overview.health.failureCode ?? delivery.failureCode;
   const state = failureCode !== null || overview.health.state === "failed"
     ? "failed"
@@ -1014,14 +1014,15 @@ function mergeProjectionDeliveryHealth(
       ? "unavailable"
       : overview.health.state === "rebuilding"
         ? "rebuilding"
-        : pendingEventCount > 0n ? "lagging" : overview.health.state;
+        : overview.health.pendingEventCount > 0n || delivery.pendingEventCount > 0n
+          ? "lagging" : overview.health.state;
   return {
     ...overview,
     health: {
       ...overview.health,
       state,
       oldestPendingAt,
-      pendingEventCount,
+      deliveryPendingEventCount: delivery.pendingEventCount,
       failedIngestionCount:
         overview.health.failedIngestionCount + delivery.failedDeliveryCount,
       failureCode,
