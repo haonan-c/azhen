@@ -38,6 +38,7 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       sequenceGapCount: 0n,
       failedIngestionCount: 0n,
       failureCode: null,
+      rebuildFailureCode: null,
       rebuildRequestId: null,
       rebuildUsersProcessed: 0n,
       asOf: "2026-08-24T12:00:02.000Z",

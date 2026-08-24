@@ -18,6 +18,8 @@ import { UsageRateRegistry, validateUsageRateChangeReason } from './usage-rates.
 import {
   UsageUserRegistry,
   type ResolvedUsageUser,
+  type UsageProjectionDeliveryHealth,
+  type UsageProjectionDeliveryHealthReport,
 } from './usage-user-registry.js';
 import type {UsageUserRegistrationFact} from './usage-account.js';
 import type {UsageProjection} from './usage-projection.js';
@@ -353,6 +355,16 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   /** Return the Registry insertion watermark for a stable Usage Projection rebuild pass. */
   getRegisteredUsageUsersRevision(): bigint {
     return this.usageUsers.revision();
+  }
+
+  /** Replace one User's content-free Projection outbox health watermarks. */
+  recordUsageProjectionDeliveryHealth(report: UsageProjectionDeliveryHealthReport): void {
+    this.usageUsers.recordProjectionDeliveryHealth(report);
+  }
+
+  /** Read exact deployment outbox health without waking User Durable Objects. */
+  getUsageProjectionDeliveryHealth(): UsageProjectionDeliveryHealth {
+    return this.usageUsers.projectionDeliveryHealth();
   }
 
   /** Resolve one opaque registered-User reference for the server-only administrator facade. */
@@ -976,11 +988,44 @@ function unavailableUsageOverview(registeredUsers: bigint, asOf: string): AdminU
       sequenceGapCount: 0n,
       failedIngestionCount: 0n,
       failureCode: null,
+      rebuildFailureCode: null,
       rebuildRequestId: null,
       rebuildUsersProcessed: 0n,
       asOf,
     },
     asOf,
+  };
+}
+
+function mergeProjectionDeliveryHealth(
+    overview: AdminUsageOverview,
+    delivery: UsageProjectionDeliveryHealth): AdminUsageOverview {
+  const oldestPendingAt = overview.health.oldestPendingAt === null
+    ? delivery.oldestPendingAt
+    : delivery.oldestPendingAt === null
+      ? overview.health.oldestPendingAt
+      : overview.health.oldestPendingAt < delivery.oldestPendingAt
+        ? overview.health.oldestPendingAt : delivery.oldestPendingAt;
+  const pendingEventCount = overview.health.pendingEventCount + delivery.pendingEventCount;
+  const failureCode = overview.health.failureCode ?? delivery.failureCode;
+  const state = failureCode !== null || overview.health.state === "failed"
+    ? "failed"
+    : overview.health.state === "unavailable"
+      ? "unavailable"
+      : overview.health.state === "rebuilding"
+        ? "rebuilding"
+        : pendingEventCount > 0n ? "lagging" : overview.health.state;
+  return {
+    ...overview,
+    health: {
+      ...overview.health,
+      state,
+      oldestPendingAt,
+      pendingEventCount,
+      failedIngestionCount:
+        overview.health.failedIngestionCount + delivery.failedDeliveryCount,
+      failureCode,
+    },
   };
 }
 
@@ -997,16 +1042,23 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async getOverview(): Promise<AdminUsageOverview> {
-    const registeredUsers = await this.admin.countRegisteredUsageUsers();
+    const [registeredUsers, deliveryHealth] = await Promise.all([
+      this.admin.countRegisteredUsageUsers(),
+      this.admin.getUsageProjectionDeliveryHealth(),
+    ]);
     const asOf = new Date().toISOString();
-    if (!this.projection) return unavailableUsageOverview(registeredUsers, asOf);
+    if (!this.projection) {
+      return mergeProjectionDeliveryHealth(
+        unavailableUsageOverview(registeredUsers, asOf), deliveryHealth);
+    }
     try {
-      return {
+      return mergeProjectionDeliveryHealth({
         ...await this.projection.getByName("").readOverview(),
         registeredUsers,
-      };
+      }, deliveryHealth);
     } catch {
-      return unavailableUsageOverview(registeredUsers, asOf);
+      return mergeProjectionDeliveryHealth(
+        unavailableUsageOverview(registeredUsers, asOf), deliveryHealth);
     }
   }
 

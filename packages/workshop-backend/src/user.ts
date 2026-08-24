@@ -353,17 +353,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Continue at-least-once delivery of retained projection outbox facts. */
   async alarm(): Promise<void> {
-    await this.#deliverProjectionOutbox();
+    await this.#runProjectionMaintenance();
   }
 
-  async #scheduleProjectionDelivery(): Promise<void> {
+  async #prepareProjectionDeliveryAlarm(): Promise<void> {
+    await this.ctx.storage.setAlarm(Date.now() + 1_000);
+  }
+
+  #scheduleProjectionDelivery(): void {
     try {
-      if (this.usageAccount.listPendingProjectionOutbox(1).length === 0) return;
-      this.ctx.waitUntil(this.#deliverProjectionOutbox());
-      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      this.ctx.waitUntil(this.#runProjectionMaintenance());
     } catch (error) {
-      // The authoritative Usage Account transaction has already committed. Projection scheduling
-      // is best-effort here and must not turn its successful terminal RPC into a failure.
+      // The alarm was persisted before the authoritative Usage Account transaction began.
       logger.warn("Usage Projection delivery could not be scheduled", {
         event: "usage.projection.delivery.schedule.failed",
         error,
@@ -371,25 +372,53 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async #deliverProjectionOutbox(): Promise<void> {
+  async #runProjectionMaintenance(): Promise<void> {
+    const backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
+    await this.#deliverProjectionOutbox(!backfillComplete);
+  }
+
+  async #reportProjectionDeliveryHealth(deliveryFailed: boolean): Promise<boolean> {
+    const health = this.usageAccount.getProjectionDeliveryHealth();
+    try {
+      await this.adminSettings.getByName("").recordUsageProjectionDeliveryHealth({
+        ...health,
+        deliveryFailed,
+      });
+      return true;
+    } catch (error) {
+      logger.warn("Usage Projection delivery health could not be recorded", {
+        event: "usage.projection.delivery.health.failed",
+        error,
+      });
+      return false;
+    }
+  }
+
+  async #deliverProjectionOutbox(backfillPending: boolean): Promise<void> {
     const pending = this.usageAccount.listPendingProjectionOutbox(32);
     if (pending.length === 0) {
-      await this.ctx.storage.deleteAlarm();
+      const healthReported = await this.#reportProjectionDeliveryHealth(false);
+      if (!healthReported) await this.ctx.storage.setAlarm(Date.now() + 10_000);
+      else if (backfillPending) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      else await this.ctx.storage.deleteAlarm();
       return;
     }
+    let deliveryFailed = false;
     try {
       const result = await this.usageProjection.getByName("").ingest(
         pending.map(entry => entry.fact),
       );
-      this.usageAccount.acknowledgeProjectionFacts(result.acknowledgedFactIds);
-      this.usageAccount.recordProjectionRejections(result.rejected);
+      this.usageAccount.recordProjectionDeliveryResult(pending, result);
     } catch (error) {
+      deliveryFailed = true;
       logger.warn("Usage Projection delivery failed", {
         event: "usage.projection.delivery.failed",
         error,
       });
     }
-    if (this.usageAccount.listPendingProjectionOutbox(1).length === 0) {
+    const healthReported = await this.#reportProjectionDeliveryHealth(deliveryFailed);
+    if (healthReported && !backfillPending &&
+        this.usageAccount.listPendingProjectionOutbox(1).length === 0) {
       await this.ctx.storage.deleteAlarm();
     } else {
       await this.ctx.storage.setAlarm(Date.now() + 10_000);
@@ -630,20 +659,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Persist the durable provider-start handoff for one trusted Agent model inference. */
   async markModelUsageStarted(operationId: string): Promise<ModelMeteringAttempt> {
     await this.activateUsageAccount();
+    await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.markModelUsageStarted(operationId);
     } finally {
-      await this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery();
     }
   }
 
   /** Release one trusted Agent model inference that did not reach its provider request. */
   async failModelUsageBeforeExecution(operationId: string): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
+    await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.failModelUsageBeforeExecution(operationId);
     } finally {
-      await this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery();
     }
   }
 
@@ -652,10 +683,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       usage: ModelUsageCompletion): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
+    await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.completeModelUsage(operationId, usage);
     } finally {
-      await this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery();
     }
   }
 
@@ -734,10 +766,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       completion: GatekeeperUsageCompletion): Promise<GatekeeperUsageRecord> {
     await this.activateUsageAccount();
+    await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.completeGatekeeperUsage(operationId, completion);
     } finally {
-      await this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery();
     }
   }
 
@@ -749,6 +782,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       reason: string,
       actorUserId: string) {
     await this.activateUsageAccount();
+    await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.reconcileUnknownGatekeeperUsage(
         billingOperationId,
@@ -758,7 +792,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         actorUserId,
       );
     } finally {
-      await this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery();
     }
   }
 

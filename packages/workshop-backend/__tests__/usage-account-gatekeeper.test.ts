@@ -7,10 +7,12 @@ import {
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
 import { UsageAccount, type GatekeeperUsageAttribution } from "../src/usage-account.js";
+import type {UsageProjection} from "../src/usage-projection.js";
 import type { UserDurableObject } from "../src/user.js";
 
 const testEnv = env as unknown as {
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
+  TEST_USAGE_PROJECTION: DurableObjectNamespace<UsageProjection>;
 };
 const users = testEnv.TEST_USER;
 const INITIAL_BALANCE = 1_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
@@ -190,18 +192,118 @@ describe("Gatekeeper two-stage billing state machine", () => {
       account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
       account.markGatekeeperUsageStarted(operationId);
       account.completeGatekeeperUsage(operationId, "executed");
-      const fact = account.listPendingProjectionOutbox(1)[0]!.fact;
+      const pending = account.listPendingProjectionOutbox(1)[0]!;
+      const fact = pending.fact;
 
-      account.recordProjectionRejections([{
-        projectionFactId: fact.projectionFactId,
-        code: "invalid-fact",
-      }]);
+      account.recordProjectionDeliveryResult([pending], {
+        acknowledgedFactIds: [],
+        rejected: [{projectionFactId: fact.projectionFactId, code: "invalid-fact"}],
+      });
 
       expect(account.listPendingProjectionOutbox(1)).toEqual([]);
       expect(account.getSnapshot().projectionOutbox).toEqual([{
         fact,
         failureCode: "invalid-fact",
       }]);
+    });
+  });
+
+  it("replays an accepted fact after acknowledgement response loss without double counting",
+      async () => {
+    await withAccount(async account => {
+      const operationId = "gatekeeper-operation:projection-ack-loss";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const pending = account.listPendingProjectionOutbox(1)[0]!;
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+
+      expect(await projection.ingest([pending.fact])).toEqual({
+        acknowledgedFactIds: [pending.fact.projectionFactId],
+        rejected: [],
+      });
+      // The response is deliberately not recorded locally. A retry receives the same ACK.
+      const replay = await projection.ingest([pending.fact]);
+      account.recordProjectionDeliveryResult([pending], replay);
+
+      expect(account.listPendingProjectionOutbox(1)).toEqual([]);
+      expect((await projection.readOverview()).metrics).toMatchObject({
+        billableApiOperations: 1n,
+        unpricedApiOperations: 1n,
+      });
+    });
+  });
+
+  it("reads pending and rebuild pages without touching delivered lifetime history", async () => {
+    await withAccount((account, storage) => {
+      for (let index = 1; index <= 200; index += 1) {
+        const operationId = `gatekeeper-operation:bounded-${index.toString().padStart(3, "0")}`;
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+        const pending = account.listPendingProjectionOutbox(1)[0]!;
+        account.recordProjectionDeliveryResult([pending], {
+          acknowledgedFactIds: [pending.fact.projectionFactId],
+          rejected: [],
+        });
+      }
+      const finalOperation = "gatekeeper-operation:bounded-final";
+      account.beginGatekeeperUsage(finalOperation, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(finalOperation);
+      account.completeGatekeeperUsage(finalOperation, "executed");
+      const finalPending = account.listPendingProjectionOutbox(1)[0]!;
+
+      const firstKey = `usageAccount:projectionOutbox:${"1".padStart(40, "0")}`;
+      storage.kv.put(firstKey, {corruptDeliveredHistory: true});
+      expect(account.listPendingProjectionOutbox(1)).toEqual([finalPending]);
+      expect(account.listUsageProjectionFacts(200n, 1)).toEqual({
+        facts: [finalPending.fact],
+        nextSourceSequence: null,
+        backfillComplete: true,
+      });
+    });
+  });
+
+  it("backfills legacy terminal and reconciliation authority once across interruption", async () => {
+    await withAccount(async (account, storage) => {
+      const settledId = "gatekeeper-operation:legacy-settled";
+      account.beginGatekeeperUsage(settledId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(settledId);
+      account.completeGatekeeperUsage(settledId, "executed");
+      const unknownId = "gatekeeper-operation:legacy-unknown";
+      account.beginGatekeeperUsage(unknownId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(unknownId);
+      account.completeGatekeeperUsage(unknownId, "unknown");
+      account.reconcileUnknownGatekeeperUsage(
+        unknownId, "gatekeeper-operation:legacy-reconcile", "settle",
+        "Recover legacy authority", "legacy-admin",
+      );
+
+      for (const [key] of Array.from(storage.kv.list({prefix: "usageAccount:projection"}))) {
+        storage.kv.delete(key);
+      }
+      expect(account.getSnapshot().projectionFacts).toEqual([]);
+      expect(account.backfillProjectionFactsBatch(1)).toBe(false);
+
+      const restarted = new UsageAccount(storage);
+      for (let index = 0; index < 8 && !restarted.backfillProjectionFactsBatch(1); index += 1) {
+        // Each call is one bounded alarm-sized recovery step.
+      }
+      expect(restarted.backfillProjectionFactsBatch(1)).toBe(true);
+      const facts = restarted.listUsageProjectionFacts(null, 10).facts;
+      expect(facts.map(item => item.outcome).toSorted()).toEqual([
+        "reconciled-settled", "settled", "usage-unknown",
+      ]);
+      expect(restarted.listUsageProjectionFacts(null, 10).facts).toEqual(facts);
+
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      await projection.ingest(facts);
+      await projection.ingest(facts);
+      expect((await projection.readOverview()).metrics).toMatchObject({
+        activeUsers: 1n,
+        billableApiOperations: 2n,
+        unpricedApiOperations: 2n,
+      });
     });
   });
 

@@ -924,14 +924,18 @@ export type AdminUsageProjectionHealth = {
   latestAppliedSourceAt: string | null;
   /** Canonical UTC source time of the oldest unapplied fact, or null when none is pending. */
   oldestPendingAt: string | null;
-  /** Exact number of accepted facts that are waiting for a source-sequence gap. */
+  /** Exact number of User outbox facts or accepted facts still waiting to be applied. */
   pendingEventCount: bigint;
   /** Exact number of Usage Principals with a source-sequence gap. */
   sequenceGapCount: bigint;
-  /** Exact number of rejected invariant-breaking ingestion attempts. */
+  /** Exact number of failed delivery attempts and rejected invariant-breaking ingestions. */
   failedIngestionCount: bigint;
   /** Bounded machine-readable failure code, or null when no failure is recorded. */
-  failureCode: "fact-id-conflict" | "source-sequence-conflict" | "invalid-fact" | null;
+  failureCode: "delivery-failed" | "fact-id-conflict" | "source-sequence-conflict" |
+    "invalid-fact" | null;
+  /** Bounded rebuild failure code, or null when the latest rebuild did not fail. */
+  rebuildFailureCode:
+    "registry-read-failed" | "user-read-failed" | "projection-write-failed" | null;
   /** Stable rebuild request identity, or null when no rebuild is active. */
   rebuildRequestId: string | null;
   /** Exact number of Registry Users completed by the active rebuild. */
