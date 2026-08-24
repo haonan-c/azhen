@@ -172,10 +172,10 @@ TypeError: The RPC receiver does not implement the method
 
 ## Required commands
 
-The focused tracer, integration type check, lint check, and diff check below include the review-fix
-state. The package-wide and root gate rows record the clean pre-review checkpoint at commit
-`18a46f8`; the final root rerun is intentionally deferred until the review has no remaining hard or
-specification findings. No failure is classified as an unrelated flake.
+The focused tracer, package checks, and final root gates below include the complete review-fix state
+at commit `1e3d4403b1a8b26bde8abdc8f7844f903e818de5`. The final gates ran in strict order:
+`pnpm lint`, `git diff --check`, `pnpm build`, and one complete `pnpm test`; every command exited
+zero. No failure is classified as an unrelated flake.
 
 The first full test gate exposed a real cross-suite race in Spotify's production billing suite.
 Playlist edit preflight started the playlist and current-user GETs in parallel, but returned after
@@ -193,13 +193,13 @@ consecutive runs and the complete Spotify package passed 21 tests.
 | `pnpm --filter @gadgets/gatekeeper-scheduler build` | Passed after review fixes |
 | `pnpm --filter @gadgets/gatekeeper-ugc-ads build` | Passed after review fixes |
 | `pnpm --filter @gadgets/integration-tests build` | Passed after review fixes |
-| `pnpm --filter @gadgets/workshop-backend test` | Passed |
+| `pnpm --filter @gadgets/workshop-backend test` | Passed (519 tests passed, 4 skipped: 441 unit tests; three-file integration recovery group 22 passed, 4 skipped; all other backend groups passed) |
 | `pnpm --filter @gadgets/gatekeeper-context test` | Passed after review fixes (42 Node tests; 23 production workerd tests) |
 | `pnpm --filter @gadgets/gatekeeper-scheduler test` | Passed after review fixes (117 workerd tests passed, 2 skipped; 18 app tests) |
 | `pnpm --filter @gadgets/gatekeeper-ugc-ads test` | Passed after review fixes (69 Node tests; 1 production workerd test) |
-| `pnpm --filter @gadgets/integration-tests test` | Passed at `18a46f8` (12 files, 113 tests); final rerun pending review |
+| `pnpm --filter @gadgets/integration-tests test` | Passed (12 files, 114 tests; complete closure tracer 3/3) |
 | `pnpm lint:check` | Passed after review fixes (warnings only) |
-| `pnpm lint` | Passed at `18a46f8`; final rerun pending review |
-| `git diff --check` | Passed after review fixes |
-| `pnpm build` | Passed at `18a46f8`; final rerun pending review |
-| `pnpm test` | Passed at `18a46f8`; final rerun pending review |
+| `pnpm lint` | Passed at final HEAD (exit 0) |
+| `git diff --check` | Passed at final HEAD (exit 0) |
+| `pnpm build` | Passed at final HEAD (exit 0) |
+| `pnpm test` | Passed once in full at final HEAD (exit 0): root 97/97; backend 519 passed and 4 skipped; integration 12 files/114 tests, including closure tracer 3/3; frontend 344 plus copy 1; Context 42 plus 23 production tests; UGC Ads 69 plus 1 production test; Scheduler 117 passed and 2 skipped plus 18 app tests; every other workspace package passed |
