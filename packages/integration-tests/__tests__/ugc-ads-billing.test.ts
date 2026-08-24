@@ -1362,6 +1362,8 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
           outcome: "settled",
           chargeSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS.toString(),
         })],
+        modelAttempts: [],
+        modelUsageRecords: [],
         replayedAttempt: expectedSettledAttempt,
         replayMatched: true,
         chronologyValid: true,
