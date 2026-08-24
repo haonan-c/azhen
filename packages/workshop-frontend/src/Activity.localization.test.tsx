@@ -69,6 +69,11 @@ describe('localized activity', () => {
             title: 'CONNECTOR ACTION TITLE VERBATIM',
             description: 'CONNECTOR ACTION BODY VERBATIM',
             implementsRevert: false,
+            billing: {
+              methodKey: 'test.action',
+              externalAccountId: 'test-account',
+              providerIdempotency: 'unsupported' as const,
+            },
           },
         })
         subscriber.ready()
@@ -134,6 +139,11 @@ describe('localized activity', () => {
             title: 'ACTION TITLE VERBATIM',
             description: 'ACTION BODY VERBATIM',
             implementsRevert: false,
+            billing: {
+              methodKey: 'test.action',
+              externalAccountId: 'test-account',
+              providerIdempotency: 'unsupported' as const,
+            },
           },
         })
         subscriber.ready()
@@ -247,6 +257,11 @@ describe('localized activity', () => {
         title: `ACTION ${index + 1} VERBATIM`,
         description: `BODY ${index + 1} VERBATIM`,
         implementsRevert: false,
+        billing: {
+          methodKey: 'test.action',
+          externalAccountId: 'test-account',
+          providerIdempotency: 'unsupported' as const,
+        },
       },
     }))
     const overseer = {

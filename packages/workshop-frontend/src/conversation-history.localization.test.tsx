@@ -143,6 +143,11 @@ const messages: AiChatMessage[] = [
         title: 'CONNECTOR ACTION TITLE VERBATIM',
         description: 'CONNECTOR ACTION BODY VERBATIM',
         implementsRevert: false,
+        billing: {
+          methodKey: 'test.action',
+          externalAccountId: 'test-account',
+          providerIdempotency: 'unsupported' as const,
+        },
         autoApprovable: true,
         actionKind: { tag: 'publish', label: 'CONNECTOR KIND VERBATIM' },
       },
