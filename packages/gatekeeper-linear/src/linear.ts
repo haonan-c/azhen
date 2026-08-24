@@ -1109,31 +1109,6 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     check.commit();
   }
 
-  async billRead<T>(
-    queue: RpcStub<ApprovalQueue>,
-    method: keyof typeof LINEAR_BILLING_METHODS,
-    read: (activity: BillableOperationActivity) => Promise<T>,
-    teamIds: (result: T) => string[],
-    describe: (result: T) => ObservationDescription,
-  ): Promise<T> {
-    let lastResult: T | undefined;
-    return runBillableRead(
-      {
-        beginBillableOperation: (methodKey, externalAccountId) =>
-          queue.beginBillableOperation(methodKey, externalAccountId),
-        authorizeObservation: description =>
-          this.authorizeTeamObservation(queue, teamIds(lastResult as T), description),
-      },
-      this.ctx.props.userObjectId,
-      LINEAR_BILLING_METHODS[method].methodKey,
-      async activity => {
-        lastResult = await read(activity);
-        return lastResult;
-      },
-      describe,
-    );
-  }
-
   /**
    * Resolve an issue reference (real identifier/UUID, or provisional id) to the id usable against
    * Linear. Throws if a provisional issue's create has not actually been applied yet (used by
@@ -1996,6 +1971,37 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
 }
 
 // ---------------------------------------------------------------------------
+// Session read billing. This generic helper is deliberately outside the validated Gatekeeper DO
+// surface: it is local coordination for session implementations, not an RPC method.
+
+async function runLinearRead<T>(
+  gk: LinearGatekeeperImpl,
+  queue: RpcStub<ApprovalQueue>,
+  method: keyof typeof LINEAR_BILLING_METHODS,
+  read: (activity: BillableOperationActivity) => Promise<T>,
+  teamIds: (result: T) => string[],
+  describe: (result: T) => ObservationDescription,
+): Promise<T> {
+  let observedTeamIds: string[] = [];
+  return runBillableRead(
+    {
+      beginBillableOperation: (methodKey, externalAccountId) =>
+        queue.beginBillableOperation(methodKey, externalAccountId),
+      authorizeObservation: description =>
+        gk.authorizeTeamObservation(queue, observedTeamIds, description),
+    },
+    gk.billingExternalAccountId(),
+    LINEAR_BILLING_METHODS[method].methodKey,
+    async activity => {
+      const result = await read(activity);
+      observedTeamIds = teamIds(result);
+      return result;
+    },
+    describe,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Cursor: lazily pages through a Linear connection, authorizing each page.
 
 class StreamingCursor<TRaw, TOut> extends RpcTarget implements Cursor<TOut> {
@@ -2093,7 +2099,8 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
   }
 
   async getMetadata(): Promise<LinearWorkspaceMetadata> {
-    const org = await this.#gk.billRead(
+    const org = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearWorkspace.getMetadata",
       activity => this.#gk.orgRaw(activity),
@@ -2182,7 +2189,8 @@ class LinearWorkspaceSessionImpl extends RpcTarget implements LinearWorkspace {
   }
 
   async findMembers(query?: string): Promise<LinearUser[]> {
-    const users = await this.#gk.billRead(
+    const users = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearWorkspace.findMembers",
       activity => this.#gk.findMembersRaw(query, activity),
@@ -2232,7 +2240,8 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
   }
 
   async getMetadata(): Promise<LinearTeamMetadata> {
-    const team = await this.#gk.billRead(
+    const team = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearTeam.getMetadata",
       activity => this.#team(activity),
@@ -2299,7 +2308,8 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
   }
 
   async listWorkflowStates(): Promise<LinearWorkflowState[]> {
-    const result = await this.#gk.billRead(
+    const result = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearTeam.listWorkflowStates",
       async activity => {
@@ -2316,7 +2326,8 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
   }
 
   async listLabels(): Promise<LinearLabel[]> {
-    const result = await this.#gk.billRead(
+    const result = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearTeam.listLabels",
       async activity => {
@@ -2387,7 +2398,8 @@ class LinearTeamSessionImpl extends RpcTarget implements LinearTeam {
   }
 
   async listMembers(): Promise<LinearUser[]> {
-    const result = await this.#gk.billRead(
+    const result = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearTeam.listMembers",
       async activity => {
@@ -2454,7 +2466,8 @@ class LinearIssueImpl extends RpcTarget implements LinearIssue {
   }
 
   async getDetails(): Promise<LinearIssueDetails> {
-    const issue = await this.#gk.billRead(
+    const issue = await runLinearRead(
+      this.#gk,
       this.#queue,
       "LinearIssue.getDetails",
       activity => this.#requireIssue(activity),
