@@ -53,6 +53,17 @@ It does not modify `main` and does not create a pull request.
 - Projection facts are a strict `detail | aggregate` union. Detail stores only canonical event time;
   aggregate stores only a canonical 15-minute UTC bucket. Cross-field kind, pricing, outcome,
   active-User, token, API, and Unpriced invariants fail closed before storage.
+- Aggregate rows freeze a stable Summary identity, monotonic revision, and absolute snapshot
+  counters. A newer revision changes totals only by its exact delta from the stored snapshot;
+  duplicate and older revisions are no-ops, and the same revision with different content fails
+  closed. Detail rows retain exact single-event contribution rules.
+- Contiguous sequence application is limited to 64 facts. A persisted per-generation/User drain
+  queue resumes by alarm after restart. The alarm multiplexer alternates drain and rebuild/cleanup
+  lifecycle work when both exist, so neither bounded state machine can starve the other.
+- A fresh Projection binding starts in bootstrap-pending state. The first real administrator
+  overview automatically starts stable `bootstrap-v1`; the overview reports `rebuilding` until a
+  full Registry/User authority scan completes. Failed bootstrap attempts remain visible and retry
+  after their bounded generation cleanup, without an administrator rebuild click.
 - Each User publishes content-free pending count, oldest pending time, and delivery failure state to
   the Registry owner. The administrator overview merges those deployment watermarks without waking
   or scanning User Durable Objects. Recovery clearing is itself alarm-retried if the health RPC is
@@ -78,7 +89,7 @@ It does not modify `main` and does not create a pull request.
 | Lag/failure visible without charging blockage | Sequence gaps return `lagging`; invalid/conflicting facts and long User delivery outages return bounded `failed` health. Projection and health-RPC failure do not roll back settlement, and successful recovery clears deployment failure state. |
 | Existing authoritative history | A bounded, resumable test creates settled, unknown, and reconciled records without Projection keys, rebuilds, repeats backfill and ingestion, and proves exact authority-equivalent totals without duplication. |
 | Bounded lifetime operations | A 200-record delivered history test corrupts an old delivered value, then proves pending reads and a late keyset page touch only their bounded indexed batch. ACK response loss is replayed against the real Projection and counted once. |
-| Exact and forward-compatible facts | Tests retain an ingestion watermark above `Number.MAX_SAFE_INTEGER`, retain a Registry revision above it, distinguish detail time from a 15-minute aggregate bucket, and reject inconsistent priced/Unpriced, model/API, failed/active facts. |
+| Exact and forward-compatible facts | Tests retain an ingestion watermark above `Number.MAX_SAFE_INTEGER`, retain a Registry revision above it, distinguish detail time from a 15-minute aggregate bucket, replace a 20-use absolute Summary snapshot by monotonic revision/delta, and reject inconsistent priced/Unpriced, model/API, failed/active facts. |
 | Content privacy | Strict exact-key validation rejects separate prompt, header, credential, and response-body sentinels. A full dump of every Projection table contains none of them and no balance fields. |
 
 ## Focused and package verification
@@ -88,11 +99,12 @@ All commands below ran from the isolated worktree.
 | Command | Result |
 | --- | --- |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts __tests__/usage-account-gatekeeper.test.ts` | GREEN: 2 files, 37 tests. |
+| `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the second fixed-point review: 23 tests, including Summary revision/delta, rebuild-side conflict isolation, 64-fact restart-safe drains, alarm deletion concurrency, automatic bootstrap, and the complete Projection privacy sentinel. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.usage-admin.config.ts` | GREEN: 15 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.metered-model.config.ts` | GREEN: 35 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.integration.config.ts __integration__/usage-projection-rpc.test.ts` | GREEN: one real WebSocket/Cap’n Web test with promise pipelining and stub disposal. |
 | `corepack pnpm --dir packages/workshop-frontend exec vitest run src/components/usage/AdminUsageOverview.test.tsx src/AdminPage.localization.test.tsx` | GREEN before final rebase; repeated in the final gate below. |
-| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after review fixes: Browser Fonts 1; default workerd 465; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; 0 fail. |
+| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the second review fixes: Browser Fonts 1; default workerd 472; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; 0 fail. |
 | `corepack pnpm --filter @gadgets/workshop-frontend test` | GREEN: 351 pass across the main and first-party-copy runs. |
 | `corepack pnpm --dir packages/gatekeeper-context exec vitest run --config vitest.production.config.ts` | GREEN: 25 tests through the real User DO and newly bound Usage Projection DO. |
 
@@ -107,6 +119,18 @@ schema initialization recreating generation 1 after cleanup. A later RED test pr
 health-RPC failure could clear the retry alarm; the final implementation retains it until the
 deployment watermark is updated. The same focused tests are now GREEN. No test was skipped or
 changed to accept a fabricated value.
+
+The second fixed-point review produced another strict RED phase. It proved that aggregate rows were
+still treated as additive events, rebuild-triggered legacy backfill could lose its User maintenance
+wakeup, successful backlog recovery waited ten seconds, a rebuild-side conflict rejected an
+already-applied active fact, a large closed sequence gap drained without a bound, an old empty
+maintenance task could delete a concurrent terminal alarm, and a fresh binding reported healthy
+zero until an administrator manually rebuilt it. Separate failing tests reproduced every case.
+The corrected tests now prove absolute Summary revision/delta behavior, one-second successful
+continuation, active ACK with rebuild failure/cleanup, 64-fact crash-resumable drain batches with
+persistent round-robin lifecycle fairness, post-health alarm rechecks, and automatic bootstrap from
+dormant User authority. The real Cap'n Web test was updated only for the intentional initial
+`rebuilding` contract, then waits for healthy before exercising lag and authoritative balance.
 
 One existing Context replay assertion was narrowed in the original candidate to compare the complete
 authoritative snapshot, including immutable Projection facts, while excluding only the asynchronous

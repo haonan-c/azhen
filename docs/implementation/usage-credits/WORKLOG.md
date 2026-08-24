@@ -352,3 +352,29 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   metered-model 35, real Cap'n Web 1, Frontend package 351, Context production tracer 25, and the
   complete Backend package matrix. Root build/test/lint and final release checks remain the next
   coordinated gate; no remote or production mutation occurred.
+
+### 2026-08-24 — Issue #62 second fixed-point review corrections
+
+- Re-entered the `implement` and `tdd` gates for seven P1 findings. Each production change followed
+  a focused RED reproduction at the real `UsageProjection`, User alarm, or `AdminUsageApi` seam.
+- Froze aggregate rows as stable Summary identities with monotonic revisions and absolute counters.
+  Projection totals now change by the new-minus-old snapshot delta; duplicate and older revisions
+  are no-ops, while conflicting content at the same revision fails closed. Detail facts retain
+  exact single-event invariants, and aggregate API/Unpriced counts can safely exceed one.
+- A rebuild read now persists and starts User projection maintenance, and successful backlog work
+  continues after one second instead of the ten-second failure delay. A rebuild-generation conflict
+  fails and cleans only that generation; the already-applied active fact is acknowledged.
+- Added a persistent per-generation/User apply-drain queue. Each event applies at most 64 contiguous
+  facts. A persisted round-robin turn alternates drain and rebuild/cleanup work when both are ready,
+  so restart, large gaps, and lifecycle cleanup remain bounded without starvation.
+- Closed the empty-maintenance alarm deletion race by rechecking pending work after the Registry
+  health RPC and after alarm deletion. The regression pauses health, commits a concurrent terminal
+  fact, aborts its late `waitUntil`, restarts the User, and proves the fact is delivered.
+- A new Projection binding is bootstrap-pending. The first real administrator overview starts the
+  stable `bootstrap-v1` bounded Registry/User rebuild and reports `rebuilding` until it completes;
+  failed attempts retry after bounded cleanup. Dormant pre-binding authority no longer needs a
+  manual rebuild click.
+- Focused verification is GREEN: Projection 23, Gatekeeper Usage Account 21, Usage Admin 15, and
+  real Cap'n Web 1. Backend build/TypeScript is GREEN. The complete Backend package is GREEN with
+  553 pass, 4 expected skips, and 0 failures. Rebase and coordinated root/release gates remain; no
+  push, merge, Issue closure, upload, promotion, deployment, or production change occurred.
