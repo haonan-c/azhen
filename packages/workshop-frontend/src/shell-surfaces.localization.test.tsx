@@ -270,8 +270,10 @@ describe('localized Workshop shell surfaces', () => {
     await render(<AppShell><div>首页内容</div></AppShell>)
 
     await vi.waitFor(() => expect(container?.textContent).toContain('使用额度余额较低'))
-    const warning = container?.querySelector<HTMLAnchorElement>('a[role="alert"]')
-    expect(warning?.getAttribute('href')).toBe('/zh/profile#usage')
+    const warning = container?.querySelector<HTMLElement>('[role="alert"]')
+    const link = warning?.querySelector<HTMLAnchorElement>('a')
+    expect(link?.getAttribute('href')).toBe('/zh/profile#usage')
+    expect(link?.getAttribute('role')).toBeNull()
   })
 
   it('localizes the announcement dismiss control without changing the announcement', async () => {

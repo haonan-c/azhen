@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   PublishedApiRate,
+  PublishedApiRatePage,
   UserCreditLedgerEntry,
+  UserCreditLedgerPage,
   UserCreditReservation,
+  UserCreditReservationPage,
   UserUsageRecord,
+  UserUsageRecordPage,
 } from '@gadgets/workshop-shared/api'
 import { useAuthenticatedApi } from '../../AuthContext'
 import { UsageCreditProvider, useOptionalUsageCredit } from '../../UsageCreditContext'
@@ -19,10 +23,98 @@ type PageState<T> = {
   nextCursor: string | null
   loading: boolean
   error: boolean
+  truncated: boolean
 }
 
 function emptyPage<T>(): PageState<T> {
-  return { items: [], nextCursor: null, loading: true, error: false }
+  return { items: [], nextCursor: null, loading: true, error: false, truncated: false }
+}
+
+type AuthenticatedApiStub = ReturnType<typeof useAuthenticatedApi>['authenticatedApi']
+type PageRequest = { cursor?: string; limit: number }
+type LoadedPage<T> = { items: T[]; nextCursor: string | null; truncated?: boolean }
+type PageLoader<T> = (api: AuthenticatedApiStub, request: PageRequest) => Promise<LoadedPage<T>>
+
+async function loadUsageRecordPage(
+  api: AuthenticatedApiStub,
+  request: PageRequest,
+): Promise<LoadedPage<UserUsageRecord>> {
+  const page: UserUsageRecordPage = await api.listOwnUsageRecords(request)
+  return {items: page.records, nextCursor: page.nextCursor}
+}
+
+async function loadReservationPage(
+  api: AuthenticatedApiStub,
+  request: PageRequest,
+): Promise<LoadedPage<UserCreditReservation>> {
+  const page: UserCreditReservationPage = await api.listOwnCreditReservations(request)
+  return {items: page.reservations, nextCursor: page.nextCursor}
+}
+
+async function loadLedgerPage(
+  api: AuthenticatedApiStub,
+  request: PageRequest,
+): Promise<LoadedPage<UserCreditLedgerEntry>> {
+  const page: UserCreditLedgerPage = await api.listOwnCreditLedger(request)
+  return {items: page.entries, nextCursor: page.nextCursor}
+}
+
+async function loadRatePage(
+  api: AuthenticatedApiStub,
+  request: PageRequest,
+): Promise<LoadedPage<PublishedApiRate>> {
+  const page: PublishedApiRatePage = await api.listPublishedApiRates(request)
+  return {items: page.rates, nextCursor: page.nextCursor, truncated: page.truncated}
+}
+
+function useApiPage<T>(api: AuthenticatedApiStub, loadPage: PageLoader<T>) {
+  const activeApi = useRef<AuthenticatedApiStub | null>(api)
+  activeApi.current = api
+  const [owned, setOwned] = useState<{
+    api: AuthenticatedApiStub
+    state: PageState<T>
+  }>(() => ({api, state: emptyPage()}))
+  const state = owned.api === api ? owned.state : emptyPage<T>()
+
+  const load = useCallback(async (cursor?: string) => {
+    setOwned(previous => {
+      const previousState = previous.api === api ? previous.state : emptyPage<T>()
+      return {api, state: {...previousState, loading: true, error: false}}
+    })
+    try {
+      const page = await loadPage(api, {cursor, limit: PAGE_SIZE})
+      if (activeApi.current !== api) return
+      setOwned(previous => {
+        if (previous.api !== api) return previous
+        return {
+          api,
+          state: {
+            items: cursor === undefined
+              ? page.items
+              : [...previous.state.items, ...page.items],
+            nextCursor: page.nextCursor,
+            loading: false,
+            error: false,
+            truncated: previous.state.truncated || page.truncated === true,
+          },
+        }
+      })
+    } catch {
+      if (activeApi.current !== api) return
+      setOwned(previous => previous.api === api
+        ? {api, state: {...previous.state, loading: false, error: true}}
+        : previous)
+    }
+  }, [api, loadPage])
+
+  useEffect(() => {
+    void load()
+    return () => {
+      if (activeApi.current === api) activeApi.current = null
+    }
+  }, [api, load])
+
+  return [state, load] as const
 }
 
 function formatCount(value: bigint): string {
@@ -133,103 +225,60 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   )
 }
 
+function LedgerRelation({
+  relation,
+  label,
+  loaded,
+}: {
+  relation: NonNullable<UserCreditLedgerEntry['reversalOfLedgerEntry']>
+  label: string
+  loaded: boolean
+}) {
+  if (loaded) {
+    return <a className="mt-1 block text-xs text-kumo-link hover:underline" href={`#ledger-${relation.id}`}>{label}</a>
+  }
+  return (
+    <details className="mt-1 text-xs text-kumo-subtle">
+      <summary className="cursor-pointer text-kumo-link hover:underline">{label}</summary>
+      <p className="mt-1 pl-3">
+        {ledgerKindLabel(relation.kind)} · {formatUsageCreditSubunits(relation.deltaSubunits)} ·{' '}
+        <time dateTime={relation.createdAt}>{formatTime(relation.createdAt)}</time>
+      </p>
+    </details>
+  )
+}
+
 function UsageCreditContent() {
   const { authenticatedApi } = useAuthenticatedApi()
   const usage = useOptionalUsageCredit()!
-  const [usageRecords, setUsageRecords] = useState<PageState<UserUsageRecord>>(emptyPage)
-  const [reservations, setReservations] = useState<PageState<UserCreditReservation>>(emptyPage)
-  const [ledger, setLedger] = useState<PageState<UserCreditLedgerEntry>>(emptyPage)
-  const [rates, setRates] = useState<PageState<PublishedApiRate>>(emptyPage)
+  const [usageRecords, loadUsageRecords] = useApiPage(authenticatedApi, loadUsageRecordPage)
+  const [reservations, loadReservations] = useApiPage(authenticatedApi, loadReservationPage)
+  const [ledger, loadLedger] = useApiPage(authenticatedApi, loadLedgerPage)
+  const [rates, loadRates] = useApiPage(authenticatedApi, loadRatePage)
   const [acknowledging, setAcknowledging] = useState(false)
   const [ackError, setAckError] = useState(false)
-  const activeApi = useRef<typeof authenticatedApi | null>(authenticatedApi)
-
-  const loadUsageRecords = useCallback(async (cursor?: string) => {
-    setUsageRecords(previous => ({ ...previous, loading: true, error: false }))
-    try {
-      const page = await authenticatedApi.listOwnUsageRecords({ cursor, limit: PAGE_SIZE })
-      if (activeApi.current !== authenticatedApi) return
-      setUsageRecords(previous => ({
-        items: cursor === undefined ? page.records : [...previous.items, ...page.records],
-        nextCursor: page.nextCursor,
-        loading: false,
-        error: false,
-      }))
-    } catch {
-      if (activeApi.current !== authenticatedApi) return
-      setUsageRecords(previous => ({ ...previous, loading: false, error: true }))
-    }
-  }, [authenticatedApi])
-
-  const loadReservations = useCallback(async (cursor?: string) => {
-    setReservations(previous => ({ ...previous, loading: true, error: false }))
-    try {
-      const page = await authenticatedApi.listOwnCreditReservations({ cursor, limit: PAGE_SIZE })
-      if (activeApi.current !== authenticatedApi) return
-      setReservations(previous => ({
-        items: cursor === undefined ? page.reservations : [...previous.items, ...page.reservations],
-        nextCursor: page.nextCursor,
-        loading: false,
-        error: false,
-      }))
-    } catch {
-      if (activeApi.current !== authenticatedApi) return
-      setReservations(previous => ({ ...previous, loading: false, error: true }))
-    }
-  }, [authenticatedApi])
-
-  const loadLedger = useCallback(async (cursor?: string) => {
-    setLedger(previous => ({ ...previous, loading: true, error: false }))
-    try {
-      const page = await authenticatedApi.listOwnCreditLedger({ cursor, limit: PAGE_SIZE })
-      if (activeApi.current !== authenticatedApi) return
-      setLedger(previous => ({
-        items: cursor === undefined ? page.entries : [...previous.items, ...page.entries],
-        nextCursor: page.nextCursor,
-        loading: false,
-        error: false,
-      }))
-    } catch {
-      if (activeApi.current !== authenticatedApi) return
-      setLedger(previous => ({ ...previous, loading: false, error: true }))
-    }
-  }, [authenticatedApi])
-
-  const loadRates = useCallback(async (cursor?: string) => {
-    setRates(previous => ({ ...previous, loading: true, error: false }))
-    try {
-      const page = await authenticatedApi.listPublishedApiRates({ cursor, limit: PAGE_SIZE })
-      if (activeApi.current !== authenticatedApi) return
-      setRates(previous => ({
-        items: cursor === undefined ? page.rates : [...previous.items, ...page.rates],
-        nextCursor: page.nextCursor,
-        loading: false,
-        error: false,
-      }))
-    } catch {
-      if (activeApi.current !== authenticatedApi) return
-      setRates(previous => ({ ...previous, loading: false, error: true }))
-    }
-  }, [authenticatedApi])
+  const acknowledgementApi = useRef<AuthenticatedApiStub | null>(authenticatedApi)
+  acknowledgementApi.current = authenticatedApi
 
   useEffect(() => {
-    activeApi.current = authenticatedApi
-    setUsageRecords(emptyPage())
-    setReservations(emptyPage())
-    setLedger(emptyPage())
-    setRates(emptyPage())
-    void loadUsageRecords()
-    void loadReservations()
-    void loadLedger()
-    void loadRates()
+    setAcknowledging(false)
+    setAckError(false)
     return () => {
-      if (activeApi.current === authenticatedApi) activeApi.current = null
+      if (acknowledgementApi.current === authenticatedApi) acknowledgementApi.current = null
     }
-  }, [authenticatedApi, loadLedger, loadRates, loadReservations, loadUsageRecords])
+  }, [authenticatedApi])
 
   const balance = usage.balance
   const modelRecords = usageRecords.items.filter(record => record.kind === 'model')
   const apiRecords = usageRecords.items.filter(record => record.kind === 'gatekeeper')
+  let executedApiCount = 0n
+  let failedApiCount = 0n
+  let unknownApiCount = 0n
+  for (const record of apiRecords) {
+    if (record.outcome === 'settled') executedApiCount += 1n
+    else if (record.outcome === 'failed-before-execution') failedApiCount += 1n
+    else unknownApiCount += 1n
+  }
   const sourceCounts = new Map<UserUsageRecord['source'], bigint>()
   for (const record of usageRecords.items) {
     sourceCounts.set(record.source, (sourceCounts.get(record.source) ?? 0n) + 1n)
@@ -237,14 +286,16 @@ function UsageCreditContent() {
 
   async function acknowledgeNotice() {
     if (balance?.activationNotice === null || balance?.activationNotice === undefined) return
+    const ownerApi = authenticatedApi
     setAcknowledging(true)
     setAckError(false)
     try {
       await usage.acknowledgeActivationNotice(balance.activationNotice.id)
     } catch {
+      if (acknowledgementApi.current !== ownerApi) return
       setAckError(true)
     } finally {
-      setAcknowledging(false)
+      if (acknowledgementApi.current === ownerApi) setAcknowledging(false)
     }
   }
 
@@ -322,17 +373,36 @@ function UsageCreditContent() {
 
       <Section title={messages.usage_credit_api_heading()}>
         {apiRecords.length > 0 && (
-          <ul className="divide-y divide-kumo-line">
-            {apiRecords.map(record => (
-              <li key={record.id} className="py-3 first:pt-0 last:pb-0">
-                <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
-                  <span className="font-medium text-kumo-default">{record.vendorId} · {record.billingMethodKey}</span>
-                  <time className="text-xs text-kumo-subtle" dateTime={record.createdAt}>{formatTime(record.createdAt)}</time>
-                </div>
-                <p className="mt-1 text-xs text-kumo-subtle">{sourceLabel(record.source)} · {outcomeLabel(record.outcome)} · {chargeLabel(record)}</p>
-              </li>
-            ))}
-          </ul>
+          <>
+            <dl className="mb-3 grid gap-3 sm:grid-cols-3">
+              <div className="rounded-lg bg-kumo-tint px-3 py-2">
+                <dt className="text-xs text-kumo-subtle">{messages.usage_credit_api_executed_loaded()}</dt>
+                {' '}
+                <dd className="mt-1 text-sm font-medium text-kumo-default">{formatCount(executedApiCount)}</dd>
+              </div>
+              <div className="rounded-lg bg-kumo-tint px-3 py-2">
+                <dt className="text-xs text-kumo-subtle">{messages.usage_credit_api_failed_loaded()}</dt>
+                {' '}
+                <dd className="mt-1 text-sm font-medium text-kumo-default">{formatCount(failedApiCount)}</dd>
+              </div>
+              <div className="rounded-lg bg-kumo-tint px-3 py-2">
+                <dt className="text-xs text-kumo-subtle">{messages.usage_credit_api_unknown_loaded()}</dt>
+                {' '}
+                <dd className="mt-1 text-sm font-medium text-kumo-default">{formatCount(unknownApiCount)}</dd>
+              </div>
+            </dl>
+            <ul className="divide-y divide-kumo-line">
+              {apiRecords.map(record => (
+                <li key={record.id} className="py-3 first:pt-0 last:pb-0">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                    <span className="font-medium text-kumo-default">{record.vendorId} · {record.billingMethodKey}</span>
+                    <time className="text-xs text-kumo-subtle" dateTime={record.createdAt}>{formatTime(record.createdAt)}</time>
+                  </div>
+                  <p className="mt-1 text-xs text-kumo-subtle">{sourceLabel(record.source)} · {outcomeLabel(record.outcome)} · {chargeLabel(record)}</p>
+                </li>
+              ))}
+            </ul>
+          </>
         )}
         {!usageRecords.loading && !usageRecords.error && apiRecords.length === 0 && <p className="text-sm text-kumo-subtle">{messages.usage_credit_api_empty()}</p>}
         {usageRecords.error && usageRecords.items.length === 0 && <p role="alert" className="text-sm text-kumo-danger">{messages.usage_credit_section_error()}</p>}
@@ -355,8 +425,16 @@ function UsageCreditContent() {
               <span className="text-kumo-default">{ledgerKindLabel(entry.kind)} · {formatUsageCreditSubunits(entry.deltaSubunits)}</span>
               <time className="text-xs text-kumo-subtle" dateTime={entry.createdAt}>{formatTime(entry.createdAt)}</time>
             </div>
-            {entry.reversalOfLedgerEntryId !== null && <a className="mt-1 block text-xs text-kumo-link hover:underline" href={`#ledger-${entry.reversalOfLedgerEntryId}`}>{messages.usage_credit_reversal_of({ id: entry.reversalOfLedgerEntryId })}</a>}
-            {entry.reversedByLedgerEntryId !== null && <a className="mt-1 block text-xs text-kumo-link hover:underline" href={`#ledger-${entry.reversedByLedgerEntryId}`}>{messages.usage_credit_reversed_by({ id: entry.reversedByLedgerEntryId })}</a>}
+            {entry.reversalOfLedgerEntry !== null && <LedgerRelation
+              relation={entry.reversalOfLedgerEntry}
+              label={messages.usage_credit_reversal_of({id: entry.reversalOfLedgerEntry.id})}
+              loaded={ledger.items.some(candidate => candidate.id === entry.reversalOfLedgerEntry?.id)}
+            />}
+            {entry.reversedByLedgerEntry !== null && <LedgerRelation
+              relation={entry.reversedByLedgerEntry}
+              label={messages.usage_credit_reversed_by({id: entry.reversedByLedgerEntry.id})}
+              loaded={ledger.items.some(candidate => candidate.id === entry.reversedByLedgerEntry?.id)}
+            />}
           </li>
         ))}</ul>}
         <PageStatus state={ledger} empty={messages.usage_credit_ledger_empty()} retry={() => void loadLedger()} more={() => void loadLedger(ledger.nextCursor ?? undefined)} />
@@ -378,6 +456,7 @@ function UsageCreditContent() {
           </table>
         )}
         <PageStatus state={rates} empty={messages.usage_credit_rates_empty()} retry={() => void loadRates()} more={() => void loadRates(rates.nextCursor ?? undefined)} />
+        {rates.truncated && <p role="status" className="mt-3 text-xs text-kumo-warning">{messages.usage_credit_rates_truncated()}</p>}
       </Section>
     </section>
   )

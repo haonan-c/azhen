@@ -43,7 +43,7 @@ vi.mock('./AuthContext', () => {
     listOwnUsageRecords: async () => ({ records: [], nextCursor: null }),
     listOwnCreditReservations: async () => ({ reservations: [], nextCursor: null }),
     listOwnCreditLedger: async () => ({ entries: [], nextCursor: null }),
-    listPublishedApiRates: async () => ({ rates: [], nextCursor: null }),
+    listPublishedApiRates: async () => ({ rates: [], nextCursor: null, truncated: false }),
   }
   return {
     useAuthenticatedApi: () => ({ authenticatedApi }),

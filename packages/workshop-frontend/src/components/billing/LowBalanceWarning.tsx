@@ -8,13 +8,14 @@ export default function LowBalanceWarning() {
   if (!usage?.balance?.lowBalance) return null
   const href = window.location.pathname.startsWith('/zh') ? '/zh/profile#usage' : '/profile#usage'
   return (
-    <a
-      href={href}
-      role="alert"
-      className="flex min-w-0 items-center gap-2 rounded-md border border-kumo-warning/40 bg-kumo-warning/10 px-3 py-1.5 text-xs text-kumo-default"
-    >
-      <Warning size={15} weight="fill" aria-hidden="true" />
-      <span>{messages.usage_credit_low_balance_warning()}</span>
-    </a>
+    <div role="alert" className="rounded-md border border-kumo-warning/40 bg-kumo-warning/10">
+      <a
+        href={href}
+        className="flex min-w-0 items-center gap-2 px-3 py-1.5 text-xs text-kumo-default"
+      >
+        <Warning size={15} weight="fill" aria-hidden="true" />
+        <span>{messages.usage_credit_low_balance_warning()}</span>
+      </a>
+    </div>
   )
 }

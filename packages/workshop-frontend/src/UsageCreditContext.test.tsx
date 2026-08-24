@@ -54,6 +54,16 @@ function Probe() {
   return <div>{usage.loading ? 'loading' : usage.stale ? 'stale' : String(usage.balance?.availableSubunits)}</div>
 }
 
+function AcknowledgeProbe() {
+  const usage = useOptionalUsageCredit()!
+  return (
+    <div>
+      <span>{usage.loading ? 'loading' : usage.stale ? 'stale' : String(usage.balance?.availableSubunits)}</span>
+      <button type="button" onClick={() => void usage.acknowledgeActivationNotice('notice-safe')}>Acknowledge</button>
+    </div>
+  )
+}
+
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 describe('UsageCreditProvider subscription lifecycle', () => {
@@ -134,5 +144,74 @@ describe('UsageCreditProvider subscription lifecycle', () => {
     await render()
     await vi.waitFor(() => expect(container?.textContent).toBe('stale'))
     expect(container?.textContent).not.toContain('SENSITIVE SUBSCRIPTION DETAIL')
+  })
+
+  it('rebuilds the full subscription after a transient initial failure', async () => {
+    vi.useFakeTimers()
+    const firstFailure = Object.assign(
+      Promise.reject(new Error('TRANSIENT SUBSCRIPTION FAILURE')),
+      { [Symbol.dispose]: vi.fn<() => void>() },
+    )
+    const recovered = deferredRpc<{ [Symbol.dispose](): void }>()
+    let recoveredSubscriber: RpcStub<UsageCreditBalanceSubscriber> | null = null
+    let attempt = 0
+    const api = Object.assign(vi.fn<() => void>(), {
+      subscribeUsageCreditBalance: vi.fn<(
+        subscriber: RpcStub<UsageCreditBalanceSubscriber>,
+      ) => typeof firstFailure | typeof recovered.promise>((subscriber) => {
+        attempt += 1
+        if (attempt > 1) {
+          recoveredSubscriber = subscriber
+          return recovered.promise
+        }
+        return firstFailure
+      }),
+      acknowledgeUsageActivationNotice: vi.fn<(
+        noticeId: string,
+      ) => Promise<UsageCreditBalance>>(),
+    })
+    testState.api = api
+
+    try {
+      await render()
+      await act(async () => {})
+      expect(container?.textContent).toBe('stale')
+
+      await act(async () => vi.advanceTimersByTime(1_000))
+      expect(api.subscribeUsageCreditBalance).toHaveBeenCalledTimes(2)
+      await act(async () => recoveredSubscriber!.update(balance(8n, 80n)))
+      expect(container?.textContent).toBe('80')
+      expect(firstFailure[Symbol.dispose]).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('ignores a late activation acknowledgement from the previous authenticated API', async () => {
+    const oldApi = makeApi()
+    const nextApi = makeApi()
+    const lateAcknowledgement = deferredRpc<UsageCreditBalance>()
+    oldApi.api.acknowledgeUsageActivationNotice.mockReturnValue(lateAcknowledgement.promise)
+    testState.api = oldApi.api
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(
+      <UsageCreditProvider><AcknowledgeProbe /></UsageCreditProvider>,
+    ))
+    await act(async () => oldApi.getSubscriber()!.update(balance(4n, 40n)))
+
+    const button = container.querySelector('button')!
+    await act(async () => button.click())
+    testState.api = nextApi.api
+    await act(async () => root!.render(
+      <UsageCreditProvider><AcknowledgeProbe /></UsageCreditProvider>,
+    ))
+    await act(async () => nextApi.getSubscriber()!.update(balance(5n, 50n)))
+    expect(container.textContent).toContain('50')
+
+    await act(async () => lateAcknowledgement.resolve(balance(99n, 990n)))
+    expect(container.textContent).toContain('50')
+    expect(container.textContent).not.toContain('990')
   })
 })

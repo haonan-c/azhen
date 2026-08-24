@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-import { act, type ReactNode } from 'react'
+import { act, useLayoutEffect, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -40,7 +40,7 @@ const testState = vi.hoisted(() => {
       async () => ({ entries: [], nextCursor: null }),
     ),
     rates: vi.fn<(_request?: unknown) => Promise<PublishedApiRatePage>>(
-      async () => ({ rates: [], nextCursor: null }),
+      async () => ({ rates: [], nextCursor: null, truncated: false }),
     ),
   }
   function rpcPromise<T>(value: T) {
@@ -60,11 +60,11 @@ const testState = vi.hoisted(() => {
     listOwnCreditLedger: state.ledger,
     listPublishedApiRates: state.rates,
   })
-  return Object.assign(state, { authenticatedApi, initialBalance })
+  return Object.assign(state, { authenticatedApi, currentApi: authenticatedApi, initialBalance })
 })
 
 vi.mock('./AuthContext', () => ({
-  useAuthenticatedApi: () => ({ authenticatedApi: testState.authenticatedApi }),
+  useAuthenticatedApi: () => ({ authenticatedApi: testState.currentApi }),
 }))
 
 import UsageCreditBalanceCard from './components/billing/UsageCreditBalanceCard'
@@ -84,8 +84,9 @@ describe('complete User Usage Credit view', () => {
     testState.records.mockResolvedValue({ records: [], nextCursor: null })
     testState.reservations.mockResolvedValue({ reservations: [], nextCursor: null })
     testState.ledger.mockResolvedValue({ entries: [], nextCursor: null })
-    testState.rates.mockResolvedValue({ rates: [], nextCursor: null })
+    testState.rates.mockResolvedValue({ rates: [], nextCursor: null, truncated: false })
     testState.acknowledge.mockReset()
+    testState.currentApi = testState.authenticatedApi
     vi.clearAllMocks()
     root = undefined
     container = undefined
@@ -138,8 +139,8 @@ describe('complete User Usage Credit view', () => {
         id: 'api-1',
         source: 'gadget' as const,
         workspaceId: 'workspace-safe',
-        vendorId: 'mcp',
-        billingMethodKey: 'safe-tool',
+        vendorId: 'github',
+        billingMethodKey: 'issues.list',
         externalAccountId: 'opaque-safe',
         pricing: 'unpriced' as const,
         outcome: 'settled' as const,
@@ -153,16 +154,34 @@ describe('complete User Usage Credit view', () => {
         id: 'reversal-safe',
         kind: 'credit-reversal' as const,
         deltaSubunits: USAGE_CREDIT_SUBUNITS_PER_CREDIT,
-        reversalOfLedgerEntryId: 'charge-safe',
-        reversedByLedgerEntryId: null,
+        reversalOfLedgerEntry: {
+          id: 'charge-safe',
+          kind: 'usage-charge' as const,
+          deltaSubunits: -USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+          createdAt: '2026-08-24T12:01:00.000Z',
+        },
+        reversedByLedgerEntry: null,
         createdAt: '2026-08-24T12:02:00.000Z',
+      }, {
+        id: 'charge-safe',
+        kind: 'usage-charge' as const,
+        deltaSubunits: -USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+        reversalOfLedgerEntry: null,
+        reversedByLedgerEntry: {
+          id: 'reversal-safe',
+          kind: 'credit-reversal' as const,
+          deltaSubunits: USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+          createdAt: '2026-08-24T12:02:00.000Z',
+        },
+        createdAt: '2026-08-24T12:01:00.000Z',
       }],
       nextCursor: null,
     })
     testState.rates.mockResolvedValue({
-      rates: [{ vendorId: 'mcp', billingMethodKey: 'safe-tool', pricing: 'unpriced' as const, amountSubunits: null },
-        { vendorId: 'mcp', billingMethodKey: 'zero-tool', pricing: 'priced' as const, amountSubunits: 0n }],
+      rates: [{ vendorId: 'github', billingMethodKey: 'issues.list', pricing: 'unpriced' as const, amountSubunits: null },
+        { vendorId: 'github', billingMethodKey: 'issues.create', pricing: 'priced' as const, amountSubunits: 0n }],
       nextCursor: null,
+      truncated: false,
     })
 
     await render(<UsageCreditBalanceCard />)
@@ -172,9 +191,9 @@ describe('complete User Usage Credit view', () => {
     expect(container?.textContent).toContain('App runs')
     expect(container?.textContent).toContain('9,007,199,254,740,993')
     expect(container?.textContent).toContain('Charge: 0.000000000000000001')
-    expect(container?.textContent).toContain('mcp · safe-tool')
+    expect(container?.textContent).toContain('github · issues.list')
     expect(container?.textContent).toContain('Unpriced')
-    expect(container?.textContent).toContain('mcp · zero-tool')
+    expect(container?.textContent).toContain('github · issues.create')
     expect(container?.textContent).toContain('0 credits / operation')
     expect(container?.querySelector('a[href="#ledger-charge-safe"]')).not.toBeNull()
     expect(container?.textContent).not.toContain('provider cost')
@@ -228,6 +247,7 @@ describe('complete User Usage Credit view', () => {
       .mockResolvedValueOnce({
         rates: [{ vendorId: 'github', billingMethodKey: 'issues.list', pricing: 'priced' as const, amountSubunits: 1n }],
         nextCursor: 'safe-cursor',
+        truncated: true,
       })
       .mockRejectedValueOnce(new Error('SENSITIVE CURSOR ERROR'))
     await render(<UsageCreditBalanceCard />)
@@ -239,6 +259,122 @@ describe('complete User Usage Credit view', () => {
     expect(testState.rates).toHaveBeenLastCalledWith({ cursor: 'safe-cursor', limit: 25 })
     expect(container?.textContent).toContain('github · issues.list')
     expect(container?.textContent).toContain('Could not load the next page')
+    expect(container?.textContent).toContain('safe inventory limit was reached')
     expect(container?.textContent).not.toContain('SENSITIVE CURSOR ERROR')
+  })
+
+  it('never renders the previous User financial pages while the authenticated API switches', async () => {
+    testState.records.mockResolvedValue({
+      records: [{
+        kind: 'gatekeeper' as const,
+        id: 'old-user-record',
+        source: 'direct-user' as const,
+        vendorId: 'old-user-private-vendor',
+        billingMethodKey: 'old-user-private-method',
+        externalAccountId: 'old-user-private-account',
+        pricing: 'unpriced' as const,
+        outcome: 'settled' as const,
+        chargeSubunits: 0n,
+        createdAt: '2026-08-24T12:00:00.000Z',
+      }],
+      nextCursor: null,
+    })
+    let resolveNextRecords!: (page: UserUsageRecordPage) => void
+    const nextRecords = new Promise<UserUsageRecordPage>(resolve => { resolveNextRecords = resolve })
+    const nextApi = Object.assign(vi.fn<() => void>(), {
+      subscribeUsageCreditBalance: testState.authenticatedApi.subscribeUsageCreditBalance,
+      acknowledgeUsageActivationNotice: testState.authenticatedApi.acknowledgeUsageActivationNotice,
+      listOwnUsageRecords: vi.fn<(_request?: unknown) => Promise<UserUsageRecordPage>>(
+        () => nextRecords,
+      ),
+      listOwnCreditReservations: testState.authenticatedApi.listOwnCreditReservations,
+      listOwnCreditLedger: testState.authenticatedApi.listOwnCreditLedger,
+      listPublishedApiRates: testState.authenticatedApi.listPublishedApiRates,
+    })
+    let switching = false
+    let exposedOldUserDuringCommit = false
+    function ApiSwitchCanary() {
+      useLayoutEffect(() => {
+        if (switching && container?.textContent?.includes('old-user-private-vendor')) {
+          exposedOldUserDuringCommit = true
+        }
+      })
+      return <UsageCreditBalanceCard />
+    }
+
+    await render(<ApiSwitchCanary />)
+    await vi.waitFor(() => expect(container?.textContent).toContain('old-user-private-vendor'))
+    switching = true
+    testState.currentApi = nextApi
+    await act(async () => root!.render(<ApiSwitchCanary />))
+
+    expect(exposedOldUserDuringCommit).toBe(false)
+    expect(container?.textContent).not.toContain('old-user-private-vendor')
+    await act(async () => resolveNextRecords({records: [], nextCursor: null}))
+  })
+
+  it('shows loaded API operation outcome counts without mixing model records', async () => {
+    const base = {
+      kind: 'gatekeeper' as const,
+      source: 'agent' as const,
+      vendorId: 'github',
+      billingMethodKey: 'issues.list',
+      externalAccountId: 'opaque-account',
+      pricing: 'unpriced' as const,
+      chargeSubunits: 0n,
+      createdAt: '2026-08-24T12:00:00.000Z',
+    }
+    testState.records.mockResolvedValue({
+      records: [
+        {...base, id: 'executed', outcome: 'settled' as const},
+        {...base, id: 'failed', outcome: 'failed-before-execution' as const},
+        {...base, id: 'unknown', outcome: 'usage-unknown' as const},
+        {
+          kind: 'model' as const,
+          id: 'model-not-api',
+          source: 'agent' as const,
+          workspaceId: 'workspace-safe',
+          deploymentModelId: 'model-safe',
+          pricing: 'unpriced' as const,
+          outcome: 'reconciliation-required' as const,
+          usageStatus: 'invalid-report' as const,
+          usage: null,
+          chargeSubunits: 0n,
+          createdAt: '2026-08-24T12:00:00.000Z',
+        },
+      ],
+      nextCursor: null,
+    })
+
+    await render(<UsageCreditBalanceCard />)
+    await vi.waitFor(() => expect(container?.textContent).toContain('Executed / accepted (loaded): 1'))
+    expect(container?.textContent).toContain('Failed before execution (loaded): 1')
+    expect(container?.textContent).toContain('Unknown / needs reconciliation (loaded): 1')
+  })
+
+  it('shows a safe linked Ledger summary when the related entry is on another page', async () => {
+    testState.ledger.mockResolvedValue({
+      entries: [{
+        id: 'reversal-visible',
+        kind: 'credit-reversal' as const,
+        deltaSubunits: USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+        reversalOfLedgerEntry: {
+          id: 'charge-on-previous-page',
+          kind: 'usage-charge' as const,
+          deltaSubunits: -USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+          createdAt: '2026-08-20T12:00:00.000Z',
+        },
+        reversedByLedgerEntry: null,
+        createdAt: '2026-08-24T12:02:00.000Z',
+      }],
+      nextCursor: 'next-ledger-page',
+    })
+
+    await render(<UsageCreditBalanceCard />)
+    await vi.waitFor(() => expect(container?.textContent).toContain('charge-on-previous-page'))
+    const relation = container?.querySelector('details')
+    expect(relation?.textContent).toContain('Usage charge')
+    expect(relation?.textContent).toContain('-1')
+    expect(relation?.textContent).not.toContain('admin')
   })
 })
