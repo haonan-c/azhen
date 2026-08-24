@@ -130,13 +130,26 @@ describe("production Spotify billing wiring", () => {
   });
 
   it("releases a playlist Action when approved provider preflight returns 403", async () => {
-    const fetchMock = vi.fn().mockImplementation(async () => new Response(null, {
-      status: 403,
-    }));
+    let releaseUserPreflight!: () => void;
+    const userPreflight = new Promise<Response>(resolve => {
+      releaseUserPreflight = () => resolve(new Response(null, { status: 403 }));
+    });
+    const fetchMock = vi.fn().mockImplementation(async (input: RequestInfo | URL) =>
+      new URL(input.toString()).pathname === "/v1/me"
+        ? userPreflight
+        : new Response(null, { status: 403 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await harness().playlistPreflightFailure("playlist-preflight-fails");
+    const resultPromise = harness().playlistPreflightFailure("playlist-preflight-fails");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const completedBeforeUserPreflight = await Promise.race([
+      resultPromise.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 25)),
+    ]);
+    releaseUserPreflight();
+    const result = await resultPromise;
 
+    expect(completedBeforeUserPreflight).toBe(false);
     expect(result.result).toEqual({ outcome: "failed-before-execution" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls.every(([, init]) => init?.method === "GET")).toBe(true);

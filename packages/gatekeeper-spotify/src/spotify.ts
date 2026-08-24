@@ -1306,7 +1306,15 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
     if (!realId) {
       return { trackCount: (await this.#effectivePlaylistEntries(logicalId, undefined)).length };
     }
-    const [summary, me] = await Promise.all([this.#getPlaylistSummary(realId), this.#currentUserRef()]);
+    const preflights = [this.#getPlaylistSummary(realId), this.#currentUserRef()] as const;
+    let summary: SpotifyPlaylistSummary;
+    let me: SpotifyUserRef;
+    try {
+      [summary, me] = await Promise.all(preflights);
+    } catch (error) {
+      await Promise.allSettled(preflights);
+      throw error;
+    }
     if (summary.owner.id !== me.id && !summary.collaborative) {
       throw new Error(
         `Cannot edit playlist "${summary.name}": it is owned by ` +
