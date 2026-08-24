@@ -46,6 +46,7 @@ const TIKHUB_PATH = "/api/v1/xiaohongshu/app_v2/search_notes";
 const TIKHUB_API_KEY = "issue-72-tikhub-fixture-key";
 const DIRECT_KEYWORD = "private-direct-keyword";
 const SCHEDULED_KEYWORD = "private-scheduled-keyword";
+const DUPLICATE_KEYWORD = "private-duplicate-delivery-keyword";
 const UNKNOWN_KEYWORD = "private-response-loss-keyword";
 const CONTEXT_CREATE_METHOD =
   CONTEXT_BILLING_METHODS["ContextApi.createContextCollection"].methodKey;
@@ -94,14 +95,18 @@ type MeteringInspection = {
       billingMethodKey: string;
       chargeSubunits: string;
     };
-    state: "settled" | "failed-before-execution" | "usage-unknown";
+    state: "ready" | "started" | "settled" | "failed-before-execution" | "usage-unknown";
     reservationId: string | null;
-    usageRecordId: string | null;
+    usageRecordId?: string;
   }>;
   usageRecords: Array<{
     id: string;
     operationId: string;
     outcome: "settled" | "failed-before-execution" | "usage-unknown";
+    attribution: MeteringInspection["attempts"][number]["attribution"];
+    chargeSnapshot: MeteringInspection["attempts"][number]["chargeSnapshot"];
+    reservationId: string | null;
+    chargeSubunits: string | null;
   }>;
   chronologyValid: boolean;
   reservationMatchesOperation: boolean;
@@ -115,24 +120,25 @@ let authenticatedAdmin: RpcStub<AuthenticatedApi>;
 let admin: RpcStub<AdminApi>;
 let deploymentModelId: string;
 let modelCall = 0;
+let registrationCallbackType = "issue-72-scheduled-ugc";
 let physicalCalls: SafePhysicalCall[] = [];
-let releaseScheduledRequest!: () => void;
-let scheduledRequestReleased = Promise.resolve();
-let signalScheduledRequest!: () => void;
-let scheduledRequestStarted = Promise.resolve();
+let releaseBusinessRequest!: () => void;
+let businessRequestReleased = Promise.resolve();
+let signalBusinessRequest!: () => void;
+let businessRequestStarted = Promise.resolve();
 
-function armScheduledRequestGate(): void {
-  scheduledRequestReleased = new Promise<void>(resolve => {
-    releaseScheduledRequest = resolve;
+function armBusinessRequestGate(): void {
+  businessRequestReleased = new Promise<void>(resolve => {
+    releaseBusinessRequest = resolve;
   });
-  scheduledRequestStarted = new Promise<void>(resolve => {
-    signalScheduledRequest = resolve;
+  businessRequestStarted = new Promise<void>(resolve => {
+    signalBusinessRequest = resolve;
   });
 }
 
 function resetPhysicalTrace(): void {
   physicalCalls = [];
-  armScheduledRequestGate();
+  armBusinessRequestGate();
 }
 
 function modelResponse(tool?: { name: string; args: unknown }): Response {
@@ -226,22 +232,40 @@ function providerEnvelope(data: unknown): Response {
 }
 
 const upstreamHandler: Handler = async (url, method, headers, request) => {
-  if (url.origin === TITLE_MODEL_ORIGIN) return modelResponse();
+  if (url.origin === TITLE_MODEL_ORIGIN) {
+    if (method !== "POST" || request.method !== "POST" ||
+        url.pathname !== "/v1/chat/completions" ||
+        headers.get("authorization") !== "Bearer private-title-model-token" ||
+        headers.get("content-type") !== "application/json") {
+      throw new Error("Title model request did not match the production protocol.");
+    }
+    return modelResponse();
+  }
   if (url.origin === MODEL_ORIGIN) {
+    if (method !== "POST" || request.method !== "POST" ||
+        url.pathname !== "/v1/chat/completions" ||
+        headers.get("authorization") !== "Bearer private-registration-model-token" ||
+        headers.get("content-type") !== "application/json") {
+      throw new Error("Registration model request did not match the production protocol.");
+    }
     const payload = JSON.parse(await request.text()) as { tools?: unknown };
     if (!Array.isArray(payload.tools) || payload.tools.length === 0) return modelResponse();
     modelCall += 1;
-    return modelResponse(modelCall === 1 ? {
+    return modelResponse(modelCall % 2 === 1 ? {
       name: "executeCode",
       args: {
         code: `
           import { restore } from "cloudflare:workers";
           export default async function(_self, env) {
-            const callback = await env.APP[restore]({type: "issue-72-scheduled-ugc"});
+            const callback = await env.APP[restore]({
+              type: ${JSON.stringify(registrationCallbackType)},
+            });
             await env.SCHEDULER.every(60000, callback, {
               title: "First-party billing tracer",
               description: "Run the persisted UGC callback after restart.",
-              occurrences: {count: 2},
+              occurrences: {
+                count: ${registrationCallbackType === "issue-72-scheduled-ugc" ? 2 : 1},
+              },
             });
           }
         `,
@@ -269,12 +293,12 @@ const upstreamHandler: Handler = async (url, method, headers, request) => {
       ])) {
     throw new Error("TikHub search query did not match the production protocol.");
   }
+  if (keyword === DIRECT_KEYWORD || keyword === SCHEDULED_KEYWORD) {
+    signalBusinessRequest();
+    await businessRequestReleased;
+  }
   physicalCalls.push({ keyword, page });
   if (keyword === UNKNOWN_KEYWORD) throw new Error("private-response-loss");
-  if (keyword === SCHEDULED_KEYWORD) {
-    signalScheduledRequest();
-    await scheduledRequestReleased;
-  }
   return providerEnvelope({
     code: 200,
     next_page: false,
@@ -352,6 +376,50 @@ function gatekeeperRecords(records: UserUsageRecord[]): UserGatekeeperUsageRecor
     record.kind === "gatekeeper");
 }
 
+function expectExactTerminalOperations(
+  inspection: MeteringInspection,
+  expected: Array<{
+    billingMethodKey: string;
+    source: string;
+    chargeSubunits: bigint;
+    automationRunId?: string;
+  }>,
+): void {
+  const pricedAttempts = inspection.attempts.filter(candidate =>
+    candidate.chargeSnapshot.pricing === "priced");
+  const pricedRecords = inspection.usageRecords.filter(candidate =>
+    candidate.chargeSnapshot.pricing === "priced");
+  expect(pricedAttempts).toHaveLength(expected.length);
+  expect(pricedRecords).toHaveLength(expected.length);
+  for (const operation of expected) {
+    const attempt = pricedAttempts.find(candidate =>
+      candidate.attribution.billingMethodKey === operation.billingMethodKey &&
+      candidate.attribution.source === operation.source &&
+      candidate.attribution.automationRunId === operation.automationRunId);
+    expect(attempt).toBeDefined();
+    const record = pricedRecords.find(candidate =>
+      candidate.operationId === attempt!.operationId);
+    expect(record).toEqual(expect.objectContaining({
+      id: attempt!.usageRecordId,
+      operationId: attempt!.operationId,
+      outcome: "settled",
+      reservationId: attempt!.reservationId,
+      chargeSubunits: operation.chargeSubunits.toString(),
+      attribution: attempt!.attribution,
+      chargeSnapshot: attempt!.chargeSnapshot,
+    }));
+    expect(attempt).toEqual(expect.objectContaining({
+      state: "settled",
+      reservationId: attempt!.operationId,
+      chargeSnapshot: expect.objectContaining({
+        pricing: "priced",
+        billingMethodKey: operation.billingMethodKey,
+        chargeSubunits: operation.chargeSubunits.toString(),
+      }),
+    }));
+  }
+}
+
 async function signInWhenAvailable(username: string): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
@@ -361,7 +429,9 @@ async function signInWhenAvailable(username: string): Promise<{
   while (Date.now() < deadline) {
     const publicApi = connect(harness.url);
     try {
-      return { publicApi, user: await signIn(publicApi, username) };
+      const user = await signIn(publicApi, username);
+      await user.getUsageCreditBalance();
+      return { publicApi, user };
     } catch (error) {
       publicApi[Symbol.dispose]();
       if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
@@ -406,8 +476,8 @@ beforeAll(async () => {
   if (!adminCapability) throw new Error("Expected the deployment administrator capability.");
   admin = adminCapability;
   await admin.addDeploymentModel("Issue 72 title helper", {
-    provider: "openai",
-    model: "gpt-5.2",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
     apiToken: "private-title-model-token",
     apiUrl: `${TITLE_MODEL_ORIGIN}/v1`,
   });
@@ -465,6 +535,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     expect(await ownerWorkspace.addCollaborator(collaboratorName, "build")).not.toBeNull();
     const gadget = await ownerWorkspace.createGadget("Issue 72 tracer", undefined, "APP");
     const gadgetId = await gadget.getId();
+    const ownerBefore = await owner.getUsageCreditBalance();
 
     const direct = await openUgcAdsSession(ownerWorkspace);
     await gadget.bind("UGC_ADS", direct.gatekeeperId);
@@ -519,11 +590,16 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     const directApp = await gadget.connectToGadget() as RpcStub<{
       directSearch(keyword: string): Promise<unknown[]>;
     }>;
-    await expect(directApp.directSearch(DIRECT_KEYWORD)).resolves.toHaveLength(1);
+    const directSearch = directApp.directSearch(DIRECT_KEYWORD);
+    await businessRequestStarted;
+    expect(physicalCalls).toEqual([]);
+    expect((await owner.getUsageCreditBalance()).reservedSubunits).toBe(RATES.ugcSearch);
+    releaseBusinessRequest();
+    await expect(directSearch).resolves.toHaveLength(1);
     directApp[Symbol.dispose]();
+    armBusinessRequestGate();
 
     const collaboratorWorkspace = await collaborator.openGadget(workspaceId);
-    const ownerBeforeSchedule = await owner.getUsageCreditBalance();
     const collaboratorBeforeSchedule = await collaborator.getUsageCreditBalance();
     const collaboratorRecordIdsBefore = new Set(
       (await collaborator.listOwnUsageRecords({ limit: 100 })).records.map(record => record.id),
@@ -570,7 +646,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     scheduleInspection.publicApi[Symbol.dispose]();
     try {
       await Promise.race([
-        scheduledRequestStarted,
+        businessRequestStarted,
         new Promise<never>((_resolve, reject) => setTimeout(
           () => reject(new Error("Timed out waiting for the real Scheduler alarm.")),
           70_000,
@@ -585,7 +661,8 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     expect(reservedDuringCallback.reservedSubunits).toBe(
       RATES.schedulerDelivery + RATES.ugcSearch,
     );
-    releaseScheduledRequest();
+    expect(physicalCalls).toEqual([{keyword: DIRECT_KEYWORD, page: 1}]);
+    releaseBusinessRequest();
 
     await waitFor("the first scheduled UGC Usage", async () => {
       const records = gatekeeperRecords(
@@ -599,11 +676,11 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     }, 30_000);
     observing.user[Symbol.dispose]();
     observing.publicApi[Symbol.dispose]();
-    armScheduledRequestGate();
+    armBusinessRequestGate();
     await harness.server.update(options => options);
 
     await Promise.race([
-      scheduledRequestStarted,
+      businessRequestStarted,
       new Promise<never>((_resolve, reject) => setTimeout(
         () => reject(new Error("Timed out waiting for the second real Scheduler alarm.")),
         70_000,
@@ -614,7 +691,11 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     expect(reservedDuringSecondCallback.reservedSubunits).toBe(
       RATES.schedulerDelivery + RATES.ugcSearch,
     );
-    releaseScheduledRequest();
+    expect(physicalCalls).toEqual([
+      {keyword: DIRECT_KEYWORD, page: 1},
+      {keyword: SCHEDULED_KEYWORD, page: 1},
+    ]);
+    releaseBusinessRequest();
     const ownerRecords = await waitFor("the second scheduled UGC Usage", async () => {
       const records = gatekeeperRecords(
         (await secondObserver.user.listOwnUsageRecords({ limit: 100 })).records,
@@ -653,7 +734,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     const managerAfter = await managerConnection.user.getUsageCreditBalance();
     expect(ownerAfter.reservedSubunits).toBe(0n);
     expect(ownerAfter.availableSubunits).toBe(
-      ownerBeforeSchedule.availableSubunits -
+      ownerBefore.availableSubunits - RATES.ugcSearch -
         2n * (RATES.schedulerDelivery + RATES.ugcSearch),
     );
     expect(collaboratorAfter.availableSubunits).toBe(
@@ -748,6 +829,58 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       reservationMatchesOperation: true,
       terminalRecordLinked: true,
     });
+    expectExactTerminalOperations(ownerInspection, [
+      {
+        billingMethodKey: UGC_SEARCH_METHOD,
+        source: "gadget",
+        chargeSubunits: RATES.ugcSearch,
+      },
+      ...firings.flatMap(firing => [
+        {
+          billingMethodKey: SCHEDULER_DELIVERY_METHOD,
+          source: "scheduled",
+          chargeSubunits: RATES.schedulerDelivery,
+          automationRunId: firing.runId,
+        },
+        {
+          billingMethodKey: UGC_SEARCH_METHOD,
+          source: "scheduled",
+          chargeSubunits: RATES.ugcSearch,
+          automationRunId: firing.runId,
+        },
+      ]),
+    ]);
+    expectExactTerminalOperations(collaboratorInspection, [{
+      billingMethodKey: SCHEDULER_REGISTER_METHOD,
+      source: "agent",
+      chargeSubunits: RATES.schedulerRegister,
+    }]);
+    expectExactTerminalOperations(managerInspection, [
+      {
+        billingMethodKey: CONTEXT_CREATE_METHOD,
+        source: "direct-user",
+        chargeSubunits: RATES.contextCreate,
+      },
+      {
+        billingMethodKey: CONTEXT_PUT_METHOD,
+        source: "direct-user",
+        chargeSubunits: RATES.contextPut,
+      },
+    ]);
+    const newCollaboratorUsage = collaboratorUsageRecords.filter(
+      record => !collaboratorRecordIdsBefore.has(record.id),
+    );
+    const modelCharges = newCollaboratorUsage.filter(record => record.kind === "model");
+    expect(modelCharges.length).toBeGreaterThan(0);
+    expect(newCollaboratorUsage.filter(record => record.kind === "gatekeeper"))
+      .toEqual(collaboratorRecords);
+    expect(collaboratorBeforeSchedule.availableSubunits - collaboratorAfter.availableSubunits)
+      .toBe(newCollaboratorUsage.reduce(
+        (total, record) => total + (record.chargeSubunits ?? 0n), 0n));
+    expect(newCollaboratorUsage.reduce(
+      (total, record) => total + (record.chargeSubunits ?? 0n), 0n))
+      .toBe(RATES.schedulerRegister + modelCharges.reduce(
+        (total, record) => total + (record.chargeSubunits ?? 0n), 0n));
     expect(new Set(ownerInspection.attempts.map(attempt => attempt.operationId)).size)
       .toBe(ownerInspection.attempts.length);
     const ownerPrincipalIds = new Set(ownerInspection.attempts.map(
@@ -818,6 +951,183 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     managerConnection.user[Symbol.dispose]();
     managerConnection.publicApi[Symbol.dispose]();
   }, 210_000);
+
+  it("retries one restored scheduled run without a second callback or financial effect", async () => {
+    registrationCallbackType = "issue-72-duplicate-delivery";
+    modelCall = 0;
+    resetPhysicalTrace();
+    const publicApi = connect(harness.url);
+    const [username] = nextUsernames("issueduplicate");
+    const user = await signUp(publicApi, username);
+    for (const vendorId of ["scheduler", "ugc_ads"]) {
+      await waitForAmbientAccount(user, vendorId);
+    }
+    const workspace = await user.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
+    const gadget = await workspace.createGadget("Duplicate delivery tracer", undefined, "APP");
+    const gadgetId = await gadget.getId();
+    const ugc = await openUgcAdsSession(workspace);
+    await gadget.bind("UGC_ADS", ugc.gatekeeperId);
+    ugc.session[Symbol.dispose]();
+    await workspace.updateCode(gadgetCodeUpdate(gadgetId, `
+      import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
+      class DuplicateDeliveryCallback extends RpcTarget {
+        constructor(env) {
+          super();
+          this.env = env;
+        }
+        async onSchedule(firing) {
+          const notes = await this.env.UGC_ADS.searchXiaohongshuNotes(
+            ${JSON.stringify(DUPLICATE_KEYWORD)}, {limit: 1});
+          await this.env.GADGET.recordFiring(firing, notes.length);
+          return Symbol("lose-response-after-loader-tombstone");
+        }
+      }
+      export class Gadget extends DurableObject {
+        async recordFiring(firing, noteCount) {
+          const firings = this.ctx.storage.kv.get("firings") ?? [];
+          firings.push({...firing, noteCount});
+          this.ctx.storage.kv.put("firings", firings);
+        }
+        getFirings() {
+          return this.ctx.storage.kv.get("firings") ?? [];
+        }
+        [restore](params) {
+          if (params?.type !== "issue-72-duplicate-delivery") {
+            throw new Error("Unknown callback.");
+          }
+          return new DuplicateDeliveryCallback(this.env);
+        }
+      }
+    `));
+    const chatId = await workspace.newChat(
+      "Register the duplicate-delivery proof schedule.",
+      deploymentModelId,
+    );
+    const hook = await waitFor("the duplicate-delivery registration", async () => {
+      const chat = (await workspace.listChats()).find(candidate => candidate.id === chatId);
+      const hooks = await workspace.listHooks();
+      return chat?.activeAgent === undefined && hooks.length === 1 ? hooks[0]! : null;
+    });
+    await workspace.enableHook(hook.id);
+    gadget[Symbol.dispose]();
+    workspace[Symbol.dispose]();
+    user[Symbol.dispose]();
+    publicApi[Symbol.dispose]();
+    await harness.server.update(options => options);
+
+    await waitFor("the first duplicate-delivery physical call", async () =>
+      physicalCalls.length === 1 ? true : null, 80_000);
+
+    const observing = await signInWhenAvailable(username);
+    const schedulerFrame = await observing.user.getGatekeeperApp("scheduler");
+    if (!schedulerFrame) throw new Error("Expected the Scheduler management capability.");
+    const schedulerUi = schedulerFrame.ui as unknown as RpcStub<{
+      list(): Promise<{
+        schedules: Array<{
+          scheduleId: string;
+          status: string;
+          retrying?: true;
+          nextFire?: number;
+        }>;
+      }>;
+    }>;
+    const firstRetry = await waitFor("the first callback response loss", async () => {
+      const [schedule] = (await schedulerUi.list()).schedules;
+      return schedule?.status === "active" && schedule.retrying && schedule.nextFire
+        ? schedule
+        : null;
+    }, 80_000);
+    const firstWorkspace = await observing.user.openGadget(workspaceId);
+    const firstGadget = await firstWorkspace.getGadget(gadgetId);
+    const firstApp = await firstGadget.connectToGadget() as RpcStub<{
+      getFirings(): Promise<Array<{scheduleId: string; runId: string; noteCount: number}>>;
+    }>;
+    const firstFirings = await firstApp.getFirings();
+    expect(firstFirings).toHaveLength(1);
+    expect(physicalCalls).toEqual([{keyword: DUPLICATE_KEYWORD, page: 1}]);
+    const firstInspection = await inspectGatekeeperMetering(username);
+    const deliveryAttempt = firstInspection.attempts.find(attempt =>
+      attempt.attribution.billingMethodKey === SCHEDULER_DELIVERY_METHOD);
+    expect(deliveryAttempt).toEqual(expect.objectContaining({
+      state: "started",
+      attribution: expect.objectContaining({
+        source: "scheduled",
+        workspaceId,
+        gadgetId,
+        automationId: firstFirings[0]!.scheduleId,
+        automationRunId: firstFirings[0]!.runId,
+      }),
+    }));
+    expect(deliveryAttempt?.usageRecordId).toBeUndefined();
+    const balanceAfterFirstDelivery = await observing.user.getUsageCreditBalance();
+    expect(balanceAfterFirstDelivery.reservedSubunits).toBe(RATES.schedulerDelivery);
+    const firstOperationIds = firstInspection.attempts.filter(attempt =>
+      attempt.attribution.source === "scheduled").map(attempt => attempt.operationId).toSorted();
+    const firstScheduledRecords = firstInspection.usageRecords.filter(record =>
+      record.attribution.source === "scheduled");
+    expect(firstScheduledRecords).toEqual([expect.objectContaining({
+      attribution: expect.objectContaining({billingMethodKey: UGC_SEARCH_METHOD}),
+      outcome: "settled",
+      chargeSubunits: RATES.ugcSearch.toString(),
+    })]);
+    firstApp[Symbol.dispose]();
+    firstGadget[Symbol.dispose]();
+    firstWorkspace[Symbol.dispose]();
+    schedulerUi[Symbol.dispose]();
+    observing.user[Symbol.dispose]();
+    observing.publicApi[Symbol.dispose]();
+    await harness.server.update(options => options);
+
+    await waitFor("the real same-run retry alarm time", async () =>
+      Date.now() > firstRetry.nextFire! + 3_000 ? true : null, 80_000);
+    const retried = await signInWhenAvailable(username);
+    const retriedFrame = await retried.user.getGatekeeperApp("scheduler");
+    if (!retriedFrame) throw new Error("Expected the restored Scheduler capability.");
+    const retriedUi = retriedFrame.ui as unknown as typeof schedulerUi;
+    await waitFor("the same-run Loader tombstone retry", async () => {
+      const [schedule] = (await retriedUi.list()).schedules;
+      return schedule?.status === "completed" ? schedule : null;
+    }, 20_000);
+    const retriedWorkspace = await retried.user.openGadget(workspaceId);
+    const retriedGadget = await retriedWorkspace.getGadget(gadgetId);
+    const retriedApp = await retriedGadget.connectToGadget() as RpcStub<{
+      getFirings(): Promise<Array<{scheduleId: string; runId: string; noteCount: number}>>;
+    }>;
+    expect(await retriedApp.getFirings()).toEqual(firstFirings);
+    expect(physicalCalls).toEqual([{keyword: DUPLICATE_KEYWORD, page: 1}]);
+    const retriedInspection = await inspectGatekeeperMetering(username);
+    expect(retriedInspection.attempts.filter(attempt =>
+      attempt.attribution.source === "scheduled").map(attempt => attempt.operationId).toSorted())
+      .toEqual(firstOperationIds);
+    const retriedScheduledRecords = retriedInspection.usageRecords.filter(record =>
+      record.attribution.source === "scheduled");
+    expect(retriedScheduledRecords).toHaveLength(2);
+    expect(retriedScheduledRecords).toEqual(expect.arrayContaining([
+      firstScheduledRecords[0],
+      expect.objectContaining({
+        operationId: deliveryAttempt!.operationId,
+        attribution: expect.objectContaining({
+          billingMethodKey: SCHEDULER_DELIVERY_METHOD,
+          automationRunId: firstFirings[0]!.runId,
+        }),
+        outcome: "settled",
+        chargeSubunits: RATES.schedulerDelivery.toString(),
+      }),
+    ]));
+    const balanceAfterRetry = await retried.user.getUsageCreditBalance();
+    expect(balanceAfterRetry).toEqual({
+      availableSubunits: balanceAfterFirstDelivery.availableSubunits,
+      reservedSubunits: 0n,
+    });
+
+    retriedApp[Symbol.dispose]();
+    retriedGadget[Symbol.dispose]();
+    retriedWorkspace[Symbol.dispose]();
+    retriedUi[Symbol.dispose]();
+    retried.user[Symbol.dispose]();
+    retried.publicApi[Symbol.dispose]();
+  }, 240_000);
 
   it("preserves pre-execution release and response-loss hold across restart", async () => {
     resetPhysicalTrace();
