@@ -9,7 +9,7 @@ import {
   ContextDocument, MAX_DOCUMENT_BODY_BYTES, contentTypeFromPath, isTextContentType, VENDOR_ID,
 } from "./context-types.js";
 import { extractDescription } from "./description-extractors.js";
-import { obsContext } from "./observability.js";
+import { obsContext, privacySafeError } from "./observability.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.context", vendorId: VENDOR_ID,
@@ -35,11 +35,6 @@ class GitTransferTooLargeError extends Error {
     super(`Repository too large: Git transfer exceeded ${maxBytes} bytes.`);
     this.name = "GitTransferTooLargeError";
   }
-}
-
-function sanitizedGitError(caught: unknown, operation: string): Error {
-  const kind = caught instanceof Error ? "error" : "non-error";
-  return new Error(`${operation} failed (${kind}).`);
 }
 
 async function* limitBody(body: AsyncIterableIterator<Uint8Array>, maxBytes: number): AsyncIterableIterator<Uint8Array> {
@@ -97,7 +92,7 @@ async function deleteCachedRepo(dir: string): Promise<void> {
     if (isEnoent(cleanupErr)) return;
     logger.warn("failed to clean up Artifacts git cache", {
       event: "artifacts.git.cache.cleanup.failed",
-      error: sanitizedGitError(cleanupErr, "Git cache cleanup"),
+      error: privacySafeError(cleanupErr, "Git cache cleanup"),
     });
   });
 }
@@ -128,7 +123,7 @@ async function cloneRepo(dir: string, url: string, branch: string, onAuth: () =>
   } catch (err) {
     logger.warn("artifacts git clone failed; cleaning up partial clone", {
       event: "artifacts.git.clone.failed",
-      error: sanitizedGitError(err, "Git clone"),
+      error: privacySafeError(err, "Git clone"),
     });
     await deleteCachedRepo(dir);
     throw err;
@@ -173,7 +168,7 @@ async function fetchOrRecloneRepo(dir: string, url: string, branch: string, onAu
   } catch (err) {
     logger.warn("artifacts git fetch failed; cleaning up before recloning", {
       event: "artifacts.git.fetch.failed",
-      error: sanitizedGitError(err, "Git fetch"),
+      error: privacySafeError(err, "Git fetch"),
     });
     return recloneRepo(dir, url, branch, onAuth);
   }
@@ -273,7 +268,7 @@ async function readArtifactRepoDocumentsWithContext(
       await repo.revokeToken(token.id).catch((err) => {
         logger.warn("failed to revoke temporary Artifacts read token for context collection sync", {
           event: "artifacts.read.token.revoke.failed",
-          error: sanitizedGitError(err, "Artifacts read-token cleanup"),
+          error: privacySafeError(err, "Artifacts read-token cleanup"),
         });
       });
     }

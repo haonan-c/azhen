@@ -19,7 +19,7 @@ import {
 import {
   isSkillManifestPath, parseSkillManifest, type SkillIndexEntry,
 } from "./agent-skill.js";
-import { obsContext } from "./observability.js";
+import { obsContext, privacySafeError } from "./observability.js";
 import {
   validateContextDocumentPath,
   validateContextDocumentWrite,
@@ -51,11 +51,6 @@ function extOf(path: string): string {
   let b = baseName(path);
   let i = b.lastIndexOf(".");
   return i <= 0 ? "" : b.slice(i + 1).toLowerCase();
-}
-
-function sanitizedArtifactsError(caught: unknown, operation: string): Error {
-  const kind = caught instanceof Error ? "error" : "non-error";
-  return new Error(`${operation} failed (${kind}).`);
 }
 
 type ContextRecord = {
@@ -151,7 +146,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
         logger.warn("failed to revoke initial Artifacts token for context collection", {
           event: "artifacts.initial.token.revoke.failed",
           collectionId: metadata.id,
-          error: sanitizedArtifactsError(err, "Artifacts initial-token cleanup"),
+          error: privacySafeError(err, "Artifacts initial-token cleanup"),
         });
       });
     } finally {
@@ -514,7 +509,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
       logger.warn("failed to refresh git-based context collection in the background", {
         event: "context.collection.git.refresh.failed",
         collectionId: this.getMetadata().id,
-        error: sanitizedArtifactsError(err, "Artifacts background refresh"),
+        error: privacySafeError(err, "Artifacts background refresh"),
       });
     });
   }
@@ -654,7 +649,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
         logger.warn("failed to delete Artifacts repo for context collection", {
           event: "artifacts.repo.delete.failed",
           collectionId: id,
-          error: sanitizedArtifactsError(err, "Artifacts repo deletion"),
+          error: privacySafeError(err, "Artifacts repo deletion"),
         });
       });
     }
@@ -670,7 +665,7 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
         logger.warn("failed to delete Artifacts repo while revoking context collection owner", {
           event: "artifacts.repo.delete.for.revoked.owner.failed",
           collectionId: meta.id,
-          error: sanitizedArtifactsError(err, "Artifacts owner-revocation cleanup"),
+          error: privacySafeError(err, "Artifacts owner-revocation cleanup"),
         });
       });
     }

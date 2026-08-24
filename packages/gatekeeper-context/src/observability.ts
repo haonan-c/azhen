@@ -11,5 +11,11 @@ export type ContextObservabilityFields = {
   vendorId: string;
 };
 
+/** Create a privacy-safe error for logs without copying caught error details. */
+export function privacySafeError(caught: unknown, operation: string): Error {
+  const kind = caught instanceof Error ? "error" : "non-error";
+  return new Error(`${operation} failed (${kind}).`);
+}
+
 /** Ambient observability fields for one Context gatekeeper operation. */
 export const obsContext = createObservabilityContext<ContextObservabilityFields>();
