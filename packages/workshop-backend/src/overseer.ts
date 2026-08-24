@@ -8945,6 +8945,13 @@ function joinSessionPresence(
   };
 }
 
+function notifySessionClosed(notifyClosed: NativeRpcStub<() => void>): void {
+  // This acknowledgement can become undeliverable while its owner tears down the same session.
+  // The close notification is best-effort, but its returned promise must still be observed.
+  notifyClosed().catch(() => {});
+  notifyClosed[Symbol.dispose]();
+}
+
 @validateRpc()
 class OverseerClientInterface extends RpcTarget implements Overseer {
   #clientProfilePromise: Promise<AiChatAuthorInfo> | undefined;
@@ -8984,8 +8991,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   [Symbol.dispose]() {
     this.#leavePresence();
     this.#leaveOutputsFanout();
-    this.notifyClosed();
-    this.notifyClosed[Symbol.dispose]();
+    notifySessionClosed(this.notifyClosed);
   }
 
   // Per-session caller identity for the SharingManager.
@@ -10733,8 +10739,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   [Symbol.dispose]() {
     this.#leavePresence();
     this.#leaveOutputsFanout();
-    this.notifyClosed();
-    this.notifyClosed[Symbol.dispose]();
+    notifySessionClosed(this.notifyClosed);
   }
 
   // Throws "Unauthorized" for any method not available to "use" collaborators.
