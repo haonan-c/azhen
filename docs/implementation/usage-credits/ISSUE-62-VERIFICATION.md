@@ -153,6 +153,13 @@ background error.
 ## Final repository gates and release dry-run
 
 - The candidate was rebased without conflict onto `origin/dev` commit `0d627e7`.
+- The second-review correction commits were later rebased without conflict onto `origin/dev`
+  commit `be1f501`. After that rebase, Backend build/TypeScript, Projection 23, Gatekeeper Usage
+  Account 21, Usage Admin 15, real Cap'n Web 1, and the complete Backend package matrix all passed
+  again. The package matrix reported 553 pass, 4 expected skips, and 0 failures.
+- Root build/test/lint, release manifest, and release dry-run evidence below belongs to the earlier
+  accepted candidate. Those root/release gates have not yet been repeated for the second-review
+  correction checkpoint; no claim below upgrades that evidence to the new checkpoint.
 - `corepack pnpm build` exited 0 for all 51 workspace build tasks.
 - `corepack pnpm test` exited 0. This included 117 root Node tests; the complete Backend matrix
   (453 default workerd, 14 Usage Admin, 35 metered-model, 23 integration with 4 expected skips, plus

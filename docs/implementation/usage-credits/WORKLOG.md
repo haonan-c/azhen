@@ -376,5 +376,7 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   manual rebuild click.
 - Focused verification is GREEN: Projection 23, Gatekeeper Usage Account 21, Usage Admin 15, and
   real Cap'n Web 1. Backend build/TypeScript is GREEN. The complete Backend package is GREEN with
-  553 pass, 4 expected skips, and 0 failures. Rebase and coordinated root/release gates remain; no
-  push, merge, Issue closure, upload, promotion, deployment, or production change occurred.
+  553 pass, 4 expected skips, and 0 failures. The correction commits rebased without conflict onto
+  `origin/dev` `be1f501`, and the same focused/build/package gates passed again. Coordinated root and
+  release gates remain; no push, merge, Issue closure, upload, promotion, deployment, or production
+  change occurred.
