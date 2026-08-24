@@ -667,6 +667,63 @@ describe("Deployment Usage Rates", () => {
     });
   });
 
+  it("keyset-pages a large configured inventory and excludes raw dynamic MCP names", async () => {
+    const settings = newUsageRates();
+    const pages = await runInDurableObject(settings, (_instance, state) => {
+      const registry = new UsageRateRegistry(state.storage);
+      registry.getAdminView();
+      const changes: UsageRateChange[] = Array.from({length: 205}, (_, index) => ({
+        kind: "gatekeeper-operation-rate",
+        vendorId: "test",
+        billingMethodKey: `operation.${index.toString().padStart(3, "0")}`,
+        amountSubunits: BigInt(index),
+      }));
+      changes.push({
+        kind: "gatekeeper-operation-rate",
+        vendorId: "mcp",
+        billingMethodKey: `mcp.tool.v1.${"a".repeat(64)}`,
+        amountSubunits: 1n,
+      }, {
+        kind: "gatekeeper-operation-rate",
+        vendorId: "mcp",
+        billingMethodKey: "raw-provider-tool-name",
+        amountSubunits: 1n,
+      });
+      for (let offset = 0; offset < changes.length; offset += 100) {
+        registry.update(
+          changes.slice(offset, offset + 100),
+          `Configure public owner page ${offset / 100}`,
+          "admin@example.com",
+        );
+      }
+
+      const result = [];
+      let cursorKey: string | undefined;
+      do {
+        const page = registry.getPublishedGatekeeperRatePage({cursorKey, limit: 100});
+        result.push(page);
+        cursorKey = page.nextCursorKey ?? undefined;
+      } while (cursorKey !== undefined);
+      return result;
+    });
+
+    const rates = pages.flatMap(page => page.rates);
+    expect(pages.map(page => page.rates.length)).toEqual([100, 100, 6]);
+    expect(new Set(rates.map(rate => `${rate.vendorId}\n${rate.billingMethodKey}`)).size)
+      .toBe(206);
+    expect(rates).toContainEqual(expect.objectContaining({
+      vendorId: "mcp",
+      billingMethodKey: `mcp.tool.v1.${"a".repeat(64)}`,
+    }));
+    expect(rates).not.toContainEqual(expect.objectContaining({
+      billingMethodKey: "raw-provider-tool-name",
+    }));
+    expect(rates.at(-1)).toMatchObject({
+      vendorId: "test",
+      billingMethodKey: "operation.204",
+    });
+  });
+
   it("serializes a model snapshot with a concurrent rate update without mixed fields", async () => {
     const settings = newUsageRates();
     const admin = new AdminApiImpl(settings, "rate-admin@example.com", users);

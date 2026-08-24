@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, type GatekeeperOperationRate, type PublishedApiRate, type PublishedApiRatePage, type PublishedApiRatePageRequest, type UsageCreditBalance, type UsageCreditBalanceSubscriber, type UserCreditLedgerPage, type UserCreditPageRequest, type UserCreditReservationPage, type UserUsageRecordPage, type UserUsageRecordPageRequest } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, type PublishedApiRate, type PublishedApiRatePage, type PublishedApiRatePageRequest, type UsageCreditBalance, type UsageCreditBalanceSubscriber, type UserCreditLedgerPage, type UserCreditPageRequest, type UserCreditReservationPage, type UserUsageRecordPage, type UserUsageRecordPageRequest } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -28,6 +28,12 @@ import { createWorkshopLogger } from "./observability";
 import { wrapDoStubForTelemetry } from "./do-telemetry";
 import { UsageProjection } from "./usage-projection.js";
 import { publicBillingMethodInventory } from "./generated/public-billing-methods.js";
+import {
+  isPublicPublishedApiMethod,
+  publishedApiRateKey,
+  type ConfiguredPublishedApiRatePage,
+  type DiscoveredPublishedApiMethodPage,
+} from "./public-api-rates.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -41,11 +47,6 @@ function publicBlueprintInfo(id: string, metadata: BlueprintPublicInfo['metadata
     metadata,
     screenshotUrl: blueprintScreenshotUrl(id, metadata),
   };
-}
-
-function publishedApiRateKey(value: Pick<PublishedApiRate,
-  "vendorId" | "billingMethodKey">): string {
-  return `${value.vendorId}\n${value.billingMethodKey}`;
 }
 
 function encodePublishedApiRateCursor(value: Pick<PublishedApiRate,
@@ -86,16 +87,23 @@ function normalizePublishedApiRatePageRequest(
 }
 
 function publishedApiRatePage(
-    request: PublishedApiRatePageRequest,
-    configuredRates: GatekeeperOperationRate[],
-    discoveredMethods: Array<Pick<PublishedApiRate, "vendorId" | "billingMethodKey">>,
+    cursorKey: string | undefined,
+    limit: number,
+    configuredPage: ConfiguredPublishedApiRatePage,
+    discoveredPage: DiscoveredPublishedApiMethodPage,
 ): PublishedApiRatePage {
-  const {cursorKey, limit} = normalizePublishedApiRatePageRequest(request);
   const methods = new Map<string, Pick<PublishedApiRate, "vendorId" | "billingMethodKey">>();
-  for (const method of [...publicBillingMethodInventory, ...discoveredMethods, ...configuredRates]) {
+  for (const method of [
+    ...publicBillingMethodInventory,
+    ...discoveredPage.methods,
+    ...configuredPage.rates,
+  ]) {
+    if (!isPublicPublishedApiMethod(method)) continue;
     methods.set(publishedApiRateKey(method), method);
   }
-  const rateByMethod = new Map(configuredRates.map(rate => [publishedApiRateKey(rate), rate]));
+  const rateByMethod = new Map(
+    configuredPage.rates.map(rate => [publishedApiRateKey(rate), rate]),
+  );
   const ordered = [...methods]
     .filter(([key]) => cursorKey === undefined || key > cursorKey)
     .toSorted(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
@@ -109,6 +117,7 @@ function publishedApiRatePage(
   return {
     rates,
     nextCursor: ordered.length > limit ? encodePublishedApiRateCursor(rates.at(-1)!) : null,
+    truncated: discoveredPage.truncated,
   };
 }
 
@@ -275,11 +284,13 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async listPublishedApiRates(
       request: PublishedApiRatePageRequest): Promise<PublishedApiRatePage> {
-    const [configuredRates, discoveredMethods] = await Promise.all([
-      this.adminSettings.getByName("").getPublishedGatekeeperRates(),
-      this.#user.listOwnDiscoveredGatekeeperMethods(),
+    const {cursorKey, limit} = normalizePublishedApiRatePageRequest(request);
+    const sourceRequest = {cursorKey, limit: limit + 1};
+    const [configuredPage, discoveredPage] = await Promise.all([
+      this.adminSettings.getByName("").getPublishedGatekeeperRatePage(sourceRequest),
+      this.#user.listOwnDiscoveredGatekeeperMethodPage(sourceRequest),
     ]);
-    return publishedApiRatePage(request, configuredRates, discoveredMethods);
+    return publishedApiRatePage(cursorKey, limit, configuredPage, discoveredPage);
   }
 
   async #openGadgetInternal(id: string, shareKey?: string,

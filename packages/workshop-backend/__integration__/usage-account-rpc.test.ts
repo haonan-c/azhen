@@ -140,21 +140,45 @@ describe("Usage Account across Cap'n Web", () => {
     const account = await createAccount(publicApi, "usagerates");
     using authenticated = await publicApi.authenticate(account.token);
     const vendorId = "mcp";
-    const billingMethodKey = "mcp.tool.v1.configured-safe-method";
+    const billingMethodKey = `mcp.tool.v1.${"a".repeat(64)}`;
+    const portalBillingMethodKey = `mcp.tool.v1.${"b".repeat(64)}`;
+    const unsafeMethodKey = "raw-provider-tool-name";
     await exports.AdminSettings.getByName("").updateUsageRates([{
       kind: "gatekeeper-operation-rate",
       vendorId,
       billingMethodKey,
       amountSubunits: 0n,
-    }], "Configure the public priced-zero RPC test method", "admin@example.com");
+    }, {
+      kind: "gatekeeper-operation-rate",
+      vendorId: "mcp_portal",
+      billingMethodKey: portalBillingMethodKey,
+      amountSubunits: 0n,
+    }, {
+      kind: "gatekeeper-operation-rate",
+      vendorId,
+      billingMethodKey: unsafeMethodKey,
+      amountSubunits: 0n,
+    }, {
+      kind: "gatekeeper-operation-rate",
+      vendorId: "mcp_portal",
+      billingMethodKey: unsafeMethodKey,
+      amountSubunits: 0n,
+    }], "Configure the public priced-zero RPC test methods", "admin@example.com");
 
     const rates = [];
+    const truncationSignals = [];
     let cursor: string | undefined;
     do {
       const page = await authenticated.listPublishedApiRates({cursor, limit: 100});
       rates.push(...page.rates);
+      truncationSignals.push(page.truncated);
       cursor = page.nextCursor ?? undefined;
     } while (cursor !== undefined);
+
+    const rateKeys = rates.map(rate => `${rate.vendorId}\n${rate.billingMethodKey}`);
+    expect(rateKeys).toEqual([...rateKeys].toSorted());
+    expect(new Set(rateKeys).size).toBe(rateKeys.length);
+    expect(truncationSignals).toEqual(truncationSignals.map(() => false));
 
     expect(rates).toContainEqual({
       vendorId,
@@ -162,6 +186,15 @@ describe("Usage Account across Cap'n Web", () => {
       pricing: "priced",
       amountSubunits: 0n,
     });
+    expect(rates).toContainEqual({
+      vendorId: "mcp_portal",
+      billingMethodKey: portalBillingMethodKey,
+      pricing: "priced",
+      amountSubunits: 0n,
+    });
+    expect(rates).not.toContainEqual(expect.objectContaining({
+      billingMethodKey: unsafeMethodKey,
+    }));
     expect(rates).toContainEqual(expect.objectContaining({
       vendorId: "github",
       pricing: "unpriced",
@@ -178,5 +211,6 @@ describe("Usage Account across Cap'n Web", () => {
     expect(serialized).not.toContain("creditConversion");
     expect(serialized).not.toContain("multiplier");
     expect(serialized).not.toContain("providerModelVersion");
+    expect(serialized).not.toContain(unsafeMethodKey);
   });
 });

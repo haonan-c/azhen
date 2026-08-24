@@ -156,6 +156,39 @@ describe("User Usage view", () => {
     ]);
   });
 
+  it("keeps a committed balance change successful when a retained subscriber throws synchronously", async () => {
+    const user = await newUser();
+    await user.getUsageCreditBalance();
+
+    await runInDurableObject(user, async instance => {
+      let updates = 0;
+      let disposals = 0;
+      const callback = {
+        dup() {
+          return this;
+        },
+        update() {
+          updates += 1;
+          if (updates > 1) throw new Error("SYNCHRONOUS CALLBACK FAILURE");
+          return Promise.resolve();
+        },
+        [Symbol.dispose]() {
+          disposals += 1;
+        },
+      } as unknown as RpcStub<UsageCreditBalanceSubscriber>;
+      const subscription = await instance.subscribeUsageCreditBalance(callback);
+
+      await expect(instance.reserveUsageCredits(
+        "usage-view-sync-callback-failure",
+        USAGE_CREDIT_SUBUNITS_PER_CREDIT,
+        TEST_SNAPSHOT,
+      )).resolves.toMatchObject({state: "reserved"});
+      expect(updates).toBe(2);
+      expect(disposals).toBe(1);
+      subscription[Symbol.dispose]();
+    });
+  });
+
   it("acknowledges the legacy activation notice idempotently", async () => {
     const user = await newUser();
     await runInDurableObject(user, (_instance, state) => {
@@ -187,6 +220,14 @@ describe("User Usage view", () => {
       "PRIVATE-ADMIN-REASON",
       "PRIVATE-ADMIN-ACTOR",
     );
+    if (adjustment.ledgerEntryId === null) throw new Error("Expected an adjustment entry.");
+    const reversal = await user.adminReverseUsageCreditEntry(
+      "zz-usage-view-cross-page-reversal",
+      adjustment.ledgerEntryId,
+      "PRIVATE-REVERSAL-REASON",
+      "PRIVATE-REVERSAL-ACTOR",
+    );
+    if (reversal.ledgerEntryId === null) throw new Error("Expected a reversal entry.");
 
     const reservationsFirst = await user.listOwnCreditReservations({limit: 1});
     expect(reservationsFirst.reservations).toHaveLength(1);
@@ -211,11 +252,35 @@ describe("User Usage view", () => {
         deltaSubunits: 1n,
       }),
     ]));
+    let reversalPage: Awaited<ReturnType<typeof user.listOwnCreditLedger>> | undefined;
+    let ledgerCursor: string | undefined;
+    do {
+      const page = await user.listOwnCreditLedger({cursor: ledgerCursor, limit: 1});
+      if (page.entries[0]?.id === reversal.ledgerEntryId) reversalPage = page;
+      ledgerCursor = page.nextCursor ?? undefined;
+    } while (reversalPage === undefined && ledgerCursor !== undefined);
+    if (reversalPage === undefined) throw new Error("Expected the reversal page.");
+    expect(reversalPage.entries).toEqual([expect.objectContaining({
+      id: reversal.ledgerEntryId,
+      kind: "credit-reversal",
+      reversalOfLedgerEntry: {
+        id: adjustment.ledgerEntryId,
+        kind: "admin-grant",
+        deltaSubunits: 1n,
+        createdAt: expect.any(String),
+      },
+      reversedByLedgerEntry: null,
+    })]);
+    expect(reversalPage.nextCursor).not.toBeNull();
     const serialized = JSON.stringify(ledger, (_key, value) =>
       typeof value === "bigint" ? value.toString() : value);
     expect(serialized).not.toContain("PRIVATE-ADMIN-REASON");
     expect(serialized).not.toContain("PRIVATE-ADMIN-ACTOR");
     expect(serialized).not.toContain("chargeSnapshot");
+    const reversalSerialized = JSON.stringify(reversalPage, (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value);
+    expect(reversalSerialized).not.toContain("PRIVATE-REVERSAL-REASON");
+    expect(reversalSerialized).not.toContain("PRIVATE-REVERSAL-ACTOR");
   });
 
   it("rejects unbounded User Reservation and Credit Ledger pages", async () => {

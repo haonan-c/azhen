@@ -31,7 +31,6 @@ import type {
   GatekeeperChargeSnapshot,
   ModelChargeSnapshot,
   PricedChargeSnapshot,
-  PublishedApiRate,
   UsageCreditBalance,
   UserCreditLedgerPage,
   UserCreditPageRequest,
@@ -40,6 +39,10 @@ import type {
   UserUsageRecordPageRequest,
 } from "@gadgets/workshop-shared/api";
 import type {UsageProjection} from "./usage-projection.js";
+import type {
+  DiscoveredPublishedApiMethodPage,
+  PublishedApiRateSourceRequest,
+} from "./public-api-rates.js";
 
 const logger = createWorkshopLogger("workshop.user");
 const PROJECTION_MAINTENANCE_REVISION_KEY =
@@ -754,11 +757,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   private publishUsageCreditBalance(balance: UsageCreditBalance): void {
     for (const subscriber of this.usageBalanceSubscribers) {
-      subscriber.update(balance).catch(() => {
+      const release = () => {
         if (this.usageBalanceSubscribers.delete(subscriber)) {
           subscriber[Symbol.dispose]();
         }
-      });
+      };
+      try {
+        subscriber.update(balance).catch(release);
+      } catch {
+        release();
+      }
     }
   }
 
@@ -781,11 +789,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.listUserCreditLedger(request);
   }
 
-  /** Return a bounded set of safe Gatekeeper methods observed for this User. */
-  async listOwnDiscoveredGatekeeperMethods(): Promise<Array<Pick<PublishedApiRate,
-    "vendorId" | "billingMethodKey">>> {
+  /** Return one bounded keyset page of safe Gatekeeper methods observed for this User. */
+  async listOwnDiscoveredGatekeeperMethodPage(
+      request: PublishedApiRateSourceRequest): Promise<DiscoveredPublishedApiMethodPage> {
     await this.activateUsageAccount();
-    return this.usageAccount.listDiscoveredGatekeeperMethods();
+    return this.usageAccount.listDiscoveredGatekeeperMethodPage(request);
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */

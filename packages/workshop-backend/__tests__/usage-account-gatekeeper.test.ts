@@ -454,6 +454,64 @@ describe("Gatekeeper two-stage billing state machine", () => {
     });
   });
 
+  it("publishes only hashed dynamic MCP method keys", async () => {
+    await withAccount(account => {
+      const safeKey = `mcp.tool.v1.${"a".repeat(64)}`;
+      for (const [operationId, billingMethodKey] of [
+        ["gatekeeper-operation:mcp-safe", safeKey],
+        ["gatekeeper-operation:mcp-unsafe", "raw-provider-tool-name"],
+      ] as const) {
+        const attribution = {...ATTRIBUTION, vendorId: "mcp", billingMethodKey};
+        const snapshot = {...UNPRICED, vendorId: "mcp", billingMethodKey};
+        account.beginGatekeeperUsage(operationId, attribution, snapshot);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+
+      expect(account.listDiscoveredGatekeeperMethodPage({limit: 10})).toEqual({
+        methods: [{vendorId: "mcp", billingMethodKey: safeKey}],
+        nextCursorKey: null,
+        truncated: false,
+      });
+    });
+  });
+
+  it("caps discovered methods without making the first rate page permanently fail", async () => {
+    await withAccount(account => {
+      for (let index = 0; index < 501; ++index) {
+        const billingMethodKey = `operation.${index.toString().padStart(3, "0")}`;
+        const operationId = `gatekeeper-operation:inventory-${index}`;
+        const attribution = {...ATTRIBUTION, vendorId: "test", billingMethodKey};
+        const snapshot = {...UNPRICED, vendorId: "test", billingMethodKey};
+        account.beginGatekeeperUsage(operationId, attribution, snapshot);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+
+      let cursorKey: string | undefined;
+      const visible = [];
+      do {
+        let page;
+        for (let attempt = 0; ; ++attempt) {
+          try {
+            page = account.listDiscoveredGatekeeperMethodPage({cursorKey, limit: 100});
+            break;
+          } catch (error) {
+            if (attempt >= 5 || !(error instanceof Error) ||
+                !error.message.includes("being prepared")) throw error;
+          }
+        }
+        expect(page.truncated).toBe(true);
+        visible.push(...page.methods);
+        cursorKey = page.nextCursorKey ?? undefined;
+      } while (cursorKey !== undefined);
+
+      expect(visible).toHaveLength(500);
+      expect(new Set(visible.map(method => method.billingMethodKey)).size).toBe(500);
+      expect(visible.some(method => method.billingMethodKey === "operation.500")).toBe(false);
+    });
+  });
+
   it("lazily indexes old Usage Records in bounded resumable batches", async () => {
     await withAccount((account, storage) => {
       for (let index = 0; index < 101; ++index) {

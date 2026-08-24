@@ -623,21 +623,25 @@ export type UserCreditReservationPage = {
   nextCursor: string | null;
 };
 
-/** User-safe projection of one Credit Ledger Entry. */
-export type UserCreditLedgerEntry = {
-  /** Stable Ledger Entry identifier used for reversal links. */
+/** User-safe summary of one Credit Ledger Entry used for bounded relationship expansion. */
+export type UserCreditLedgerEntrySummary = {
+  /** Stable Ledger Entry identifier. */
   id: string;
   /** Public balance-change category. */
   kind: "initial-grant" | "usage-charge" | "admin-grant" | "admin-deduction" |
     "admin-reconciliation" | "credit-reversal";
   /** Exact signed Usage Credit change. */
   deltaSubunits: bigint;
-  /** Original Ledger Entry linked by a Credit Reversal, or null. */
-  reversalOfLedgerEntryId: string | null;
-  /** Credit Reversal that offsets this entry, or null. */
-  reversedByLedgerEntryId: string | null;
   /** Canonical UTC creation time. */
   createdAt: string;
+};
+
+/** User-safe projection of one Credit Ledger Entry. */
+export type UserCreditLedgerEntry = UserCreditLedgerEntrySummary & {
+  /** Safe original-entry summary linked by a Credit Reversal, or null. */
+  reversalOfLedgerEntry: UserCreditLedgerEntrySummary | null;
+  /** Safe Credit Reversal summary that offsets this entry, or null. */
+  reversedByLedgerEntry: UserCreditLedgerEntrySummary | null;
 };
 
 /** One bounded page of the authenticated User's own Credit Ledger. */
@@ -674,6 +678,8 @@ export type PublishedApiRatePage = {
   rates: PublishedApiRate[];
   /** Opaque cursor for the next page, or null when this page is complete. */
   nextCursor: string | null;
+  /** True when the User's bounded dynamic-method inventory omitted later discoveries. */
+  truncated: boolean;
 };
 
 /** Number of exact integer rate subunits in one US dollar. */

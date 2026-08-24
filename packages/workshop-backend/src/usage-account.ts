@@ -12,6 +12,7 @@ import {
   type UsageCreditActivationNotice,
   type UserGatekeeperUsageRecord,
   type UserCreditLedgerEntry,
+  type UserCreditLedgerEntrySummary,
   type UserCreditLedgerPage,
   type UserCreditPageRequest,
   type UserCreditReservation,
@@ -39,6 +40,13 @@ import type {
   UsageProjectionIngestResult,
   UsageProjectionRejection,
 } from "./usage-projection.js";
+import {
+  isPublicPublishedApiMethod,
+  normalizePublishedApiRateSourceRequest,
+  publishedApiRateKey,
+  type DiscoveredPublishedApiMethodPage,
+  type PublishedApiRateSourceRequest,
+} from "./public-api-rates.js";
 
 const LEDGER_PREFIX = "usageAccount:ledger:";
 const RESERVATION_PREFIX = "usageAccount:reservation:";
@@ -67,11 +75,15 @@ const PROJECTION_PENDING_COUNT_KEY = "usageAccount:projectionPendingCount:v1";
 const PROJECTION_SOURCE_MARKER_PREFIX = "usageAccount:projectionSourceMarker:";
 const PROJECTION_BACKFILL_STAGE_KEY = "usageAccount:projectionBackfillStage:v1";
 const PROJECTION_BACKFILL_CURSOR_KEY = "usageAccount:projectionBackfillCursor:v1";
-const DISCOVERED_GATEKEEPER_METHOD_PREFIX = "usageAccount:discoveredGatekeeperMethod:";
+const DISCOVERED_GATEKEEPER_METHOD_PREFIX = "usageAccount:discoveredGatekeeperMethod:v2:";
 const DISCOVERED_GATEKEEPER_METHOD_VERSION_KEY =
-  "usageAccount:discoveredGatekeeperMethodVersion:v1";
+  "usageAccount:discoveredGatekeeperMethodVersion:v2";
 const DISCOVERED_GATEKEEPER_METHOD_MIGRATION_CURSOR_KEY =
-  "usageAccount:discoveredGatekeeperMethodMigrationCursor:v1";
+  "usageAccount:discoveredGatekeeperMethodMigrationCursor:v2";
+const DISCOVERED_GATEKEEPER_METHOD_COUNT_KEY =
+  "usageAccount:discoveredGatekeeperMethodCount:v2";
+const DISCOVERED_GATEKEEPER_METHOD_TRUNCATED_KEY =
+  "usageAccount:discoveredGatekeeperMethodTruncated:v2";
 const GATEKEEPER_RECONCILIATION_PREFIX = "usageAccount:gatekeeperReconciliation:";
 const GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX =
   "usageAccount:gatekeeperReconciliationByUsage:";
@@ -793,16 +805,19 @@ export class UsageAccount {
             throw new Error("Credit Ledger Entry identity does not reconcile.");
           }
           assertLedgerEntry(entry);
+          const reversalOfLedgerEntryId = entry.kind === "credit-reversal"
+            ? entry.adminAudit.originalLedgerEntryId
+            : null;
+          const reversedByLedgerEntryId =
+            this.storage.kv.get<string>(REVERSAL_PREFIX + entry.id) ?? null;
           return {
-            id: entry.id,
-            kind: entry.kind,
-            deltaSubunits: entry.deltaSubunits,
-            reversalOfLedgerEntryId: entry.kind === "credit-reversal"
-              ? entry.adminAudit.originalLedgerEntryId
-              : null,
-            reversedByLedgerEntryId:
-              this.storage.kv.get<string>(REVERSAL_PREFIX + entry.id) ?? null,
-            createdAt: entry.createdAt,
+            ...userCreditLedgerEntrySummary(entry),
+            reversalOfLedgerEntry: reversalOfLedgerEntryId === null
+              ? null
+              : this.readUserCreditLedgerEntrySummary(reversalOfLedgerEntryId),
+            reversedByLedgerEntry: reversedByLedgerEntryId === null
+              ? null
+              : this.readUserCreditLedgerEntrySummary(reversedByLedgerEntryId),
           };
         }),
         nextCursor: entries.length > limit
@@ -812,28 +827,47 @@ export class UsageAccount {
     });
   }
 
-  /** Return a bounded set of safe Gatekeeper methods observed for this User. */
-  listDiscoveredGatekeeperMethods(): Array<Pick<PublishedApiRate,
-    "vendorId" | "billingMethodKey">> {
+  private readUserCreditLedgerEntrySummary(id: string): UserCreditLedgerEntrySummary {
+    const entry = this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + id);
+    if (entry === undefined || entry.id !== id) {
+      throw new Error("Related Credit Ledger Entry does not reconcile.");
+    }
+    assertLedgerEntry(entry);
+    return userCreditLedgerEntrySummary(entry);
+  }
+
+  /** Return one bounded keyset page of safe Gatekeeper methods observed for this User. */
+  listDiscoveredGatekeeperMethodPage(
+      request: PublishedApiRateSourceRequest): DiscoveredPublishedApiMethodPage {
+    const {cursorKey, limit} = normalizePublishedApiRateSourceRequest(request);
     const ready = this.storage.transactionSync(() =>
       this.migrateDiscoveredGatekeeperMethodsBatch());
     if (!ready) throw new Error("Published API methods are being prepared. Retry the request.");
     return this.storage.transactionSync(() => {
-      const methods = Array.from(this.storage.kv.list<Pick<PublishedApiRate,
+      const entries = Array.from(this.storage.kv.list<Pick<PublishedApiRate,
         "vendorId" | "billingMethodKey">>({
         prefix: DISCOVERED_GATEKEEPER_METHOD_PREFIX,
-        limit: MAX_DISCOVERED_GATEKEEPER_METHODS + 1,
-      })).map(([, method]) => method);
-      if (methods.length > MAX_DISCOVERED_GATEKEEPER_METHODS) {
-        throw new Error("Published API method inventory exceeds its safe bound.");
-      }
-      for (const method of methods) {
-        if (!isStableUsageDimension(method.vendorId) ||
-            !isStableUsageDimension(method.billingMethodKey)) {
+        limit: limit + 1,
+        ...(cursorKey === undefined
+          ? {}
+          : {startAfter: DISCOVERED_GATEKEEPER_METHOD_PREFIX + cursorKey}),
+      }));
+      const visible = entries.slice(0, limit);
+      const methods = visible.map(([key, method]) => {
+        if (key !== DISCOVERED_GATEKEEPER_METHOD_PREFIX + publishedApiRateKey(method) ||
+            !isPublicPublishedApiMethod(method)) {
           throw new Error("Published API method identity does not reconcile.");
         }
-      }
-      return methods;
+        return method;
+      });
+      return {
+        methods,
+        nextCursorKey: entries.length > limit
+          ? publishedApiRateKey(methods.at(-1)!)
+          : null,
+        truncated:
+          this.storage.kv.get<boolean>(DISCOVERED_GATEKEEPER_METHOD_TRUNCATED_KEY) === true,
+      };
     });
   }
 
@@ -900,11 +934,19 @@ export class UsageAccount {
       vendorId: attribution.vendorId,
       billingMethodKey: attribution.billingMethodKey,
     };
-    this.storage.kv.put(
-      DISCOVERED_GATEKEEPER_METHOD_PREFIX +
-        `${encodeURIComponent(method.vendorId)}/${encodeURIComponent(method.billingMethodKey)}`,
-      method,
-    );
+    if (!isPublicPublishedApiMethod(method)) return;
+    const key = DISCOVERED_GATEKEEPER_METHOD_PREFIX + publishedApiRateKey(method);
+    if (this.storage.kv.get(key) !== undefined) return;
+    const count = this.storage.kv.get<number>(DISCOVERED_GATEKEEPER_METHOD_COUNT_KEY) ?? 0;
+    if (!Number.isSafeInteger(count) || count < 0 || count > MAX_DISCOVERED_GATEKEEPER_METHODS) {
+      throw new Error("Published API method inventory count does not reconcile.");
+    }
+    if (count === MAX_DISCOVERED_GATEKEEPER_METHODS) {
+      this.storage.kv.put(DISCOVERED_GATEKEEPER_METHOD_TRUNCATED_KEY, true);
+      return;
+    }
+    this.storage.kv.put(key, method);
+    this.storage.kv.put(DISCOVERED_GATEKEEPER_METHOD_COUNT_KEY, count + 1);
   }
 
   /** Atomically reserve positive Credit for one stable operation ID. */
@@ -2881,6 +2923,16 @@ function normalizeUserCreditPageRequest(
     throw new TypeError(`${label} page limit is invalid.`);
   }
   return {cursor, limit};
+}
+
+function userCreditLedgerEntrySummary(
+    entry: CreditLedgerEntry): UserCreditLedgerEntrySummary {
+  return {
+    id: entry.id,
+    kind: entry.kind,
+    deltaSubunits: entry.deltaSubunits,
+    createdAt: entry.createdAt,
+  };
 }
 
 function userCreditReservation(
