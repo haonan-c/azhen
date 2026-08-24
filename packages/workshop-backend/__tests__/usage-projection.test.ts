@@ -14,6 +14,8 @@ const testEnv = env as unknown as {
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
   TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
 };
+const PROJECTION_MAINTENANCE_REVISION_KEY =
+  "usageAccount:projectionMaintenanceRevision:v1";
 
 function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjectionDetailFact {
   return {
@@ -61,6 +63,26 @@ function aggregateFact(
 }
 
 describe("deployment Usage Projection", () => {
+  it("migrates projection metadata created before rebuild authority completion", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        ALTER TABLE usage_projection_meta DROP COLUMN rebuild_authority_complete
+      `);
+    });
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart with pre-review projection metadata");
+    })).rejects.toThrow("restart with pre-review projection metadata");
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+
+    expect((await restarted.readOverview()).generation).toBe(1n);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.sql.exec<{name: string}>(
+        "PRAGMA table_info(usage_projection_meta)",
+      ).toArray().map(column => column.name))).toContain("rebuild_authority_complete");
+  });
+
   it("applies an exact fact once across duplicate delivery", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const input = fact();
@@ -186,7 +208,7 @@ describe("deployment Usage Projection", () => {
     for (let offset = 0; offset < pending.length; offset += 64) {
       const page = pending.slice(offset, offset + 64);
       expect(await projection.ingest(page)).toEqual({
-        acknowledgedFactIds: page.map(item => item.projectionFactId),
+        acknowledgedFactIds: [],
         rejected: [],
       });
     }
@@ -235,6 +257,144 @@ describe("deployment Usage Projection", () => {
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
     expect((await restarted.readOverview()).metrics.cacheHitInputTokens).toBe(193n);
     expect((await restarted.readHealth()).sequenceGapCount).toBe(0n);
+  });
+
+  it("rolls back a drain crash between totals and applied progress", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const usagePrincipalRef = crypto.randomUUID();
+    const pending = Array.from({length: 65}, (_, index) => fact({
+      projectionFactId: crypto.randomUUID(),
+      usagePrincipalRef,
+      sourceSequence: BigInt(index + 2),
+      cacheHitInputTokens: 1n,
+      providerCostUsdSubunits: 1n,
+    }));
+    await projection.ingest(pending.slice(0, 64));
+    await projection.ingest(pending.slice(64));
+    await projection.ingest([fact({
+      projectionFactId: crypto.randomUUID(),
+      usagePrincipalRef,
+      sourceSequence: 1n,
+      cacheHitInputTokens: 1n,
+      providerCostUsdSubunits: 1n,
+    })]);
+    expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(64n);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_projection_apply_once
+        BEFORE UPDATE OF applied ON usage_projection_facts
+        WHEN OLD.source_sequence = '65' AND OLD.applied = 0 AND NEW.applied = 1
+        BEGIN
+          SELECT RAISE(ABORT, 'controlled projection apply crash');
+        END
+      `);
+    });
+    await expect(runInDurableObject(projection, instance => instance.alarm()))
+      .rejects.toThrow("controlled projection apply crash");
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart after projection apply crash");
+    })).rejects.toThrow("restart after projection apply crash");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    await runInDurableObject(restarted, (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER fail_projection_apply_once");
+    });
+    await runInDurableObject(restarted, instance => instance.alarm());
+    expect((await restarted.readOverview()).metrics.cacheHitInputTokens).toBe(66n);
+    expect((await restarted.readHealth()).sequenceGapCount).toBe(0n);
+  });
+
+  it("round-robins bounded drains across principals after restart", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const firstPrincipal = "00000000-0000-4000-8000-000000000001";
+    const secondPrincipal = "00000000-0000-4000-8000-000000000002";
+    const enqueue = async (
+        usagePrincipalRef: string,
+        cacheHitInputTokens: bigint,
+        cacheMissInputTokens: bigint): Promise<void> => {
+      const pending = Array.from({length: 129}, (_, index) => fact({
+        projectionFactId: crypto.randomUUID(),
+        usagePrincipalRef,
+        sourceSequence: BigInt(index + 2),
+        cacheHitInputTokens,
+        cacheMissInputTokens,
+        providerCostUsdSubunits: 1n,
+      }));
+      for (let offset = 0; offset < pending.length; offset += 64) {
+        await projection.ingest(pending.slice(offset, offset + 64));
+      }
+      await projection.ingest([fact({
+        projectionFactId: crypto.randomUUID(),
+        usagePrincipalRef,
+        sourceSequence: 1n,
+        cacheHitInputTokens,
+        cacheMissInputTokens,
+        providerCostUsdSubunits: 1n,
+      })]);
+    };
+    await enqueue(firstPrincipal, 1n, 0n);
+    await enqueue(secondPrincipal, 0n, 1n);
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart before fair projection drain");
+    })).rejects.toThrow("restart before fair projection drain");
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+
+    await runInDurableObject(restarted, instance => instance.alarm());
+    expect((await restarted.readOverview()).metrics).toMatchObject({
+      cacheHitInputTokens: 128n,
+      cacheMissInputTokens: 64n,
+    });
+    await runInDurableObject(restarted, instance => instance.alarm());
+    expect((await restarted.readOverview()).metrics).toMatchObject({
+      cacheHitInputTokens: 128n,
+      cacheMissInputTokens: 128n,
+    });
+  });
+
+  it("finishes a rebuild only after its runnable live-fact drain is empty", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const requestId = `rebuild-live-drain-${crypto.randomUUID()}`;
+    await runInDurableObject(projection, async (instance, state) => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => ({users: [], nextCursor: null}),
+        }),
+      };
+      expect((await instance.requestRebuild(requestId)).state).toBe("rebuilding");
+      await state.storage.deleteAlarm();
+    });
+    const usagePrincipalRef = crypto.randomUUID();
+    const pending = Array.from({length: 65}, (_, index) => fact({
+      projectionFactId: crypto.randomUUID(),
+      usagePrincipalRef,
+      sourceSequence: BigInt(index + 2),
+      cacheHitInputTokens: 1n,
+      providerCostUsdSubunits: 1n,
+    }));
+    await projection.ingest(pending.slice(0, 64));
+    await projection.ingest(pending.slice(64));
+    await projection.ingest([fact({
+      projectionFactId: crypto.randomUUID(),
+      usagePrincipalRef,
+      sourceSequence: 1n,
+      cacheHitInputTokens: 1n,
+      providerCostUsdSubunits: 1n,
+    })]);
+
+    for (let index = 0; index < 8; index += 1) {
+      await runInDurableObject(projection, instance => instance.alarm());
+      if ((await projection.requestRebuild(requestId)).state === "completed") break;
+    }
+
+    expect(await projection.requestRebuild(requestId)).toMatchObject({
+      state: "completed",
+      failureCode: null,
+    });
+    expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(66n);
+    expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
 
   it("keeps explicitly priced zero separate from Unpriced Use", async () => {
@@ -622,15 +782,12 @@ describe("deployment Usage Projection", () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
     const beforeWatermark = (await projection.readOverview()).ingestionWatermark;
     const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
-    await runInDurableObject(user, async instance => {
+    await runInDurableObject(user, async (instance, state) => {
       (instance as unknown as {adminSettings: unknown}).adminSettings = {
         getByName: () => ({recordUsageProjectionDeliveryHealth: async () => {
           healthStarted.resolve();
           await releaseHealth.promise;
         }}),
-      };
-      (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: () => new Promise(() => {})}),
       };
       const staleEmptyMaintenance = instance.alarm();
       await healthStarted.promise;
@@ -651,13 +808,22 @@ describe("deployment Usage Projection", () => {
         configurationGap: true,
       });
       await instance.markGatekeeperUsageStarted(operationId);
-      await instance.completeGatekeeperUsage(operationId, "executed");
+      const maintenanceRevision = BigInt(state.storage.kv.get<string>(
+        PROJECTION_MAINTENANCE_REVISION_KEY,
+      ) ?? "0") + 1n;
+      state.storage.kv.put(
+        PROJECTION_MAINTENANCE_REVISION_KEY, maintenanceRevision.toString(),
+      );
+      await state.storage.setAlarm(Date.now() + 1_000);
       releaseHealth.resolve();
       await staleEmptyMaintenance;
+      (instance as unknown as {usageAccount: {
+        completeGatekeeperUsage(operationId: string, completion: "executed"): unknown;
+      }}).usageAccount.completeGatekeeperUsage(operationId, "executed");
     });
     await expect(runInDurableObject(user, (_instance, state) => {
-      state.abort("cancel late terminal waitUntil");
-    })).rejects.toThrow("cancel late terminal waitUntil");
+      state.abort("restart after empty pre-arm commit");
+    })).rejects.toThrow("restart after empty pre-arm commit");
 
     const restarted = testEnv.TEST_USER.get(userId);
     expect(await runInDurableObject(restarted, (_instance, state) =>
@@ -666,6 +832,157 @@ describe("deployment Usage Projection", () => {
     await expect.poll(async () =>
       (await projection.readOverview()).ingestionWatermark,
     ).toBe(beforeWatermark + 1n);
+  });
+
+  it("keeps an alarm when empty maintenance starts after pre-arm but before commit", async () => {
+    const identity = `projection-prearm-empty-${crypto.randomUUID()}`;
+    const userId = testEnv.TEST_USER.idFromName(identity);
+    const user = testEnv.TEST_USER.get(userId);
+    expect(await user.createAccount(identity, identity, new Uint8Array([43, 44, 45])))
+      .not.toBeNull();
+    await user.activateUsageAccount();
+    const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+    await user.beginGatekeeperUsage(operationId, {
+      principal: {version: 1, kind: "user", userId: userId.toString()},
+      source: "direct-user",
+      vendorId: "context",
+      billingMethodKey: "context.read.v1",
+      externalAccountId: "projection-prearm-empty-account",
+    }, {
+      kind: "gatekeeper",
+      pricing: "unpriced",
+      usageRateVersion: 1n,
+      issuedAt: "2026-08-24T12:00:00.000Z",
+      vendorId: "context",
+      billingMethodKey: "context.read.v1",
+      chargeSubunits: 0n,
+      configurationGap: true,
+    });
+    await user.markGatekeeperUsageStarted(operationId);
+    const prearmPersisted = Promise.withResolvers<void>();
+    const releasePrearm = Promise.withResolvers<void>();
+
+    const persistedAlarm = await runInDurableObject(user, async (instance, state) => {
+      (instance as unknown as {usageProjection: unknown}).usageProjection = {
+        getByName: () => ({ingest: () => new Promise(() => {})}),
+      };
+      (instance as unknown as {adminSettings: unknown}).adminSettings = {
+        getByName: () => ({recordUsageProjectionDeliveryHealth: async () => {}}),
+      };
+      const storage = state.storage as DurableObjectStorage & {
+        setAlarm(scheduledTime: number | Date): Promise<void>;
+      };
+      const setAlarm = storage.setAlarm.bind(storage);
+      let interceptPrearm = true;
+      Object.defineProperty(storage, "setAlarm", {
+        configurable: true,
+        value: async (scheduledTime: number | Date) => {
+          await setAlarm(scheduledTime);
+          if (!interceptPrearm) return;
+          interceptPrearm = false;
+          prearmPersisted.resolve();
+          await releasePrearm.promise;
+        },
+      });
+      const terminal = instance.completeGatekeeperUsage(operationId, "executed");
+      await prearmPersisted.promise;
+      await instance.alarm();
+      const alarm = await state.storage.getAlarm();
+      releasePrearm.resolve();
+      await terminal;
+      return alarm;
+    });
+    expect(persistedAlarm).not.toBeNull();
+    await expect(runInDurableObject(user, (_instance, state) => {
+      state.abort("restart after exact empty pre-arm race");
+    })).rejects.toThrow("restart after exact empty pre-arm race");
+
+    const restarted = testEnv.TEST_USER.get(userId);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.getAlarm())).not.toBeNull();
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+  });
+
+  it("keeps a pre-arm revision after non-empty delivery drains its old batch", async () => {
+    const identity = `projection-nonempty-race-${crypto.randomUUID()}`;
+    const userId = testEnv.TEST_USER.idFromName(identity);
+    const user = testEnv.TEST_USER.get(userId);
+    expect(await user.createAccount(identity, identity, new Uint8Array([40, 41, 42])))
+      .not.toBeNull();
+    await user.activateUsageAccount();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const beforeWatermark = (await projection.readOverview()).ingestionWatermark;
+    const oldOperationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+    const newOperationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+    const prearmPersisted = Promise.withResolvers<void>();
+    const releasePrearm = Promise.withResolvers<void>();
+
+    const persistedAlarm = await runInDurableObject(user, async (instance, state) => {
+      const attribution = {
+        principal: {version: 1 as const, kind: "user" as const, userId: userId.toString()},
+        source: "direct-user" as const,
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        externalAccountId: "projection-nonempty-race-account",
+      };
+      const charge = {
+        kind: "gatekeeper" as const,
+        pricing: "unpriced" as const,
+        usageRateVersion: 1n,
+        issuedAt: "2026-08-24T12:00:00.000Z",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        chargeSubunits: 0n,
+        configurationGap: true as const,
+      };
+      await instance.beginGatekeeperUsage(oldOperationId, attribution, charge);
+      await instance.markGatekeeperUsageStarted(oldOperationId);
+      await instance.beginGatekeeperUsage(newOperationId, attribution, charge);
+      await instance.markGatekeeperUsageStarted(newOperationId);
+      const account = (instance as unknown as {usageAccount: {
+        completeGatekeeperUsage(operationId: string, completion: "executed"): unknown;
+      }}).usageAccount;
+      account.completeGatekeeperUsage(oldOperationId, "executed");
+      (instance as unknown as {usageProjection: unknown}).usageProjection = {
+        getByName: () => ({ingest: () => new Promise(() => {})}),
+      };
+      (instance as unknown as {adminSettings: unknown}).adminSettings = {
+        getByName: () => ({recordUsageProjectionDeliveryHealth: async () => {}}),
+      };
+      const storage = state.storage as DurableObjectStorage & {
+        setAlarm(scheduledTime: number | Date): Promise<void>;
+      };
+      const setAlarm = storage.setAlarm.bind(storage);
+      let interceptPrearm = true;
+      Object.defineProperty(storage, "setAlarm", {
+        configurable: true,
+        value: async (scheduledTime: number | Date) => {
+          await setAlarm(scheduledTime);
+          if (!interceptPrearm) return;
+          interceptPrearm = false;
+          prearmPersisted.resolve();
+          await releasePrearm.promise;
+        },
+      });
+      const terminal = instance.completeGatekeeperUsage(newOperationId, "executed");
+      await prearmPersisted.promise;
+      await instance.alarm();
+      const alarm = await state.storage.getAlarm();
+      releasePrearm.resolve();
+      await terminal;
+      return alarm;
+    });
+    expect(persistedAlarm).not.toBeNull();
+    await expect(runInDurableObject(user, (_instance, state) => {
+      state.abort("restart after non-empty pre-arm commit");
+    })).rejects.toThrow("restart after non-empty pre-arm commit");
+
+    const restarted = testEnv.TEST_USER.get(userId);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.getAlarm())).not.toBeNull();
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await projection.readOverview()).ingestionWatermark).toBe(beforeWatermark + 2n);
+    expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
 
   it("merges unreachable User outboxes into deployment health and clears on recovery", async () => {
@@ -703,6 +1020,12 @@ describe("deployment Usage Projection", () => {
       await instance.alarm();
     });
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
+    const deploymentProjection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    await runInDurableObject(deploymentProjection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete' WHERE singleton = 1
+      `);
+    });
     const admin = new AdminUsageApiImpl(
       settings, testEnv.TEST_USER, "projection-health-admin", undefined,
       testEnv.TEST_USAGE_PROJECTION,
@@ -835,6 +1158,52 @@ describe("deployment Usage Projection", () => {
     expect(projectedAfter.generation).toBe(projectedBefore.generation + 1n);
     expect(projectedAfter.metrics).toEqual(expectedMetrics);
     expect(await user.getAdminUsageBalanceState()).toEqual(authoritativeBalanceBefore);
+  });
+
+  it("runs only one rebuild step while a Registry page is in flight", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const requestId = `rebuild-single-step-${crypto.randomUUID()}`;
+    const registryReadStarted = Promise.withResolvers<void>();
+    const releaseRegistryRead = Promise.withResolvers<void>();
+    let registryReads = 0;
+    let readsWhileBlocked = 0;
+    await runInDurableObject(projection, async instance => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => {
+            registryReads += 1;
+            if (registryReads === 1) {
+              registryReadStarted.resolve();
+              await releaseRegistryRead.promise;
+              return {
+                users: [{
+                  registeredUserRef: crypto.randomUUID(),
+                  identity: "rebuild-step@example.test",
+                  displayName: "Rebuild Step",
+                  registeredAt: "2026-08-24T12:00:00.000Z",
+                  activatedAt: "2026-08-24T12:00:00.000Z",
+                }],
+                nextCursor: null,
+              };
+            }
+            return {users: [], nextCursor: null};
+          },
+        }),
+      };
+      expect((await instance.requestRebuild(requestId)).state).toBe("rebuilding");
+      const alarmStep = instance.alarm();
+      await registryReadStarted.promise;
+      readsWhileBlocked = registryReads;
+      releaseRegistryRead.resolve();
+      await alarmStep;
+    });
+
+    expect(readsWhileBlocked).toBe(1);
+    expect(await projection.requestRebuild(requestId)).toMatchObject({
+      state: "rebuilding",
+      usersProcessed: 0n,
+    });
   });
 
   it("backfills pre-Projection Usage Records during rebuild without double counting", async () => {
@@ -1067,13 +1436,41 @@ describe("deployment Usage Projection", () => {
     );
 
     const first = await admin.getOverview();
-    expect(first.health.state === "healthy" &&
-      first.metrics.unpricedApiOperations === 0n).toBe(false);
+    expect(first.health.state).toBe("rebuilding");
+    expect(first.metrics).toBeNull();
     await expect.poll(async () => {
       await runDurableObjectAlarm(projection);
       const overview = await admin.getOverview();
-      return [overview.health.state, overview.metrics.unpricedApiOperations];
+      return [overview.health.state, overview.metrics?.unpricedApiOperations ?? null];
     }).toEqual(["healthy", 1n]);
+  });
+
+  it("keeps bootstrap totals unavailable after the authority scan fails", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    await runInDurableObject(projection, instance => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => {
+            throw new Error("controlled bootstrap Registry failure");
+          },
+        }),
+      };
+    });
+    const projectionNamespace = {
+      getByName: () => projection,
+    } as unknown as DurableObjectNamespace<UsageProjection>;
+    const admin = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""), testEnv.TEST_USER,
+      "projection-bootstrap-failure-admin", undefined, projectionNamespace,
+    );
+    expect((await admin.getOverview()).metrics).toBeNull();
+    await runInDurableObject(projection, instance => instance.alarm());
+
+    const failed = await admin.getOverview();
+    expect(failed.health.state).toBe("failed");
+    expect(failed.health.rebuildFailureCode).toBe("registry-read-failed");
+    expect(failed.metrics).toBeNull();
   });
 
   it("exposes a bounded rebuild failure through projection health", async () => {

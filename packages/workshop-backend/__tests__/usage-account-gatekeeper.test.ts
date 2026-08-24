@@ -7,7 +7,10 @@ import {
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
 import { UsageAccount, type GatekeeperUsageAttribution } from "../src/usage-account.js";
-import type {UsageProjection} from "../src/usage-projection.js";
+import type {
+  UsageProjection,
+  UsageProjectionAggregateFact,
+} from "../src/usage-projection.js";
 import type { UserDurableObject } from "../src/user.js";
 
 const testEnv = env as unknown as {
@@ -231,6 +234,78 @@ describe("Gatekeeper two-stage billing state machine", () => {
         billableApiOperations: 1n,
         unpricedApiOperations: 1n,
       });
+    });
+  });
+
+  it("retains a queued Summary until a later conflict is written back as poison", async () => {
+    await withAccount(async (account, storage) => {
+      const usagePrincipalRef = account.getRegistrationOutbox().fact.registeredUserRef;
+      const summaryFactId = crypto.randomUUID();
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      const summary = (
+          sourceSequence: bigint,
+          cacheHitInputTokens: bigint): UsageProjectionAggregateFact => ({
+        schemaVersion: 1,
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence,
+        usagePrincipalRef,
+        rowKind: "aggregate",
+        bucketStart: "2026-08-24T12:00:00.000Z",
+        summaryFactId,
+        summaryRevision: 1n,
+        source: "agent",
+        kind: "model",
+        outcome: "settled",
+        pricing: "priced",
+        deploymentModelId: "model-1",
+        vendorId: null,
+        billingMethodKey: null,
+        externalAccountId: null,
+        gadgetId: null,
+        cacheHitInputTokens,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: cacheHitInputTokens,
+        chargedUsageCreditSubunits: cacheHitInputTokens,
+        billableApiOperations: 0n,
+        activeUserContribution: 1n,
+        unpricedModelUses: 0n,
+        unpricedApiOperations: 0n,
+      });
+      const first = summary(1n, 1n);
+      const second = summary(2n, 2n);
+      const key = (prefix: string, sequence: bigint) =>
+        prefix + sequence.toString().padStart(40, "0");
+      const outboxPrefix = "usageAccount:projectionOutbox:";
+      const pendingPrefix = "usageAccount:projectionPending:";
+      storage.kv.put(key(outboxPrefix, 2n), {fact: second});
+      storage.kv.put(key(pendingPrefix, 2n), second.projectionFactId);
+      storage.kv.put("usageAccount:projectionPendingCount:v1", 1n);
+      storage.kv.put("usageAccount:projectionSequence:v1", 2n);
+      const secondOnly = account.listPendingProjectionOutbox(1);
+
+      const queued = await projection.ingest([second]);
+      expect(queued).toEqual({acknowledgedFactIds: [], rejected: []});
+      account.recordProjectionDeliveryResult(secondOnly, queued);
+      expect(account.listPendingProjectionOutbox(1)).toEqual(secondOnly);
+
+      storage.kv.put(key(outboxPrefix, 1n), {fact: first});
+      storage.kv.put(key(pendingPrefix, 1n), first.projectionFactId);
+      storage.kv.put("usageAccount:projectionPendingCount:v1", 2n);
+      const pending = account.listPendingProjectionOutbox(2);
+      const resolved = await projection.ingest(pending.map(entry => entry.fact));
+      expect(resolved).toEqual({
+        acknowledgedFactIds: [first.projectionFactId],
+        rejected: [{projectionFactId: second.projectionFactId, code: "invalid-fact"}],
+      });
+      account.recordProjectionDeliveryResult(pending, resolved);
+
+      expect(account.getSnapshot().projectionOutbox).toEqual([
+        {fact: first, deliveredAt: expect.any(String)},
+        {fact: second, failureCode: "invalid-fact"},
+      ]);
     });
   });
 

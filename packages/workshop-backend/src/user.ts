@@ -38,6 +38,10 @@ import type {
 import type {UsageProjection} from "./usage-projection.js";
 
 const logger = createWorkshopLogger("workshop.user");
+const PROJECTION_MAINTENANCE_REVISION_KEY =
+  "usageAccount:projectionMaintenanceRevision:v1";
+const PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY =
+  "usageAccount:projectionMaintenanceSettledRevision:v1";
 
 // How many workspaces one Outputs catch-up pass examines, bounding the Durable Objects a single
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
@@ -321,6 +325,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private usageProjection: DurableObjectNamespace<UsageProjection>;
+  private projectionPreparations = new Set<bigint>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -356,11 +361,53 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     await this.#runProjectionMaintenance();
   }
 
-  async #prepareProjectionDeliveryAlarm(): Promise<void> {
-    await this.ctx.storage.setAlarm(Date.now() + 1_000);
+  async #prepareProjectionDeliveryAlarm(): Promise<bigint> {
+    const revision = this.#projectionMaintenanceRevision() + 1n;
+    this.projectionPreparations.add(revision);
+    this.ctx.storage.kv.put(PROJECTION_MAINTENANCE_REVISION_KEY, revision.toString());
+    try {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return revision;
+    } catch (error) {
+      this.#finishProjectionPreparation(revision);
+      throw error;
+    }
   }
 
-  #scheduleProjectionDelivery(): void {
+  #projectionMaintenanceRevision(): bigint {
+    const stored = this.ctx.storage.kv.get<string>(PROJECTION_MAINTENANCE_REVISION_KEY);
+    if (stored === undefined) return 0n;
+    if (!/^(?:0|[1-9][0-9]*)$/.test(stored)) {
+      throw new Error("Usage Projection maintenance revision is invalid.");
+    }
+    return BigInt(stored);
+  }
+
+  #projectionMaintenanceSettledRevision(): bigint {
+    const stored = this.ctx.storage.kv.get<string>(
+      PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+    );
+    if (stored === undefined) return 0n;
+    if (!/^(?:0|[1-9][0-9]*)$/.test(stored)) {
+      throw new Error("Usage Projection settled maintenance revision is invalid.");
+    }
+    return BigInt(stored);
+  }
+
+  #finishProjectionPreparation(revision: bigint): void {
+    if (!this.projectionPreparations.delete(revision)) {
+      throw new Error("Usage Projection preparation revision is not active.");
+    }
+    if (this.projectionPreparations.size === 0) {
+      this.ctx.storage.kv.put(
+        PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+        this.#projectionMaintenanceRevision().toString(),
+      );
+    }
+  }
+
+  #scheduleProjectionDelivery(preparationRevision: bigint): void {
+    this.#finishProjectionPreparation(preparationRevision);
     try {
       this.ctx.waitUntil(this.#runProjectionMaintenance());
     } catch (error) {
@@ -373,8 +420,35 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async #runProjectionMaintenance(): Promise<void> {
+    if (this.projectionPreparations.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return;
+    }
+    const preparedRevision = this.#projectionMaintenanceRevision();
+    const settledRevision = this.#projectionMaintenanceSettledRevision();
+    if (settledRevision > preparedRevision) {
+      throw new Error("Usage Projection maintenance revisions do not reconcile.");
+    }
+    if (settledRevision !== preparedRevision) {
+      this.ctx.storage.kv.put(
+        PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+        preparedRevision.toString(),
+      );
+    }
+    const maintenanceRevision = this.#projectionMaintenanceRevision();
     const backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
-    await this.#deliverProjectionOutbox(!backfillComplete);
+    await this.#deliverProjectionOutbox(!backfillComplete, maintenanceRevision);
+  }
+
+  async #deleteProjectionAlarmIfOwned(maintenanceRevision: bigint): Promise<void> {
+    if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return;
+    }
+    await this.ctx.storage.deleteAlarm();
+    if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    }
   }
 
   async #reportProjectionDeliveryHealth(deliveryFailed: boolean): Promise<boolean> {
@@ -394,7 +468,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
-  async #deliverProjectionOutbox(backfillPending: boolean): Promise<void> {
+  async #deliverProjectionOutbox(
+      backfillPending: boolean,
+      maintenanceRevision: bigint): Promise<void> {
     const pending = this.usageAccount.listPendingProjectionOutbox(32);
     if (pending.length === 0) {
       const healthReported = await this.#reportProjectionDeliveryHealth(false);
@@ -404,7 +480,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       else if (backfillPending || pendingAfterHealth) {
         await this.ctx.storage.setAlarm(Date.now() + 1_000);
       } else {
-        await this.ctx.storage.deleteAlarm();
+        await this.#deleteProjectionAlarmIfOwned(maintenanceRevision);
         if (this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
           await this.ctx.storage.setAlarm(Date.now() + 1_000);
         }
@@ -431,7 +507,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 1_000);
     } else {
-      await this.ctx.storage.deleteAlarm();
+      await this.#deleteProjectionAlarmIfOwned(maintenanceRevision);
     }
   }
 
@@ -618,11 +694,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       afterSourceSequence: bigint | null,
       limit: number) {
     await this.activateUsageAccount();
-    await this.#prepareProjectionDeliveryAlarm();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.listUsageProjectionFacts(afterSourceSequence, limit);
     } finally {
-      this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery(preparationRevision);
     }
   }
 
@@ -674,22 +750,22 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Persist the durable provider-start handoff for one trusted Agent model inference. */
   async markModelUsageStarted(operationId: string): Promise<ModelMeteringAttempt> {
     await this.activateUsageAccount();
-    await this.#prepareProjectionDeliveryAlarm();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.markModelUsageStarted(operationId);
     } finally {
-      this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery(preparationRevision);
     }
   }
 
   /** Release one trusted Agent model inference that did not reach its provider request. */
   async failModelUsageBeforeExecution(operationId: string): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
-    await this.#prepareProjectionDeliveryAlarm();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.failModelUsageBeforeExecution(operationId);
     } finally {
-      this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery(preparationRevision);
     }
   }
 
@@ -698,11 +774,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       usage: ModelUsageCompletion): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
-    await this.#prepareProjectionDeliveryAlarm();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.completeModelUsage(operationId, usage);
     } finally {
-      this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery(preparationRevision);
     }
   }
 
@@ -781,11 +857,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       completion: GatekeeperUsageCompletion): Promise<GatekeeperUsageRecord> {
     await this.activateUsageAccount();
-    await this.#prepareProjectionDeliveryAlarm();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.completeGatekeeperUsage(operationId, completion);
     } finally {
-      this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery(preparationRevision);
     }
   }
 
@@ -797,7 +873,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       reason: string,
       actorUserId: string) {
     await this.activateUsageAccount();
-    await this.#prepareProjectionDeliveryAlarm();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.reconcileUnknownGatekeeperUsage(
         billingOperationId,
@@ -807,7 +883,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         actorUserId,
       );
     } finally {
-      this.#scheduleProjectionDelivery();
+      this.#scheduleProjectionDelivery(preparationRevision);
     }
   }
 
