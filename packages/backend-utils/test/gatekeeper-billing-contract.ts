@@ -1,3 +1,4 @@
+import { parse } from "@babel/parser";
 import { describe, expect, it } from "vitest";
 import {
   runBillableAction,
@@ -11,6 +12,10 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
+type ProgramStatement = ReturnType<typeof parse>["program"]["body"][number];
+type InterfaceDeclaration = Extract<ProgramStatement, { type: "TSInterfaceDeclaration" }>;
+type TypeAliasDeclaration = Extract<ProgramStatement, { type: "TSTypeAliasDeclaration" }>;
+
 /** One exhaustive public Gatekeeper method classification from the usage-credit oracle. */
 export type BillingSurfaceClass =
   | "R"
@@ -18,43 +23,137 @@ export type BillingSurfaceClass =
   | "H"
   | { kind: "C" | "K"; reason: string };
 
+/** Read the declared public methods of selected TypeScript interfaces with the compiler AST. */
+export function publicInterfaceMethods(
+  source: string | readonly string[],
+  interfaces: readonly string[],
+): string[] {
+  const declarations = new Map<string, InterfaceDeclaration[]>();
+  const aliases = new Map<string, TypeAliasDeclaration>();
+  for (const moduleSource of typeof source === "string" ? [source] : source) {
+    const program = parse(moduleSource, {
+      sourceType: "module", plugins: ["typescript", "decorators-legacy"],
+    }).program;
+    for (const statement of program.body) {
+      const declaration = statement.type === "ExportNamedDeclaration"
+        ? statement.declaration
+        : statement;
+      if (declaration?.type === "TSInterfaceDeclaration") {
+        const existing = declarations.get(declaration.id.name) ?? [];
+        existing.push(declaration);
+        declarations.set(declaration.id.name, existing);
+      } else if (declaration?.type === "TSTypeAliasDeclaration") {
+        aliases.set(declaration.id.name, declaration);
+      }
+    }
+  }
+
+  const methods = new Set<string>();
+  const visited = new Set<string>();
+  const visitedAliases = new Set<string>();
+  const discoverType = (node: unknown) => {
+    if (typeof node !== "object" || node === null) return;
+    if (Array.isArray(node)) {
+      for (const child of node) discoverType(child);
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    if (record.type === "TSTypeReference") {
+      const typeName = record.typeName as { type?: string; name?: string } | undefined;
+      if (typeName?.type === "Identifier" && typeName.name) {
+        if (declarations.has(typeName.name)) collect(typeName.name, typeName.name);
+        const alias = aliases.get(typeName.name);
+        if (alias && !visitedAliases.has(typeName.name)) {
+          visitedAliases.add(typeName.name);
+          discoverType(alias.typeAnnotation);
+        }
+      }
+    }
+    for (const [key, value] of Object.entries(record)) {
+      if (key !== "loc" && key !== "start" && key !== "end") discoverType(value);
+    }
+  };
+  const collect = (interfaceName: string, exposedAs: string) => {
+    if (visited.has(`${exposedAs}:${interfaceName}`)) return;
+    visited.add(`${exposedAs}:${interfaceName}`);
+    const matches = declarations.get(interfaceName);
+    if (!matches) throw new Error(`missing interface ${interfaceName}`);
+    for (const declaration of matches) {
+      for (const base of declaration.extends ?? []) {
+        if (base.expression.type !== "Identifier") {
+          throw new Error(`${interfaceName} has an unsupported inherited interface`);
+        }
+        const baseName = base.expression.name;
+        if (baseName === "RpcTarget") continue;
+        if (!declarations.has(baseName)) {
+          throw new Error(`${interfaceName} inherits missing interface ${baseName}`);
+        }
+        collect(baseName, exposedAs);
+      }
+      for (const member of declaration.body.body) {
+        const callable = member.type === "TSMethodSignature" ||
+          (member.type === "TSPropertySignature" &&
+            member.typeAnnotation?.typeAnnotation.type === "TSFunctionType");
+        if (!callable) continue;
+        if (member.key.type !== "Identifier") {
+          throw new Error(`${interfaceName} has a non-identifier public method`);
+        }
+        methods.add(`${exposedAs}.${member.key.name}`);
+        if (member.type === "TSMethodSignature") {
+          discoverType(member.typeAnnotation);
+          for (const parameter of member.parameters) discoverType(parameter.typeAnnotation);
+        } else if (member.typeAnnotation?.typeAnnotation.type === "TSFunctionType") {
+          discoverType(member.typeAnnotation.typeAnnotation.typeAnnotation);
+          for (const parameter of member.typeAnnotation.typeAnnotation.parameters) {
+            discoverType(parameter.typeAnnotation);
+          }
+        }
+      }
+      for (const member of declaration.body.body) {
+        if (member.type === "TSPropertySignature" &&
+            member.typeAnnotation?.typeAnnotation.type !== "TSFunctionType") {
+          discoverType(member.typeAnnotation);
+        }
+      }
+    }
+  };
+  for (const interfaceName of interfaces) {
+    collect(interfaceName, interfaceName);
+  }
+  return [...methods];
+}
+
 /**
  * Verify that every method in selected public Session interfaces is classified exactly once and
  * that every billable method, but no control or continuation method, has a registry entry.
  */
 export function testPublicBillingSurface(
   vendor: string,
-  typesUrl: URL,
+  typesSource: string | readonly string[],
   interfaces: readonly string[],
   classification: Readonly<Record<string, BillingSurfaceClass>>,
   billingRegistry: Readonly<Record<string, { methodKey: string }>>,
 ): void {
   describe(`${vendor} public billing surface`, () => {
     it("exhaustively classifies every public Session method", () => {
-      const source = readFileSync(typesUrl, "utf8");
-      const methods: string[] = [];
-      for (const interfaceName of interfaces) {
-        const match = source.match(new RegExp(
-          `export interface ${interfaceName}(?:\\s+extends[^\\{]+)?\\s*\\{([\\s\\S]*?)^\\}`,
-          "m",
-        ));
-        expect(match, `missing interface ${interfaceName}`).not.toBeNull();
-        for (const member of match![1].matchAll(/^\s{2}([A-Za-z_$][\w$]*)\s*\(/gm)) {
-          methods.push(`${interfaceName}.${member[1]}`);
-        }
-      }
-      expect(Object.keys(classification).toSorted()).toEqual(methods.toSorted());
+      const methods = publicInterfaceMethods(typesSource, interfaces);
+      expect(Object.keys(classification)).toHaveLength(methods.length);
+      expect(Object.keys(classification)).toEqual(expect.arrayContaining(methods));
       const billable = Object.entries(classification)
         .filter(([, entry]) => entry === "R" || entry === "A" || entry === "H")
-        .map(([method]) => method)
-        .toSorted();
-      expect(Object.keys(billingRegistry).toSorted()).toEqual(billable);
+        .map(([method]) => method);
+      expect(Object.keys(billingRegistry)).toHaveLength(billable.length);
+      expect(Object.keys(billingRegistry)).toEqual(expect.arrayContaining(billable));
       const allowlist = Object.values(classification)
         .filter((entry): entry is Extract<BillingSurfaceClass, object> => typeof entry === "object");
       expect(allowlist.every(entry => entry.reason.trim().length >= 20)).toBe(true);
-      expect(Object.values(billingRegistry).every(({ methodKey }) => /\.v\d+$/.test(methodKey)))
-        .toBe(true);
+      expect(Object.values(billingRegistry).every(({ methodKey }) =>
+        /^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,199}$/.test(methodKey),
+      )).toBe(true);
+      const methodKeys = Object.values(billingRegistry).map(({ methodKey }) => methodKey);
+      expect(new Set(methodKeys).size).toBe(methodKeys.length);
     });
+
   });
 }
 
@@ -67,7 +166,7 @@ class MemoryActionStorage implements BillableActionStorage {
 }
 
 function execution(id: string): ActionExecution {
-  return { billingOperationId: id, mode: "apply" };
+  return { billingOperationId: id, mode: "execute" };
 }
 
 /** Add the shared lifecycle checks to one migrated Gatekeeper package's test suite. */
@@ -166,4 +265,3 @@ export function testGatekeeperBillingContract(
     }
   });
 }
-import { readFileSync } from "node:fs";

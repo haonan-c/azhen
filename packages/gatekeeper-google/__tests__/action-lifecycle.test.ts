@@ -52,8 +52,8 @@ describe("Google rejected Actions", () => {
     const doc = testEnv.TEST_GOOGLE_DOC_GATEKEEPER.getByName(crypto.randomUUID());
 
     await expect(runInDurableObject(gmail, instance => instance.applyAction(1)))
-      .rejects.toThrow("predates billing");
+      .rejects.toThrow("expected ActionExecution");
     await expect(runInDurableObject(doc, instance => instance.applyAction(1)))
-      .rejects.toThrow("predates billing");
+      .rejects.toThrow("expected ActionExecution");
   });
 });

@@ -363,7 +363,7 @@ export function observation(title: string, description: string): ObservationDesc
 
 const kind = (tag: string, label: string): ActionDescription["actionKind"] => ({ tag: `confluence.${tag}`, label });
 
-function describeAction(action: ConfluenceAction): ActionDescription {
+function describeAction(action: ConfluenceAction): Omit<ActionDescription, "billing"> {
   switch (action.type) {
     case "createContent":
       return {

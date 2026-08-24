@@ -1,0 +1,162 @@
+{
+  "packages/gatekeeper-cloudflare/src/cloudflare-api.ts": {
+    "sites": ["fetch:cfGet:fetch"],
+    "reason": "Cloudflare account identity lookup only; this package declares an explicit zero business-operation surface."
+  },
+  "packages/gatekeeper-cloudflare/src/cloudflare.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth and alarm work; they do not expose business Session operations."
+  },
+  "packages/gatekeeper-cloudflare/src/oauth.ts": {
+    "sites": ["fetch:redeem:fetch"],
+    "reason": "OAuth token redemption is an authentication control-plane request, outside the business-operation surface."
+  },
+  "packages/gatekeeper-confluence/src/confluence-api.ts": {
+    "sites": ["fetch:#send:fetch", "fetch:getJson:fetch", "fetch:postToken:fetch"],
+    "reason": "Confluence provider requests are reached through the package billing wrapper; OAuth discovery and token exchange are control-plane calls."
+  },
+  "packages/gatekeeper-confluence/src/confluence.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-context/src/artifact-sync.ts": {
+    "sites": ["fetch:fetchRepo:fetch"],
+    "reason": "Context artifact synchronization is called only by the registered, metered management operation."
+  },
+  "packages/gatekeeper-context/src/collection-kv.ts": {
+    "sites": ["service-binding:listPublicCollectionsFromKv:env.CONTEXT_COLLECTIONS.get"],
+    "reason": "The public collection catalog reads local deployment state and does not contact an external business provider."
+  },
+  "packages/gatekeeper-context/src/context-collection.ts": {
+    "sites": ["service-binding:#createArtifactRepo:artifacts.create", "service-binding:#createArtifactRepo:artifacts.get", "service-binding:#createArtifactRepo:repo.revokeToken", "service-binding:createGitToken:repo.createToken", "service-binding:createGitToken:this.#artifacts().get", "service-binding:deleteForRevokedOwner:this.env.ARTIFACTS.delete", "service-binding:deleteSelf:this.env.ARTIFACTS.delete", "service-binding:listGitTokens:repo.listTokens", "service-binding:listGitTokens:this.#artifacts().get", "service-binding:revokeGitToken:repo.revokeToken", "service-binding:revokeGitToken:this.#artifacts().get"],
+    "reason": "Artifact repository and token calls run inside registered Context management operations; deletion cleanup follows the same controlled lifecycle."
+  },
+  "packages/gatekeeper-context/src/index.ts": {
+    "sites": ["entrypoint:fetch:fetch"],
+    "reason": "The Context Worker fetch entrypoint serves the management UI and routes account control requests."
+  },
+  "packages/gatekeeper-context/src/registry-do.ts": {
+    "sites": ["service-binding:#writeSnapshot:this.env.CONTEXT_COLLECTIONS.put"],
+    "reason": "The registry snapshot write mirrors local public-collection metadata after a controlled management mutation."
+  },
+  "packages/gatekeeper-email/src/email.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:email:email", "entrypoint:fetch:fetch"],
+    "reason": "Email, alarm, and fetch are inbound Worker control entrypoints; this Gatekeeper declares no callable business surface."
+  },
+  "packages/gatekeeper-github/src/github-api.ts": {
+    "sites": ["fetch:exchangeAuthCode:fetch", "fetch:request:fetch"],
+    "reason": "GitHub business requests pass through the package billing wrapper; authorization-code exchange is a control-plane call."
+  },
+  "packages/gatekeeper-github/src/github.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-google/src/auth-retry.ts": {
+    "sites": ["fetch:fetchWithAuthRetry:fetch"],
+    "reason": "The Google transport preserves one begun billing activity across a possible authentication retry."
+  },
+  "packages/gatekeeper-google/src/google-api.ts": {
+    "sites": ["fetch:exchangeAuthCode:fetch", "fetch:getAccessToken:fetch", "fetch:getGoogleAccountDescription:fetch", "fetch:getGoogleVerifiedEmail:fetch", "fetch:revokeGoogleToken:fetch"],
+    "reason": "These Google calls implement OAuth, credential refresh, identity description, and revocation in the account control plane."
+  },
+  "packages/gatekeeper-google/src/google-configurators.ts": {
+    "sites": ["fetch:listDriveFiles:fetch"],
+    "reason": "The Drive picker is a resource-configuration probe that runs before a business Session capability is created."
+  },
+  "packages/gatekeeper-google/src/google.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, configurator UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-homeassistant/src/approvals.ts": {
+    "sites": ["send:executeAction:ws.send", "send:fetchDashboardConfig:ws.send"],
+    "reason": "Approved Home Assistant actions and their preview reads run inside the shared billed action activity."
+  },
+  "packages/gatekeeper-homeassistant/src/homeassistant-api.ts": {
+    "sites": ["fetch:connect:creds.fetcher.fetch", "fetch:fetchJson:creds.fetcher?.fetch", "fetch:fetchJson:fetch", "send:callService:this.send", "send:fetchRegistrySnapshot:ws.send", "send:fetchRegistrySnapshot:ws.send", "send:fetchRegistrySnapshot:ws.send", "send:fetchRegistrySnapshot:ws.send", "send:fetchRegistrySnapshot:ws.send", "send:fireEvent:this.send", "send:onMessage:ws.send", "send:send:this.#ws.send", "websocket:connect:WebSocket"],
+    "reason": "Home Assistant REST and WebSocket transports are created or invoked only inside the registered billing activity seam."
+  },
+  "packages/gatekeeper-homeassistant/src/homeassistant.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch", "send:#describeRaw:ws.send", "send:getConfig:ws.send", "send:listAreas:ws.send", "send:listAreas:ws.send", "send:listDashboards:ws.send", "send:listDevices:ws.send", "send:listDevices:ws.send", "send:listDevices:ws.send", "send:listFloors:ws.send", "send:listLabels:ws.send", "send:listLabels:ws.send", "send:listLovelaceResources:ws.send", "send:revertAction:ws.send"],
+    "reason": "Business WebSocket sends use the Session or Action billing wrapper; Worker entrypoints remain account control-plane routes."
+  },
+  "packages/gatekeeper-linear/src/linear-api.ts": {
+    "sites": ["fetch:graphql:fetch", "fetch:postForm:fetch", "fetch:revokeToken:fetch"],
+    "reason": "Linear GraphQL calls use registered billing paths; OAuth token creation and revocation are account control-plane calls."
+  },
+  "packages/gatekeeper-linear/src/linear.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-mcp/src/mcp.ts": {
+    "sites": ["entrypoint:fetch:fetch"],
+    "reason": "The MCP Gatekeeper fetch entrypoint handles endpoint account setup; tool business calls use the shared MCP transport."
+  },
+  "packages/gatekeeper-mcp-portal/src/portal.ts": {
+    "sites": ["entrypoint:fetch:fetch"],
+    "reason": "The MCP Portal fetch entrypoint handles admin-configured account setup; tool calls use the shared MCP transport."
+  },
+  "packages/gatekeeper-notion/src/notion-api.ts": {
+    "sites": ["fetch:#send:fetch", "fetch:postToken:fetch"],
+    "reason": "Notion business requests pass through the package billing wrapper; token exchange is an OAuth control-plane call."
+  },
+  "packages/gatekeeper-notion/src/notion.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-scheduler/src/schedule-driver.ts": {
+    "sites": ["entrypoint:alarm:alarm", "hook:#deliverPrepared:hookResult.callback.onSchedule"],
+    "reason": "The alarm delivers the registered callback through one metered scheduled operation before invoking the workspace hook."
+  },
+  "packages/gatekeeper-slack/src/slack-api.ts": {
+    "sites": ["fetch:#call:fetch", "fetch:postToken:fetch", "fetch:refreshAccessToken:fetch", "fetch:revokeToken:fetch"],
+    "reason": "Slack Web API business calls use the billing wrapper; token create, refresh, and revoke calls are account control operations."
+  },
+  "packages/gatekeeper-slack/src/slack.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-spotify/src/spotify-api.ts": {
+    "sites": ["fetch:#request:fetch", "fetch:tokenRequest:fetch"],
+    "reason": "Spotify business requests pass through the package billing wrapper; token requests belong to account credential control."
+  },
+  "packages/gatekeeper-spotify/src/spotify.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-supabase/src/supabase-api.ts": {
+    "sites": ["fetch:#request:fetch", "fetch:postTokenForm:fetch", "fetch:revokeRefreshToken:fetch"],
+    "reason": "Supabase business requests use registered billing paths; token creation and revocation are account control-plane calls."
+  },
+  "packages/gatekeeper-supabase/src/supabase.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/gatekeeper-ugc-ads/src/index.ts": {
+    "sites": ["entrypoint:fetch:fetch"],
+    "reason": "The UGC Ads Worker fetch entrypoint serves account-control routes; business calls use registered Session methods."
+  },
+  "packages/gatekeeper-ugc-ads/src/render.ts": {
+    "sites": ["browser:renderImage:launch"],
+    "reason": "Browser Rendering starts only inside the registered image-render billing operation."
+  },
+  "packages/gatekeeper-ugc-ads/src/tikhub-api.ts": {
+    "sites": ["fetch:callTikHub:fetch", "fetch:postTikHubAttempt:fetch"],
+    "reason": "TikHub provider calls and retries remain inside one registered UGC Ads billing operation."
+  },
+  "packages/gatekeeper-zoominfo/src/zoominfo-api.ts": {
+    "sites": ["fetch:#request:fetch", "fetch:tokenRequest:fetch"],
+    "reason": "ZoomInfo business requests use registered billing paths; token requests belong to account credential control."
+  },
+  "packages/gatekeeper-zoominfo/src/zoominfo.ts": {
+    "sites": ["entrypoint:alarm:alarm", "entrypoint:fetch:fetch"],
+    "reason": "Gatekeeper Worker control entrypoints dispatch OAuth, account UI, and credential-alarm work outside business Sessions."
+  },
+  "packages/mcp-shared/src/account.ts": {
+    "sites": ["entrypoint:alarm:alarm"],
+    "reason": "The MCP account alarm performs queued-action cleanup and does not invoke a remote tool."
+  },
+  "packages/mcp-shared/src/fetch.ts": {
+    "sites": ["fetch:guardedFetch:fetch"],
+    "reason": "The SSRF-checked MCP transport is invoked only after dynamic tool classification selects observation or approved Action billing."
+  }
+}

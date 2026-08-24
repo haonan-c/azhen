@@ -28,7 +28,10 @@ describe("shipping UGC Ads read-only Action capability", () => {
     const result = await runInDurableObject(gatekeeper, async instance => ({
       autoApprovable: await instance.getAutoApprovableActions(),
       actionErrors: await Promise.all([
-        rejectionMessage(async () => instance.applyAction(72)),
+        rejectionMessage(async () => instance.applyAction(72, {
+          billingOperationId: "read-only-action",
+          mode: "execute",
+        })),
         rejectionMessage(async () => instance.rejectAction(72)),
         rejectionMessage(async () => instance.revertAction(72)),
       ]),

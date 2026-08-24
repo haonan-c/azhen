@@ -1618,7 +1618,7 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(

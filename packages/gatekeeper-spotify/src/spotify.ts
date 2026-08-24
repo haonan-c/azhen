@@ -1954,7 +1954,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
   async submitActionForApproval(
     queue: RpcStub<ApprovalQueue>,
     action: SpotifyAction,
-    description: ActionDescription,
+    description: Omit<ActionDescription, "billing">,
   ): Promise<void> {
     this.ctx.storage.kv.put<StoredActionRecord>(this.#actionKey(action.approvalId), { action, state: "staged" });
     try {
@@ -2039,7 +2039,7 @@ export class SpotifyGatekeeperImpl extends DurableObject<Env, SpotifyGatekeeperI
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(

@@ -594,7 +594,7 @@ export class EmailGatekeeperImpl extends DurableObject<Env, EmailGatekeeperImplP
 
   // ---------------------------------------------------------------------------
 
-  async applyAction(action: number): Promise<void> {
+  async applyAction(action: number): Promise<never> {
     throw new Error("Email gatekeeper has no actions");
   }
 

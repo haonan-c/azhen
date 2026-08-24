@@ -65,6 +65,59 @@ const EXECUTION: ActionExecution = {
 };
 
 describe("Gatekeeper read billing", () => {
+  it("does not call the provider when the durable started transition fails", async () => {
+    const trace: string[] = [];
+    const authorizer = makeAuthorizer(trace);
+    const originalBegin = authorizer.beginBillableOperation;
+    authorizer.beginBillableOperation = async (methodKey, externalAccountId) => {
+      const operation = await originalBegin(methodKey, externalAccountId);
+      operation.markStarted = async () => {
+        trace.push("mark-started-rejected");
+        throw new Error("start unavailable");
+      };
+      return operation;
+    };
+
+    await expect(runBillableRead(
+      authorizer,
+      "account-1",
+      "vendor.records.list",
+      async () => {
+        trace.push("provider");
+        return [];
+      },
+      () => ({ title: "List records", description: "List records" }),
+    )).rejects.toThrow("start unavailable");
+
+    expect(trace).not.toContain("provider");
+    expect(trace).not.toContain("authorize:operation-1");
+    expect(trace).toContain("complete:failed-before-execution");
+  });
+
+  it("does not authorize or return a business result before billing completes", async () => {
+    const trace: string[] = [];
+    const authorizer = makeAuthorizer(trace);
+    const originalBegin = authorizer.beginBillableOperation;
+    authorizer.beginBillableOperation = async (methodKey, externalAccountId) => {
+      const operation = await originalBegin(methodKey, externalAccountId);
+      operation.complete = async outcome => {
+        trace.push(`complete-rejected:${outcome}`);
+        throw new Error("completion unavailable");
+      };
+      return operation;
+    };
+
+    await expect(runBillableRead(
+      authorizer,
+      "account-1",
+      "vendor.records.list",
+      async () => "private result",
+      () => ({ title: "Read", description: "Read provider data" }),
+    )).rejects.toThrow("completion unavailable");
+
+    expect(trace).not.toContain("authorize:operation-1");
+  });
+
   it("settles one caller-visible operation across multiple requests", async () => {
     const trace: string[] = [];
     const result = await runBillableRead(

@@ -87,6 +87,18 @@ function readWorkerConfig(dir: string): WorkerConfig {
   return config;
 }
 
+/** Build one inline Worker input whose bindings are isolated from local development variables. */
+export function inlineWorker(config: WorkerConfig) {
+  return {
+    config: {...config, secrets: {required: []}},
+    vars: config.vars ?? {},
+    secrets: Object.fromEntries(
+      Object.entries(config.vars ?? {}).filter((entry): entry is [string, string] =>
+        typeof entry[1] === "string"),
+    ),
+  };
+}
+
 function workshopConfig(
     gatekeepers: { binding: string; name: string }[],
     enableWorkerLoader: boolean,
@@ -157,9 +169,10 @@ export async function startHarness(opts: {
     root: opts.root ?? REPO_ROOT,
     // workshop-backend is primary, so unrouted requests (e.g. /api) go to it.
     workers: [
-      { config: workshopConfig(gatekeepers, opts.enableWorkerLoader ?? false, opts.patchWorkshop) },
-      ...gatekeepers.map(({ config }) => ({ config })),
-      ...auxiliaryWorkers.map(config => ({ config })),
+      inlineWorker(workshopConfig(
+        gatekeepers, opts.enableWorkerLoader ?? false, opts.patchWorkshop)),
+      ...gatekeepers.map(({ config }) => inlineWorker(config)),
+      ...auxiliaryWorkers.map(inlineWorker),
     ],
   });
 

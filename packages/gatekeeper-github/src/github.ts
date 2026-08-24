@@ -1309,7 +1309,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
     const scopes = await account.getScopes();
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = GitHubApi.forControl(async () => await account.getAccessToken());
     try {
       return await fn(api, scopes);
     } catch (error) {
@@ -1475,7 +1475,7 @@ export class GitHubVerifier extends WorkerEntrypoint<Env, GitHubVerifierProps>
   async hasRepoAccess(owner: string, repo: string): Promise<boolean> {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     const account = this.ctx.exports.UserAccount.get(id);
-    const api = new GitHubApi(async () => await account.getAccessToken());
+    const api = GitHubApi.forControl(async () => await account.getAccessToken());
     try {
       await api.getRepo(owner, repo);
       return true;
@@ -1506,9 +1506,23 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   async #withApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
     const account = this.#userAccount();
-    const baseApi = new GitHubApi(async () => await account.getAccessToken());
     const activity = currentGitHubOperationActivity();
-    const api = activity ? baseApi.withActivity(activity) : baseApi;
+    if (!activity) throw new Error("GitHub business transport requires a started operation.");
+    const api = GitHubApi.forOperation(async () => await account.getAccessToken(), activity);
+    try {
+      return await fn(api);
+    } catch (error) {
+      if (error instanceof GitHubApiError && error.isAuthError) {
+        await account.noteCredentialsExpired();
+        throw new Error("GitHub credentials have expired or been revoked. Please reconnect the account.", { cause: error });
+      }
+      throw error;
+    }
+  }
+
+  async #withControlApi<T>(fn: (api: GitHubApi) => Promise<T>): Promise<T> {
+    const account = this.#userAccount();
+    const api = GitHubApi.forControl(async () => await account.getAccessToken());
     try {
       return await fn(api);
     } catch (error) {
@@ -3247,7 +3261,13 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async describe(): Promise<ResourceDescription> {
     switch (this.ctx.props.resourceKind) {
       case "repo": {
-        const repo = await this.#getRepoMetadata();
+        const remote = await this.#withControlApi(api =>
+          api.getRepo(this.ctx.props.owner, this.ctx.props.repo));
+        const repo: GitHubRepoMetadata = {
+          ...repoRef(this.ctx.props.owner, this.ctx.props.repo),
+          description: remote.description ?? undefined,
+          visibility: remote.visibility ?? (remote.private ? "private" : "public"),
+        };
         return {
           url: repo.url,
           title: repo.fullName,
@@ -3257,7 +3277,12 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         };
       }
       case "issue": {
-        const issue = await this.#getIssueDetails(String(this.ctx.props.issueNumber));
+        const remote = await this.#withControlApi(api => api.getIssue(
+          this.ctx.props.owner, this.ctx.props.repo, this.ctx.props.issueNumber!));
+        if (remote.pull_request) {
+          throw new Error(`#${this.ctx.props.issueNumber} is a pull request, not an issue.`);
+        }
+        const issue = normalizeIssueDetails(this.ctx.props.owner, this.ctx.props.repo, remote);
         return {
           url: issue.url,
           title: `Issue #${issue.id}: ${issue.title}`,
@@ -3267,7 +3292,9 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         };
       }
       case "pull": {
-        const pull = await this.#getPullRequestDetails(String(this.ctx.props.issueNumber));
+        const remote = await this.#withControlApi(api => api.getPullRequest(
+          this.ctx.props.owner, this.ctx.props.repo, this.ctx.props.issueNumber!));
+        const pull = normalizePullDetails(this.ctx.props.owner, this.ctx.props.repo, remote);
         return {
           url: pull.url,
           title: `Pull Request #${pull.id}: ${pull.title}`,
@@ -3290,7 +3317,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
   async submitActionForApproval(
     approvalQueue: RpcStub<ApprovalQueue>,
     action: GitHubAction,
-    description: ActionDescription,
+    description: Omit<ActionDescription, "billing">,
   ): Promise<void> {
     const claim = await createGitHubActionClaim(action);
     this.#stageAction(action, claim);
@@ -3325,7 +3352,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(
@@ -3839,7 +3866,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           return { message: "Missing title revert information.", canRetry: false };
         }
         const previousTitle = action.previousTitle;
-        await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: previousTitle }));
+        await this.#withControlApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { title: previousTitle }));
         this.#clearCaches();
         return;
       }
@@ -3850,7 +3877,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           return { message: "Missing body revert information.", canRetry: false };
         }
         const previousBodyMarkdown = action.previousBodyMarkdown;
-        await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { body: previousBodyMarkdown }));
+        await this.#withControlApi(api => api.updateIssue(action.owner, action.repo, Number(realId), { body: previousBodyMarkdown }));
         this.#clearCaches();
         return;
       }
@@ -3862,7 +3889,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           return { message: "Missing label revert information.", canRetry: false };
         }
         const previousLabels = action.previousLabels;
-        await this.#withApi(api => api.setLabels(action.owner, action.repo, Number(realId), previousLabels));
+        await this.#withControlApi(api => api.setLabels(action.owner, action.repo, Number(realId), previousLabels));
         this.#clearCaches();
         return;
       }
@@ -3873,7 +3900,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
           return { message: "Missing state revert information.", canRetry: false };
         }
         const previousState = action.previousState;
-        await this.#withApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
+        await this.#withControlApi(api => api.updateIssue(action.owner, action.repo, Number(realId), {
           state: previousState,
           state_reason: denormalizeStateReason(action.previousReason),
         }));
@@ -3884,7 +3911,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         if (revertInfo?.type !== "issueComment") {
           return { message: "Missing issue comment revert information.", canRetry: false };
         }
-        await this.#withApi(api => api.deleteIssueComment(action.owner, action.repo, revertInfo.commentId));
+        await this.#withControlApi(api => api.deleteIssueComment(action.owner, action.repo, revertInfo.commentId));
         this.#clearCaches();
         return;
       }
@@ -3892,7 +3919,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
         if (revertInfo?.type !== "reviewComment") {
           return { message: "Missing review comment revert information.", canRetry: false };
         }
-        await this.#withApi(api => api.deletePullRequestReviewComment(action.owner, action.repo, revertInfo.commentId));
+        await this.#withControlApi(api => api.deletePullRequestReviewComment(action.owner, action.repo, revertInfo.commentId));
         this.#clearCaches();
         return;
       }

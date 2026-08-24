@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "main": "./src/mcp.ts",
+  "gatekeeperBilling": {
+    "kind": "dynamic-mcp",
+    "facet": "McpFacetBase"
+  },
   "scripts": {
     "dev": "echo \"run 'pnpm dev-server' in the root directory instead\" >&2 && exit 1",
     "build:configurator": "node ../../scripts/build-gatekeeper-configurator.mjs .",

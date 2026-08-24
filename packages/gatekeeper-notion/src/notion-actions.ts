@@ -702,7 +702,7 @@ export function observation(title: string, description: string): ObservationDesc
 // ---------------------------------------------------------------------------------------------
 // Action descriptions
 
-export function describeAction(action: NotionAction): ActionDescription {
+export function describeAction(action: NotionAction): Omit<ActionDescription, "billing"> {
   switch (action.type) {
     case "appendContent":
       return {

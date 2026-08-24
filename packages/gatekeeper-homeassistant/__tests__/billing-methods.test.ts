@@ -1,9 +1,32 @@
 import { describe, expect, it } from "vitest";
 import {
+  testPublicBillingSurface,
+  type BillingSurfaceClass,
+} from "../../backend-utils/test/gatekeeper-billing-contract";
+import {
   HOME_ASSISTANT_BILLING_METHODS,
   HOME_ASSISTANT_LOCAL_READ_METHODS,
   HOME_ASSISTANT_WRITE_BILLING_METHODS,
 } from "../src/billing-methods.js";
+import TYPES_SOURCE from "../src/types.d.ts?raw";
+
+const HOME_ASSISTANT_SURFACE: Record<string, BillingSurfaceClass> = {
+  ...Object.fromEntries(Object.keys(HOME_ASSISTANT_BILLING_METHODS).map(method => [method, "R"])),
+  ...Object.fromEntries(Object.keys(HOME_ASSISTANT_WRITE_BILLING_METHODS)
+    .map(method => [method, "A"])),
+  ...Object.fromEntries(HOME_ASSISTANT_LOCAL_READ_METHODS.map(method => [method, {
+    kind: "C",
+    reason: "Constructs a scoped capability without reading provider or cache business data.",
+  }])),
+};
+
+testPublicBillingSurface(
+  "Home Assistant",
+  TYPES_SOURCE,
+  ["HomeAssistantSession", "Area", "Label", "Device", "Entity", "Dashboard"],
+  HOME_ASSISTANT_SURFACE,
+  {...HOME_ASSISTANT_BILLING_METHODS, ...HOME_ASSISTANT_WRITE_BILLING_METHODS},
+);
 
 const EXPECTED_METHOD_KEYS = [
   "homeassistant.instance.get-config",

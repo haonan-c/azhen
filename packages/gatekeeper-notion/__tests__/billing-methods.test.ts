@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   testGatekeeperBillingContract,
@@ -11,7 +12,7 @@ import {
 
 testPublicBillingSurface(
   "Notion",
-  new URL("../src/types.d.ts", import.meta.url),
+  readFileSync(new URL("../src/types.d.ts", import.meta.url), "utf8"),
   ["NotionWorkspace", "NotionPage", "NotionDatabase"],
   {
     "NotionWorkspace.getMetadata": "R", "NotionWorkspace.search": "R",
@@ -26,6 +27,9 @@ testPublicBillingSurface(
     "NotionPage.addComment": "A", "NotionDatabase.getMetadata": "R",
     "NotionDatabase.getSchema": "R", "NotionDatabase.query": "R",
     "NotionDatabase.getPage": "R", "NotionDatabase.createPage": "A",
+    "Cursor.next": {
+      kind: "K", reason: "Continues the original Notion read without creating a second Attempt.",
+    },
   },
   { ...NOTION_BILLING_METHODS, ...NOTION_WRITE_BILLING_METHODS },
 );

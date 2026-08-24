@@ -673,7 +673,7 @@ export class ZoomInfoGatekeeperImpl extends DurableObject<Env, ZoomInfoGatekeepe
 
   async applyAction(
     action: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(

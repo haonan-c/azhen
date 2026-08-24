@@ -66,6 +66,7 @@ const PRICED_GIT_MANAGEMENT_METHODS = [
   "ContextApi.revokeContextCollectionGitToken",
 ] as const;
 const PRICED_METHODS = [
+  CONTEXT_BILLING_METHODS["ContextGatekeeper.getAgentCatalog"].methodKey,
   CONTEXT_BILLING_METHODS["LibraryReadSession.list"].methodKey,
   CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey,
   CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
@@ -487,6 +488,63 @@ afterEach(() => {
 });
 
 describe("production Context billing runtime", () => {
+  it("meters catalog storage reads after durable start and before authorization", async () => {
+    const user = await newUser();
+    const sharingDomain = `catalog-domain-${crypto.randomUUID()}`;
+    const accountId = `catalog-account-${crypto.randomUUID()}`;
+    await addCollection({
+      sharingDomain,
+      accountId,
+      collectionId: "catalog",
+      title: "Catalog fixture",
+      documents: [],
+    });
+
+    const traced = await runSession({
+      user,
+      sharingDomain,
+      accountId,
+      run: async ({gatekeeper, authorizer}) => {
+        using authorizerStub = new RpcStub(authorizer);
+        return await gatekeeper.getAgentCatalog({limit: 10}, authorizerStub);
+      },
+    });
+
+    expect(traced.result.entries).toEqual([
+      expect.objectContaining({id: "catalog", title: "Catalog fixture"}),
+    ]);
+    expect(traced.trace.events.map(event => event.split(":")[0])).toEqual([
+      "begin", "began", "operation-id", "mark-started", "started", "complete", "completed",
+      "authorize",
+    ]);
+    expect(traced.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
+    expect(traced.snapshot.gatekeeperMeteringAttempts[0]?.attribution.billingMethodKey)
+      .toBe(CONTEXT_BILLING_METHODS["ContextGatekeeper.getAgentCatalog"].methodKey);
+    expect(traced.snapshot.gatekeeperUsageRecords).toHaveLength(1);
+
+    const rejectedUser = await newUser();
+    const balance = await rejectedUser.getUsageCreditBalance();
+    await rejectedUser.adminDeductUsageCredits(
+      `empty-catalog-balance-${crypto.randomUUID()}`,
+      balance.availableSubunits,
+      "Empty balance before catalog storage reads",
+      "test-admin",
+    );
+    const rejected = await runSession({
+      user: rejectedUser,
+      sharingDomain,
+      accountId,
+      run: async ({gatekeeper, authorizer}) => {
+        using authorizerStub = new RpcStub(authorizer);
+        return await rejectionMessage(() =>
+          gatekeeper.getAgentCatalog({limit: 10}, authorizerStub));
+      },
+    });
+    expect(rejected.result).toContain("Insufficient Usage Credit");
+    expect(rejected.trace.events.map(event => event.split(":")[0])).toEqual(["begin"]);
+    expect(rejected.snapshot.gatekeeperMeteringAttempts).toEqual([]);
+  });
+
   it("keeps the shipping read-only Gatekeeper outside the Action billing lifecycle", async () => {
     const user = await newUser();
     await env.TEST_ARTIFACTS_TRACE.reset();
@@ -498,7 +556,10 @@ describe("production Context billing runtime", () => {
       run: async ({gatekeeper}) => ({
         autoApprovable: await gatekeeper.getAutoApprovableActions(),
         actionErrors: await Promise.all([
-          rejectionMessage(async () => gatekeeper.applyAction(72)),
+          rejectionMessage(async () => gatekeeper.applyAction(72, {
+            billingOperationId: "read-only-action",
+            mode: "execute",
+          })),
           rejectionMessage(async () => gatekeeper.rejectAction(72)),
           rejectionMessage(async () => gatekeeper.revertAction(72)),
         ]),
@@ -1675,7 +1736,7 @@ describe("production Context billing runtime", () => {
     expect(missing.trace.events.filter(event => event.startsWith("begin:"))).toHaveLength(1);
   });
 
-  it("meters Slash Command invoke once without billing its delegated read", async () => {
+  it("meters Slash Command catalog and invoke without billing the delegated read", async () => {
     const consoleCalls = captureConsoleCalls();
     const user = await newUser();
     const sharingDomain = `skill-domain-${crypto.randomUUID()}`;
@@ -1703,9 +1764,9 @@ describe("production Context billing runtime", () => {
       accountId,
       run: async ({ gatekeeper, authorizer }) => {
         using provider = await gatekeeper.getSlashCommandProvider();
-        const command = (await provider.list())[0];
-        if (!command) throw new Error("Expected one Context Slash Command.");
         using authorizerStub = new RpcStub(authorizer);
+        const command = (await provider.list(authorizerStub))[0];
+        if (!command) throw new Error("Expected one Context Slash Command.");
         return {
           commandId: command.id,
           slashResult: await provider.invoke(command.id, sentinels.query, authorizerStub),
@@ -1718,12 +1779,21 @@ describe("production Context billing runtime", () => {
     expect(invocation.result.slashResult.message).toContain(sentinels.query);
     expect(invocation.result.slashResult.message).toContain(sentinels.content);
 
-    const [attempt] = invocation.snapshot.gatekeeperMeteringAttempts;
-    expect(invocation.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
-    if (!attempt) throw new Error("Expected one Slash Command Metering Attempt.");
-    expect(attempt.attribution.billingMethodKey)
-      .toBe(CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey);
-    expect(attempt.chargeSnapshot).toMatchObject({
+    const attempts = invocation.snapshot.gatekeeperMeteringAttempts;
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map(attempt => attempt.attribution.billingMethodKey).toSorted()).toEqual([
+      CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
+      CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.list"].methodKey,
+    ].toSorted());
+    const listAttempt = attempts.find(attempt => attempt.attribution.billingMethodKey ===
+      CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.list"].methodKey);
+    const invokeAttempt = attempts.find(attempt => attempt.attribution.billingMethodKey ===
+      CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey);
+    expect(listAttempt?.chargeSnapshot).toMatchObject({
+      pricing: "unpriced",
+      chargeSubunits: 0n,
+    });
+    expect(invokeAttempt?.chargeSnapshot).toMatchObject({
       pricing: "priced",
       chargeSubunits: PRICED_CHARGE,
     });
@@ -1731,29 +1801,93 @@ describe("production Context billing runtime", () => {
       candidate.attribution.billingMethodKey ===
         CONTEXT_BILLING_METHODS["LibraryReadSession.read"].methodKey)).toBe(false);
 
-    const [usageRecord] = invocation.snapshot.gatekeeperUsageRecords;
-    expect(invocation.snapshot.gatekeeperUsageRecords).toHaveLength(1);
-    if (!usageRecord) throw new Error("Expected one Slash Command Usage Record.");
-    expect(usageRecord).toMatchObject({
-      operationId: attempt.operationId,
-      attribution: {
-        billingMethodKey:
-          CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.invoke"].methodKey,
-      },
-      chargeSnapshot: attempt.chargeSnapshot,
-      chargeSubunits: PRICED_CHARGE,
-      outcome: "settled",
-    });
+    const usageRecords = invocation.snapshot.gatekeeperUsageRecords;
+    expect(usageRecords).toHaveLength(2);
+    for (const attempt of attempts) {
+      expect(usageRecords).toContainEqual(expect.objectContaining({
+        operationId: attempt.operationId,
+        attribution: expect.objectContaining({
+          billingMethodKey: attempt.attribution.billingMethodKey,
+        }),
+        chargeSnapshot: attempt.chargeSnapshot,
+        chargeSubunits: attempt.chargeSnapshot.chargeSubunits,
+        outcome: "settled",
+      }));
+    }
     const usageCharges = invocation.snapshot.ledgerEntries.filter(entry =>
       entry.kind === "usage-charge");
-    expect(usageCharges).toEqual([expect.objectContaining({
-      operationId: attempt.operationId,
-      deltaSubunits: -PRICED_CHARGE,
-    })]);
-    expect(attempt.usageRecordId).toBe(usageRecord.id);
-    expect(usageRecord.ledgerEntryId).toBe(usageCharges[0]?.id);
+    expect(usageCharges).toHaveLength(1);
+    for (const attempt of attempts) {
+      const usageRecord = usageRecords.find(record => record.operationId === attempt.operationId);
+      const usageCharge = usageCharges.find(entry => entry.operationId === attempt.operationId);
+      expect(attempt.usageRecordId).toBe(usageRecord?.id);
+      if (attempt === invokeAttempt) {
+        expect(usageCharge?.deltaSubunits).toBe(-PRICED_CHARGE);
+        expect(usageRecord?.ledgerEntryId).toBe(usageCharge?.id);
+      } else {
+        expect(usageCharge).toBeUndefined();
+        expect(usageRecord?.ledgerEntryId).toBeNull();
+      }
+    }
+    expect(invocation.snapshot.unpricedUsageDecisions).toHaveLength(1);
 
     expectUsagePrivacy(invocation.snapshot, sentinels, consoleCalls);
+  });
+
+  it("settles slash catalog use before withholding its private metadata", async () => {
+    const user = await newUser();
+    const sharingDomain = `withheld-skill-domain-${crypto.randomUUID()}`;
+    const accountId = `withheld-skill-account-${crypto.randomUUID()}`;
+    const observer = `withheld-skill-observer-${crypto.randomUUID()}`;
+    await addCollection({
+      sharingDomain,
+      accountId,
+      collectionId: "private-skills",
+      title: "Private skills",
+      documents: [{
+        path: "draft/SKILL.md",
+        description: "Private skill",
+        body: "---\nname: private-helper\ndescription: Private helper\n---\nprivate",
+      }],
+    });
+
+    const withheld = await runSession({
+      user,
+      sharingDomain,
+      accountId,
+      withholdObservation: true,
+      run: async ({ gatekeeper, createObserverVerifier, authorizer }) => {
+        await gatekeeper.addObserver(observer, createObserverVerifier());
+        using provider = await gatekeeper.getSlashCommandProvider();
+        using authorizerStub = new RpcStub(authorizer);
+        return rejectionMessage(() => provider.list(authorizerStub));
+      },
+    });
+
+    expect(withheld.result).toBe("Observation withheld by the host.");
+    expect(withheld.trace.events.map(event => event.split(":")[0])).toEqual([
+      "begin", "began", "operation-id", "mark-started", "started", "complete", "completed",
+      "authorize",
+    ]);
+    const [attempt] = withheld.snapshot.gatekeeperMeteringAttempts;
+    expect(withheld.snapshot.gatekeeperMeteringAttempts).toHaveLength(1);
+    expect(attempt).toMatchObject({
+      state: "settled",
+      attribution: {
+        billingMethodKey: CONTEXT_BILLING_METHODS["ContextSlashCommandProvider.list"].methodKey,
+      },
+      chargeSnapshot: {pricing: "unpriced", chargeSubunits: 0n},
+    });
+    expect(withheld.snapshot.gatekeeperUsageRecords).toContainEqual(expect.objectContaining({
+      operationId: attempt?.operationId,
+      outcome: "settled",
+      chargeSubunits: 0n,
+    }));
+    expect(withheld.trace.observations).toEqual([expect.objectContaining({
+      billingOperationId: attempt?.operationId,
+      excludeObservers: [observer],
+      title: "Context skill catalog",
+    })]);
   });
 
   it("settles before authorization withholding and rejects before business execution", async () => {

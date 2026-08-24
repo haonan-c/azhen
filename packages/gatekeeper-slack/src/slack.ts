@@ -1079,7 +1079,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
     this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
-  applyAction(): Promise<void> { return unreachableAction(); }
+  applyAction(): Promise<never> { return unreachableAction(); }
   rejectAction(): Promise<void> { return unreachableAction(); }
   revertAction(): Promise<void> { return unreachableAction(); }
 }
@@ -1151,7 +1151,7 @@ export class SlackConversationGatekeeperImpl
 
   async removeObserver(_id: string): Promise<void> {}
 
-  applyAction(): Promise<void> { return unreachableAction(); }
+  applyAction(): Promise<never> { return unreachableAction(); }
   rejectAction(): Promise<void> { return unreachableAction(); }
   revertAction(): Promise<void> { return unreachableAction(); }
 }
@@ -1227,7 +1227,7 @@ export class SlackThreadGatekeeperImpl extends DurableObject<Env, SlackThreadGat
 
   async removeObserver(_id: string): Promise<void> {}
 
-  applyAction(): Promise<void> { return unreachableAction(); }
+  applyAction(): Promise<never> { return unreachableAction(); }
   rejectAction(): Promise<void> { return unreachableAction(); }
   revertAction(): Promise<void> { return unreachableAction(); }
 }

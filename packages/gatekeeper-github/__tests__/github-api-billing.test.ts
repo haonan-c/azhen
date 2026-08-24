@@ -15,6 +15,15 @@ function activityTrace() {
 }
 
 describe("GitHub API billing activity", () => {
+  it("rejects a business adapter without a started operation before provider work", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(() => GitHubApi.forOperation(async () => "token", undefined as never))
+      .toThrow("GitHub business transport requires a started operation");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("removes provider response content from logged errors", () => {
     const safe = githubErrorForLogging(new GitHubApiError(
       500,
@@ -36,7 +45,7 @@ describe("GitHub API billing activity", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { trace, activity } = activityTrace();
 
-    await new GitHubApi(async () => "token").withActivity(activity).getRepo("owner", "repo");
+    await GitHubApi.forOperation(async () => "token", activity).getRepo("owner", "repo");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(trace).toEqual(["dispatch", "response:429", "dispatch", "response:200"]);
@@ -50,7 +59,7 @@ describe("GitHub API billing activity", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { activity } = activityTrace();
 
-    const call = new GitHubApi(async () => "token").withActivity(activity)
+    const call = GitHubApi.forOperation(async () => "token", activity)
       .createIssue("owner", "repo", { title: "fixture" });
     await expect(call).rejects.toMatchObject<Partial<GitHubApiError>>({
       status: 429,
@@ -68,7 +77,7 @@ describe("GitHub API billing activity", () => {
     })));
     const { trace, activity } = activityTrace();
 
-    await expect(new GitHubApi(async () => "token").withActivity(activity)
+    await expect(GitHubApi.forOperation(async () => "token", activity)
       .getRepo("owner", "repo")).rejects.toThrow();
     expect(trace).toEqual(["dispatch", "response:200"]);
   });

@@ -1220,6 +1220,7 @@ describe("DeepSeek Agent billing", () => {
     const assistance = new Promise<void>(resolve => { signalAssistance = resolve; });
     providerHandler = async (url, _method, _headers, request) => {
       if (url.origin === TITLE_PROVIDER_ORIGIN) return deepSeekSse();
+      if (url.origin === ACTION_PROVIDER_ORIGIN) return new Response(null, {status: 204});
       if (url.origin !== PROVIDER_ORIGIN) return null;
       const payload = JSON.parse(await request.text()) as {tools?: unknown};
       if (!Array.isArray(payload.tools) || payload.tools.length === 0) return deepSeekSse();

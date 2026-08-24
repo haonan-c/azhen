@@ -1,9 +1,31 @@
 import { describe, expect, it } from "vitest";
 import {
+  testPublicBillingSurface,
+  type BillingSurfaceClass,
+} from "../../backend-utils/test/gatekeeper-billing-contract";
+import {
   SPOTIFY_BILLING_METHODS,
   SPOTIFY_LOCAL_READ_METHODS,
   SPOTIFY_WRITE_BILLING_METHODS,
 } from "../src/billing-methods.js";
+import TYPES_SOURCE from "../src/types.d.ts?raw";
+
+const SPOTIFY_SURFACE: Record<string, BillingSurfaceClass> = {
+  ...Object.fromEntries(Object.keys(SPOTIFY_BILLING_METHODS).map(method => [method, "R"])),
+  ...Object.fromEntries(Object.keys(SPOTIFY_WRITE_BILLING_METHODS).map(method => [method, "A"])),
+  ...Object.fromEntries(SPOTIFY_LOCAL_READ_METHODS.map(method => [method, {
+    kind: "C",
+    reason: "Constructs a scoped capability without reading provider or cache business data.",
+  }])),
+};
+
+testPublicBillingSurface(
+  "Spotify",
+  TYPES_SOURCE,
+  ["SpotifyPlayer", "SpotifyPlaylist", "SpotifyAccountSession"],
+  SPOTIFY_SURFACE,
+  {...SPOTIFY_BILLING_METHODS, ...SPOTIFY_WRITE_BILLING_METHODS},
+);
 
 const EXPECTED_READ_KEYS = [
   "spotify.account.get-profile",

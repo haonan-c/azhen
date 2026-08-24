@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   testGatekeeperBillingContract,
@@ -11,7 +12,7 @@ import {
 
 testPublicBillingSurface(
   "Supabase",
-  new URL("../src/types.d.ts", import.meta.url),
+  readFileSync(new URL("../src/types.d.ts", import.meta.url), "utf8"),
   ["SupabaseOrganization", "SupabaseProject", "SupabaseDatabase"],
   {
     "SupabaseOrganization.getInfo": "R", "SupabaseOrganization.listProjects": "R",

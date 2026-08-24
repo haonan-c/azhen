@@ -11,3 +11,11 @@ export const SCHEDULER_BILLING_METHODS = {
   "ScheduleManagementApi.list": operation("scheduler.schedule.list.account.v1"),
   "ScheduledTaskHook.onSchedule": operation("scheduler.schedule.delivery.v1"),
 } as const;
+
+/** Catalog classification: Scheduler always returns no catalog and performs no business work. */
+export const SCHEDULER_CONTROL_METHODS = {
+  "SchedulerGatekeeper.getAgentCatalog": {
+    kind: "CONTROL_NO_METER",
+    reason: "Returns null without reading provider, schedule, or business cache data.",
+  },
+} as const;

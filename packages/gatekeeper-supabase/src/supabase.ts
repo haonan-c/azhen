@@ -1146,7 +1146,7 @@ export class SupabaseGatekeeperImpl extends DurableObject<Env, SupabaseGatekeepe
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(

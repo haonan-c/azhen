@@ -55,8 +55,8 @@ const UGC_ADS_ICON = {
     ",8,0,0,0,16,0V96h8a8,8,0,0,0,0-16Z'/></svg>"),
 };
 
-// Agent-facing API returned by describeBinding(). Keep in sync with the return types below.
-const UGC_ADS_TYPES = `
+/** Agent-facing API returned by describeBinding(). Keep in sync with the return types below. */
+export const UGC_ADS_TYPES = `
 /**
  * Content-creation Agent Skills, plus small WeChat Official Account (微信公众号) and Xiaohongshu
  * (小红书) content-search capabilities and image rendering. Skills are invoked as slash commands;
@@ -405,7 +405,7 @@ export class UgcAdsGatekeeper
   async removeObserver(_id: string): Promise<void> {}
 
   /** Reject an action; this read-only gatekeeper has no actions. */
-  applyAction(_action: number): Promise<void> {
+  applyAction(_action: number): Promise<never> {
     throw new Error("UGC Ads is read-only and implements no actions.");
   }
   /** Reject an action; this read-only gatekeeper has no actions. */
@@ -425,7 +425,8 @@ export class UgcAdsGatekeeper
 // scripts/build-skills.mjs.
 
 export class UgcAdsSlashCommandProvider extends NativeRpcTarget implements SlashCommandProvider {
-  async list(): Promise<SlashCommandDescriptor[]> {
+  async list(
+      _authorizer: NativeRpcStub<ObservationAuthorizer>): Promise<SlashCommandDescriptor[]> {
     return UGC_ADS_SKILLS.map(skill => ({
       id: skill.name,
       name: skill.name,

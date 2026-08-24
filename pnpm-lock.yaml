@@ -68,6 +68,9 @@ importers:
         specifier: workspace:*
         version: link:../workshop-shared
     devDependencies:
+      '@babel/parser':
+        specifier: 7.29.7
+        version: 7.29.7
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
         version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)

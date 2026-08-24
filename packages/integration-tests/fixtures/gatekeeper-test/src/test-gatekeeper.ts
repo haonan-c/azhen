@@ -256,7 +256,7 @@ class TestSessionImpl extends RpcTarget implements TestSession {
   }
 
   async requestAction(label: string): Promise<void> {
-    await this.#requestAction(label);
+    await this.#requestAction(label, ACTION_METHOD_KEY);
   }
 
   async requestBillableAction(
@@ -274,7 +274,7 @@ class TestSessionImpl extends RpcTarget implements TestSession {
 
   async #requestAction(
       label: string,
-      methodKey?: string,
+      methodKey: string,
       providerIdempotency?: "supported",
       autoApprovable = false,
   ): Promise<void> {
@@ -288,11 +288,11 @@ class TestSessionImpl extends RpcTarget implements TestSession {
     }
     await this.approvalQueue.submitAction(action, {
       title: `Test action ${label}`,
-      ...(methodKey === undefined ? {} : {billing: {
-          methodKey,
-          externalAccountId: this.accountLabel,
-          providerIdempotency: providerIdempotency ?? "unsupported",
-        }}),
+      billing: {
+        methodKey,
+        externalAccountId: this.accountLabel,
+        providerIdempotency: providerIdempotency ?? "unsupported",
+      },
       ...(autoApprovable
         ? {actionKind: {tag: "test-write", label: "Test writes"}, autoApprovable: true}
         : {}),
@@ -362,12 +362,11 @@ export class TestGatekeeper
   }
 
   async applyAction(
-      action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+      action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     const label = this.ctx.storage.kv.get<string>(`action:${action}`);
     if (!label) throw new Error("No such test action.");
     if (!execution) {
-      await control(this.ctx.exports).recordAppliedAction(label);
-      return {outcome: "accepted"};
+      throw new Error("Test Actions require a billing execution context.");
     }
     const key = `execution:${execution.billingOperationId}`;
     let record = this.ctx.storage.kv.get<TestActionExecutionRecord>(key);

@@ -413,14 +413,26 @@ export class GitHubApi {
   #getToken: () => Promise<string>;
   #activity?: GitHubApiActivity;
 
-  constructor(getToken: () => Promise<string>, activity?: GitHubApiActivity) {
+  private constructor(getToken: () => Promise<string>, activity?: GitHubApiActivity) {
     this.#getToken = getToken;
     this.#activity = activity;
   }
 
+  /** Create an API client for explicit OAuth, configurator, verifier, or compensation work. */
+  static forControl(getToken: () => Promise<string>): GitHubApi {
+    return new GitHubApi(getToken);
+  }
+
+  /** Create a business API client that cannot dispatch without a started operation activity. */
+  static forOperation(
+      getToken: () => Promise<string>, activity: GitHubApiActivity): GitHubApi {
+    if (!activity) throw new TypeError("GitHub business transport requires a started operation.");
+    return new GitHubApi(getToken, activity);
+  }
+
   /** Return an API client that reports all attempts to one caller-owned billing operation. */
   withActivity(activity: GitHubApiActivity): GitHubApi {
-    return new GitHubApi(this.#getToken, activity);
+    return GitHubApi.forOperation(this.#getToken, activity);
   }
 
   async #request<T>(

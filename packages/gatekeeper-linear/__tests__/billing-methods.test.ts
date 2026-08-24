@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   testGatekeeperBillingContract,
@@ -11,7 +12,7 @@ import {
 
 testPublicBillingSurface(
   "Linear",
-  new URL("../src/types.d.ts", import.meta.url),
+  readFileSync(new URL("../src/types.d.ts", import.meta.url), "utf8"),
   ["LinearWorkspace", "LinearTeam", "LinearIssue"],
   {
     "LinearWorkspace.getMetadata": "R", "LinearWorkspace.listTeams": "R",
@@ -41,6 +42,9 @@ testPublicBillingSurface(
     "LinearIssue.setParent": "A", "LinearIssue.readComments": "R",
     "LinearIssue.postComment": "A", "LinearIssue.createSubIssue": "A",
     "LinearIssue.archive": "A", "LinearIssue.unarchive": "A",
+    "Cursor.next": {
+      kind: "K", reason: "Continues the original Linear read without creating a second Attempt.",
+    },
   },
   { ...LINEAR_BILLING_METHODS, ...LINEAR_WRITE_BILLING_METHODS },
 );

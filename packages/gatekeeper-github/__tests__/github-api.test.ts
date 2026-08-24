@@ -91,7 +91,7 @@ describe("GitHubApi.searchIssuesConditional", () => {
       });
     }));
 
-    const api = new GitHubApi(async () => "test-token");
+    const api = GitHubApi.forControl(async () => "test-token");
     await api.searchIssuesConditional(
       "repo:cloudflare/quiche OR repo:cloudflare/workerd is:issue",
       1,

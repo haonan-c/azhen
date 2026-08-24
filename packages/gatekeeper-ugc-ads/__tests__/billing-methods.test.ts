@@ -1,6 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { testGatekeeperBillingContract } from "../../backend-utils/test/gatekeeper-billing-contract";
-import { UGC_ADS_BILLING_METHODS } from "../src/billing-methods";
+import {
+  testGatekeeperBillingContract,
+  testPublicBillingSurface,
+} from "../../backend-utils/test/gatekeeper-billing-contract";
+import { UGC_ADS_BILLING_METHODS, UGC_ADS_CONTROL_METHODS } from "../src/billing-methods";
+import { UGC_ADS_TYPES } from "../src/ugc-ads";
+
+const UGC_ADS_PUBLIC_BILLING_METHODS = Object.fromEntries(
+  Object.entries(UGC_ADS_BILLING_METHODS)
+    .filter(([method]) => method.startsWith("UgcAdsSession."))
+    .map(([method, billing]) => [method.replace("UgcAdsSession.", "UgcAds."), billing]),
+);
+
+testPublicBillingSurface(
+  "UGC Ads",
+  UGC_ADS_TYPES,
+  ["UgcAds"],
+  Object.fromEntries(Object.keys(UGC_ADS_PUBLIC_BILLING_METHODS)
+    .map(method => [method, "R"])),
+  UGC_ADS_PUBLIC_BILLING_METHODS,
+);
 
 testGatekeeperBillingContract(
   "UGC Ads",
@@ -8,6 +27,23 @@ testGatekeeperBillingContract(
 );
 
 describe("UGC Ads billing methods", () => {
+  it("classifies the bundled catalog as a local control operation", () => {
+    expect(UGC_ADS_CONTROL_METHODS).toEqual({
+      "UgcAdsGatekeeper.getAgentCatalog": {
+        kind: "CONTROL_NO_METER",
+        reason: "Returns only build-time bundled skill metadata and performs no provider or business storage read.",
+      },
+      "UgcAdsGatekeeper.getSlashCommandProvider": {
+        kind: "CONTROL_NO_METER",
+        reason: "Constructs the slash-command capability without reading provider or business data.",
+      },
+      "UgcAdsSlashCommandProvider.list": {
+        kind: "CONTROL_NO_METER",
+        reason: "Returns only build-time bundled skill metadata without provider or business storage reads.",
+      },
+    });
+  });
+
   it("assigns a unique stable key to every public Session business operation", () => {
     expect(Object.keys(UGC_ADS_BILLING_METHODS).toSorted()).toEqual([
       "UgcAdsSession.getXiaohongshuCreatorProfile",

@@ -580,7 +580,7 @@ function applyConfluenceAction(
   store: ConfluenceStore,
   storage: DurableObjectStorage,
   action: number,
-  execution?: ActionExecution,
+  execution: ActionExecution,
 ): Promise<ActionExecutionResult> {
   if (!execution) throw new Error("This Confluence Action predates billing and cannot be applied.");
   const existing = active.get(execution.billingOperationId);
@@ -640,7 +640,7 @@ export class ConfluenceSiteGatekeeperImpl extends DurableObject<Env, SiteGatekee
   async removeObserver(id: string): Promise<void> { this.#tracker().removeObserver(id); }
 
   #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
-  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+  async applyAction(action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     return applyConfluenceAction(
       this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
     );
@@ -695,7 +695,7 @@ export class ConfluenceSpaceGatekeeperImpl extends DurableObject<Env, SpaceGatek
   async removeObserver(id: string): Promise<void> { this.#tracker().removeObserver(id); }
 
   #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
-  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+  async applyAction(action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     return applyConfluenceAction(
       this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
     );
@@ -751,7 +751,7 @@ export class ConfluenceContentGatekeeperImpl extends DurableObject<Env, ContentG
   async removeObserver(id: string): Promise<void> { this.#tracker().removeObserver(id); }
 
   #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
-  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+  async applyAction(action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     return applyConfluenceAction(
       this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
     );

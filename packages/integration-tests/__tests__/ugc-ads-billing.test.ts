@@ -893,7 +893,12 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
     try {
       const before = await context.user.getUsageCreditBalance();
       const resultPromise = context.session.searchXiaohongshuNotes(XHS_KEYWORD, {limit: 2});
-      await firstXhsRequestStarted;
+      await Promise.race([
+        firstXhsRequestStarted,
+        resultPromise.then(() => {
+          throw new Error("Xiaohongshu search completed before its first provider request.");
+        }),
+      ]);
       expect(await context.user.getUsageCreditBalance()).toEqual({
         reservedSubunits: XHS_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - XHS_CHARGE_SUBUNITS,

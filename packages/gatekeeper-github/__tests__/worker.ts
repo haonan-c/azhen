@@ -107,6 +107,15 @@ export class UserAccount extends DurableObject {
 export class GitHubBillingTestParent extends DurableObject {
   #exports(): TestExports { return this.ctx.exports as unknown as TestExports; }
 
+  async describeResource(name: string, resourceKind: "repo" | "issue" | "pull") {
+    const opened = await this.#session(name, resourceKind);
+    using _session = opened.session;
+    return {
+      description: await opened.gatekeeper.describe(),
+      trace: opened.queue.trace,
+    };
+  }
+
   async metadata(name: string) {
     const { queue, session } = await this.#session(name, "repo");
     using _session = session;

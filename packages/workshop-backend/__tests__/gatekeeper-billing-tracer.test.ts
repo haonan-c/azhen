@@ -13,11 +13,12 @@ import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { USAGE_CREDIT_SUBUNITS_PER_CREDIT } from "@gadgets/workshop-shared/api";
+import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import type {
-  BillableOperation, ObservationDescription,
+  ActionDescription, BillableOperation, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { AdminSettings } from "../src/admin-settings.js";
-import type { OverseerDurableObject } from "../src/overseer.js";
+import type { ActionRecord, OverseerDurableObject } from "../src/overseer.js";
 import { UserDurableObject } from "../src/user.js";
 import type { UsageAttribution } from "../src/usage-attribution.js";
 
@@ -41,7 +42,8 @@ type OverseerBillingImpl = {
     gatekeepers: { put(record: unknown): void; delete(id: number): void };
     nextActionId: { get(): number };
     actions: {
-      get(id: number): { type: string; description: ObservationDescription } | undefined;
+      get(id: number): ActionRecord | undefined;
+      put(record: ActionRecord): void;
     };
   };
   beginBillableOperation(
@@ -64,6 +66,18 @@ type OverseerBillingImpl = {
     description: ObservationDescription,
     caller: { from: "agent"; chatId: number; attribution: UsageAttribution },
   ): Promise<void>;
+  submitAction(
+    gatekeeperId: number,
+    action: number,
+    description: ActionDescription,
+    caller: { from: "agent"; chatId: number; attribution: UsageAttribution },
+  ): Promise<void>;
+  applyPendingAction(
+    record: ActionRecord & {type: "action"},
+    resolvedBy: AiChatAuthorInfo,
+    autoApproved: boolean,
+  ): Promise<void>;
+  continueApplyingAction(actionId: number, recovering: boolean): Promise<void>;
 };
 
 async function newUser(): Promise<{ id: string; stub: DurableObjectStub<UserDurableObject> }> {
@@ -509,6 +523,127 @@ describe("Gatekeeper billing tracer: priced two-stage lifecycle", () => {
         billingMethodKey: PRICED_METHOD_KEY,
         chargeSubunits: CHARGE,
       })).rejects.toThrow("Usage Principal does not match this Usage Account.");
+    });
+  });
+});
+
+describe("Gatekeeper billing contract enforcement", () => {
+  it("rejects an external Action that omits its billing facts", async () => {
+    const user = await newUser();
+    const stub = env.TEST_OVERSEER.getByName(`tracer-action-bypass-${crypto.randomUUID()}`);
+
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      const impl = (instance as unknown as { impl: OverseerBillingImpl }).impl;
+      const workspaceId = (instance as unknown as { ctx: { id: { toString(): string } } })
+        .ctx.id.toString();
+      impl.storage.gatekeepers.put({
+        id: 1,
+        class: { type: "vendor", vendorId: VENDOR_ID, accountId: EXTERNAL_ACCOUNT_ID },
+        creationSpec: {
+          type: "gatekeeper",
+          vendorId: VENDOR_ID,
+          resourceUrl: "https://context.local/",
+          typeUrlPattern: "https://context.local/*",
+        },
+      });
+      const caller = {
+        from: "agent" as const,
+        chatId: 1,
+        attribution: {
+          principal: { version: 1 as const, kind: "user" as const, userId: user.id },
+          source: "agent" as const,
+          workspaceId,
+          chatId: 1,
+        },
+      };
+      const missingBilling = {
+        title: "Bypass billing",
+        description: "Attempt one external side effect without a billing method.",
+      } as ActionDescription;
+
+      await expect(impl.submitAction(1, 1, missingBilling, caller))
+        .rejects.toThrow("Action billing description is required");
+      expect(impl.storage.nextActionId.get()).toBe(0);
+    });
+  });
+
+  it("keeps a pre-migration unbilled Action pending when approval is attempted", async () => {
+    const user = await newUser();
+    const stub = env.TEST_OVERSEER.getByName(`tracer-legacy-action-${crypto.randomUUID()}`);
+
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      const impl = (instance as unknown as { impl: OverseerBillingImpl }).impl;
+      const workspaceId = (instance as unknown as { ctx: { id: { toString(): string } } })
+        .ctx.id.toString();
+      const legacy = {
+        id: 7,
+        gatekeeperId: 1,
+        caller: {
+          from: "agent" as const,
+          chatId: 1,
+          attribution: {
+            principal: {version: 1 as const, kind: "user" as const, userId: user.id},
+            source: "agent" as const,
+            workspaceId,
+            chatId: 1,
+          },
+        },
+        createdAt: new Date(),
+        state: "pending" as const,
+        type: "action" as const,
+        action: 11,
+        description: {
+          title: "Legacy Action",
+          description: "An Action persisted before billing became mandatory.",
+        },
+      } as unknown as ActionRecord & {type: "action"};
+      impl.storage.actions.put(legacy);
+
+      await expect(impl.applyPendingAction(
+        legacy,
+        {type: "user", id: user.id, name: "Billing tracer"},
+        false,
+      )).rejects.toThrow("Action billing context is required before approval");
+      expect(impl.storage.actions.get(legacy.id)?.state).toBe("pending");
+    });
+  });
+
+  it("terminates a pre-migration unbilled Action already claimed before upgrade", async () => {
+    const user = await newUser();
+    const stub = env.TEST_OVERSEER.getByName(`tracer-claimed-legacy-${crypto.randomUUID()}`);
+
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      const impl = (instance as unknown as { impl: OverseerBillingImpl }).impl;
+      const workspaceId = (instance as unknown as { ctx: { id: { toString(): string } } })
+        .ctx.id.toString();
+      const legacy = {
+        id: 8,
+        gatekeeperId: 1,
+        caller: {
+          from: "agent" as const,
+          chatId: 1,
+          attribution: {
+            principal: {version: 1 as const, kind: "user" as const, userId: user.id},
+            source: "agent" as const,
+            workspaceId,
+            chatId: 1,
+          },
+        },
+        createdAt: new Date(),
+        state: "applying" as const,
+        type: "action" as const,
+        action: 12,
+        executionStage: "claimed",
+        description: {
+          title: "Claimed Legacy Action",
+          description: "An Action claimed before the billing migration completed.",
+        },
+      } as unknown as ActionRecord & {type: "action"};
+      impl.storage.actions.put(legacy);
+
+      await expect(impl.continueApplyingAction(legacy.id, true))
+        .rejects.toThrow("Action billing description is required");
+      expect(impl.storage.actions.get(legacy.id)?.state).toBe("unknown");
     });
   });
 });

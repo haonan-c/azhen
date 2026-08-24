@@ -1,5 +1,17 @@
 import { createLogger } from "../src/logger.js";
 import { createObservabilityContext } from "../src/observability-context.js";
+import type { ActionDescription, Gatekeeper } from "@gadgets/workshop-shared/gatekeeper";
+
+declare const gatekeeper: Gatekeeper<unknown>;
+// @ts-expect-error an Action cannot execute without the host-minted billing context
+gatekeeper.applyAction(1);
+// @ts-expect-error an Action cannot enter approval without stable billing facts
+const unbilledAction: ActionDescription = {
+  title: "Unbilled Action",
+  description: "This malformed fixture must fail the shared contract build.",
+  implementsRevert: false,
+};
+void unbilledAction;
 
 const obsContext = createObservabilityContext<{
   chatId: number;

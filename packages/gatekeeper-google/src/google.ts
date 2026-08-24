@@ -1981,7 +1981,7 @@ export class GmailGatekeeperImpl extends DurableObject<Env, GmailGatekeeperImplP
   /** --------------------------------------------------------------------------- */
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(
@@ -2349,7 +2349,7 @@ export class GoogleDocGatekeeperImpl
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(
@@ -2771,7 +2771,7 @@ export class GoogleSheetsGatekeeperImpl
   }
 
   /** Read-only — no side-effecting actions. */
-  async applyAction(_action: number): Promise<void> {
+  async applyAction(_action: number): Promise<never> {
     throw new Error("Google Sheets is read-only and implements no actions.");
   }
   async rejectAction(_action: number): Promise<void> {
@@ -3119,7 +3119,7 @@ export class GoogleCalendarGatekeeperImpl
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
+    execution: ActionExecution,
   ): Promise<ActionExecutionResult> {
     if (!execution) {
       throw new Error(
@@ -3596,7 +3596,9 @@ export class BigQueryGatekeeperImpl
   }
 
   /** Read-only — no side-effecting actions. */
-  async applyAction(_action: number): Promise<void> {}
+  async applyAction(_action: number): Promise<never> {
+    throw new Error("BigQuery is read-only and implements no actions.");
+  }
   async rejectAction(_action: number): Promise<void> {}
   revertAction(_action: number): Promise<void> {
     throw new Error("BigQuery gatekeeper has no writable actions to revert");

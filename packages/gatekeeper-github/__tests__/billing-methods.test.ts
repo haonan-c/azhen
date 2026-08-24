@@ -1,10 +1,32 @@
 import { describe, expect, it } from "vitest";
 import {
+  testPublicBillingSurface,
+  type BillingSurfaceClass,
+} from "../../backend-utils/test/gatekeeper-billing-contract";
+import {
   GITHUB_BILLING_METHODS,
   GITHUB_READ_BILLING_METHODS,
   GITHUB_WRITE_BILLING_METHODS,
   githubActionBilling,
 } from "../src/billing-methods.js";
+import TYPES_SOURCE from "../src/types.d.ts?raw";
+
+const GITHUB_SURFACE: Record<string, BillingSurfaceClass> = {
+  ...Object.fromEntries(Object.keys(GITHUB_READ_BILLING_METHODS).map(method => [method, "R"])),
+  ...Object.fromEntries(Object.keys(GITHUB_WRITE_BILLING_METHODS).map(method => [method, "A"])),
+  "Cursor.next": {
+    kind: "K",
+    reason: "Continues the operation represented by the Cursor without creating a second Attempt.",
+  },
+};
+
+testPublicBillingSurface(
+  "GitHub",
+  TYPES_SOURCE,
+  ["GitHubRepo", "GitHubIssue", "GitHubPullRequest", "Cursor"],
+  GITHUB_SURFACE,
+  GITHUB_BILLING_METHODS,
+);
 
 const EXPECTED_READ_KEYS = [
   "github.repository.metadata.read.v1",

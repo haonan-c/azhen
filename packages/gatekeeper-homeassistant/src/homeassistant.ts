@@ -61,6 +61,7 @@ import {
   executeAction,
   fetchDashboardConfig,
   resolveTargets,
+  type HomeAssistantActionDescription,
 } from "./approvals";
 import {
   indexPendingByEntity,
@@ -1185,9 +1186,13 @@ export class HomeAssistantGatekeeperImpl
 
   async applyAction(
     actionId: number,
-    execution?: ActionExecution,
-  ): Promise<ActionExecutionResult | void> {
-    if (!execution) return await this.#applyLegacyAction(actionId);
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
+    if (!execution) {
+      throw new Error(
+        "This Home Assistant Action predates billing. Reject it and submit the operation again.",
+      );
+    }
 
     const active = this.#actionApplications.get(execution.billingOperationId);
     if (active) return await active;
@@ -1198,38 +1203,6 @@ export class HomeAssistantGatekeeperImpl
     });
     this.#actionApplications.set(execution.billingOperationId, work);
     return await work;
-  }
-
-  async #applyLegacyAction(actionId: number): Promise<void> {
-    // The overseer only knows the numeric action ID; the full action lives in DO storage.
-    const pending = this.#getPending(actionId);
-    if (!pending) {
-      throw new Error(`No queued Home Assistant action exists with id ${actionId}.`);
-    }
-    const action = pending.action;
-    const creds = await this.#getCreds();
-
-    let revertInfo: HomeAssistantRevertInfo;
-    try {
-      revertInfo = await this.#snapshotForRevert(action, creds);
-    } catch {
-      // If we can't snapshot, proceed without revert.
-      revertInfo = { type: "noRevert" };
-    }
-
-    try {
-      await executeAction(action, creds);
-    } catch (e) {
-      if (e instanceof HomeAssistantError && e.isAuthError) {
-        await this.#userAccount().noteCredentialsExpired();
-      }
-      throw e;
-    }
-
-    // Action succeeded: move the row from "pending" to "applied", storing the revert info so a
-    // later revertAction() can find it (the overseer passes back only the action ID).
-    this.#storeApplied(action, revertInfo);
-    this.#deletePending(actionId);
   }
 
   async #applyBillableAction(
@@ -1440,10 +1413,10 @@ export class HomeAssistantGatekeeperImpl
         const row: PendingActionRow = { id, action, submittedAt: Date.now() };
         self.ctx.storage.kv.put<PendingActionRow>(`pending:${id}`, row);
 
-        let description: ActionDescription;
+        let descriptionDraft: HomeAssistantActionDescription;
         try {
           const registry = await fetchRegistrySnapshot(creds);
-          description = describeAction(action, registry);
+          descriptionDraft = describeAction(action, registry);
         } catch {
           // If registry fetch fails, fall back to a minimal description.
           const emptyRegistry: RegistrySnapshot = {
@@ -1454,11 +1427,11 @@ export class HomeAssistantGatekeeperImpl
             entities: [],
             states: new Map(),
           };
-          description = describeAction(action, emptyRegistry);
+          descriptionDraft = describeAction(action, emptyRegistry);
         }
 
-        description = {
-          ...description,
+        const description: ActionDescription = {
+          ...descriptionDraft,
           billing: {
             methodKey: HOME_ASSISTANT_WRITE_BILLING_METHODS[method].methodKey,
             externalAccountId: ctx.externalAccountId,

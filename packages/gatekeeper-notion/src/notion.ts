@@ -697,7 +697,7 @@ function applyNotionAction(
   store: NotionStore,
   storage: DurableObjectStorage,
   action: number,
-  execution?: ActionExecution,
+  execution: ActionExecution,
 ): Promise<ActionExecutionResult> {
   if (!execution) throw new Error("This Notion Action predates billing and cannot be applied.");
   const existing = active.get(execution.billingOperationId);
@@ -870,7 +870,7 @@ export class NotionItemGatekeeperImpl extends DurableObject<Env, NotionItemGatek
   async removeObserver(_id: string): Promise<void> {}
 
   #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
-  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+  async applyAction(action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     return applyNotionAction(
       this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
     );
@@ -1035,7 +1035,7 @@ export class NotionWorkspaceGatekeeperImpl
   }
 
   #actionApplications = new Map<string, Promise<ActionExecutionResult>>();
-  async applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult> {
+  async applyAction(action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     return applyNotionAction(
       this.#actionApplications, this.#store(), this.ctx.storage, action, execution,
     );

@@ -4,6 +4,8 @@ function operation(methodKey: string) {
 
 /** Stable billing registry for Context Library caller-visible business operations. */
 export const CONTEXT_BILLING_METHODS = {
+  "ContextGatekeeper.getAgentCatalog": operation("context.catalog.list.v1"),
+  "ContextSlashCommandProvider.list": operation("context.skill.list.v1"),
   "LibraryReadSession.search": operation("context.library.search.v1"),
   "LibraryReadSession.list": operation("context.library.list.v1"),
   "LibraryReadSession.read": operation("context.library.read.v1"),
@@ -28,6 +30,22 @@ export const CONTEXT_BILLING_METHODS = {
   "ContextApi.moveContextDocument": operation("context.management.document.move.v1"),
   "ContextApi.listEnabledContextCollections":
     operation("context.management.collection.list-enabled.v1"),
+} as const;
+
+/** Context capability-construction methods that perform no caller-visible business work. */
+export const CONTEXT_CONTROL_METHODS = {
+  "ContextApi.getViewerInfo": {
+    kind: "CONTROL_NO_METER",
+    reason: "Returns host UI permissions without reading business collection data.",
+  },
+  "ContextApi.canWriteContextCollection": {
+    kind: "CONTROL_NO_METER",
+    reason: "Checks local edit authority without reading provider or document business data.",
+  },
+  "ContextGatekeeper.getSlashCommandProvider": {
+    kind: "CONTROL_NO_METER",
+    reason: "Constructs the slash-command capability without reading collection or skill data.",
+  },
 } as const;
 
 /** One method name from the Context billing registry. */

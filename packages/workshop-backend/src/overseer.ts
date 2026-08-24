@@ -3411,6 +3411,9 @@ class OverseerImpl implements AgentHooks {
       if (!fresh || fresh.type !== "action" || fresh.state !== "pending") {
         throw new Error(`Action is not pending: ${record.id}`);
       }
+      if (!fresh.description.billing || !fresh.description.billingOperationId) {
+        throw new Error("Action billing context is required before approval.");
+      }
       fresh.caller = normalizeGatekeeperCaller(fresh.caller);
       fresh.state = "applying";
       fresh.approvedAt = new Date();
@@ -3441,29 +3444,19 @@ class OverseerImpl implements AgentHooks {
 
   async #continueApplyingAction(actionId: number, recovering: boolean): Promise<void> {
     let action = this.#getApplyingAction(actionId);
-    let gatekeeper = this.getGatekeeperFacet(action.gatekeeperId);
 
     if (action.description.billing === undefined) {
-      let outcome: ActionExecutionOutcome;
-      try {
-        outcome = (await gatekeeper.applyAction(action.action))?.outcome ?? "accepted";
-      } catch (error) {
-        this.ctx.storage.transactionSync(() => {
-          let fresh = this.#getApplyingAction(actionId);
-          fresh.state = "pending";
-          delete fresh.approvedAt;
-          delete fresh.resolvedBy;
-          delete fresh.autoApproved;
-          delete fresh.executionStage;
-          this.storage.actions.put(fresh);
-        });
-        throw error;
-      }
-      this.#finishActionExecution(actionId, outcome);
-      await this.handleActionExecutionTerminal(actionId);
-      return;
+      this.ctx.storage.transactionSync(() => {
+        let fresh = this.#getApplyingAction(actionId);
+        fresh.executionOutcome = "unknown";
+        fresh.state = "unknown";
+        fresh.appliedAt = new Date();
+        this.storage.actions.put(fresh);
+      });
+      throw new Error("Action billing description is required.");
     }
 
+    let gatekeeper = this.getGatekeeperFacet(action.gatekeeperId);
     let billing = action.description.billing;
     let billingOperationId = action.description.billingOperationId;
     if (!billingOperationId) throw new Error("Billable Action has no operation ID.");
@@ -3521,7 +3514,7 @@ class OverseerImpl implements AgentHooks {
           : {}),
         mode: recoveredAfterStart ? "recover" : "execute",
       };
-      let result: ActionExecutionResult | void;
+      let result: ActionExecutionResult;
       try {
         result = await gatekeeper.applyAction(action.action, execution);
       } catch {
@@ -3530,9 +3523,6 @@ class OverseerImpl implements AgentHooks {
         } catch {
           result = {outcome: "unknown"};
         }
-      }
-      if (result === undefined) {
-        result = {outcome: "unknown"};
       }
       if (result.outcome !== "accepted" && result.outcome !== "failed-before-execution" &&
           result.outcome !== "unknown") {
@@ -4220,13 +4210,14 @@ class OverseerImpl implements AgentHooks {
     if (description.billingOperationId !== undefined) {
       throw new TypeError("A Gatekeeper cannot supply an Action billing operation ID.");
     }
-    if (description.billing !== undefined) {
-      let {methodKey, externalAccountId, providerIdempotency} = description.billing;
-      if (!isStableGatekeeperUsageDimension(methodKey) ||
-          !isStableGatekeeperUsageDimension(externalAccountId) ||
-          (providerIdempotency !== "supported" && providerIdempotency !== "unsupported")) {
-        throw new TypeError("Action billing description is invalid.");
-      }
+    if (description.billing === undefined) {
+      throw new TypeError("Action billing description is required.");
+    }
+    let {methodKey, externalAccountId, providerIdempotency} = description.billing;
+    if (!isStableGatekeeperUsageDimension(methodKey) ||
+        !isStableGatekeeperUsageDimension(externalAccountId) ||
+        (providerIdempotency !== "supported" && providerIdempotency !== "unsupported")) {
+      throw new TypeError("Action billing description is invalid.");
     }
 
     let submissionId = actionSubmissionId(gatekeeperId, action);
@@ -4270,10 +4261,10 @@ class OverseerImpl implements AgentHooks {
       state: "pending",
       type: "action",
       ...(systemAssistance ? {systemAssistanceId: systemAssistance.id} : {}),
-      ...(description.billing?.providerIdempotency === "supported"
+      ...(description.billing.providerIdempotency === "supported"
         ? {providerIdempotencyKey: `gatekeeper-provider:${crypto.randomUUID()}`}
         : {}),
-      description: description.billing === undefined ? description : {
+      description: {
         ...description,
         billingOperationId: `gatekeeper-action:${crypto.randomUUID()}`,
       },
@@ -6288,13 +6279,15 @@ class OverseerImpl implements AgentHooks {
     return result;
   }
 
-  async listSlashCommands(): Promise<SlashCommandChoice[]> {
+  async listSlashCommands(caller: GatekeeperCaller): Promise<SlashCommandChoice[]> {
     let sources = [...this.storage.gatekeepers.list()]
       .filter(record => record.hasSlashCommands)
       .map(record => ({
         gatekeeperId: record.id,
         providerLabel: record.resourceTitle || `Gatekeeper ${record.id}`,
         gatekeeper: this.getGatekeeperFacet(record.id),
+        authorizer: new NativeRpcStub<ObservationAuthorizer>(
+          new SlashCommandAuthorizerImpl(this, record.id, caller)),
       }));
     return [{
       selection: {builtin: true, commandId: "compact"},
@@ -9849,7 +9842,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async listSlashCommands(): Promise<SlashCommandChoice[]> {
     await this.slashCommandsReady;
-    return this.impl.listSlashCommands();
+    return this.impl.listSlashCommands({
+      from: "user",
+      attribution: this.impl.usageAttribution(this.clientUserId, "direct-user"),
+    });
   }
 
   async uploadChatAttachment(

@@ -14,6 +14,7 @@ type SlashCommandSource = {
   gatekeeperId: number;
   providerLabel: string;
   gatekeeper: Fetcher<Gatekeeper<any>>;
+  authorizer: RpcStub<ObservationAuthorizer>;
 };
 
 /** Collect the complete slash-command catalog from the attached Gatekeepers that advertise one. */
@@ -21,9 +22,10 @@ export async function collectSlashCommands(
     sources: SlashCommandSource[]): Promise<SlashCommandChoice[]> {
   let catalogs = await Promise.all(sources.map(async source => {
     try {
+      using authorizer = source.authorizer;
       using provider = await (source.gatekeeper as SlashCommandGatekeeper)
           .getSlashCommandProvider();
-      let commands = await provider.list();
+      let commands = await provider.list(authorizer);
       return commands.map(command => ({
         selection: {gatekeeperId: source.gatekeeperId, commandId: command.id},
         name: command.name,

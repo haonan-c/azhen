@@ -24,7 +24,7 @@ const githubViewerLogins = new WeakMap<object, Promise<string>>();
 function githubApi(target: object): GitHubApi {
   const getToken = githubTokenGetters.get(target);
   if (!getToken) throw new Error("GitHub configurator is not initialized.");
-  return new GitHubApi(getToken);
+  return GitHubApi.forControl(getToken);
 }
 
 function viewerLogin(target: object): Promise<string> {

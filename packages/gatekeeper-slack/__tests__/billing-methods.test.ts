@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   testGatekeeperBillingContract,
@@ -7,7 +8,7 @@ import { SLACK_BILLING_METHODS } from "../src/billing-methods";
 
 testPublicBillingSurface(
   "Slack",
-  new URL("../src/types.d.ts", import.meta.url),
+  readFileSync(new URL("../src/types.d.ts", import.meta.url), "utf8"),
   ["SlackWorkspaceSession", "SlackConversation", "SlackThread"],
   {
     "SlackWorkspaceSession.getInfo": "R", "SlackWorkspaceSession.listChannels": "R",

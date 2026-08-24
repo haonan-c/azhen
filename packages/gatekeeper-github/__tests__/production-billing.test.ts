@@ -59,6 +59,22 @@ function pullResponse() {
 }
 
 describe("production GitHub billing wiring", () => {
+  it.each([
+    { kind: "repo" as const, response: repoResponse(), title: "owner/repo" },
+    { kind: "issue" as const, response: issueResponse(), title: "Issue #1: Old title" },
+    { kind: "pull" as const, response: pullResponse(), title: "Pull Request #1: Pull" },
+  ])("loads a cold $kind description through explicit control transport", async scenario => {
+    const fetchMock = vi.fn(async () => Response.json(scenario.response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await harness().describeResource(`describe-${scenario.kind}`, scenario.kind);
+
+    expect(result.description.title).toBe(scenario.title);
+    expect(result.trace.events).toEqual([]);
+    expect(result.trace.observations).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("meters repository metadata before authorization", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json(repoResponse())));
 

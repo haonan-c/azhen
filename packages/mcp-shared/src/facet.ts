@@ -190,14 +190,14 @@ export abstract class McpFacetBase<
   /** Applies or recovers an approved action without retrying an outcome-unknown write. */
   async applyAction(
     action: number,
-    execution?: ActionExecution,
-  ): Promise<ActionExecutionResult | void> {
+    execution: ActionExecution,
+  ): Promise<ActionExecutionResult> {
     const call = (fn: (client: McpClient) => Promise<McpToolCallResult>) =>
       this.call(fn, { retryOnExpiry: false });
-    if (execution !== undefined) {
-      return this.#actions().applyBillable(action, execution, call, this.log);
+    if (!execution) {
+      throw new Error("This MCP Action predates billing. Reject it and call the tool again.");
     }
-    await this.#actions().apply(action, call, this.log);
+    return this.#actions().applyBillable(action, execution, call, this.log);
   }
 
   /** Rejects a pending action. */

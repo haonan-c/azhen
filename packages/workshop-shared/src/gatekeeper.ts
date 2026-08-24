@@ -821,12 +821,11 @@ export interface Gatekeeper<Session> extends DurableObject {
   /**
    * Apply or recover an approved Action and return only after its content-free outcome is durable.
    *
-   * A Billable Action receives `execution`. In `execute` mode the Gatekeeper must persist its claim
-   * before the first provider request. In `recover` mode it must inspect that claim without
-   * redispatching an indeterminate non-idempotent request; a provider-safe retry must reuse the
-   * supplied key. A legacy unmetered Action receives no execution context and may return void.
+   * In `execute` mode the Gatekeeper must persist its claim before the first provider request. In
+   * `recover` mode it must inspect that claim without redispatching an indeterminate non-idempotent
+   * request; a provider-safe retry must reuse the supplied key.
    */
-  applyAction(action: number, execution?: ActionExecution): Promise<ActionExecutionResult | void>;
+  applyAction(action: number, execution: ActionExecution): Promise<ActionExecutionResult>;
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any
@@ -1016,9 +1015,10 @@ export type SlashCommandDescriptor = {
 export interface SlashCommandProvider extends RpcTarget {
   /**
    * Complete catalog of commands offered by this provider. Providers should keep this reasonably
-   * small.
+   * small. The host authorizer supplies billing authority when catalog construction reads business
+   * data; providers whose catalog is only build-time control metadata may return it without billing.
    */
-  list(): Promise<SlashCommandDescriptor[]>;
+  list(authorizer: RpcStub<ObservationAuthorizer>): Promise<SlashCommandDescriptor[]>;
 
   /**
    * Runs the command identified by `id`, which must be an ID previously returned by list().
@@ -1258,10 +1258,9 @@ export type ActionDescription = {
   title: string;
 
   /**
-   * Pricing and safe-retry facts captured when the Action enters the approval queue. Absent for a
-   * legacy Action that has not migrated to Billable API Operation charging.
+   * Pricing and safe-retry facts captured when the Action enters the approval queue.
    */
-  billing?: ActionBilling;
+  billing: ActionBilling;
 
   /**
    * Workshop-minted operation ID that links the Action audit to its Billable API Operation. A

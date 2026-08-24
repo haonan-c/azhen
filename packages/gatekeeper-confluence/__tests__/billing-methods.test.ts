@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   testGatekeeperBillingContract,
@@ -11,7 +12,7 @@ import {
 
 testPublicBillingSurface(
   "Confluence",
-  new URL("../src/types.d.ts", import.meta.url),
+  readFileSync(new URL("../src/types.d.ts", import.meta.url), "utf8"),
   ["ConfluenceSite", "ConfluenceSpace", "ConfluenceContent"],
   {
     "ConfluenceSite.getMetadata": "R", "ConfluenceSite.listSpaces": "R",
@@ -29,6 +30,9 @@ testPublicBillingSurface(
     "ConfluenceContent.addComment": "A", "ConfluenceContent.listAttachments": "R",
     "ConfluenceContent.downloadAttachment": "R", "ConfluenceContent.uploadAttachment": "A",
     "ConfluenceContent.trash": "A", "ConfluenceContent.restore": "A",
+    "Cursor.next": {
+      kind: "K", reason: "Continues the original Confluence read without creating a second Attempt.",
+    },
   },
   { ...CONFLUENCE_BILLING_METHODS, ...CONFLUENCE_WRITE_BILLING_METHODS },
 );

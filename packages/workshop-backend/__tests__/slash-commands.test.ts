@@ -21,7 +21,7 @@ function gatekeeper(options: {
   return {
     getSlashCommandProvider() {
       let provider = {
-        async list() {
+        async list(_authorizer: unknown) {
           options.onList?.();
           if (options.failList) throw new Error("list failed");
           return options.commands?.() ?? [];
@@ -43,7 +43,12 @@ function gatekeeper(options: {
 function source(
     id: number, providerLabel: string, value: object,
 ): Parameters<typeof collectSlashCommands>[0][number] {
-  return {gatekeeperId: id, providerLabel, gatekeeper: value as never};
+  return {
+    gatekeeperId: id,
+    providerLabel,
+    gatekeeper: value as never,
+    authorizer: {[Symbol.dispose]() {}} as never,
+  };
 }
 
 const deploy: SlashCommandDescriptor = {

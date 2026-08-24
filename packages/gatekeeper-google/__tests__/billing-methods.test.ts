@@ -1,10 +1,50 @@
 import { describe, expect, it } from "vitest";
 import {
+  testPublicBillingSurface,
+  type BillingSurfaceClass,
+} from "../../backend-utils/test/gatekeeper-billing-contract";
+import {
   GOOGLE_BILLING_METHODS,
   GOOGLE_LOCAL_READ_METHODS,
   GOOGLE_WRITE_BILLING_METHODS,
   googleActionBilling,
 } from "../src/billing-methods.js";
+import BIGQUERY_TYPES from "../src/bigquery-types.d.ts?raw";
+import CALENDAR_TYPES from "../src/calendar-types.d.ts?raw";
+import DOCS_TYPES from "../src/docs-types.d.ts?raw";
+import SHEETS_TYPES from "../src/sheets-types.d.ts?raw";
+import GMAIL_TYPES from "../src/types.d.ts?raw";
+import SHARED_GATEKEEPER_TYPES from "../../workshop-shared/src/gatekeeper.ts?raw";
+
+const {
+  "GmailThreadCursor.next": gmailCursorBilling,
+  ...GOOGLE_DIRECT_READ_BILLING_METHODS
+} = GOOGLE_BILLING_METHODS;
+const GOOGLE_SURFACE_BILLING_METHODS = {
+  ...GOOGLE_DIRECT_READ_BILLING_METHODS,
+  "Cursor.next": gmailCursorBilling,
+  ...GOOGLE_WRITE_BILLING_METHODS,
+};
+const GOOGLE_SURFACE: Record<string, BillingSurfaceClass> = {
+  ...Object.fromEntries(Object.keys(GOOGLE_SURFACE_BILLING_METHODS).map(method => [
+    method,
+    method === "Cursor.next" || method in GOOGLE_DIRECT_READ_BILLING_METHODS ? "R" : "A",
+  ])),
+  ...Object.fromEntries(GOOGLE_LOCAL_READ_METHODS.map(method => [method, {
+    kind: "C",
+    reason: "Constructs a scoped capability without reading provider or cache business data.",
+  }])),
+};
+
+testPublicBillingSurface(
+  "Google",
+  [GMAIL_TYPES, DOCS_TYPES, SHEETS_TYPES, CALENDAR_TYPES, BIGQUERY_TYPES,
+    SHARED_GATEKEEPER_TYPES].join("\n"),
+  ["GmailSession", "GmailThread", "GmailMessage", "GoogleDocSession",
+    "GoogleSpreadsheetSession", "GoogleCalendarSession", "BigQuerySession", "Cursor"],
+  GOOGLE_SURFACE,
+  GOOGLE_SURFACE_BILLING_METHODS,
+);
 
 const EXPECTED_READ_METHOD_KEYS = [
   "google.gmail.thread-list.next-page",

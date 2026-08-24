@@ -26,6 +26,9 @@ export { resolveTargets };
 
 const HOME_ASSISTANT_ACTION_TIMEOUT_MS = 15_000;
 
+/** Approval copy before the submission point attaches the stable billing method. */
+export type HomeAssistantActionDescription = Omit<ActionDescription, "billing">;
+
 /** Signals that an Action response deadline passed after its command was dispatched. */
 export class HomeAssistantActionTimeoutError extends HomeAssistantError {}
 
@@ -137,7 +140,7 @@ export function canRevert(action: HomeAssistantAction): boolean {
 export function describeAction(
   action: HomeAssistantAction,
   registry: RegistrySnapshot,
-): ActionDescription {
+): HomeAssistantActionDescription {
   switch (action.type) {
     case "callService":
       return describeCallService(action, registry);
@@ -151,7 +154,7 @@ export function describeAction(
 function describeCallService(
   action: HomeAssistantAction & { type: "callService" },
   registry: RegistrySnapshot,
-): ActionDescription {
+): HomeAssistantActionDescription {
   const { domain, service, data, target, origin } = action;
 
   // Safety net: if validation upstream missed something, never let `[object Object]` or
@@ -275,7 +278,9 @@ function describeCallService(
   };
 }
 
-function describeFireEvent(action: HomeAssistantAction & { type: "fireEvent" }): ActionDescription {
+function describeFireEvent(
+  action: HomeAssistantAction & { type: "fireEvent" },
+): HomeAssistantActionDescription {
   const dataStr = fmtData(action.data);
   return {
     title: `Fire event: ${action.eventType}`,
@@ -289,7 +294,7 @@ function describeFireEvent(action: HomeAssistantAction & { type: "fireEvent" }):
 
 function describeSaveDashboard(
   action: HomeAssistantAction & { type: "saveDashboard" },
-): ActionDescription {
+): HomeAssistantActionDescription {
   const config = action.config as { title?: string; views?: unknown[] } | undefined;
   const urlLabel = action.urlPath ?? "lovelace (default)";
   const viewCount = Array.isArray(config?.views) ? config!.views!.length : 0;

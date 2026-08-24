@@ -18,3 +18,19 @@ export const UGC_ADS_BILLING_METHODS = {
     operation("ugc-ads.xiaohongshu.creator-profile.read.v1"),
   "UgcAdsSession.renderImage": operation("ugc-ads.image.render.v1"),
 } as const;
+
+/** Catalog classification: bundled metadata is local control data, not external business work. */
+export const UGC_ADS_CONTROL_METHODS = {
+  "UgcAdsGatekeeper.getAgentCatalog": {
+    kind: "CONTROL_NO_METER",
+    reason: "Returns only build-time bundled skill metadata and performs no provider or business storage read.",
+  },
+  "UgcAdsGatekeeper.getSlashCommandProvider": {
+    kind: "CONTROL_NO_METER",
+    reason: "Constructs the slash-command capability without reading provider or business data.",
+  },
+  "UgcAdsSlashCommandProvider.list": {
+    kind: "CONTROL_NO_METER",
+    reason: "Returns only build-time bundled skill metadata without provider or business storage reads.",
+  },
+} as const;

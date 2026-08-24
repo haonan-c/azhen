@@ -40,7 +40,11 @@ import {
 } from "./scheduler-core.js";
 import { ScheduleDriver } from "./schedule-driver.js";
 import type { ScheduleSpec } from "./schedule-types.js";
-import type { ManagementListOptions, ManagementSchedulePage } from "./management.js";
+import type {
+  ManagementListOptions,
+  ManagementSchedulePage,
+  ScheduleManagementApiContract,
+} from "./management.js";
 import type {
   CalendarRule,
   NormalizedScheduleOccurrences,
@@ -319,7 +323,7 @@ export class SchedulerGatekeeper
   async removeObserver(_id: string): Promise<void> {}
 
   /** Rejects action application because the scheduler is read-only. */
-  applyAction(_action: number): Promise<void> {
+  applyAction(_action: number): Promise<never> {
     throw new Error("Scheduled Tasks is read-only and implements no actions.");
   }
 
@@ -337,7 +341,7 @@ export class SchedulerGatekeeper
 }
 
 @validateRpc()
-export class ScheduleManagementApi extends RpcTarget {
+export class ScheduleManagementApi extends RpcTarget implements ScheduleManagementApiContract {
   constructor(
     private readonly driver: Pick<ScheduleDriver, "listAccount">,
     private readonly accountId: string,

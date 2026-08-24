@@ -21,3 +21,9 @@ export type ManagementSchedulePage = {
   schedules: ManagementSchedule[];
   cursor?: string;
 };
+
+/** Read-only account management capability exposed to the Scheduler app. */
+export interface ScheduleManagementApiContract {
+  /** List one bounded page of schedules across the connected account. */
+  list(options?: ManagementListOptions): Promise<ManagementSchedulePage>;
+}

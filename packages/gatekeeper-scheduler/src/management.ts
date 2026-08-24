@@ -9,6 +9,7 @@ export type {
   ManagementListOptions,
   ManagementSchedule,
   ManagementSchedulePage,
+  ScheduleManagementApiContract,
 } from "./management-types.js";
 
 /** Fixed maximum number of schedules returned to the management app per request. */
