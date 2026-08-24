@@ -1052,6 +1052,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
         unavailableUsageOverview(registeredUsers, asOf), deliveryHealth);
     }
     try {
+      await this.projection.getByName("").ensureBootstrap();
       return mergeProjectionDeliveryHealth({
         ...await this.projection.getByName("").readOverview(),
         registeredUsers,

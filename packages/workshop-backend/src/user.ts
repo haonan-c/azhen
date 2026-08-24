@@ -398,9 +398,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     const pending = this.usageAccount.listPendingProjectionOutbox(32);
     if (pending.length === 0) {
       const healthReported = await this.#reportProjectionDeliveryHealth(false);
+      const pendingAfterHealth =
+        this.usageAccount.listPendingProjectionOutbox(1).length > 0;
       if (!healthReported) await this.ctx.storage.setAlarm(Date.now() + 10_000);
-      else if (backfillPending) await this.ctx.storage.setAlarm(Date.now() + 1_000);
-      else await this.ctx.storage.deleteAlarm();
+      else if (backfillPending || pendingAfterHealth) {
+        await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      } else {
+        await this.ctx.storage.deleteAlarm();
+        if (this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
+          await this.ctx.storage.setAlarm(Date.now() + 1_000);
+        }
+      }
       return;
     }
     let deliveryFailed = false;
@@ -417,11 +425,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       });
     }
     const healthReported = await this.#reportProjectionDeliveryHealth(deliveryFailed);
-    if (healthReported && !backfillPending &&
-        this.usageAccount.listPendingProjectionOutbox(1).length === 0) {
-      await this.ctx.storage.deleteAlarm();
-    } else {
+    if (deliveryFailed || !healthReported) {
       await this.ctx.storage.setAlarm(Date.now() + 10_000);
+    } else if (backfillPending ||
+        this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    } else {
+      await this.ctx.storage.deleteAlarm();
     }
   }
 
@@ -608,7 +618,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       afterSourceSequence: bigint | null,
       limit: number) {
     await this.activateUsageAccount();
-    return this.usageAccount.listUsageProjectionFacts(afterSourceSequence, limit);
+    await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.listUsageProjectionFacts(afterSourceSequence, limit);
+    } finally {
+      this.#scheduleProjectionDelivery();
+    }
   }
 
   /** Return one bounded page of this User's content-free Usage Records. */

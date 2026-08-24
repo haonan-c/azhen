@@ -41,7 +41,8 @@ describe("Issue #62 Usage Projection over real Cap'n Web", () => {
     const usageFuture = admin.getUsageApi();
     const initialOverviewFuture = usageFuture.getOverview();
     using usage: RpcStub<AdminUsageApi> = await usageFuture;
-    expect((await initialOverviewFuture).health.state).toBe("healthy");
+    expect((await initialOverviewFuture).health.state).toBe("rebuilding");
+    await expect.poll(async () => (await usage.getOverview()).health.state).toBe("healthy");
 
     const registered = (await usage.searchUsers({query: ordinaryIdentity})).users[0];
     if (!registered) throw new Error("Expected the activated ordinary User in Registry.");

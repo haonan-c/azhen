@@ -54,6 +54,8 @@ function aggregateFact(
     ...base,
     rowKind: "aggregate",
     bucketStart: "2026-08-24T12:00:00.000Z",
+    summaryFactId: crypto.randomUUID(),
+    summaryRevision: 1n,
     ...overrides,
   };
 }
@@ -90,6 +92,52 @@ describe("deployment Usage Projection", () => {
       .toBe(9_007_199_254_740_993n);
   });
 
+  it("acks active ingestion while failing a conflicting rebuild generation", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const input = fact();
+    const conflicting = fact({
+      ...input,
+      cacheHitInputTokens: input.cacheHitInputTokens + 1n,
+      providerCostUsdSubunits: input.providerCostUsdSubunits + 1n,
+    });
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        INSERT INTO usage_projection_totals (
+          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+          unpriced_model_uses, unpriced_api_operations
+        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET active_generation = '2' WHERE singleton = 1
+      `);
+    });
+    expect(await projection.ingest([conflicting])).toMatchObject({
+      acknowledgedFactIds: [input.projectionFactId],
+    });
+    const requestId = `rebuild-conflict-${crypto.randomUUID()}`;
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET active_generation = '1', rebuild_request_id = ?,
+          rebuild_state = 'rebuilding', rebuild_generation = '2',
+          rebuild_registry_revision = '0', rebuild_started_at = ?, rebuild_completed_at = NULL,
+          rebuild_failure_code = NULL
+        WHERE singleton = 1
+      `, requestId, new Date().toISOString());
+    });
+
+    expect(await projection.ingest([input])).toEqual({
+      acknowledgedFactIds: [input.projectionFactId],
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics.cacheHitInputTokens)
+      .toBe(input.cacheHitInputTokens);
+    expect(await projection.requestRebuild(requestId)).toMatchObject({
+      state: "failed",
+      failureCode: "projection-write-failed",
+    });
+  });
+
   it("holds an out-of-order fact until the per-User sequence gap closes", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const principal = crypto.randomUUID();
@@ -122,6 +170,71 @@ describe("deployment Usage Projection", () => {
       activeUsers: 2n,
     });
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
+  });
+
+  it("drains a large acknowledged sequence gap in restart-safe bounded alarms", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const usagePrincipalRef = crypto.randomUUID();
+    const pending = Array.from({length: 192}, (_, index) => fact({
+      projectionFactId: crypto.randomUUID(),
+      usagePrincipalRef,
+      sourceSequence: BigInt(index + 2),
+      cacheHitInputTokens: 1n,
+      providerCostUsdSubunits: 1n,
+    }));
+    for (let offset = 0; offset < pending.length; offset += 64) {
+      const page = pending.slice(offset, offset + 64);
+      expect(await projection.ingest(page)).toEqual({
+        acknowledgedFactIds: page.map(item => item.projectionFactId),
+        rejected: [],
+      });
+    }
+    const first = fact({
+      projectionFactId: crypto.randomUUID(),
+      usagePrincipalRef,
+      sourceSequence: 1n,
+      cacheHitInputTokens: 1n,
+      providerCostUsdSubunits: 1n,
+    });
+    expect(await projection.ingest([first])).toEqual({
+      acknowledgedFactIds: [first.projectionFactId],
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(64n);
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.getAlarm())).not.toBeNull();
+
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart during bounded sequence drain");
+    })).rejects.toThrow("restart during bounded sequence drain");
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    await runInDurableObject(restarted, (_instance, state) => {
+      state.storage.sql.exec(`
+        INSERT INTO usage_projection_totals (
+          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+          unpriced_model_uses, unpriced_api_operations
+        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET cleanup_generation = '2', cleanup_stage = 'totals'
+        WHERE singleton = 1
+      `);
+    });
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await restarted.readOverview()).metrics.cacheHitInputTokens).toBe(128n);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await restarted.readOverview()).metrics.cacheHitInputTokens).toBe(128n);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.sql.exec<{cleanup_generation: string | null}>(`
+        SELECT cleanup_generation FROM usage_projection_meta WHERE singleton = 1
+      `).one().cleanup_generation)).toBeNull();
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await restarted.readOverview()).metrics.cacheHitInputTokens).toBe(192n);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await restarted.readOverview()).metrics.cacheHitInputTokens).toBe(193n);
+    expect((await restarted.readHealth()).sequenceGapCount).toBe(0n);
   });
 
   it("keeps explicitly priced zero separate from Unpriced Use", async () => {
@@ -171,6 +284,163 @@ describe("deployment Usage Projection", () => {
       occurred_at: null,
       bucket_start: "2026-08-24T12:00:00.000Z",
     }]);
+  });
+
+  it("replaces one aggregate snapshot by revision while detail remains additive", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const usagePrincipalRef = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const snapshots = Array.from({length: 20}, (_, index) => {
+      const total = BigInt(index + 1);
+      return aggregateFact({
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence: total,
+        usagePrincipalRef,
+        summaryFactId,
+        summaryRevision: total,
+        cacheHitInputTokens: total,
+        outputTokens: total,
+        reasoningTokens: total,
+        providerCostUsdSubunits: total,
+        chargedUsageCreditSubunits: total,
+      });
+    });
+    expect(await projection.ingest(snapshots)).toEqual({
+      acknowledgedFactIds: snapshots.map(item => item.projectionFactId),
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics).toMatchObject({
+      cacheHitInputTokens: 20n,
+      outputTokens: 20n,
+      reasoningTokens: 20n,
+      providerCostUsdSubunits: 20n,
+      chargedUsageCreditSubunits: 20n,
+      activeUsers: 1n,
+    });
+
+    const duplicate = {
+      ...snapshots.at(-1)!,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 21n,
+    };
+    const newer = {
+      ...duplicate,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 22n,
+      summaryRevision: 22n,
+      cacheHitInputTokens: 25n,
+      outputTokens: 25n,
+      reasoningTokens: 25n,
+      providerCostUsdSubunits: 25n,
+      chargedUsageCreditSubunits: 25n,
+    };
+    const older = {
+      ...newer,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 23n,
+      summaryRevision: 21n,
+      cacheHitInputTokens: 21n,
+      outputTokens: 21n,
+      reasoningTokens: 21n,
+      providerCostUsdSubunits: 21n,
+      chargedUsageCreditSubunits: 21n,
+    };
+    expect(await projection.ingest([duplicate, newer, older])).toEqual({
+      acknowledgedFactIds: [duplicate, newer, older].map(item => item.projectionFactId),
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics).toMatchObject({
+      cacheHitInputTokens: 25n,
+      outputTokens: 25n,
+      providerCostUsdSubunits: 25n,
+      chargedUsageCreditSubunits: 25n,
+    });
+
+    const conflictingRevision = {
+      ...newer,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 24n,
+      cacheHitInputTokens: 26n,
+    };
+    expect(await projection.ingest([conflictingRevision])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{
+        projectionFactId: conflictingRevision.projectionFactId,
+        code: "invalid-fact",
+      }],
+    });
+
+    const detail = fact({
+      usagePrincipalRef: crypto.randomUUID(),
+      cacheHitInputTokens: 7n,
+      outputTokens: 7n,
+      reasoningTokens: 7n,
+      providerCostUsdSubunits: 7n,
+      chargedUsageCreditSubunits: 7n,
+    });
+    expect(await projection.ingest([detail])).toEqual({
+      acknowledgedFactIds: [detail.projectionFactId],
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics).toMatchObject({
+      cacheHitInputTokens: 32n,
+      outputTokens: 32n,
+      providerCostUsdSubunits: 32n,
+      chargedUsageCreditSubunits: 32n,
+      activeUsers: 2n,
+    });
+  });
+
+  it("accepts absolute aggregate use counts above one without weakening detail facts", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const aggregate = aggregateFact({
+      kind: "gatekeeper",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "context",
+      billingMethodKey: "context.read.v1",
+      externalAccountId: "summary-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      billableApiOperations: 20n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: 20n,
+    });
+    expect(await projection.ingest([aggregate])).toEqual({
+      acknowledgedFactIds: [aggregate.projectionFactId],
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics).toMatchObject({
+      billableApiOperations: 20n,
+      unpricedApiOperations: 20n,
+      activeUsers: 1n,
+    });
+
+    const invalidDetail = fact({
+      kind: "gatekeeper",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "context",
+      billingMethodKey: "context.read.v1",
+      externalAccountId: "detail-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      billableApiOperations: 2n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: 2n,
+    });
+    expect(await projection.ingest([invalidDetail])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{projectionFactId: invalidDetail.projectionFactId, code: "invalid-fact"}],
+    });
   });
 
   it.each([
@@ -334,6 +604,64 @@ describe("deployment Usage Projection", () => {
     })).rejects.toThrow("restart after authoritative commit");
 
     const restarted = testEnv.TEST_USER.get(userId);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    await expect.poll(async () =>
+      (await projection.readOverview()).ingestionWatermark,
+    ).toBe(beforeWatermark + 1n);
+  });
+
+  it("keeps a concurrent terminal alarm after an empty maintenance health wait", async () => {
+    const identity = `projection-empty-race-${crypto.randomUUID()}`;
+    const userId = testEnv.TEST_USER.idFromName(identity);
+    const user = testEnv.TEST_USER.get(userId);
+    expect(await user.createAccount(identity, identity, new Uint8Array([34, 35, 36])))
+      .not.toBeNull();
+    await user.activateUsageAccount();
+    const healthStarted = Promise.withResolvers<void>();
+    const releaseHealth = Promise.withResolvers<void>();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const beforeWatermark = (await projection.readOverview()).ingestionWatermark;
+    const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+    await runInDurableObject(user, async instance => {
+      (instance as unknown as {adminSettings: unknown}).adminSettings = {
+        getByName: () => ({recordUsageProjectionDeliveryHealth: async () => {
+          healthStarted.resolve();
+          await releaseHealth.promise;
+        }}),
+      };
+      (instance as unknown as {usageProjection: unknown}).usageProjection = {
+        getByName: () => ({ingest: () => new Promise(() => {})}),
+      };
+      const staleEmptyMaintenance = instance.alarm();
+      await healthStarted.promise;
+      await instance.beginGatekeeperUsage(operationId, {
+        principal: {version: 1, kind: "user", userId: userId.toString()},
+        source: "direct-user",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        externalAccountId: "projection-empty-race-account",
+      }, {
+        kind: "gatekeeper",
+        pricing: "unpriced",
+        usageRateVersion: 1n,
+        issuedAt: "2026-08-24T12:00:00.000Z",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        chargeSubunits: 0n,
+        configurationGap: true,
+      });
+      await instance.markGatekeeperUsageStarted(operationId);
+      await instance.completeGatekeeperUsage(operationId, "executed");
+      releaseHealth.resolve();
+      await staleEmptyMaintenance;
+    });
+    await expect(runInDurableObject(user, (_instance, state) => {
+      state.abort("cancel late terminal waitUntil");
+    })).rejects.toThrow("cancel late terminal waitUntil");
+
+    const restarted = testEnv.TEST_USER.get(userId);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.getAlarm())).not.toBeNull();
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
     await expect.poll(async () =>
       (await projection.readOverview()).ingestionWatermark,
@@ -578,6 +906,174 @@ describe("deployment Usage Projection", () => {
     const retained = await user.listUsageProjectionFacts(null, 10);
     expect(retained.backfillComplete).toBe(true);
     expect(retained.facts).toHaveLength(3);
+  });
+
+  it("keeps User legacy backfill alive when the requesting rebuild stops", async () => {
+    const identity = `projection-rebuild-backfill-${crypto.randomUUID()}`;
+    const userId = testEnv.TEST_USER.idFromName(identity);
+    const user = testEnv.TEST_USER.get(userId);
+    expect(await user.createAccount(identity, identity, new Uint8Array([31, 32, 33])))
+      .not.toBeNull();
+    await user.activateUsageAccount();
+    await runInDurableObject(user, async instance => {
+      (instance as unknown as {usageProjection: unknown}).usageProjection = {
+        getByName: () => ({ingest: async (facts: UsageProjectionFact[]) => ({
+          acknowledgedFactIds: facts.map(item => item.projectionFactId),
+          rejected: [],
+        })}),
+      };
+      for (let index = 0; index < 33; index += 1) {
+        const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+        await instance.beginGatekeeperUsage(operationId, {
+          principal: {version: 1, kind: "user", userId: userId.toString()},
+          source: "direct-user",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "projection-rebuild-backfill-account",
+        }, {
+          kind: "gatekeeper",
+          pricing: "unpriced",
+          usageRateVersion: 1n,
+          issuedAt: "2026-08-24T12:00:00.000Z",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          chargeSubunits: 0n,
+          configurationGap: true,
+        });
+        await instance.markGatekeeperUsageStarted(operationId);
+        await instance.completeGatekeeperUsage(operationId, "executed");
+      }
+    });
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
+    const registered = (await settings.searchRegisteredUsageUsers({query: identity, limit: 1}))
+      .users[0]!;
+    await runInDurableObject(user, async (_instance, state) => {
+      for (const [key] of Array.from(state.storage.kv.list({
+        prefix: "usageAccount:projection",
+      }))) {
+        state.storage.kv.delete(key);
+      }
+      await state.storage.deleteAlarm();
+    });
+    await runInDurableObject(user, instance => {
+      (instance as unknown as {usageProjection: unknown}).usageProjection = {
+        getByName: () => ({ingest: async () => {
+          throw new Error("controlled Projection outage");
+        }}),
+      };
+    });
+
+    const rebuilding = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    await expect(runInDurableObject(rebuilding, async (instance, state) => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => ({
+            users: [registered],
+            nextCursor: null,
+          }),
+          resolveRegisteredUsageUser: async () => ({userDoId: userId.toString()}),
+        }),
+      };
+      await instance.requestRebuild(`legacy-backfill-stop-${crypto.randomUUID()}`);
+      await instance.alarm();
+      await instance.alarm();
+      state.abort("stop requesting rebuild after one legacy page");
+    })).rejects.toThrow("stop requesting rebuild after one legacy page");
+    expect(await runInDurableObject(user, (_userInstance, userState) =>
+      userState.storage.getAlarm())).not.toBeNull();
+    const activeProjection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const unpricedBefore = (await activeProjection.readOverview()).metrics.unpricedApiOperations;
+    await expect(runInDurableObject(user, (_instance, state) => {
+      state.abort("restart after rebuild backfill outage");
+    })).rejects.toThrow("restart after rebuild backfill outage");
+    const restarted = testEnv.TEST_USER.get(userId);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    const continuationAlarm = await runInDurableObject(
+      restarted, (_instance, state) => state.storage.getAlarm());
+    expect(continuationAlarm).not.toBeNull();
+    expect(continuationAlarm!).toBeLessThanOrEqual(Date.now() + 1_500);
+    expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
+      .toBe(unpricedBefore + 32n);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
+      .toBe(unpricedBefore + 33n);
+  });
+
+  it("automatically bootstraps an empty Projection from dormant User authority", async () => {
+    const identity = `projection-bootstrap-${crypto.randomUUID()}`;
+    const userId = testEnv.TEST_USER.idFromName(identity);
+    const user = testEnv.TEST_USER.get(userId);
+    expect(await user.createAccount(identity, identity, new Uint8Array([37, 38, 39])))
+      .not.toBeNull();
+    await user.activateUsageAccount();
+    await runInDurableObject(user, async instance => {
+      (instance as unknown as {usageProjection: unknown}).usageProjection = {
+        getByName: () => ({ingest: async (facts: UsageProjectionFact[]) => ({
+          acknowledgedFactIds: facts.map(item => item.projectionFactId),
+          rejected: [],
+        })}),
+      };
+      const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+      await instance.beginGatekeeperUsage(operationId, {
+        principal: {version: 1, kind: "user", userId: userId.toString()},
+        source: "direct-user",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        externalAccountId: "projection-bootstrap-account",
+      }, {
+        kind: "gatekeeper",
+        pricing: "unpriced",
+        usageRateVersion: 1n,
+        issuedAt: "2026-08-24T12:00:00.000Z",
+        vendorId: "context",
+        billingMethodKey: "context.read.v1",
+        chargeSubunits: 0n,
+        configurationGap: true,
+      });
+      await instance.markGatekeeperUsageStarted(operationId);
+      await instance.completeGatekeeperUsage(operationId, "executed");
+    });
+    const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
+    const registered = (await settings.searchRegisteredUsageUsers({query: identity, limit: 1}))
+      .users[0]!;
+    await runInDurableObject(user, (_instance, state) => {
+      for (const [key] of Array.from(state.storage.kv.list({
+        prefix: "usageAccount:projection",
+      }))) {
+        state.storage.kv.delete(key);
+      }
+    });
+
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    await runInDurableObject(projection, instance => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => ({
+            users: [registered],
+            nextCursor: null,
+          }),
+          resolveRegisteredUsageUser: async () => ({userDoId: userId.toString()}),
+        }),
+      };
+    });
+    const projectionNamespace = {
+      getByName: () => projection,
+    } as unknown as DurableObjectNamespace<UsageProjection>;
+    const admin = new AdminUsageApiImpl(
+      settings, testEnv.TEST_USER, "projection-bootstrap-admin", undefined,
+      projectionNamespace,
+    );
+
+    const first = await admin.getOverview();
+    expect(first.health.state === "healthy" &&
+      first.metrics.unpricedApiOperations === 0n).toBe(false);
+    await expect.poll(async () => {
+      await runDurableObjectAlarm(projection);
+      const overview = await admin.getOverview();
+      return [overview.health.state, overview.metrics.unpricedApiOperations];
+    }).toEqual(["healthy", 1n]);
   });
 
   it("exposes a bounded rebuild failure through projection health", async () => {
