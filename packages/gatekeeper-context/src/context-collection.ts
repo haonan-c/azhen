@@ -12,7 +12,10 @@ import {
 } from "./context-types.js";
 import { metadataToSummary } from "./collection-kv.js";
 import { domainName } from "./domain.js";
-import { readArtifactRepoDocuments } from "./artifact-sync.js";
+import {
+  disposeArtifactRepoCapability,
+  readArtifactRepoDocuments,
+} from "./artifact-sync.js";
 import {
   isSkillManifestPath, parseSkillManifest, type SkillIndexEntry,
 } from "./agent-skill.js";
@@ -48,6 +51,11 @@ function extOf(path: string): string {
   let b = baseName(path);
   let i = b.lastIndexOf(".");
   return i <= 0 ? "" : b.slice(i + 1).toLowerCase();
+}
+
+function sanitizedArtifactsError(caught: unknown, operation: string): Error {
+  const kind = caught instanceof Error ? "error" : "non-error";
+  return new Error(`${operation} failed (${kind}).`);
 }
 
 type ContextRecord = {
@@ -136,14 +144,19 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     });
 
     let repo = await artifacts.get(metadata.id);
-    // Artifacts auto-creates an initial write token when the repo is first
-    // created. We don't want or need this token, so we immediately revoke it.
-    await repo.revokeToken(created.token).catch(() => {
-      logger.warn("failed to revoke initial Artifacts token for context collection", {
-        event: "artifacts.initial.token.revoke.failed",
-        collectionId: metadata.id,
+    try {
+      // Artifacts auto-creates an initial write token when the repo is first
+      // created. We don't want or need this token, so we immediately revoke it.
+      await repo.revokeToken(created.token).catch((err) => {
+        logger.warn("failed to revoke initial Artifacts token for context collection", {
+          event: "artifacts.initial.token.revoke.failed",
+          collectionId: metadata.id,
+          error: sanitizedArtifactsError(err, "Artifacts initial-token cleanup"),
+        });
       });
-    });
+    } finally {
+      disposeArtifactRepoCapability(repo);
+    }
     return created.remote;
   }
 
@@ -442,37 +455,49 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     let meta = this.getMetadata();
     if (meta.content.source !== "git") throw new Error("Collection is not git-based.");
     let repo = await this.#artifacts().get(meta.id);
-    let token = await repo.createToken("write", GIT_TOKEN_TTL_SECONDS);
-    return {
-      id: token.id,
-      plaintext: token.plaintext,
-      remote: meta.content.remote,
-    };
+    try {
+      let token = await repo.createToken("write", GIT_TOKEN_TTL_SECONDS);
+      return {
+        id: token.id,
+        plaintext: token.plaintext,
+        remote: meta.content.remote,
+      };
+    } finally {
+      disposeArtifactRepoCapability(repo);
+    }
   }
 
   async listGitTokens(): Promise<ContextGitTokenList> {
     if (!this.#isGitBased()) throw new Error("Collection is not git-based.");
     let meta = this.getMetadata();
     let repo = await this.#artifacts().get(meta.id);
-    let result = await repo.listTokens();
-    return {
-      tokens: result.tokens
-        // User-created tokens for mirror setup are always write tokens. This DO
-        // mints its own read tokens for cloning the repo into memory which we
-        // don't want to expose the user.
-        .filter(token => token.scope === "write" && token.state === "active")
-        .map(token => ({
-          id: token.id,
-          expiresAt: token.expiresAt,
-        })),
-    };
+    try {
+      let result = await repo.listTokens();
+      return {
+        tokens: result.tokens
+          // User-created tokens for mirror setup are always write tokens. This DO
+          // mints its own read tokens for cloning the repo into memory which we
+          // don't want to expose the user.
+          .filter(token => token.scope === "write" && token.state === "active")
+          .map(token => ({
+            id: token.id,
+            expiresAt: token.expiresAt,
+          })),
+      };
+    } finally {
+      disposeArtifactRepoCapability(repo);
+    }
   }
 
   async revokeGitToken(tokenId: string): Promise<boolean> {
     if (!this.#isGitBased()) throw new Error("Collection is not git-based.");
     let meta = this.getMetadata();
     let repo = await this.#artifacts().get(meta.id);
-    return repo.revokeToken(tokenId);
+    try {
+      return await repo.revokeToken(tokenId);
+    } finally {
+      disposeArtifactRepoCapability(repo);
+    }
   }
 
   #isGitBased(): boolean {
@@ -485,10 +510,11 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     if (content.source !== "git") return;
     if (Date.now() - content.lastRefreshedAt.getTime() < GIT_REFRESH_MIN_INTERVAL_MS) return;
 
-    void this.#refreshArtifactSource().catch(() => {
+    void this.#refreshArtifactSource().catch((err) => {
       logger.warn("failed to refresh git-based context collection in the background", {
         event: "context.collection.git.refresh.failed",
         collectionId: this.getMetadata().id,
+        error: sanitizedArtifactsError(err, "Artifacts background refresh"),
       });
     });
   }
@@ -624,10 +650,11 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
     }
 
     if (meta.content.source === "git" && this.env.ARTIFACTS) {
-      await this.env.ARTIFACTS.delete(id).catch(() => {
+      await this.env.ARTIFACTS.delete(id).catch((err) => {
         logger.warn("failed to delete Artifacts repo for context collection", {
           event: "artifacts.repo.delete.failed",
           collectionId: id,
+          error: sanitizedArtifactsError(err, "Artifacts repo deletion"),
         });
       });
     }
@@ -639,10 +666,11 @@ export class ContextCollectionDurableObject extends DurableObject<Cloudflare.Env
   async deleteForRevokedOwner(): Promise<void> {
     let meta = this.getMetadata();
     if (meta.content.source === "git" && meta.id && this.env.ARTIFACTS) {
-      await this.env.ARTIFACTS.delete(meta.id).catch(() => {
+      await this.env.ARTIFACTS.delete(meta.id).catch((err) => {
         logger.warn("failed to delete Artifacts repo while revoking context collection owner", {
           event: "artifacts.repo.delete.for.revoked.owner.failed",
           collectionId: meta.id,
+          error: sanitizedArtifactsError(err, "Artifacts owner-revocation cleanup"),
         });
       });
     }

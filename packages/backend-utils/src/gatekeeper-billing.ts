@@ -161,17 +161,31 @@ export async function runBillableRead<T>(
   return result;
 }
 
-/** Run one direct caller-visible operation through billing without an observation record. */
+/**
+ * Run one direct caller-visible operation through billing without an observation record.
+ *
+ * The optional preflight runs after reservation and before execution is marked as started.
+ * A rejected preflight completes the operation as failed before execution.
+ */
 export async function runBillableOperation<T>(
   authorizer: BillableOperationAuthorizer,
   externalAccountId: string,
   billingMethodKey: string,
   run: (activity: BillableOperationActivity) => Promise<T>,
+  preflight?: () => Promise<void>,
 ): Promise<T> {
   using operation = await authorizer.beginBillableOperation(
     billingMethodKey,
     externalAccountId,
   );
+  if (preflight) {
+    try {
+      await preflight();
+    } catch (error) {
+      await completeQuietly(operation, "failed-before-execution");
+      throw error;
+    }
+  }
   try {
     await operation.markStarted();
   } catch (error) {

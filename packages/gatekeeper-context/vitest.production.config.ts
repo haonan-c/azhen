@@ -12,7 +12,6 @@ const EXPECTED_BILLING_REJECTIONS = new Set([
   "Simulated Git propagation failure.",
   "Simulated completion response loss.",
   "Gatekeeper Metering completion conflicts with its Usage Record.",
-  "Simulated background artifact refresh failure.",
   "Simulated Artifacts response loss.",
   "Simulated Artifacts read-token cleanup failure.",
   "Simulated management result delivery failure.",
@@ -38,7 +37,6 @@ export default defineConfig({
           TEST_CONTEXT_GATEKEEPER: { className: "ContextGatekeeper", useSQLite: true },
           TEST_USER: { className: "UserDurableObject", useSQLite: true },
           TEST_ADMIN_SETTINGS: { className: "AdminSettings", useSQLite: true },
-          TEST_ARTIFACT_REPO: { className: "ArtifactRepoMock", useSQLite: true },
         },
         kvNamespaces: ["CONTEXT_COLLECTIONS"],
         serviceBindings: {

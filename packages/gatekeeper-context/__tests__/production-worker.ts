@@ -1,5 +1,5 @@
 import worker from "../src/index.js";
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { UsageRateChange } from "@gadgets/workshop-shared/api";
 import type { UsageUserRegistrationFact } from "../../workshop-backend/src/usage-account.js";
 import { UsageRateRegistry } from "../../workshop-backend/src/usage-rates.js";
@@ -29,17 +29,17 @@ type StoredArtifactToken = {
   expiresAt: string;
 };
 
-/** Durable Artifacts repository handle for the production Context tracer. */
-export class ArtifactRepoMock extends DurableObject {
-  async seedInitialToken(id: string, plaintext: string): Promise<void> {
-    const now = new Date().toISOString();
-    this.ctx.storage.kv.put(`token:${id}`, {
-      id,
-      plaintext,
-      scope: "write",
-      createdAt: now,
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-    } satisfies StoredArtifactToken);
+type ArtifactRepoState = {
+  sequence: number;
+  tokens: Map<string, StoredArtifactToken>;
+};
+
+const artifactRepos = new Map<string, ArtifactRepoState>();
+
+/** RPC Artifacts repository handle for the production Context tracer. */
+class ArtifactRepoHandle extends RpcTarget {
+  constructor(private readonly state: ArtifactRepoState) {
+    super();
   }
 
   async createToken(scope: "write" | "read" = "write") {
@@ -47,8 +47,7 @@ export class ArtifactRepoMock extends DurableObject {
     if (scope === "read" && !artifactReadTokensEnabled) {
       throw new Error("Simulated background artifact refresh failure.");
     }
-    const sequence = (this.ctx.storage.kv.get<number>("tokenSequence") ?? 0) + 1;
-    this.ctx.storage.kv.put("tokenSequence", sequence);
+    const sequence = ++this.state.sequence;
     const token = {
       id: `${scope}-token-${sequence}`,
       plaintext: `${scope}-plaintext-${sequence}`,
@@ -56,7 +55,7 @@ export class ArtifactRepoMock extends DurableObject {
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     };
-    this.ctx.storage.kv.put(`token:${token.id}`, token);
+    this.state.tokens.set(token.id, token);
     if (scope === "write" && loseNextWriteTokenResponse) {
       loseNextWriteTokenResponse = false;
       throw new Error("Simulated Artifacts response loss.");
@@ -66,47 +65,50 @@ export class ArtifactRepoMock extends DurableObject {
 
   async listTokens() {
     artifactTrace.push("repo.listTokens");
-    const tokens = [...this.ctx.storage.kv.list<StoredArtifactToken>({ prefix: "token:" })]
-      .map(([, token]) => ({
-        id: token.id,
-        scope: token.scope,
-        createdAt: token.createdAt,
-        expiresAt: token.expiresAt,
-        state: "active" as const,
-      }));
+    const tokens = [...this.state.tokens.values()].map(token => ({
+      id: token.id,
+      scope: token.scope,
+      createdAt: token.createdAt,
+      expiresAt: token.expiresAt,
+      state: "active" as const,
+    }));
     return { tokens, total: tokens.length };
   }
 
   async revokeToken(tokenOrId: string): Promise<boolean> {
-    const match = [...this.ctx.storage.kv.list<StoredArtifactToken>({ prefix: "token:" })]
-      .find(([, token]) => token.id === tokenOrId || token.plaintext === tokenOrId);
+    const match = [...this.state.tokens.values()]
+      .find(token => token.id === tokenOrId ||
+        (token.id.startsWith("initial-token-") && token.plaintext === tokenOrId));
     artifactTrace.push(`repo.revokeToken:${match ? "matched" : "missing"}`);
     if (!match) return false;
-    if (match[1].scope === "read" && failNextReadTokenRevoke) {
+    if (match.scope === "read" && failNextReadTokenRevoke) {
       failNextReadTokenRevoke = false;
       throw new Error("Simulated Artifacts read-token cleanup failure.");
     }
-    this.ctx.storage.kv.delete(match[0]);
+    this.state.tokens.delete(match.id);
     return true;
   }
 
-  async hasActiveReadCredential(plaintext: string): Promise<boolean> {
-    return [...this.ctx.storage.kv.list<StoredArtifactToken>({ prefix: "token:" })]
-      .some(([, token]) => token.scope === "read" && token.plaintext === plaintext);
-  }
 }
 
-type ArtifactsMockEnv = Cloudflare.Env & {
-  TEST_ARTIFACT_REPO: DurableObjectNamespace<ArtifactRepoMock>;
-};
-
 /** Fail-closed Artifacts double used only by the production Context tracer. */
-export class ArtifactsMock extends WorkerEntrypoint<ArtifactsMockEnv> {
+export class ArtifactsMock extends WorkerEntrypoint {
   async create(name: string, options?: { setDefaultBranch?: string }) {
     artifactTrace.push(`artifacts.create:${name}`);
+    if (artifactRepos.has(name)) throw new Error("Artifacts repository already exists.");
     const token = `initial-plaintext-${name}`;
-    await this.env.TEST_ARTIFACT_REPO.getByName(name)
-      .seedInitialToken(`initial-token-${name}`, token);
+    const initialId = `initial-token-${name}`;
+    const now = new Date().toISOString();
+    artifactRepos.set(name, {
+      sequence: 0,
+      tokens: new Map([[initialId, {
+        id: initialId,
+        plaintext: token,
+        scope: "write",
+        createdAt: now,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }]]),
+    });
     return {
       id: name,
       name,
@@ -118,9 +120,11 @@ export class ArtifactsMock extends WorkerEntrypoint<ArtifactsMockEnv> {
     };
   }
 
-  async get(name: string): Promise<ArtifactRepoMock> {
+  async get(name: string): Promise<ArtifactRepoHandle> {
     artifactTrace.push(`artifacts.get:${name}`);
-    return this.env.TEST_ARTIFACT_REPO.getByName(name);
+    const state = artifactRepos.get(name);
+    if (!state) throw new Error("Artifacts repository not found.");
+    return new ArtifactRepoHandle(state);
   }
 }
 
@@ -192,7 +196,7 @@ function parsePacketLines(body: Uint8Array): string[] {
 }
 
 /** Fail-closed smart HTTP Git service used as the production Worker's global outbound. */
-export class GitHttpMock extends WorkerEntrypoint<ArtifactsMockEnv> {
+export class GitHttpMock extends WorkerEntrypoint {
   async fetch(request: Request): Promise<Response> {
     const configuration = gitHttpConfiguration;
     if (!configuration) throw new Error("Unmatched Git HTTP request.");
@@ -200,9 +204,10 @@ export class GitHttpMock extends WorkerEntrypoint<ArtifactsMockEnv> {
     const remote = new URL(configuration.remote);
     if (url.origin !== remote.origin) throw new Error("Unmatched Git HTTP origin.");
     const credential = decodeBasicCredential(request.headers.get("authorization"));
+    const repo = artifactRepos.get(configuration.repoName);
     const authorized = credential?.username === "x-access-token" &&
-      await this.env.TEST_ARTIFACT_REPO.getByName(configuration.repoName)
-        .hasActiveReadCredential(credential.password);
+      repo !== undefined && [...repo.tokens.values()].some(token =>
+        token.scope === "read" && token.plaintext === credential.password);
     if (request.method === "GET" &&
         url.pathname === `${remote.pathname}/info/refs` &&
         url.search === "?service=git-upload-pack") {

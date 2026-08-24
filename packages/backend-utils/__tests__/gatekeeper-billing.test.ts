@@ -163,6 +163,28 @@ describe("Gatekeeper read billing", () => {
 });
 
 describe("Gatekeeper direct operation billing", () => {
+  it("releases a failed preflight before marking the operation started", async () => {
+    const trace: string[] = [];
+
+    await expect(runBillableOperation(
+      makeAuthorizer(trace),
+      "account-1",
+      "vendor.direct.v1",
+      async () => { trace.push("business"); },
+      async () => {
+        trace.push("preflight");
+        throw new Error("invalid");
+      },
+    )).rejects.toThrow("invalid");
+
+    expect(trace).toEqual([
+      "begin:vendor.direct.v1:account-1",
+      "preflight",
+      "complete:failed-before-execution",
+      "dispose",
+    ]);
+  });
+
   it("classifies failures before dispatch and after an ambiguous dispatch", async () => {
     const outcomes: string[] = [];
     const authorizer = {

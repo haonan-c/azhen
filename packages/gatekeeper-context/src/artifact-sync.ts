@@ -25,11 +25,21 @@ const logger = obsContext.createLogger({
 // this limit when unpacked.
 const MAX_GIT_DIR_BYTES = 64 * 1024 * 1024;
 
+/** Release an RPC-backed Artifacts test/service handle; native handles need no release. */
+export function disposeArtifactRepoCapability(repo: ArtifactsRepo): void {
+  (repo as ArtifactsRepo & Partial<Disposable>)[Symbol.dispose]?.();
+}
+
 class GitTransferTooLargeError extends Error {
   constructor(readonly maxBytes: number) {
     super(`Repository too large: Git transfer exceeded ${maxBytes} bytes.`);
     this.name = "GitTransferTooLargeError";
   }
+}
+
+function sanitizedGitError(caught: unknown, operation: string): Error {
+  const kind = caught instanceof Error ? "error" : "non-error";
+  return new Error(`${operation} failed (${kind}).`);
 }
 
 async function* limitBody(body: AsyncIterableIterator<Uint8Array>, maxBytes: number): AsyncIterableIterator<Uint8Array> {
@@ -87,6 +97,7 @@ async function deleteCachedRepo(dir: string): Promise<void> {
     if (isEnoent(cleanupErr)) return;
     logger.warn("failed to clean up Artifacts git cache", {
       event: "artifacts.git.cache.cleanup.failed",
+      error: sanitizedGitError(cleanupErr, "Git cache cleanup"),
     });
   });
 }
@@ -117,6 +128,7 @@ async function cloneRepo(dir: string, url: string, branch: string, onAuth: () =>
   } catch (err) {
     logger.warn("artifacts git clone failed; cleaning up partial clone", {
       event: "artifacts.git.clone.failed",
+      error: sanitizedGitError(err, "Git clone"),
     });
     await deleteCachedRepo(dir);
     throw err;
@@ -158,9 +170,10 @@ async function fetchOrRecloneRepo(dir: string, url: string, branch: string, onAu
 
   try {
     return await fetchRepo(dir, url, branch, onAuth, remainingBytes);
-  } catch {
+  } catch (err) {
     logger.warn("artifacts git fetch failed; cleaning up before recloning", {
       event: "artifacts.git.fetch.failed",
+      error: sanitizedGitError(err, "Git fetch"),
     });
     return recloneRepo(dir, url, branch, onAuth);
   }
@@ -194,67 +207,77 @@ async function readArtifactRepoDocumentsWithContext(
   currentCommit?: string,
 ): Promise<ArtifactRepoReadResult> {
   let repo = await artifacts.get(repoName);
-  // Create a temporary read token just for this function call.
-  let token = await repo.createToken("read", 3600);
-
   try {
-    let onAuth = () => ({ username: "x-access-token", password: token.plaintext });
-    let branchRefName = `refs/heads/${branch}`;
-    let refs = await listServerRefs({ http: makeHttp(MAX_GIT_DIR_BYTES), url, prefix: branchRefName, onAuth });
-    let branchRef = refs.find(ref => ref.ref === branchRefName);
-    if (!branchRef) {
-      return currentCommit === ""
-        ? { commit: "", changed: false }
-        : { commit: "", changed: true, documents: [] };
-    }
-    if (branchRef.oid === currentCommit) {
-      // Currently stored commit is still the tip of the mirrored branch.
-      return { commit: currentCommit, changed: false };
-    }
-
-    let commit = "";
-    if ((await gitdirStats(dir)).exists) {
-      // Stale repo checkout already exists in in-memory filesystem.
-      commit = await fetchOrRecloneRepo(dir, url, branch, onAuth);
-      if (!commit) return { commit: "", changed: true, documents: [] };
-    } else {
-      // Repo needs to be cloned from scratch.
-      await cloneRepo(dir, url, branch, onAuth);
-      commit = await resolveRef({ fs, dir, ref: "HEAD" });
-    }
-    if (!commit) return { commit: "", changed: true, documents: [] };
-
-    let filepaths = await listGitFiles({ fs, dir, ref: commit });
-    let documents: ContextDocument[] = [];
-    for (let filepath of filepaths) {
-      let { blob } = await readBlob({ fs, dir, oid: commit, filepath });
-      let contentType = contentTypeFromPath(filepath);
-      let bodyBytes = encodedBodyBytes(contentType, blob);
-      if (bodyBytes > MAX_DOCUMENT_BODY_BYTES) {
-        logger.warn("skipping oversized mirrored context file", {
-          event: "context.file.oversized.skipped",
-          bodyBytes,
-          maxBodyBytes: MAX_DOCUMENT_BODY_BYTES,
-        });
-        continue;
+    // Create a temporary read token just for this function call.
+    let token = await repo.createToken("read", 3600);
+    try {
+      let onAuth = () => ({ username: "x-access-token", password: token.plaintext });
+      let branchRefName = `refs/heads/${branch}`;
+      let refs = await listServerRefs({
+        http: makeHttp(MAX_GIT_DIR_BYTES), url, prefix: branchRefName, onAuth,
+      });
+      let branchRef = refs.find(ref => ref.ref === branchRefName);
+      if (!branchRef) {
+        return currentCommit === ""
+          ? { commit: "", changed: false }
+          : { commit: "", changed: true, documents: [] };
       }
-      let body = isTextContentType(contentType) ? new TextDecoder().decode(blob) : Buffer.from(blob).toString("base64");
-      documents.push({
-        path: filepath,
-        name: posixPath.basename(filepath),
-        description: isTextContentType(contentType) ? extractDescription(contentType, body) ?? "" : "",
-        contentType,
-        body,
-        lastUpdated: new Date(),
+      if (branchRef.oid === currentCommit) {
+        // Currently stored commit is still the tip of the mirrored branch.
+        return { commit: currentCommit, changed: false };
+      }
+
+      let commit = "";
+      if ((await gitdirStats(dir)).exists) {
+        // Stale repo checkout already exists in in-memory filesystem.
+        commit = await fetchOrRecloneRepo(dir, url, branch, onAuth);
+        if (!commit) return { commit: "", changed: true, documents: [] };
+      } else {
+        // Repo needs to be cloned from scratch.
+        await cloneRepo(dir, url, branch, onAuth);
+        commit = await resolveRef({ fs, dir, ref: "HEAD" });
+      }
+      if (!commit) return { commit: "", changed: true, documents: [] };
+
+      let filepaths = await listGitFiles({ fs, dir, ref: commit });
+      let documents: ContextDocument[] = [];
+      for (let filepath of filepaths) {
+        let { blob } = await readBlob({ fs, dir, oid: commit, filepath });
+        let contentType = contentTypeFromPath(filepath);
+        let bodyBytes = encodedBodyBytes(contentType, blob);
+        if (bodyBytes > MAX_DOCUMENT_BODY_BYTES) {
+          logger.warn("skipping oversized mirrored context file", {
+            event: "context.file.oversized.skipped",
+            bodyBytes,
+            maxBodyBytes: MAX_DOCUMENT_BODY_BYTES,
+          });
+          continue;
+        }
+        let body = isTextContentType(contentType)
+          ? new TextDecoder().decode(blob)
+          : Buffer.from(blob).toString("base64");
+        documents.push({
+          path: filepath,
+          name: posixPath.basename(filepath),
+          description: isTextContentType(contentType)
+            ? extractDescription(contentType, body) ?? ""
+            : "",
+          contentType,
+          body,
+          lastUpdated: new Date(),
+        });
+      }
+
+      return { commit, changed: true, documents };
+    } finally {
+      await repo.revokeToken(token.id).catch((err) => {
+        logger.warn("failed to revoke temporary Artifacts read token for context collection sync", {
+          event: "artifacts.read.token.revoke.failed",
+          error: sanitizedGitError(err, "Artifacts read-token cleanup"),
+        });
       });
     }
-
-    return { commit, changed: true, documents };
   } finally {
-    await repo.revokeToken(token.id).catch(() => {
-      logger.warn("failed to revoke temporary Artifacts read token for context collection sync", {
-        event: "artifacts.read.token.revoke.failed",
-      });
-    });
+    disposeArtifactRepoCapability(repo);
   }
 }
