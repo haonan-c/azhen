@@ -90,7 +90,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(attempt.state).toBe("ready");
       expect(attempt.reservationId).toBe("op-settle");
       expect(attempt.reservationAmountSubunits).toBe(CHARGE);
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: CHARGE,
       });
@@ -105,7 +105,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.chargeSubunits).toBe(CHARGE);
       expect(record.ledgerEntryId).not.toBeNull();
       // The exact fixed charge leaves the balance; nothing stays reserved.
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: 0n,
       });
@@ -120,7 +120,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       const attempt = account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
       expect(attempt.reservationId).toBeNull();
       expect(attempt.reservationAmountSubunits).toBe(0n);
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE,
         reservedSubunits: 0n,
       });
@@ -130,7 +130,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.outcome).toBe("settled");
       expect(record.chargeSubunits).toBe(0n);
       expect(record.ledgerEntryId).toBeNull();
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE,
         reservedSubunits: 0n,
       });
@@ -496,7 +496,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.outcome).toBe("failed-before-execution");
       expect(record.chargeSubunits).toBeNull();
       expect(record.ledgerEntryId).toBeNull();
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE,
         reservedSubunits: 0n,
       });
@@ -512,7 +512,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.outcome).toBe("usage-unknown");
       expect(record.chargeSubunits).toBeNull();
       // Held, not released and not charged: the Credit stays reserved for reconciliation.
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: CHARGE,
       });
@@ -536,7 +536,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       const record = account.completeGatekeeperUsage("op-retry", "executed");
       expect(account.completeGatekeeperUsage("op-retry", "executed")).toEqual(record);
       // Exactly one charge reached the immutable Ledger.
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: 0n,
       });

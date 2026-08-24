@@ -135,7 +135,7 @@ async function createAccount(publicApi: RpcStub<PublicApi>) {
   const token = await publicApi.createAccount(username, username, PASSWORD_HASH);
   if (token === null) throw new Error(`Failed to create ${username}.`);
   using authenticated = await publicApi.authenticate(token);
-  expect(await authenticated.getUsageCreditBalance()).toEqual({
+  expect(await authenticated.getUsageCreditBalance()).toMatchObject({
     availableSubunits: INITIAL_BALANCE,
     reservedSubunits: 0n,
   });

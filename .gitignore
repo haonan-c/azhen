@@ -11,6 +11,7 @@ packages/gatekeeper-*/src/generated/app.txt
 # Bundled format blueprints (regenerated at build time from FORMAT_BLUEPRINTS_DIR).
 packages/workshop-backend/src/generated/format-blueprints.ts
 packages/workshop-backend/src/generated/browser-export-runtime.txt
+packages/workshop-backend/src/generated/public-billing-methods.ts
 # Bundled UGC Ads skills (regenerated at build time from vendor/).
 packages/gatekeeper-ugc-ads/src/generated/skills.ts
 

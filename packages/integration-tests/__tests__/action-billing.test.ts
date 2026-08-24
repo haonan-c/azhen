@@ -172,7 +172,7 @@ describe("approved Action billing", () => {
     }]);
     expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
       .toBe("accepted");
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
@@ -203,7 +203,12 @@ describe("approved Action billing", () => {
     expect(providerCalls.slice(callStart)).toEqual([]);
     expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
       .toBe("failed-before-execution");
-    expect(await user.getUsageCreditBalance()).toEqual(before);
+    const afterFailure = await user.getUsageCreditBalance();
+    expect(afterFailure).toMatchObject({
+      availableSubunits: before.availableSubunits,
+      reservedSubunits: before.reservedSubunits,
+    });
+    expect(afterFailure.revision).toBeGreaterThan(before.revision);
   });
 
   it("holds an indeterminate non-idempotent Action without an automatic retry", async () => {
@@ -232,7 +237,7 @@ describe("approved Action billing", () => {
     expect(providerCalls.slice(callStart)).toHaveLength(1);
     expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
       .toBe("unknown");
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: ACTION_CHARGE,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
@@ -266,7 +271,7 @@ describe("approved Action billing", () => {
     expect(calls[1].idempotencyKey).toBe(calls[0].idempotencyKey);
     expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
       .toBe("accepted");
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
@@ -307,7 +312,7 @@ describe("approved Action billing", () => {
       expect(providerCalls.slice(callStart)).toHaveLength(providerCallCount);
       expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
         .toBe(expectedState);
-      expect(await user.getUsageCreditBalance()).toEqual({
+      expect(await user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits,
         availableSubunits: before.availableSubunits - ACTION_CHARGE,
       });
@@ -347,7 +352,7 @@ describe("approved Action billing", () => {
     });
 
     expect(providerCalls.slice(callStart)).toHaveLength(1);
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
@@ -458,7 +463,7 @@ describe("approved Action billing", () => {
 
       expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
         .toBe("accepted");
-      expect(await user.getUsageCreditBalance()).toEqual({
+      expect(await user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - rateAtBegin,
       });
@@ -539,7 +544,7 @@ describe("approved Action billing", () => {
     expect((await reopenedWorkspace.listActions()).find(entry => entry.id === actionId)?.state)
       .toBe("accepted");
     expect(await reopenedOwner.getUsageCreditBalance()).toEqual(ownerBefore);
-    expect(await reopenedSubmitter.getUsageCreditBalance()).toEqual({
+    expect(await reopenedSubmitter.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: submitterBefore.availableSubunits - ACTION_CHARGE,
     });
@@ -592,7 +597,7 @@ describe("approved Action billing", () => {
     expect(settled.ledgerEntryId).toMatch(/^usage-credit-charge:/);
     expect((await workspace.listActions()).find(entry => entry.id === settleAction.id)?.state)
       .toBe("accepted");
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
@@ -636,7 +641,7 @@ describe("approved Action billing", () => {
     expect(released.ledgerEntryId).toBeNull();
     expect((await workspace.listActions()).find(entry => entry.id === releaseAction.id)?.state)
       .toBe("failed-before-execution");
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits,
     });
@@ -663,7 +668,7 @@ describe("approved Action billing", () => {
     expect(reversed.ledgerEntryId).toMatch(/^usage-credit-admin:/);
     expect((await workspace.listActions()).find(entry => entry.id === reverseAction.id)?.state)
       .toBe("accepted");
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits,
     });
@@ -755,7 +760,12 @@ describe("approved Action billing", () => {
       newState: "reverted",
       decision: "reverse",
     });
-    expect(await user.getUsageCreditBalance()).toEqual(before);
+    const afterReversal = await user.getUsageCreditBalance();
+    expect(afterReversal).toMatchObject({
+      availableSubunits: before.availableSubunits,
+      reservedSubunits: before.reservedSubunits,
+    });
+    expect(afterReversal.revision).toBeGreaterThan(before.revision);
   });
 
   it("does not retry an indeterminate Gatekeeper revert or change its original charge", async () => {

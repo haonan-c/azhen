@@ -294,10 +294,12 @@ describe("Home Assistant read billing", () => {
         }
         expect((await upstream.calls()).length, `${read.name} must reach the mock Home Assistant`)
           .toBeGreaterThan(upstreamStart);
-        expect(await context.user.getUsageCreditBalance(), read.name).toEqual({
+        const after = await context.user.getUsageCreditBalance();
+        expect(after, read.name).toMatchObject({
           reservedSubunits: 0n,
           availableSubunits: before.availableSubunits - expectedCharge,
         });
+        expect(after.revision, read.name).toBeGreaterThan(before.revision);
         expect(await latestGatekeeperUsage(context.user), read.name).toMatchObject({
           source: "direct-user",
           vendorId: VENDOR_ID,
@@ -363,13 +365,13 @@ describe("Home Assistant read billing", () => {
           ? balance
           : null;
       });
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: readCharge("HomeAssistantSession.getConfig"),
         availableSubunits:
           before.availableSubunits - readCharge("HomeAssistantSession.getConfig"),
       });
       await pending;
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits:
           before.availableSubunits - readCharge("HomeAssistantSession.getConfig"),
@@ -394,7 +396,12 @@ describe("Home Assistant read billing", () => {
       await expect(instance.listAreas()).rejects.toThrow();
 
       expect(await upstream.calls()).toEqual([]);
-      expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      const afterRelease = await context.user.getUsageCreditBalance();
+      expect(afterRelease).toMatchObject({
+        availableSubunits: before.availableSubunits,
+        reservedSubunits: before.reservedSubunits,
+      });
+      expect(afterRelease.revision).toBeGreaterThan(before.revision);
       expect(await latestGatekeeperUsage(context.user)).toMatchObject({
         billingMethodKey:
           HOME_ASSISTANT_BILLING_METHODS["HomeAssistantSession.listAreas"].methodKey,
@@ -425,7 +432,7 @@ describe("Home Assistant read billing", () => {
         transport: "rest",
         operation: "GET /api/states",
       }]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: charge,
         availableSubunits: before.availableSubunits - charge,
       });
@@ -458,7 +465,7 @@ describe("Home Assistant read billing", () => {
         transport: "websocket",
         operation: "config/area_registry/list",
       }]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: readCharge("HomeAssistantSession.listAreas"),
         availableSubunits:
           before.availableSubunits - readCharge("HomeAssistantSession.listAreas"),

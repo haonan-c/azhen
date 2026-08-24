@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, type UsageCreditBalanceSubscriber } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, type BillableOperation, type BillableOperationAuthorizer, type BillableOperationOutcome } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
@@ -31,7 +31,11 @@ import type {
   GatekeeperChargeSnapshot,
   ModelChargeSnapshot,
   PricedChargeSnapshot,
+  PublishedApiRate,
   UsageCreditBalance,
+  UserCreditLedgerPage,
+  UserCreditPageRequest,
+  UserCreditReservationPage,
   UserUsageRecordPage,
   UserUsageRecordPageRequest,
 } from "@gadgets/workshop-shared/api";
@@ -123,6 +127,16 @@ class DirectUserBillingAuthorizer extends NativeRpcTarget
       externalAccountId,
       idempotencyKey,
     );
+  }
+}
+
+class UsageCreditBalanceSubscription extends NativeRpcTarget {
+  constructor(private unsubscribe: () => void) {
+    super();
+  }
+
+  [Symbol.dispose](): void {
+    this.unsubscribe();
   }
 }
 
@@ -245,6 +259,9 @@ function makeUserStorage(storage: DurableObjectStorage) {
       },
       preferredModel: <string | null>null,
       onboardingCompleted: false,
+      // New accounts do not receive the one-time notice reserved for Users returning from before
+      // the Usage Credit launch. A missing stored value identifies an existing legacy account.
+      usageCreditNativeAccount: false,
 
       // Set once the user's pre-existing workspaces have been asked to populate the outputs index
       // (see #backfillOutputs()). Workspaces created since push on their own.
@@ -326,6 +343,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private usageProjection: DurableObjectNamespace<UsageProjection>;
   private projectionPreparations = new Set<bigint>();
+  private usageBalanceSubscribers = new Set<RpcStub<UsageCreditBalanceSubscriber>>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -349,7 +367,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         identity: profile.id,
         displayName: profile.name,
       };
-    });
+    }, balance => this.publishUsageCreditBalance(balance));
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.usageProjection = this.ctx.exports.UsageProjection;
 
@@ -540,6 +558,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
       // Create on first use.
       this.storage.created.put(true);
+      this.storage.usageCreditNativeAccount.put(true);
       this.storage.profile.put({
         type: "user",
         name: email.split("@")[0],
@@ -597,6 +616,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     this.storage.created.put(true);
+    this.storage.usageCreditNativeAccount.put(true);
     this.storage.profile.put({
       type: "user",
       name: displayName,
@@ -627,6 +647,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
+      this.storage.usageCreditNativeAccount.put(true);
       this.storage.profile.put({
         type: "user",
         name: email.split("@")[0],
@@ -670,7 +691,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     const initialGrantSnapshot = this.usageAccount.isInitialized()
       ? undefined
       : await this.adminSettings.getByName("").issueInitialGrantSnapshot();
-    const outbox = this.usageAccount.activate(initialGrantSnapshot);
+    const outbox = this.usageAccount.activate(
+      initialGrantSnapshot,
+      !this.storage.usageCreditNativeAccount.get(),
+    );
     if (outbox.deliveredAt !== undefined) return;
 
     await this.adminSettings.getByName("").registerUsageUser(outbox.fact);
@@ -702,10 +726,66 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  /** Subscribe to this User's ordered authoritative balance snapshots. */
+  async subscribeUsageCreditBalance(
+      subscriber: RpcStub<UsageCreditBalanceSubscriber>):
+      Promise<NativeRpcStub<UsageCreditBalanceSubscription>> {
+    await this.activateUsageAccount();
+    const retained = subscriber.dup();
+    this.usageBalanceSubscribers.add(retained);
+    const unsubscribe = () => {
+      if (!this.usageBalanceSubscribers.delete(retained)) return;
+      retained[Symbol.dispose]();
+    };
+    try {
+      await retained.update(this.usageAccount.getBalance());
+    } catch (error) {
+      unsubscribe();
+      throw error;
+    }
+    return new NativeRpcStub(new UsageCreditBalanceSubscription(unsubscribe));
+  }
+
+  /** Idempotently acknowledge this User's pending legacy activation notice. */
+  async acknowledgeUsageActivationNotice(noticeId: string): Promise<UsageCreditBalance> {
+    await this.activateUsageAccount();
+    return this.usageAccount.acknowledgeActivationNotice(noticeId);
+  }
+
+  private publishUsageCreditBalance(balance: UsageCreditBalance): void {
+    for (const subscriber of this.usageBalanceSubscribers) {
+      subscriber.update(balance).catch(() => {
+        if (this.usageBalanceSubscribers.delete(subscriber)) {
+          subscriber[Symbol.dispose]();
+        }
+      });
+    }
+  }
+
   /** Return one bounded page of this User's content-free Usage Records. */
   async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
     await this.activateUsageAccount();
     return this.usageAccount.listUserUsageRecords(request);
+  }
+
+  /** Return one bounded page of this User's Credit Reservations. */
+  async listOwnCreditReservations(
+      request: UserCreditPageRequest): Promise<UserCreditReservationPage> {
+    await this.activateUsageAccount();
+    return this.usageAccount.listUserCreditReservations(request);
+  }
+
+  /** Return one bounded page of this User's safe Credit Ledger projection. */
+  async listOwnCreditLedger(request: UserCreditPageRequest): Promise<UserCreditLedgerPage> {
+    await this.activateUsageAccount();
+    return this.usageAccount.listUserCreditLedger(request);
+  }
+
+  /** Return a bounded set of safe Gatekeeper methods observed for this User. */
+  async listOwnDiscoveredGatekeeperMethods(): Promise<Array<Pick<PublishedApiRate,
+    "vendorId" | "billingMethodKey">>> {
+    await this.activateUsageAccount();
+    return this.usageAccount.listDiscoveredGatekeeperMethods();
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */

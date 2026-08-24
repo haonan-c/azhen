@@ -427,7 +427,7 @@ describe("DeepSeek Agent billing", () => {
 
     expect(providerRequests).toHaveLength(1);
     expect(providerRequests[0]?.isAgentInference).toBe(true);
-    expect(after).toEqual({
+    expect(after).toMatchObject({
       availableSubunits: before.availableSubunits - expected,
       reservedSubunits: 0n,
     });
@@ -551,7 +551,7 @@ describe("DeepSeek Agent billing", () => {
     );
     expect(agentProviderCalls).toBe(2);
     expect(requestTimes).toHaveLength(2);
-    expect(after).toEqual({
+    expect(after).toMatchObject({
       availableSubunits: before.availableSubunits - expectedTotal,
       reservedSubunits: 0n,
     });

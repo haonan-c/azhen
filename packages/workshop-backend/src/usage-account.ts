@@ -7,8 +7,15 @@ import {
   type InitialGrantSnapshot,
   type ModelChargeSnapshot,
   type PricedChargeSnapshot,
+  type PublishedApiRate,
   type UsageCreditBalance,
+  type UsageCreditActivationNotice,
   type UserGatekeeperUsageRecord,
+  type UserCreditLedgerEntry,
+  type UserCreditLedgerPage,
+  type UserCreditPageRequest,
+  type UserCreditReservation,
+  type UserCreditReservationPage,
   type UserModelUsageRecord,
   type UserUsageRecordPage,
   type UserUsageRecordPageRequest,
@@ -37,6 +44,8 @@ const LEDGER_PREFIX = "usageAccount:ledger:";
 const RESERVATION_PREFIX = "usageAccount:reservation:";
 const UNPRICED_DECISION_PREFIX = "usageAccount:unpricedDecision:";
 const TOTALS_KEY = "usageAccount:totals:v1";
+const BALANCE_REVISION_KEY = "usageAccount:balanceRevision:v1";
+const ACTIVATION_NOTICE_KEY = "usageAccount:activationNotice:v1";
 const INITIAL_GRANT_ID = "usage-credit-initial-grant:v1";
 const REGISTRATION_OUTBOX_KEY = "usageAccount:registrationOutbox:v1";
 const ADMIN_OPERATION_PREFIX = "usageAccount:adminOperation:";
@@ -58,6 +67,11 @@ const PROJECTION_PENDING_COUNT_KEY = "usageAccount:projectionPendingCount:v1";
 const PROJECTION_SOURCE_MARKER_PREFIX = "usageAccount:projectionSourceMarker:";
 const PROJECTION_BACKFILL_STAGE_KEY = "usageAccount:projectionBackfillStage:v1";
 const PROJECTION_BACKFILL_CURSOR_KEY = "usageAccount:projectionBackfillCursor:v1";
+const DISCOVERED_GATEKEEPER_METHOD_PREFIX = "usageAccount:discoveredGatekeeperMethod:";
+const DISCOVERED_GATEKEEPER_METHOD_VERSION_KEY =
+  "usageAccount:discoveredGatekeeperMethodVersion:v1";
+const DISCOVERED_GATEKEEPER_METHOD_MIGRATION_CURSOR_KEY =
+  "usageAccount:discoveredGatekeeperMethodMigrationCursor:v1";
 const GATEKEEPER_RECONCILIATION_PREFIX = "usageAccount:gatekeeperReconciliation:";
 const GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX =
   "usageAccount:gatekeeperReconciliationByUsage:";
@@ -66,6 +80,7 @@ const DEFAULT_USER_USAGE_PAGE_LIMIT = 50;
 const MAX_USER_USAGE_PAGE_LIMIT = 100;
 const GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH = 100;
 const PROJECTION_BACKFILL_BATCH = 32;
+const MAX_DISCOVERED_GATEKEEPER_METHODS = 500;
 
 type ProjectionBackfillStage = "model" | "gatekeeper" | "reconciliation" | "complete";
 
@@ -74,6 +89,10 @@ type TransactionResult<T> = { value: T } | { error: Error };
 type UsageAccountTotals = {
   ledgerBalanceSubunits: bigint;
   reservedSubunits: bigint;
+};
+
+type StoredUsageCreditActivationNotice = UsageCreditActivationNotice & {
+  acknowledgedAt?: string;
 };
 
 type UnpricedChargeSnapshot = Extract<ChargeSnapshot, {pricing: "unpriced"}>;
@@ -330,7 +349,8 @@ export type UsageAccountSnapshot = UsageCreditBalance & {
 export class UsageAccount {
   constructor(
       private readonly storage: DurableObjectStorage,
-      private readonly registrationIdentity?: () => UsageUserRegistrationIdentity) {}
+      private readonly registrationIdentity?: () => UsageUserRegistrationIdentity,
+      private readonly balanceChanged?: (balance: UsageCreditBalance) => void) {}
 
   /** Return whether this account already has its singular initial grant and matching totals. */
   isInitialized(): boolean {
@@ -351,9 +371,11 @@ export class UsageAccount {
    * Atomically create or confirm the initial grant and stable registration outbox fact.
    */
   activate(
-      initialGrantSnapshot: InitialGrantSnapshot | undefined): UsageUserRegistrationOutbox {
+      initialGrantSnapshot: InitialGrantSnapshot | undefined,
+      activationNoticeEligible = false): UsageUserRegistrationOutbox {
     return this.storage.transactionSync(() => {
       this.ensureInitialGrant(initialGrantSnapshot);
+      if (activationNoticeEligible) this.ensureActivationNotice();
       const outbox = this.storage.kv.get<UsageUserRegistrationOutbox>(REGISTRATION_OUTBOX_KEY);
       if (!outbox) throw new Error("Usage User registration outbox is missing.");
       assertRegistrationOutbox(outbox);
@@ -396,6 +418,11 @@ export class UsageAccount {
       return {
         availableSubunits: totals.ledgerBalanceSubunits - totals.reservedSubunits,
         reservedSubunits: totals.reservedSubunits,
+        revision: this.getBalanceRevision(),
+        lowBalance: totals.ledgerBalanceSubunits - totals.reservedSubunits <=
+          this.getLowBalanceThresholdSubunits(),
+        lowBalanceThresholdSubunits: this.getLowBalanceThresholdSubunits(),
+        activationNotice: this.getPendingActivationNotice(),
       };
     });
   }
@@ -403,6 +430,72 @@ export class UsageAccount {
   /** Return all exact authoritative balance components for a server-bound admin capability. */
   getAdminBalanceState(): AdminUsageBalanceState {
     return this.storage.transactionSync(() => balanceState(this.ensureInitialGrant()));
+  }
+
+  /** Persist an idempotent acknowledgement of the pending legacy activation notice. */
+  acknowledgeActivationNotice(noticeId: string): UsageCreditBalance {
+    let changed = false;
+    this.storage.transactionSync(() => {
+      if (typeof noticeId !== "string" || noticeId.length === 0 || noticeId.length > 300 ||
+          hasAsciiControlCharacter(noticeId)) {
+        throw new TypeError("Usage Credit activation notice identifier is invalid.");
+      }
+      const notice = this.storage.kv.get<StoredUsageCreditActivationNotice>(ACTIVATION_NOTICE_KEY);
+      if (notice === undefined || notice.id !== noticeId) {
+        throw new Error("Usage Credit activation notice does not exist.");
+      }
+      if (notice.acknowledgedAt !== undefined) return;
+      this.storage.kv.put<StoredUsageCreditActivationNotice>(ACTIVATION_NOTICE_KEY, {
+        ...notice,
+        acknowledgedAt: new Date().toISOString(),
+      });
+      this.storage.kv.put(BALANCE_REVISION_KEY, this.getBalanceRevision() + 1n);
+      changed = true;
+    });
+    const balance = this.getBalance();
+    if (changed) this.balanceChanged?.(balance);
+    return balance;
+  }
+
+  private getBalanceRevision(): bigint {
+    const revision = this.storage.kv.get<bigint>(BALANCE_REVISION_KEY);
+    if (typeof revision !== "bigint" || revision < 1n) {
+      throw new Error("Usage Credit balance revision does not reconcile.");
+    }
+    return revision;
+  }
+
+  private getLowBalanceThresholdSubunits(): bigint {
+    const grant = this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + INITIAL_GRANT_ID);
+    if (!grant) throw new Error("Usage Credit initial grant is missing.");
+    assertInitialGrant(grant);
+    return (grant.deltaSubunits + 9n) / 10n;
+  }
+
+  private getPendingActivationNotice(): UsageCreditActivationNotice | null {
+    const notice = this.storage.kv.get<StoredUsageCreditActivationNotice>(ACTIVATION_NOTICE_KEY);
+    if (notice === undefined || notice.acknowledgedAt !== undefined) return null;
+    return {
+      id: notice.id,
+      grantedSubunits: notice.grantedSubunits,
+      activatedAt: notice.activatedAt,
+    };
+  }
+
+  private ensureActivationNotice(): void {
+    if (this.storage.kv.get<StoredUsageCreditActivationNotice>(ACTIVATION_NOTICE_KEY) !== undefined) {
+      return;
+    }
+    const grant = this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + INITIAL_GRANT_ID);
+    const outbox = this.storage.kv.get<UsageUserRegistrationOutbox>(REGISTRATION_OUTBOX_KEY);
+    if (!grant || !outbox) throw new Error("Usage Credit activation notice state is incomplete.");
+    assertInitialGrant(grant);
+    assertRegistrationOutbox(outbox);
+    this.storage.kv.put<StoredUsageCreditActivationNotice>(ACTIVATION_NOTICE_KEY, {
+      id: `usage-credit-activation:${outbox.fact.registrationEventId}`,
+      grantedSubunits: grant.deltaSubunits,
+      activatedAt: outbox.fact.activatedAt,
+    });
   }
 
   /** Reconcile all stored Ledger entries into an internal diagnostic snapshot. */
@@ -653,6 +746,97 @@ export class UsageAccount {
     });
   }
 
+  /** Return one bounded page of this User's Credit Reservations. */
+  listUserCreditReservations(request: UserCreditPageRequest): UserCreditReservationPage {
+    const {cursor, limit} = normalizeUserCreditPageRequest(request, "Credit Reservation");
+    return this.storage.transactionSync(() => {
+      const entries = Array.from(this.storage.kv.list<CreditReservation>({
+        prefix: RESERVATION_PREFIX,
+        reverse: true,
+        limit: limit + 1,
+        ...(cursor === undefined ? {} : {end: RESERVATION_PREFIX + cursor}),
+      }));
+      const visible = entries.slice(0, limit);
+      return {
+        reservations: visible.map(([key, reservation]) => {
+          const operationId = key.slice(RESERVATION_PREFIX.length);
+          this.assertStoredReservationConsistency(reservation, operationId);
+          return userCreditReservation(
+            reservation,
+            this.storage.kv.get<ModelMeteringAttempt>(MODEL_ATTEMPT_PREFIX + operationId),
+            this.storage.kv.get<GatekeeperMeteringAttempt>(
+              GATEKEEPER_ATTEMPT_PREFIX + operationId,
+            ),
+          );
+        }),
+        nextCursor: entries.length > limit
+          ? visible.at(-1)![0].slice(RESERVATION_PREFIX.length)
+          : null,
+      };
+    });
+  }
+
+  /** Return one bounded page of this User's safe Credit Ledger projection. */
+  listUserCreditLedger(request: UserCreditPageRequest): UserCreditLedgerPage {
+    const {cursor, limit} = normalizeUserCreditPageRequest(request, "Credit Ledger");
+    return this.storage.transactionSync(() => {
+      const entries = Array.from(this.storage.kv.list<CreditLedgerEntry>({
+        prefix: LEDGER_PREFIX,
+        reverse: true,
+        limit: limit + 1,
+        ...(cursor === undefined ? {} : {end: LEDGER_PREFIX + cursor}),
+      }));
+      const visible = entries.slice(0, limit);
+      return {
+        entries: visible.map(([key, entry]): UserCreditLedgerEntry => {
+          if (key !== LEDGER_PREFIX + entry.id) {
+            throw new Error("Credit Ledger Entry identity does not reconcile.");
+          }
+          assertLedgerEntry(entry);
+          return {
+            id: entry.id,
+            kind: entry.kind,
+            deltaSubunits: entry.deltaSubunits,
+            reversalOfLedgerEntryId: entry.kind === "credit-reversal"
+              ? entry.adminAudit.originalLedgerEntryId
+              : null,
+            reversedByLedgerEntryId:
+              this.storage.kv.get<string>(REVERSAL_PREFIX + entry.id) ?? null,
+            createdAt: entry.createdAt,
+          };
+        }),
+        nextCursor: entries.length > limit
+          ? visible.at(-1)![0].slice(LEDGER_PREFIX.length)
+          : null,
+      };
+    });
+  }
+
+  /** Return a bounded set of safe Gatekeeper methods observed for this User. */
+  listDiscoveredGatekeeperMethods(): Array<Pick<PublishedApiRate,
+    "vendorId" | "billingMethodKey">> {
+    const ready = this.storage.transactionSync(() =>
+      this.migrateDiscoveredGatekeeperMethodsBatch());
+    if (!ready) throw new Error("Published API methods are being prepared. Retry the request.");
+    return this.storage.transactionSync(() => {
+      const methods = Array.from(this.storage.kv.list<Pick<PublishedApiRate,
+        "vendorId" | "billingMethodKey">>({
+        prefix: DISCOVERED_GATEKEEPER_METHOD_PREFIX,
+        limit: MAX_DISCOVERED_GATEKEEPER_METHODS + 1,
+      })).map(([, method]) => method);
+      if (methods.length > MAX_DISCOVERED_GATEKEEPER_METHODS) {
+        throw new Error("Published API method inventory exceeds its safe bound.");
+      }
+      for (const method of methods) {
+        if (!isStableUsageDimension(method.vendorId) ||
+            !isStableUsageDimension(method.billingMethodKey)) {
+          throw new Error("Published API method identity does not reconcile.");
+        }
+      }
+      return methods;
+    });
+  }
+
   private migrateGatekeeperUsageTimeIndexBatch(): boolean {
     if (this.storage.kv.get<boolean>(GATEKEEPER_USAGE_TIME_INDEX_VERSION_KEY) === true) return true;
     const startAfter = this.storage.kv.get<string>(
@@ -681,13 +865,55 @@ export class UsageAccount {
     return true;
   }
 
+  private migrateDiscoveredGatekeeperMethodsBatch(): boolean {
+    if (this.storage.kv.get<boolean>(DISCOVERED_GATEKEEPER_METHOD_VERSION_KEY) === true) {
+      return true;
+    }
+    const startAfter = this.storage.kv.get<string>(
+      DISCOVERED_GATEKEEPER_METHOD_MIGRATION_CURSOR_KEY,
+    );
+    const entries = Array.from(this.storage.kv.list<GatekeeperUsageRecord>({
+      prefix: GATEKEEPER_USAGE_RECORD_PREFIX,
+      ...(startAfter === undefined ? {} : {startAfter}),
+      limit: GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH + 1,
+    }));
+    const batch = entries.slice(0, GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH);
+    for (const [recordKey, record] of batch) {
+      const operationId = recordKey.slice(GATEKEEPER_USAGE_RECORD_PREFIX.length);
+      assertGatekeeperUsageRecord(record, operationId);
+      this.recordDiscoveredGatekeeperMethod(record.attribution);
+    }
+    if (entries.length > GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_BATCH) {
+      this.storage.kv.put(
+        DISCOVERED_GATEKEEPER_METHOD_MIGRATION_CURSOR_KEY,
+        batch.at(-1)![0],
+      );
+      return false;
+    }
+    this.storage.kv.delete(DISCOVERED_GATEKEEPER_METHOD_MIGRATION_CURSOR_KEY);
+    this.storage.kv.put(DISCOVERED_GATEKEEPER_METHOD_VERSION_KEY, true);
+    return true;
+  }
+
+  private recordDiscoveredGatekeeperMethod(attribution: GatekeeperUsageAttribution): void {
+    const method = {
+      vendorId: attribution.vendorId,
+      billingMethodKey: attribution.billingMethodKey,
+    };
+    this.storage.kv.put(
+      DISCOVERED_GATEKEEPER_METHOD_PREFIX +
+        `${encodeURIComponent(method.vendorId)}/${encodeURIComponent(method.billingMethodKey)}`,
+      method,
+    );
+  }
+
   /** Atomically reserve positive Credit for one stable operation ID. */
   reserve(
       operationId: string,
       amountSubunits: bigint,
       chargeSnapshot: PricedChargeSnapshot,
       initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
-    const result = this.storage.transactionSync<TransactionResult<CreditReservation>>(() => {
+    const result = this.balanceTransaction<TransactionResult<CreditReservation>>(() => {
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
@@ -810,7 +1036,7 @@ export class UsageAccount {
       chargeSnapshot: ModelChargeSnapshot,
       reservationBound: ModelUsageReservationBound,
       initialGrantSnapshot?: InitialGrantSnapshot): ModelMeteringAttempt {
-    const result = this.storage.transactionSync<TransactionResult<ModelMeteringAttempt>>(() => {
+    const result = this.balanceTransaction<TransactionResult<ModelMeteringAttempt>>(() => {
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
@@ -916,7 +1142,7 @@ export class UsageAccount {
 
   /** Persist that one Agent model request is about to cross the provider boundary. */
   markModelUsageStarted(operationId: string): ModelMeteringAttempt {
-    const result = this.storage.transactionSync<TransactionResult<ModelMeteringAttempt>>(() => {
+    const result = this.balanceTransaction<TransactionResult<ModelMeteringAttempt>>(() => {
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
       const key = MODEL_ATTEMPT_PREFIX + operationId;
@@ -951,7 +1177,7 @@ export class UsageAccount {
 
   /** Release one known-not-dispatched Agent inference and persist its terminal result. */
   failModelUsageBeforeExecution(operationId: string): ModelUsageRecord {
-    const result = this.storage.transactionSync<TransactionResult<ModelUsageRecord>>(() => {
+    const result = this.balanceTransaction<TransactionResult<ModelUsageRecord>>(() => {
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
       const attempt = this.storage.kv.get<ModelMeteringAttempt>(MODEL_ATTEMPT_PREFIX + operationId);
@@ -970,7 +1196,7 @@ export class UsageAccount {
   completeModelUsage(
       operationId: string,
       usage: ModelUsageCompletion): ModelUsageRecord {
-    const result = this.storage.transactionSync<TransactionResult<ModelUsageRecord>>(() => {
+    const result = this.balanceTransaction<TransactionResult<ModelUsageRecord>>(() => {
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
       const attemptKey = MODEL_ATTEMPT_PREFIX + operationId;
@@ -1229,7 +1455,7 @@ export class UsageAccount {
       chargeSnapshot: GatekeeperChargeSnapshot,
       initialGrantSnapshot?: InitialGrantSnapshot): GatekeeperMeteringAttempt {
     const result =
-        this.storage.transactionSync<TransactionResult<GatekeeperMeteringAttempt>>(() => {
+        this.balanceTransaction<TransactionResult<GatekeeperMeteringAttempt>>(() => {
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
@@ -1371,7 +1597,7 @@ export class UsageAccount {
   completeGatekeeperUsage(
       operationId: string,
       completion: GatekeeperUsageCompletion): GatekeeperUsageRecord {
-    const result = this.storage.transactionSync<TransactionResult<GatekeeperUsageRecord>>(() => {
+    const result = this.balanceTransaction<TransactionResult<GatekeeperUsageRecord>>(() => {
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
       if (completion !== "executed" && completion !== "failed-before-execution" &&
@@ -1460,6 +1686,7 @@ export class UsageAccount {
       };
       this.storage.kv.put(recordKey, record);
       this.storage.kv.put(gatekeeperUsageTimeIndexKey(record), operationId);
+      this.recordDiscoveredGatekeeperMethod(record.attribution);
       this.storage.kv.put<GatekeeperMeteringAttempt>(attemptKey, {
         ...attempt,
         state: outcome,
@@ -1638,7 +1865,7 @@ export class UsageAccount {
       decision: "settle" | "release",
       reason: string,
       actorUserId: string): GatekeeperUsageReconciliation {
-    const result = this.storage.transactionSync<TransactionResult<GatekeeperUsageReconciliation>>(
+    const result = this.balanceTransaction<TransactionResult<GatekeeperUsageReconciliation>>(
       () => {
         const billingIdError = operationIdValidationError(billingOperationId);
         const reconciliationIdError = operationIdValidationError(reconciliationOperationId);
@@ -1759,7 +1986,7 @@ export class UsageAccount {
       operationId: string,
       settledAmountSubunits: bigint,
       initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
-    const result = this.storage.transactionSync<TransactionResult<CreditReservation>>(() => {
+    const result = this.balanceTransaction<TransactionResult<CreditReservation>>(() => {
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
@@ -1829,7 +2056,7 @@ export class UsageAccount {
   release(
       operationId: string,
       initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
-    const result = this.storage.transactionSync<TransactionResult<CreditReservation>>(() => {
+    const result = this.balanceTransaction<TransactionResult<CreditReservation>>(() => {
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
@@ -1933,7 +2160,7 @@ export class UsageAccount {
       input: StoredAdminUsageOperationInput): AdminUsageOperationResult {
     const operationError = adminOperationIdValidationError(operationId);
     if (operationError) throw operationError;
-    return this.storage.transactionSync(() => {
+    return this.balanceTransaction(() => {
       const totals = this.ensureInitialGrant();
       const operationKey = ADMIN_OPERATION_PREFIX + operationId;
       const existing = this.storage.kv.get<StoredAdminUsageOperation>(operationKey);
@@ -2068,6 +2295,9 @@ export class UsageAccount {
       assertInitialGrant(existingGrant);
       assertUsageAccountTotals(existingTotals);
       assertRegistrationOutbox(existingOutbox);
+      if (this.storage.kv.get<bigint>(BALANCE_REVISION_KEY) === undefined) {
+        this.storage.kv.put(BALANCE_REVISION_KEY, 1n);
+      }
       return existingTotals;
     }
     if (existingTotals !== undefined || existingOutbox !== undefined) {
@@ -2111,10 +2341,34 @@ export class UsageAccount {
     };
     this.storage.kv.put(key, entry);
     this.storage.kv.put(TOTALS_KEY, totals);
+    this.storage.kv.put(BALANCE_REVISION_KEY, 1n);
     this.storage.kv.put(REGISTRATION_OUTBOX_KEY, outbox);
     this.storage.kv.put(PROJECTION_PENDING_COUNT_KEY, 0n);
     this.storage.kv.put<ProjectionBackfillStage>(PROJECTION_BACKFILL_STAGE_KEY, "complete");
     return totals;
+  }
+
+  private balanceTransaction<T>(callback: () => T): T {
+    let changed = false;
+    const value = this.storage.transactionSync(() => {
+      const before = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+      const value = callback();
+      const after = this.storage.kv.get<UsageAccountTotals>(TOTALS_KEY);
+      if (after !== undefined) {
+        const revision = this.storage.kv.get<bigint>(BALANCE_REVISION_KEY);
+        if (revision === undefined) {
+          this.storage.kv.put(BALANCE_REVISION_KEY, 1n);
+        } else if (before !== undefined &&
+            (before.ledgerBalanceSubunits !== after.ledgerBalanceSubunits ||
+             before.reservedSubunits !== after.reservedSubunits)) {
+          this.storage.kv.put(BALANCE_REVISION_KEY, revision + 1n);
+          changed = true;
+        }
+      }
+      return value;
+    });
+    if (changed) this.balanceChanged?.(this.getBalance());
+    return value;
   }
 
   private assertStoredReservationConsistency(
@@ -2198,6 +2452,11 @@ export class UsageAccount {
     return {
       availableSubunits: totals.ledgerBalanceSubunits - totals.reservedSubunits,
       reservedSubunits: totals.reservedSubunits,
+      revision: this.getBalanceRevision(),
+      lowBalance: totals.ledgerBalanceSubunits - totals.reservedSubunits <=
+        this.getLowBalanceThresholdSubunits(),
+      lowBalanceThresholdSubunits: this.getLowBalanceThresholdSubunits(),
+      activationNotice: this.getPendingActivationNotice(),
       ledgerBalanceSubunits: totals.ledgerBalanceSubunits,
       ledgerEntries,
       reservations,
@@ -2602,6 +2861,72 @@ function normalizeUserUsageRecordPageRequest(
     throw new TypeError("User Usage Record page limit is invalid.");
   }
   return {cursor, limit};
+}
+
+function normalizeUserCreditPageRequest(
+    value: UserCreditPageRequest,
+    label: "Credit Reservation" | "Credit Ledger"): {cursor?: string; limit: number} {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).some(key => key !== "cursor" && key !== "limit")) {
+    throw new TypeError(`${label} page request is invalid.`);
+  }
+  const cursor = value.cursor;
+  if (cursor !== undefined &&
+      (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 500 ||
+       hasAsciiControlCharacter(cursor))) {
+    throw new TypeError(`${label} cursor is invalid.`);
+  }
+  const limit = value.limit ?? DEFAULT_USER_USAGE_PAGE_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_USER_USAGE_PAGE_LIMIT) {
+    throw new TypeError(`${label} page limit is invalid.`);
+  }
+  return {cursor, limit};
+}
+
+function userCreditReservation(
+    reservation: CreditReservation,
+    modelAttempt: ModelMeteringAttempt | undefined,
+    gatekeeperAttempt: GatekeeperMeteringAttempt | undefined): UserCreditReservation {
+  if (modelAttempt !== undefined) assertModelMeteringAttempt(modelAttempt, reservation.operationId);
+  if (gatekeeperAttempt !== undefined) {
+    assertGatekeeperMeteringAttempt(gatekeeperAttempt, reservation.operationId);
+  }
+  if (modelAttempt !== undefined && gatekeeperAttempt !== undefined) {
+    throw new Error("Credit Reservation has conflicting Metering Attempts.");
+  }
+  let state: UserCreditReservation["state"];
+  if (reservation.state === "settled" || reservation.state === "released") {
+    state = reservation.state;
+  } else {
+    const attempt = modelAttempt ?? gatekeeperAttempt;
+    switch (attempt?.state) {
+      case "started":
+        state = "started";
+        break;
+      case "usage-unknown":
+        state = "unknown-held";
+        break;
+      case "reconciliation-required":
+        state = "reconciliation-required";
+        break;
+      default:
+        state = "active";
+        break;
+    }
+  }
+  const snapshot = reservation.chargeSnapshot;
+  return {
+    id: `credit-reservation:${reservation.operationId}`,
+    state,
+    meteredKind: snapshot.kind,
+    amountSubunits: reservation.amountSubunits,
+    settledAmountSubunits: reservation.settledAmountSubunits ?? null,
+    ...(snapshot.kind === "gatekeeper"
+      ? {vendorId: snapshot.vendorId, billingMethodKey: snapshot.billingMethodKey}
+      : {}),
+    createdAt: reservation.createdAt,
+    completedAt: reservation.settledAt ?? reservation.releasedAt ?? null,
+  };
 }
 
 function userModelUsageRecord(record: ModelUsageRecord): UserModelUsageRecord {

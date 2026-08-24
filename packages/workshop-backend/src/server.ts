@@ -1,7 +1,7 @@
 import { RpcStub, RpcTarget, newHttpBatchRpcResponse, newWebSocketRpcSession, RpcSessionOptions } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, type UsageCreditBalance, type UserUsageRecordPage, type UserUsageRecordPageRequest } from '@gadgets/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, GadgetMetadataWithTimestamps, AiChatAuthorInfo, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, AgentSpawnerConfig, WorkpieceId, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, createOpenGadgetError, getOpenGadgetErrorCode, OPEN_GADGET_ERROR_CODES, AUTH_ERROR_CODES, createAuthError, type GatekeeperOperationRate, type PublishedApiRate, type PublishedApiRatePage, type PublishedApiRatePageRequest, type UsageCreditBalance, type UsageCreditBalanceSubscriber, type UserCreditLedgerPage, type UserCreditPageRequest, type UserCreditReservationPage, type UserUsageRecordPage, type UserUsageRecordPageRequest } from '@gadgets/workshop-shared/api';
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -27,6 +27,7 @@ import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { wrapDoStubForTelemetry } from "./do-telemetry";
 import { UsageProjection } from "./usage-projection.js";
+import { publicBillingMethodInventory } from "./generated/public-billing-methods.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -39,6 +40,75 @@ function publicBlueprintInfo(id: string, metadata: BlueprintPublicInfo['metadata
     id,
     metadata,
     screenshotUrl: blueprintScreenshotUrl(id, metadata),
+  };
+}
+
+function publishedApiRateKey(value: Pick<PublishedApiRate,
+  "vendorId" | "billingMethodKey">): string {
+  return `${value.vendorId}\n${value.billingMethodKey}`;
+}
+
+function encodePublishedApiRateCursor(value: Pick<PublishedApiRate,
+  "vendorId" | "billingMethodKey">): string {
+  return btoa(JSON.stringify([value.vendorId, value.billingMethodKey]));
+}
+
+function decodePublishedApiRateCursor(cursor: string): string {
+  try {
+    const parsed: unknown = JSON.parse(atob(cursor));
+    if (!Array.isArray(parsed) || parsed.length !== 2 ||
+        parsed.some(value => typeof value !== "string" ||
+          !/^[A-Za-z0-9@][A-Za-z0-9._:/@-]{0,199}$/.test(value))) {
+      throw new TypeError();
+    }
+    return `${parsed[0]}\n${parsed[1]}`;
+  } catch {
+    throw new TypeError("Published API Rate cursor is invalid.");
+  }
+}
+
+function normalizePublishedApiRatePageRequest(
+    request: PublishedApiRatePageRequest): {cursorKey?: string; limit: number} {
+  if (typeof request !== "object" || request === null || Array.isArray(request) ||
+      Object.keys(request).some(key => key !== "cursor" && key !== "limit")) {
+    throw new TypeError("Published API Rate page request is invalid.");
+  }
+  const limit = request.limit ?? 50;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new TypeError("Published API Rate page limit is invalid.");
+  }
+  if (request.cursor === undefined) return {limit};
+  if (typeof request.cursor !== "string" || request.cursor.length === 0 ||
+      request.cursor.length > 600) {
+    throw new TypeError("Published API Rate cursor is invalid.");
+  }
+  return {cursorKey: decodePublishedApiRateCursor(request.cursor), limit};
+}
+
+function publishedApiRatePage(
+    request: PublishedApiRatePageRequest,
+    configuredRates: GatekeeperOperationRate[],
+    discoveredMethods: Array<Pick<PublishedApiRate, "vendorId" | "billingMethodKey">>,
+): PublishedApiRatePage {
+  const {cursorKey, limit} = normalizePublishedApiRatePageRequest(request);
+  const methods = new Map<string, Pick<PublishedApiRate, "vendorId" | "billingMethodKey">>();
+  for (const method of [...publicBillingMethodInventory, ...discoveredMethods, ...configuredRates]) {
+    methods.set(publishedApiRateKey(method), method);
+  }
+  const rateByMethod = new Map(configuredRates.map(rate => [publishedApiRateKey(rate), rate]));
+  const ordered = [...methods]
+    .filter(([key]) => cursorKey === undefined || key > cursorKey)
+    .toSorted(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  const visible = ordered.slice(0, limit);
+  const rates = visible.map(([key, method]): PublishedApiRate => {
+    const configured = rateByMethod.get(key);
+    return configured === undefined
+      ? {...method, pricing: "unpriced", amountSubunits: null}
+      : {...method, pricing: "priced", amountSubunits: configured.amountSubunits};
+  });
+  return {
+    rates,
+    nextCursor: ordered.length > limit ? encodePublishedApiRateCursor(rates.at(-1)!) : null,
   };
 }
 
@@ -180,8 +250,36 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.#user.getUsageCreditBalance();
   }
 
+  subscribeUsageCreditBalance(
+      subscriber: RpcStub<UsageCreditBalanceSubscriber>): Promise<RpcStub<{}>> {
+    // @ts-expect-error Native RPC stubs are bridged into Cap'n Web stubs at this boundary.
+    return this.#user.subscribeUsageCreditBalance(subscriber);
+  }
+
+  acknowledgeUsageActivationNotice(noticeId: string): Promise<UsageCreditBalance> {
+    return this.#user.acknowledgeUsageActivationNotice(noticeId);
+  }
+
   listOwnUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
     return this.#user.listUsageRecords(request);
+  }
+
+  listOwnCreditReservations(
+      request: UserCreditPageRequest): Promise<UserCreditReservationPage> {
+    return this.#user.listOwnCreditReservations(request);
+  }
+
+  listOwnCreditLedger(request: UserCreditPageRequest): Promise<UserCreditLedgerPage> {
+    return this.#user.listOwnCreditLedger(request);
+  }
+
+  async listPublishedApiRates(
+      request: PublishedApiRatePageRequest): Promise<PublishedApiRatePage> {
+    const [configuredRates, discoveredMethods] = await Promise.all([
+      this.adminSettings.getByName("").getPublishedGatekeeperRates(),
+      this.#user.listOwnDiscoveredGatekeeperMethods(),
+    ]);
+    return publishedApiRatePage(request, configuredRates, discoveredMethods);
   }
 
   async #openGadgetInternal(id: string, shareKey?: string,

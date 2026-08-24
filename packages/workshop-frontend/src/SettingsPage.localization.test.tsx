@@ -12,9 +12,17 @@ const testState = vi.hoisted(() => ({
   getUsageCreditBalance: vi.fn<() => Promise<{
     availableSubunits: bigint;
     reservedSubunits: bigint;
+    revision: bigint;
+    lowBalance: boolean;
+    lowBalanceThresholdSubunits: bigint;
+    activationNotice: null;
   }>>(async () => ({
     availableSubunits: 1_000_000_000_000_000_000_000n,
     reservedSubunits: 0n,
+    revision: 1n,
+    lowBalance: false,
+    lowBalanceThresholdSubunits: 100_000_000_000_000_000_000n,
+    activationNotice: null,
   })),
 }))
 
@@ -27,6 +35,15 @@ vi.mock('./AuthContext', () => {
     whoami: testState.whoami,
     hasPasswordLogin: testState.hasPasswordLogin,
     getUsageCreditBalance: testState.getUsageCreditBalance,
+    subscribeUsageCreditBalance: (subscriber: { update(balance: unknown): Promise<void> }) => {
+      void testState.getUsageCreditBalance().then(balance => subscriber.update(balance))
+      return Object.assign(Promise.resolve({ [Symbol.dispose]() {} }), { [Symbol.dispose]() {} })
+    },
+    acknowledgeUsageActivationNotice: testState.getUsageCreditBalance,
+    listOwnUsageRecords: async () => ({ records: [], nextCursor: null }),
+    listOwnCreditReservations: async () => ({ reservations: [], nextCursor: null }),
+    listOwnCreditLedger: async () => ({ entries: [], nextCursor: null }),
+    listPublishedApiRates: async () => ({ rates: [], nextCursor: null }),
   }
   return {
     useAuthenticatedApi: () => ({ authenticatedApi }),

@@ -6,13 +6,14 @@
   "scripts": {
     "dev": "echo \"run 'pnpm dev-server' in the root directory instead\" >&2 && exit 1",
     "deploy": "wrangler deploy",
-    "build:worker": "node build-browser-runtime.mjs && pnpm exec capnweb-validate build --out .wrangler/validate",
-    "build": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && tsc",
+    "build:worker": "node build-browser-runtime.mjs && node scripts/build-public-billing-method-inventory.mjs && pnpm exec capnweb-validate build --out .wrangler/validate",
+    "build": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && node scripts/build-public-billing-method-inventory.mjs && tsc",
     "clean": "rm -rf dist",
-    "test": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run --config vitest.integration.config.ts __integration__/browser-export-fonts.test.ts && vitest run && vitest run --config vitest.usage-admin.config.ts && vitest run --config vitest.metered-model.config.ts && vitest run --config vitest.open-gadget-rpc.config.ts && vitest run --config vitest.integration.config.ts __integration__/open-gadget-rpc.test.ts __integration__/usage-account-rpc.test.ts __integration__/usage-projection-rpc.test.ts __integration__/action-execution-recovery.test.ts && vitest run --config vitest.usage-registry-rpc.config.ts && vitest run --config vitest.integration.config.ts __integration__/browser-export-docx.test.ts",
-    "test:integration": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run --config vitest.integration.config.ts && vitest run --config vitest.usage-registry-rpc.config.ts",
-    "test:watch": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest",
+    "test": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && node scripts/build-public-billing-method-inventory.mjs && vitest run --config vitest.integration.config.ts __integration__/browser-export-fonts.test.ts && vitest run && vitest run --config vitest.usage-admin.config.ts && vitest run --config vitest.metered-model.config.ts && vitest run --config vitest.open-gadget-rpc.config.ts && vitest run --config vitest.integration.config.ts __integration__/open-gadget-rpc.test.ts __integration__/usage-account-rpc.test.ts __integration__/usage-projection-rpc.test.ts __integration__/action-execution-recovery.test.ts && vitest run --config vitest.usage-registry-rpc.config.ts && vitest run --config vitest.integration.config.ts __integration__/browser-export-docx.test.ts",
+    "test:integration": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && node scripts/build-public-billing-method-inventory.mjs && vitest run --config vitest.integration.config.ts && vitest run --config vitest.usage-registry-rpc.config.ts",
+    "test:watch": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && node scripts/build-public-billing-method-inventory.mjs && vitest",
     "build:format-blueprints": "node scripts/build-format-blueprints.mjs",
+    "build:billing-inventory": "node scripts/build-public-billing-method-inventory.mjs",
     "import:format-blueprint": "node --experimental-strip-types --no-warnings scripts/import-format-blueprint.mjs"
   },
   "dependencies": {

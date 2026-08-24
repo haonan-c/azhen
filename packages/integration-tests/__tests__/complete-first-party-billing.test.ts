@@ -1276,10 +1276,11 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       }),
     ]));
     const balanceAfterRetry = await retried.user.getUsageCreditBalance();
-    expect(balanceAfterRetry).toEqual({
+    expect(balanceAfterRetry).toMatchObject({
       availableSubunits: balanceAfterFirstDelivery.availableSubunits,
       reservedSubunits: 0n,
     });
+    expect(balanceAfterRetry.revision).toBeGreaterThan(balanceAfterFirstDelivery.revision);
     const duplicateUsageRecords =
       (await retried.user.listOwnUsageRecords({limit: 100})).records;
     const duplicatePrivateText = JSON.stringify({
@@ -1329,7 +1330,12 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     await expect(ugc.session.getXiaohongshuNoteDetail("private-invalid-note-url"))
       .rejects.toThrow();
     expect(physicalCalls).toEqual([]);
-    expect(await user.getUsageCreditBalance()).toEqual(before);
+    const afterPreExecutionRelease = await user.getUsageCreditBalance();
+    expect(afterPreExecutionRelease).toMatchObject({
+      availableSubunits: before.availableSubunits,
+      reservedSubunits: before.reservedSubunits,
+    });
+    expect(afterPreExecutionRelease.revision).toBeGreaterThan(before.revision);
 
     await expect(ugc.session.searchXiaohongshuNotes(UNKNOWN_KEYWORD, {limit: 1}))
       .rejects.toThrow();
@@ -1337,7 +1343,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       {keyword: UNKNOWN_KEYWORD, page: 1},
       {keyword: UNKNOWN_KEYWORD, page: 1},
     ]);
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: RATES.ugcSearch,
       availableSubunits: before.availableSubunits - RATES.ugcSearch,
     });
@@ -1349,7 +1355,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     await harness.server.update(options => options);
 
     const reopened = await signInWhenAvailable(username);
-    expect(await reopened.user.getUsageCreditBalance()).toEqual({
+    expect(await reopened.user.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: RATES.ugcSearch,
       availableSubunits: before.availableSubunits - RATES.ugcSearch,
     });

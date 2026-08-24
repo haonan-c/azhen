@@ -5,6 +5,7 @@ import {
   type ChargeSnapshot,
   type DailyUtcModelRateSchedule,
   type GatekeeperChargeSnapshot,
+  type GatekeeperOperationRate,
   type InitialGrantSnapshot,
   type ModelChargeSnapshot,
   type ModelUsageRateCatalogEntry,
@@ -319,6 +320,12 @@ export class UsageRateRegistry {
       const current = this.ensureCurrentVersion();
       return this.readAdminView(current);
     });
+  }
+
+  /** Return only the current public Gatekeeper rates, excluding deployment financial settings. */
+  getPublishedGatekeeperRates(): GatekeeperOperationRate[] {
+    return this.storage.transaction(() =>
+      structuredClone(this.ensureCurrentVersion().gatekeeperOperationRates));
   }
 
   /** Apply effective administrator changes as one version, or return unchanged for a no-op. */

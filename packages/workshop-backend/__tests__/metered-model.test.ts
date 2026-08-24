@@ -592,7 +592,12 @@ describe("DeepSeek Agent model metering", () => {
 
     expect(result.stopReason).toBe("error");
     expect(providerCalls).toBe(1);
-    expect(await user.getUsageCreditBalance()).toEqual(before);
+    const after = await user.getUsageCreditBalance();
+    expect(after).toMatchObject({
+      availableSubunits: before.availableSubunits,
+      reservedSubunits: before.reservedSubunits,
+    });
+    expect(after.revision).toBeGreaterThan(before.revision);
     const account = await runInDurableObject(user, (_instance, state) =>
       new UsageAccount(state.storage).getSnapshot());
     expect(account.modelUsageRecords).toEqual([
