@@ -27,11 +27,17 @@ It does not modify `main` and does not create a pull request.
   Credit Ledger change. Idempotent terminal replay does not append another fact.
 - A User DO persists a one-second alarm before it enters any terminal Usage Account transaction,
   then starts a low-latency `waitUntil` delivery after the transaction returns. An empty alarm after
-  a failed transaction is safe. A restart after the authoritative commit cannot lose the last
-  outbox entry. Delivery and health-report batches are limited to 32 facts. Remote failure does not
-  change the already-committed terminal RPC result; retry alarms are bounded to ten seconds.
+  a failed transaction is safe. Durable prepared/settled revisions plus the current isolate's active
+  preparation set prevent both empty and non-empty maintenance from deleting the alarm between
+  pre-arm and commit; an abandoned preparation is settled only after isolate restart. A restart
+  after the authoritative commit cannot lose the last outbox entry. Delivery and health-report
+  batches are limited to 32 facts. Remote failure does not change the already-committed terminal RPC
+  result; retry alarms are bounded to ten seconds.
 - Permanent payload or invariant rejection remains in the retained outbox with only a bounded
   machine code. It is not retried forever and it remains available for diagnosis and rebuild.
+- A Projection ACK now means that the fact was applied, not only queued. An out-of-order Summary
+  remains pending in the User outbox. If closing the gap later proves that queued snapshot invalid,
+  replay returns the persisted rejection and the User records the bounded poison code.
 - Pending outbox work has an ordered source-sequence index and exact counter. Page reads use
   `startAfter` and a limit, and ACK/rejection updates read their exact source-sequence keys. Delivered
   lifetime history is not materialized for delivery, paging, ACK, or rejection.
@@ -58,12 +64,15 @@ It does not modify `main` and does not create a pull request.
   duplicate and older revisions are no-ops, and the same revision with different content fails
   closed. Detail rows retain exact single-event contribution rules.
 - Contiguous sequence application is limited to 64 facts. A persisted per-generation/User drain
-  queue resumes by alarm after restart. The alarm multiplexer alternates drain and rebuild/cleanup
-  lifecycle work when both exist, so neither bounded state machine can starve the other.
+  queue resumes by alarm after restart. Drain selection, totals, Summary state, active membership,
+  fact state, high-water mark, and queue update share one SQLite transaction. A persisted row cursor
+  round-robins principals, while the alarm multiplexer alternates drain and rebuild/cleanup lifecycle
+  work, so neither a large User backlog nor either bounded state machine can starve another.
 - A fresh Projection binding starts in bootstrap-pending state. The first real administrator
-  overview automatically starts stable `bootstrap-v1`; the overview reports `rebuilding` until a
-  full Registry/User authority scan completes. Failed bootstrap attempts remain visible and retry
-  after their bounded generation cleanup, without an administrator rebuild click.
+  overview automatically starts stable `bootstrap-v1`; metrics remain `null` during both rebuilding
+  and failed bootstrap until a full Registry/User authority scan completes. Failed bootstrap
+  attempts remain visible and retry after their bounded generation cleanup, without an administrator
+  rebuild click. Later manual rebuilds can continue showing the previously verified generation.
 - Each User publishes content-free pending count, oldest pending time, and delivery failure state to
   the Registry owner. The administrator overview merges those deployment watermarks without waking
   or scanning User Durable Objects. Recovery clearing is itself alarm-retried if the health RPC is
@@ -100,11 +109,15 @@ All commands below ran from the isolated worktree.
 | --- | --- |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts __tests__/usage-account-gatekeeper.test.ts` | GREEN: 2 files, 37 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the second fixed-point review: 23 tests, including Summary revision/delta, rebuild-side conflict isolation, 64-fact restart-safe drains, alarm deletion concurrency, automatic bootstrap, and the complete Projection privacy sentinel. |
+| `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the third fixed-point review: 31 tests, including atomic drain rollback, exact empty/non-empty pre-arm ownership, unavailable bootstrap metrics, single rebuild-step scheduling, rebuild-drain completion, principal fairness, delayed Summary ACK/rejection, and old-meta migration. |
+| `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-account-gatekeeper.test.ts` | GREEN after the third fixed-point review: 22 tests, including retained queued Summary poison writeback. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.usage-admin.config.ts` | GREEN: 15 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.metered-model.config.ts` | GREEN: 35 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.integration.config.ts __integration__/usage-projection-rpc.test.ts` | GREEN: one real WebSocket/Cap’n Web test with promise pipelining and stub disposal. |
 | `corepack pnpm --dir packages/workshop-frontend exec vitest run src/components/usage/AdminUsageOverview.test.tsx src/AdminPage.localization.test.tsx` | GREEN before final rebase; repeated in the final gate below. |
 | `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the second review fixes: Browser Fonts 1; default workerd 472; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; 0 fail. |
+| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the final third-review alarm correction: Browser Fonts 1; default workerd 481; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; total 562 pass, 4 expected skips, 0 fail. |
+| `corepack pnpm --filter @gadgets/workshop-backend exec tsc --noEmit` | GREEN after the third review fixes. |
 | `corepack pnpm --filter @gadgets/workshop-frontend test` | GREEN: 351 pass across the main and first-party-copy runs. |
 | `corepack pnpm --dir packages/gatekeeper-context exec vitest run --config vitest.production.config.ts` | GREEN: 25 tests through the real User DO and newly bound Usage Projection DO. |
 
@@ -139,6 +152,22 @@ advance between two otherwise idempotent snapshots. The review correction also e
 test host with the real Registry delivery-health delegate; its final 25-test run has no missing-RPC
 background error.
 
+The third fixed-point review produced seven more strict RED slices. They reproduced a drain crash
+after totals but before progress, both empty and non-empty User alarm deletion races, false-zero
+bootstrap metrics, concurrent rebuild steps across an awaited Registry RPC, premature rebuild
+failure with a runnable drain, fixed-principal drain starvation, and a queued Summary conflict that
+never reached the User outbox. The corrections now prove one-transaction exact-once drain progress,
+revision-owned alarm deletion with a post-delete recheck, unavailable bootstrap totals until verified,
+alarm-only rebuild stepping, a persisted authority-complete rebuild phase, restart-safe principal
+round-robin, and delayed ACK followed by persisted poison rejection. A later fixed-point self-review
+added the exact case where maintenance starts after the same request's pre-arm but before its commit;
+durable prepared/settled revisions and an isolate-active guard now keep the alarm in both empty and
+non-empty branches without relying on the one-second delay. A migration regression also
+restarts an object whose older metadata table lacks the new authority-complete column. Focused tests,
+direct TypeScript, and the full Backend package matrix are GREEN. Root, release-manifest, Wrangler,
+and release-builder gates were intentionally not run in this review cycle and remain coordinated
+main-agent work; no remote or production mutation occurred.
+
 ## Generated types, migration, and release shape
 
 - `corepack pnpm types:generate` added only the expected `UsageProjection` Durable Object namespace
@@ -157,6 +186,10 @@ background error.
   commit `be1f501`. After that rebase, Backend build/TypeScript, Projection 23, Gatekeeper Usage
   Account 21, Usage Admin 15, real Cap'n Web 1, and the complete Backend package matrix all passed
   again. The package matrix reported 553 pass, 4 expected skips, and 0 failures.
+- The third-review checkpoint is based on `be1f501`. Its focused tests, direct TypeScript check, and
+  complete Backend package matrix passed with 562 tests, 4 expected skips, and 0 failures. Root,
+  release-manifest, Wrangler, and release dry-run gates have not yet been repeated for this
+  checkpoint.
 - Root build/test/lint, release manifest, and release dry-run evidence below belongs to the earlier
   accepted candidate. Those root/release gates have not yet been repeated for the second-review
   correction checkpoint; no claim below upgrades that evidence to the new checkpoint.

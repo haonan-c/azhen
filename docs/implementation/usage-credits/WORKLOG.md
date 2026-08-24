@@ -380,3 +380,28 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   `origin/dev` `be1f501`, and the same focused/build/package gates passed again. Coordinated root and
   release gates remain; no push, merge, Issue closure, upload, promotion, deployment, or production
   change occurred.
+
+### 2026-08-24 — Issue #62 third fixed-point review corrections
+
+- Re-entered the `implement`, `tdd`, and `code-review` gates for seven findings. Each correction
+  started from a focused failing test at the real Projection, User alarm, Usage Account outbox, or
+  administrator overview seam.
+- Made apply-drain progress atomic with its totals, Summary, active membership, fact state, and
+  high-water updates. A controlled SQLite trigger crash now rolls the whole batch back, and restart
+  applies it exactly once.
+- Added durable User prepared/settled maintenance revisions and an isolate-active preparation guard.
+  Empty and non-empty maintenance cannot delete the alarm after the same request pre-arms but before
+  it commits; ownership is rechecked after deletion, and abandoned preparations recover on restart.
+- Kept bootstrap metrics unavailable until the first authority scan succeeds. Rebuild steps now run
+  only from persisted alarms, and a persisted authority-complete phase prevents repeated Registry
+  scans while a runnable dual-write drain finishes.
+- Added a persistent row cursor for principal-fair drain selection. Two large User backlogs advance
+  in round-robin order across restart, while lifecycle work retains its existing alternating turn.
+- Changed Projection acknowledgement to mean applied. An out-of-order Summary stays pending; if the
+  closed gap later proves a same-revision/different-snapshot conflict, replay returns `invalid-fact`
+  and the retained User outbox records that bounded poison code.
+- Added an old-metadata restart migration for the rebuild authority-complete column. Focused
+  Projection tests passed 31/31, Gatekeeper Usage Account passed 22/22, Usage Admin passed 15/15,
+  direct TypeScript exited 0, and the full Backend package passed 562 tests with 4 expected skips
+  and 0 failures. Root/release/Wrangler gates were not run in this cycle. No push, merge, Issue
+  closure, upload, promotion, deployment, production change, or worktree deletion occurred.
