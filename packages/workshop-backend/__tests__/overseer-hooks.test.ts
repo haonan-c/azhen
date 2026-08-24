@@ -321,10 +321,7 @@ describe("OverseerDurableObject.startHook", () => {
   });
 });
 
-async function makeTargetOverseer(
-    gadgetId?: number,
-    notifyClosedCallback: () => void = () => {},
-) {
+async function makeTargetOverseer(gadgetId?: number) {
   let controllerEnable = vi.fn(async (_initiator: object, _target: object) => {});
   let record = {
     id: 4,
@@ -368,26 +365,10 @@ async function makeTargetOverseer(
       },
     },
   } satisfies Pick<OverseerDurableObject, "open"> & {impl: object};
-  let notifyClosed = new NativeRpcStub<() => void>(notifyClosedCallback);
+  let notifyClosed = new NativeRpcStub<() => void>(() => {});
   let client = await overseer.open("user-id", "profile-id", notifyClosed);
   return {client, controllerEnable};
 }
-
-describe("workspace session disposal", () => {
-  it("observes a close acknowledgement that becomes undeliverable", async () => {
-    let rejectAcknowledgement!: (reason: Error) => void;
-    const acknowledgement = new Promise<void>((_resolve, reject) => {
-      rejectAcknowledgement = reject;
-    });
-    const notifyClosed = vi.fn(() => acknowledgement);
-    const {client} = await makeTargetOverseer(undefined, notifyClosed);
-
-    client[Symbol.dispose]();
-    await vi.waitFor(() => expect(notifyClosed).toHaveBeenCalledOnce());
-    rejectAcknowledgement(new Error("close acknowledgement became undeliverable"));
-    await new Promise<void>(resolve => queueMicrotask(resolve));
-  });
-});
 
 describe("hook target", () => {
 

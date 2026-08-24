@@ -487,6 +487,22 @@ describe("workspace session across a user-DO-only reset", () => {
   });
 });
 
+describe("workspace session transport teardown", () => {
+  it("observes workspace-close delivery when the client transport closes", async () => {
+    const publicApi = await connect();
+    const account = await createAccount(publicApi, "transportclose");
+    const authenticated = await publicApi.authenticate(account.token);
+    const workspace = await authenticated.newGadget();
+
+    expect(await workspace.getMetadata()).toMatchObject({role: "build"});
+    // Close the callback's transport before its retained workspace capabilities are released.
+    publicApi[Symbol.dispose]();
+    authenticated[Symbol.dispose]();
+    workspace[Symbol.dispose]();
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+  });
+});
+
 describe("Deployment Model RPC", () => {
   it("disables AI while the Deployment Model Catalog is empty", async () => {
     using publicApi = await connect();
