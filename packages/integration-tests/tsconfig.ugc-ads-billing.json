@@ -13,5 +13,8 @@
       "@gadgets/workshop-shared/*": ["../workshop-shared/src/*"]
     }
   },
-  "include": ["__tests__/ugc-ads-billing.test.ts"]
+  "include": [
+    "__tests__/complete-first-party-billing.test.ts",
+    "__tests__/ugc-ads-billing.test.ts"
+  ]
 }

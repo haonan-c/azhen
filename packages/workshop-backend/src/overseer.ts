@@ -107,12 +107,16 @@ function invokeWithUsage(target, invocation, methodName, args) {
       [invocation, () => reflectApply(method, target, args)]);
 }
 
-function wrapRestoredTarget(target) {
+function wrapRestoredTarget(target, invokeHookDelivery) {
   return new TrustedProxy(target, {
     get(inner, prop) {
       if (prop === "__workshopInvoke") {
         return (invocation, methodName, args) =>
           invokeWithUsage(inner, invocation, methodName, args);
+      }
+      if (prop === "__workshopInvokeHookDelivery") {
+        return (invocation, methodName, args, deliveryId) =>
+          invokeHookDelivery(inner, invocation, methodName, args, deliveryId);
       }
       return reflectGet(inner, prop, inner);
     },
@@ -129,7 +133,7 @@ export function createAttributedGadgetClass(UserGadget) {
       const hookDeliveries = new SafeMap();
       const invoke = (invocation, methodName, args) =>
         invokeWithUsage(this.#delegate, invocation, methodName, args);
-      const invokeHookDelivery = async (invocation, methodName, args, deliveryId) => {
+      const invokeHookDelivery = async (target, invocation, methodName, args, deliveryId) => {
         if (typeof deliveryId !== "string" || deliveryId.length === 0 || deliveryId.length > 200) {
           throw new TypeError("Invalid Hook delivery ID.");
         }
@@ -151,7 +155,7 @@ export function createAttributedGadgetClass(UserGadget) {
             throw new Error("Hook callback delivery outcome is unknown.");
           }
           await ctx.storage.sync();
-          const result = await invokeWithUsage(this.#delegate, invocation, methodName, args);
+          const result = await invokeWithUsage(target, invocation, methodName, args);
           ctx.storage.kv.put(key, {state: "delivered"});
           await ctx.storage.sync();
           return result;
@@ -169,12 +173,14 @@ export function createAttributedGadgetClass(UserGadget) {
           throw new TypeError("This Gadget does not implement restore().");
         }
         return new RpcStub(wrapRestoredTarget(
-            reflectApply(restoreMethod, this.#delegate, [params])));
+            reflectApply(restoreMethod, this.#delegate, [params]), invokeHookDelivery));
       };
       return new TrustedProxy(this, {
         get: (target, prop) => {
           if (prop === "__workshopInvoke") return invoke;
-          if (prop === "__workshopInvokeHookDelivery") return invokeHookDelivery;
+          if (prop === "__workshopInvokeHookDelivery") {
+            return (...args) => invokeHookDelivery(this.#delegate, ...args);
+          }
           if (prop === restore) return restoreUserTarget;
           const value = reflectGet(this.#delegate, prop, this.#delegate);
           return typeof value === "function"
@@ -8316,6 +8322,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     let {record, vendorId} = await requireDeliverableHook(this.impl, this.env, hookId);
 
     let attribution = normalizeUsageAttribution(record.attribution);
+    let deliveryId: string | undefined;
     if (vendorId === "scheduler") {
       if (!run || !("automationId" in run)) {
         throw new Error("Scheduled run attribution is required.");
@@ -8326,18 +8333,24 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
         automationId: run.automationId,
         automationRunId: run.automationRunId,
       });
+      deliveryId = `scheduled:${hookId}:${run.automationRunId}`;
+      if (deliveryId.length > 200) {
+        throw new TypeError("Scheduled callback delivery ID must be at most 200 characters.");
+      }
     } else if (run !== undefined && !("deliveryId" in run)) {
       throw new Error("Automation dimensions are only valid for scheduled hooks.");
     } else if (run?.deliveryId !== undefined &&
         (run.deliveryId.length === 0 || run.deliveryId.length > 200)) {
       throw new TypeError("Hook delivery ID must contain 1 to 200 characters.");
+    } else {
+      deliveryId = run?.deliveryId;
     }
 
     let callback = this.impl.ctx.exports.HookCallbackLoopback({props: {
       overseerId: this.impl.ctx.id.toString(),
       hookId,
       attribution,
-      ...(run?.deliveryId ? {deliveryId: run.deliveryId} : {}),
+      ...(deliveryId ? {deliveryId} : {}),
     }});
 
     return {

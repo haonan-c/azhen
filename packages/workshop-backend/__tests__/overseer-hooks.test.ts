@@ -85,6 +85,7 @@ describe("OverseerDurableObject.startHook", () => {
     });
     expect(result.callback).toEqual({props: expect.objectContaining({
       hookId: 1,
+      deliveryId: "scheduled:1:run-1",
       attribution: expect.objectContaining({
         principal: {version: 1, kind: "user", userId: "a".repeat(64)},
         source: "scheduled",

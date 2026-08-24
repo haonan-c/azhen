@@ -22,7 +22,6 @@ export class UserDurableObject extends ProductionUserDurableObject {
     const attempts = snapshot.gatekeeperMeteringAttempts;
     const usageRecords = snapshot.gatekeeperUsageRecords;
     const attempt = attempts.length === 1 ? attempts[0] : undefined;
-    const usageRecord = usageRecords.length === 1 ? usageRecords[0] : undefined;
     const replayedAttempt = replay && attempt
       ? await this.beginGatekeeperUsage(
           attempt.operationId,
@@ -35,22 +34,23 @@ export class UserDurableObject extends ProductionUserDurableObject {
       usageRecords,
       replayedAttempt,
       replayMatched: !replayedAttempt || serialize(replayedAttempt) === serialize(attempt),
-      chronologyValid: Boolean(attempt && (
-        attempt.startedAt !== undefined &&
-        attempt.completedAt !== undefined &&
-        attempt.createdAt <= attempt.startedAt &&
-        attempt.startedAt <= attempt.completedAt
+      chronologyValid: attempts.length > 0 && attempts.every(candidate => (
+        candidate.startedAt !== undefined &&
+        candidate.completedAt !== undefined &&
+        candidate.createdAt <= candidate.startedAt &&
+        candidate.startedAt <= candidate.completedAt
       )),
-      reservationMatchesOperation: Boolean(attempt && (
-        attempt.chargeSnapshot.pricing === "unpriced"
-          ? attempt.reservationId === null
-          : attempt.reservationId === attempt.operationId
+      reservationMatchesOperation: attempts.length > 0 && attempts.every(candidate => (
+        candidate.chargeSnapshot.pricing === "unpriced"
+          ? candidate.reservationId === null
+          : candidate.reservationId === candidate.operationId
       )),
-      terminalRecordLinked: Boolean(attempt && usageRecord && (
-        attempt.operationId === usageRecord.operationId &&
-        attempt.usageRecordId === usageRecord.id &&
-        attempt.completedAt === usageRecord.createdAt
-      )),
+      terminalRecordLinked: attempts.length > 0 && attempts.every(candidate => {
+        const linked = usageRecords.find(record => record.id === candidate.usageRecordId);
+        return linked !== undefined &&
+          candidate.operationId === linked.operationId &&
+          candidate.completedAt === linked.createdAt;
+      }),
     };
   }
 }
