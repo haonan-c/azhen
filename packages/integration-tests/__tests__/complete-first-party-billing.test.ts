@@ -70,6 +70,11 @@ const RATES = {
 };
 
 type SafePhysicalCall = { keyword: string; page: number };
+type SafeModelPhysicalCall = {
+  source: "agent" | "system-assistance";
+  method: "POST";
+  path: "/v1/chat/completions";
+};
 type MeteringInspection = {
   attempts: Array<{
     operationId: string;
@@ -108,6 +113,40 @@ type MeteringInspection = {
     reservationId: string | null;
     chargeSubunits: string | null;
   }>;
+  modelAttempts: Array<{
+    operationId: string;
+    attribution: {
+      source: "agent" | "system-assistance";
+      workspaceId: string;
+      chatId?: number;
+      deploymentModelId: string;
+    };
+    chargeSnapshot: {
+      kind: "model";
+      pricing: "priced" | "unpriced";
+      usageRateVersion: string;
+      provider: string;
+      model: string;
+    };
+    state: "ready" | "started" | "settled" | "failed-before-execution" | "usage-unknown";
+    reservationId: string | null;
+    usageRecordId?: string;
+  }>;
+  modelUsageRecords: Array<{
+    id: string;
+    operationId: string;
+    attribution: MeteringInspection["modelAttempts"][number]["attribution"];
+    chargeSnapshot: MeteringInspection["modelAttempts"][number]["chargeSnapshot"];
+    outcome: "settled" | "failed-before-execution" | "usage-unknown";
+    usageStatus: "reported" | "not-reported" | "invalid-report";
+    usage: {
+      cacheHitInputTokens: string;
+      cacheMissInputTokens: string;
+      outputTokens: string;
+      reasoningTokens: string;
+    } | null;
+    chargeSubunits: string | null;
+  }>;
   chronologyValid: boolean;
   reservationMatchesOperation: boolean;
   terminalRecordLinked: boolean;
@@ -119,9 +158,11 @@ let adminPublicApi: ReturnType<typeof connect>;
 let authenticatedAdmin: RpcStub<AuthenticatedApi>;
 let admin: RpcStub<AdminApi>;
 let deploymentModelId: string;
+let titleModelId: string;
 let modelCall = 0;
 let registrationCallbackType = "issue-72-scheduled-ugc";
 let physicalCalls: SafePhysicalCall[] = [];
+let modelPhysicalCalls: SafeModelPhysicalCall[] = [];
 let releaseBusinessRequest!: () => void;
 let businessRequestReleased = Promise.resolve();
 let signalBusinessRequest!: () => void;
@@ -138,6 +179,7 @@ function armBusinessRequestGate(): void {
 
 function resetPhysicalTrace(): void {
   physicalCalls = [];
+  modelPhysicalCalls = [];
   armBusinessRequestGate();
 }
 
@@ -239,6 +281,11 @@ const upstreamHandler: Handler = async (url, method, headers, request) => {
         headers.get("content-type") !== "application/json") {
       throw new Error("Title model request did not match the production protocol.");
     }
+    modelPhysicalCalls.push({
+      source: "system-assistance",
+      method: "POST",
+      path: "/v1/chat/completions",
+    });
     return modelResponse();
   }
   if (url.origin === MODEL_ORIGIN) {
@@ -248,10 +295,15 @@ const upstreamHandler: Handler = async (url, method, headers, request) => {
         headers.get("content-type") !== "application/json") {
       throw new Error("Registration model request did not match the production protocol.");
     }
+    modelPhysicalCalls.push({
+      source: "agent",
+      method: "POST",
+      path: "/v1/chat/completions",
+    });
     const payload = JSON.parse(await request.text()) as { tools?: unknown };
     if (!Array.isArray(payload.tools) || payload.tools.length === 0) return modelResponse();
     modelCall += 1;
-    return modelResponse(modelCall % 2 === 1 ? {
+    return modelResponse(modelCall === 1 ? {
       name: "executeCode",
       args: {
         code: `
@@ -270,6 +322,9 @@ const upstreamHandler: Handler = async (url, method, headers, request) => {
           }
         `,
       },
+    } : modelCall === 2 ? {
+      name: "setGadgetBinding",
+      args: { gadget: "APP", source: "SCHEDULER", name: "SCHEDULER" },
     } : undefined);
   }
   if (url.hostname !== "api.tikhub.io" || url.pathname !== TIKHUB_PATH) return null;
@@ -420,6 +475,76 @@ function expectExactTerminalOperations(
   }
 }
 
+function expectExactModelOperations(
+  inspection: MeteringInspection,
+  publicRecords: UserUsageRecord[],
+  expected: Array<{
+    source: "agent" | "system-assistance";
+    deploymentModelId: string;
+    count: number;
+  }>,
+): void {
+  const expectedCount = expected.reduce((total, operation) => total + operation.count, 0);
+  const publicModelRecords = publicRecords.filter(record => record.kind === "model");
+  expect(inspection.modelAttempts).toHaveLength(expectedCount);
+  expect(inspection.modelUsageRecords).toHaveLength(expectedCount);
+  expect(publicModelRecords).toHaveLength(expectedCount);
+  for (const operation of expected) {
+    const attempts = inspection.modelAttempts.filter(candidate =>
+      candidate.attribution.source === operation.source &&
+      candidate.attribution.deploymentModelId === operation.deploymentModelId);
+    expect(attempts).toHaveLength(operation.count);
+    for (const attempt of attempts) {
+      const record = inspection.modelUsageRecords.find(candidate =>
+        candidate.operationId === attempt.operationId);
+      expect(record).toEqual(expect.objectContaining({
+        id: attempt.usageRecordId,
+        attribution: attempt.attribution,
+        chargeSnapshot: attempt.chargeSnapshot,
+        outcome: "settled",
+        usageStatus: "reported",
+        usage: {
+          cacheHitInputTokens: "1",
+          cacheMissInputTokens: "4",
+          outputTokens: "3",
+          reasoningTokens: "1",
+        },
+      }));
+      expect(BigInt(record!.chargeSubunits!)).toBeGreaterThan(0n);
+      expect(attempt).toEqual(expect.objectContaining({
+        state: "settled",
+        reservationId: attempt.operationId,
+        chargeSnapshot: expect.objectContaining({
+          kind: "model",
+          pricing: "priced",
+          provider: "deepseek",
+          model: "deepseek-v4-flash",
+        }),
+      }));
+      const publicRecord = publicModelRecords.find(candidate =>
+        candidate.kind === "model" &&
+        candidate.id.endsWith(record!.id.slice(record!.id.lastIndexOf(":") + 1)));
+      expect(publicRecord).toEqual(expect.objectContaining({
+        kind: "model",
+        source: operation.source,
+        workspaceId: attempt.attribution.workspaceId,
+        chatId: attempt.attribution.chatId,
+        deploymentModelId: operation.deploymentModelId,
+        pricing: "priced",
+        outcome: "settled",
+        usageStatus: "reported",
+        usage: {
+          cacheHitInputTokens: 1n,
+          cacheMissInputTokens: 4n,
+          outputTokens: 3n,
+          reasoningTokens: 1n,
+        },
+        chargeSubunits: BigInt(record!.chargeSubunits!),
+      }));
+    }
+  }
+}
+
 async function signInWhenAvailable(username: string): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
@@ -488,9 +613,12 @@ beforeAll(async () => {
     apiUrl: `${MODEL_ORIGIN}/v1`,
   });
   const catalog = await admin.getDeploymentModelCatalog();
+  const titleModel = catalog.models.find(candidate => candidate.name === "Issue 72 title helper");
   const model = catalog.models.find(candidate => candidate.name === "Issue 72 registration model");
-  if (!model) throw new Error("Expected the #72 Deployment Model.");
+  if (!titleModel || !model) throw new Error("Expected both #72 Deployment Models.");
+  titleModelId = titleModel.id;
   deploymentModelId = model.id;
+  await admin.setDeploymentQuickModel(titleModelId);
   await updateGatekeeperRate("context", CONTEXT_CREATE_METHOD, RATES.contextCreate);
   await updateGatekeeperRate("context", CONTEXT_PUT_METHOD, RATES.contextPut);
   await updateGatekeeperRate("ugc_ads", UGC_SEARCH_METHOD, RATES.ugcSearch);
@@ -616,6 +744,13 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     });
     expect((await collaboratorWorkspace.listActions()).every(action => action.type !== "action"))
       .toBe(true);
+    expect((await gadget.listBindings(chatId)).map(binding => binding.name).toSorted())
+      .toEqual(["SCHEDULER", "UGC_ADS"]);
+    const beforeReadOnlyCatalog = await inspectGatekeeperMetering(ownerName);
+    const physicalBeforeReadOnlyCatalog = [...physicalCalls];
+    expect(await collaboratorWorkspace.listPreApprovableActions()).toEqual([]);
+    expect(await inspectGatekeeperMetering(ownerName)).toEqual(beforeReadOnlyCatalog);
+    expect(physicalCalls).toEqual(physicalBeforeReadOnlyCatalog);
 
     gadget[Symbol.dispose]();
     collaboratorWorkspace[Symbol.dispose]();
@@ -871,7 +1006,18 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       record => !collaboratorRecordIdsBefore.has(record.id),
     );
     const modelCharges = newCollaboratorUsage.filter(record => record.kind === "model");
-    expect(modelCharges.length).toBeGreaterThan(0);
+    expectExactModelOperations(collaboratorInspection, modelCharges, [
+      { source: "agent", deploymentModelId, count: 3 },
+      { source: "system-assistance", deploymentModelId: titleModelId, count: 1 },
+    ]);
+    expect(modelPhysicalCalls.filter(call => call.source === "agent")).toEqual([
+      { source: "agent", method: "POST", path: "/v1/chat/completions" },
+      { source: "agent", method: "POST", path: "/v1/chat/completions" },
+      { source: "agent", method: "POST", path: "/v1/chat/completions" },
+    ]);
+    expect(modelPhysicalCalls.filter(call => call.source === "system-assistance")).toEqual([
+      { source: "system-assistance", method: "POST", path: "/v1/chat/completions" },
+    ]);
     expect(newCollaboratorUsage.filter(record => record.kind === "gatekeeper"))
       .toEqual(collaboratorRecords);
     expect(collaboratorBeforeSchedule.availableSubunits - collaboratorAfter.availableSubunits)
@@ -956,6 +1102,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     registrationCallbackType = "issue-72-duplicate-delivery";
     modelCall = 0;
     resetPhysicalTrace();
+    const logStart = harness.server.getLogs().length;
     const publicApi = connect(harness.url);
     const [username] = nextUsernames("issueduplicate");
     const user = await signUp(publicApi, username);
@@ -1120,6 +1267,27 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
       availableSubunits: balanceAfterFirstDelivery.availableSubunits,
       reservedSubunits: 0n,
     });
+    const duplicateUsageRecords =
+      (await retried.user.listOwnUsageRecords({limit: 100})).records;
+    const duplicatePrivateText = JSON.stringify({
+      firstInspection,
+      retriedInspection,
+      duplicateUsageRecords,
+      logs: harness.server.getLogs().slice(logStart),
+    }, (_key, value) => typeof value === "bigint" ? value.toString() : value);
+    for (const forbidden of [
+      DUPLICATE_KEYWORD,
+      "Duplicate delivery tracer",
+      "Register the duplicate-delivery proof schedule.",
+      "First-party billing tracer",
+      "Run the persisted UGC callback after restart.",
+      "private-note-title",
+      "private-note-token",
+      TIKHUB_API_KEY,
+      "authorization",
+    ]) {
+      expect(duplicatePrivateText).not.toContain(forbidden);
+    }
 
     retriedApp[Symbol.dispose]();
     retriedGadget[Symbol.dispose]();

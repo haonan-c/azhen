@@ -13,6 +13,7 @@ export default defineConfig({
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
         durableObjects: {
           SCHEDULE_DRIVER: { className: "ScheduleDriver", useSQLite: true },
+          TEST_SCHEDULER_GATEKEEPER: { className: "SchedulerGatekeeper", useSQLite: true },
           SCHEDULER_SCOPE_TEST_PARENT: {
             className: "SchedulerScopeTestParent",
             useSQLite: true,

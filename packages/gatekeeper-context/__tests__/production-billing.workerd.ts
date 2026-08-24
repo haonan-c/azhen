@@ -487,6 +487,39 @@ afterEach(() => {
 });
 
 describe("production Context billing runtime", () => {
+  it("keeps the shipping read-only Gatekeeper outside the Action billing lifecycle", async () => {
+    const user = await newUser();
+    await env.TEST_ARTIFACTS_TRACE.reset();
+    await env.TEST_GIT_HTTP.reset();
+    const traced = await runSession({
+      user,
+      sharingDomain: `read-only-domain-${crypto.randomUUID()}`,
+      accountId: crypto.randomUUID(),
+      run: async ({gatekeeper}) => ({
+        autoApprovable: await gatekeeper.getAutoApprovableActions(),
+        actionErrors: await Promise.all([
+          rejectionMessage(async () => gatekeeper.applyAction(72)),
+          rejectionMessage(async () => gatekeeper.rejectAction(72)),
+          rejectionMessage(async () => gatekeeper.revertAction(72)),
+        ]),
+      }),
+    });
+
+    expect(traced.result).toEqual({
+      autoApprovable: [],
+      actionErrors: [
+        "The Context Library is read-only and implements no actions.",
+        "The Context Library is read-only and implements no actions.",
+        "The Context Library is read-only and implements no actions.",
+      ],
+    });
+    expect(traced.trace.events).toEqual([]);
+    expect(traced.snapshot.gatekeeperMeteringAttempts).toEqual([]);
+    expect(traced.snapshot.gatekeeperUsageRecords).toEqual([]);
+    expect(await env.TEST_ARTIFACTS_TRACE.get()).toEqual([]);
+    expect(await env.TEST_GIT_HTTP.getTrace()).toEqual([]);
+  });
+
   it("opens the production management capability through the Workshop User", async () => {
     const user = await newUser();
     const opened = await runManagement({

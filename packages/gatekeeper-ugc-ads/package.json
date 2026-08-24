@@ -9,7 +9,7 @@
     "build:skills": "node scripts/build-skills.mjs",
     "build": "pnpm run build:skills && tsc",
     "types:check": "pnpm run build:skills && tsc --noEmit",
-    "test": "pnpm run build:skills && vitest run",
+    "test": "pnpm run build:skills && vitest run && vitest run --config vitest.production.config.ts",
     "clean": "rm -rf dist src/generated"
   },
   "dependencies": {
@@ -20,6 +20,8 @@
     "capnweb-validate": "catalog:"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "catalog:",
+    "miniflare": "5.20260801.0-alpha",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "wrangler": "catalog:"

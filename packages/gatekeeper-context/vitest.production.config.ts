@@ -16,6 +16,7 @@ const EXPECTED_BILLING_REJECTIONS = new Set([
   "Simulated Artifacts read-token cleanup failure.",
   "Simulated management result delivery failure.",
   "Collection is not git-based.",
+  "The Context Library is read-only and implements no actions.",
 ]);
 
 export default defineConfig({

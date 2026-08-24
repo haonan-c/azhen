@@ -36,12 +36,17 @@ The test `crosses direct, management, and restarted unattended production Worker
 - exact per-operation reconciliation covers Context create/put, Scheduler register, direct UGC,
   each Scheduler delivery, and each scheduled UGC call. Every Attempt links to one Record with the
   same attribution and immutable Charge Snapshot. The owner and manager balance deltas equal these
-  operations, while the collaborator delta separately equals Scheduler registration plus the Agent
-  model Usage Records;
+  operations. The collaborator delta equals Scheduler registration plus three Agent model Usage
+  Records and one independently identified `system-assistance` title Usage Record;
+- the strict DeepSeek doubles record exactly three Agent POSTs and one title POST. Each physical
+  call matches one public model Usage Record and one internal Attempt/Record pair with the real
+  source, Deployment Model, token usage, immutable Charge Snapshot, and exact charge;
 - physical TikHub calls are exactly one direct call and one call for each recurrence;
 - owner and collaborator host principals are distinct, direct source is `gadget`, registration
   source is `agent`, and unattended source is `scheduled`, with Workspace, Gadget, schedule, and run
   dimensions present;
+- the Agent binds the shipping Scheduler and UGC singletons to the Gadget, and the production
+  Workshop `listPreApprovableActions()` aggregation returns exactly no Action kind;
 - observations and `bindHook` records may exist, but the three first-party paths create no approved
   `type: "action"` record.
 
@@ -56,7 +61,9 @@ The test `retries one restored scheduled run without a second callback or financ
   callback;
 - the schedule completes while Gadget firing count, TikHub physical call count, scheduled Attempt
   IDs, and available Credit remain unchanged. The held delivery reservation settles into the one
-  expected Scheduler Record; no second reservation, operation, or charge is created.
+  expected Scheduler Record; no second reservation, operation, or charge is created;
+- `DUPLICATE_KEYWORD`, schedule/chat/Gadget text, note content, tokens, and authorization markers
+  are absent from both real pre/post-retry Usage snapshots and incremental Worker logs.
 
 The test `preserves pre-execution release and response-loss hold across restart` proves:
 
@@ -74,7 +81,7 @@ pnpm --filter @gadgets/integration-tests exec vitest run \
   __tests__/complete-first-party-billing.test.ts
 Test Files  1 passed (1)
 Tests       3 passed (3)
-Duration    284.89s
+Duration    283.25s
 ```
 
 ## Oracle mapping
@@ -89,6 +96,7 @@ Duration    284.89s
 | Commit, delivery loss, authorization order, authoritative failure | `holds a committed local mutation when propagation loses its response`; `keeps a committed mutation settled when completion responses are lost`; `settles before authorization withholding and rejects before business execution`; `rejects authoritative billing before local management execution` | `pnpm --filter @gadgets/gatekeeper-context test` | Passed |
 | Git, Artifacts, token lifecycle, explicit sync, dispatch boundaries | `meters Git collection creation and its token lifecycle once per management call`; `keeps explicit clone, fetch, and document traversal inside each sync operation`; `releases explicit sync once when local source validation rejects before dispatch`; `holds an accepted Git token operation when the Artifacts response is lost` | `pnpm --filter @gadgets/gatekeeper-context test` | Passed |
 | Background refresh and duplicate delivery | `runs stale Git background refresh without a second management operation`; `replays two management deliveries through one host-issued billing operation` | `pnpm --filter @gadgets/gatekeeper-context test` | Passed |
+| Read-only Action capability | `keeps the shipping read-only Gatekeeper outside the Action billing lifecycle` | `pnpm --filter @gadgets/gatekeeper-context exec vitest run --config vitest.production.config.ts -t 'keeps the shipping read-only'` | Passed: auto-approvable list empty; all three defensive callbacks reject; zero Attempt, Record, Artifacts call, or Git call |
 | Privacy | `keeps caller-controlled attribution and Git/token data off the Session RPC surface`; `keeps host attribution, idempotent finance, and observed content out of Usage facts and logs`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-context test`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 
 ### Scheduler
@@ -103,6 +111,7 @@ Duration    284.89s
 | Admission/pre-callback failure | `expires a one-shot and releases billing when startHook rejects`; `does not dispatch the callback when authoritative metering rejects begin` | `pnpm --filter @gadgets/gatekeeper-scheduler test` | Passed |
 | Started ambiguity | `persists a stable logical run and retry deadline after callback failure`; `retries one restored scheduled run without a second callback or financial effect` | `pnpm --filter @gadgets/gatekeeper-scheduler test`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 | Downstream inheritance | `crosses direct, management, and restarted unattended production Worker paths`; `retries one restored scheduled run without a second callback or financial effect` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
+| Read-only Action capability | `rejects every defensive Action callback without billing or delivery`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-scheduler exec vitest run -t 'rejects every defensive Action'`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: shipping DO list empty; callbacks reject with zero billing/delivery trace; production Workshop aggregation empty |
 
 The initial complete tracer exposed a production gap: Scheduler supplied a stable delivery ID, but a
 Worker Loader `[restore]` target did not implement `__workshopInvokeHookDelivery`. The production
@@ -128,7 +137,16 @@ TypeError: The RPC receiver does not implement the method
 | Pre-execution and authoritative failure | `releases a local validation failure before any TikHub request`; `does not call TikHub when the authoritative reservation fails`; `preserves pre-execution release and response-loss hold across restart` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 | Timeout, response loss, 5xx and invalid JSON | `holds the reservation after an ambiguous Xiaohongshu %s`; `holds the reservation for an ambiguous %s`; `preserves pre-execution release and response-loss hold across restart` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
 | Sharing policy and post-execution authorization | `keeps production Xiaohongshu observations shareable with workspace collaborators` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts` | Passed |
+| Read-only Action capability | `rejects every defensive Action callback without billing or upstream dispatch`; `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/gatekeeper-ugc-ads exec vitest run --config vitest.production.config.ts -t 'rejects every defensive Action'`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: shipping DO list empty; callbacks reject with fail-closed outbound count zero; production Workshop aggregation empty |
 | Privacy and fail-closed network | `expectPrivateDiagnosticsAbsent` production cases; all three complete-tracer tests | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/ugc-ads-billing.test.ts`<br>`pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed |
+
+### Model Usage separation
+
+| Oracle | Test name(s) | Command | Result |
+| --- | --- | --- | --- |
+| Agent model calls | `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: three strict DeepSeek POSTs; three `kind: model`, `source: agent` records with the Agent Deployment Model, reported token categories, linked Snapshot, exact charge, Workspace, and Chat |
+| Title system assistance | `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: one strict title POST; one separate `kind: model`, `source: system-assistance` record with the quick Deployment Model, reported token categories, linked Snapshot, exact charge, Workspace, and Chat |
+| Complete collaborator balance | `crosses direct, management, and restarted unattended production Worker paths` | `pnpm --filter @gadgets/integration-tests exec vitest run __tests__/complete-first-party-billing.test.ts` | Passed: balance delta equals Scheduler registration plus all three Agent charges plus the title charge; reservation returns to zero |
 
 ### Shared lifecycle and no-Action boundary
 
@@ -139,8 +157,10 @@ TypeError: The RPC receiver does not implement the method
 - Context replay and Scheduler same-run recovery cover duplicate financial delivery. The complete
   tracer also requires one operation per method per run and a distinct operation for the next run.
 - The combined production workspace contains observation and `bindHook` records but no approved
-  Action. The three shipping Gatekeepers retain their empty auto-approvable lists and defensive
-  unsupported Action methods; no fake Action was added for billing tests.
+  Action. Production Workshop aggregation calls the bound Scheduler and UGC capabilities and gets
+  an empty list. Separate real workerd tests call all three shipping Gatekeeper capabilities,
+  require an empty list, and prove their defensive apply/reject/revert callbacks cannot begin
+  billing or dispatch physical work. No fake Action was added for billing tests.
 
 ## Required commands
 
@@ -161,14 +181,14 @@ consecutive runs and the complete Spotify package passed 21 tests.
 | --- | --- |
 | `pnpm --filter @gadgets/workshop-shared build` | Passed |
 | `pnpm --filter @gadgets/workshop-backend build` | Passed |
-| `pnpm --filter @gadgets/gatekeeper-context build` | Passed |
-| `pnpm --filter @gadgets/gatekeeper-scheduler build` | Passed |
-| `pnpm --filter @gadgets/gatekeeper-ugc-ads build` | Passed |
+| `pnpm --filter @gadgets/gatekeeper-context build` | Passed after review fixes |
+| `pnpm --filter @gadgets/gatekeeper-scheduler build` | Passed after review fixes |
+| `pnpm --filter @gadgets/gatekeeper-ugc-ads build` | Passed after review fixes |
 | `pnpm --filter @gadgets/integration-tests build` | Passed after review fixes |
 | `pnpm --filter @gadgets/workshop-backend test` | Passed |
-| `pnpm --filter @gadgets/gatekeeper-context test` | Passed |
-| `pnpm --filter @gadgets/gatekeeper-scheduler test` | Passed |
-| `pnpm --filter @gadgets/gatekeeper-ugc-ads test` | Passed |
+| `pnpm --filter @gadgets/gatekeeper-context test` | Passed after review fixes (42 Node tests; 23 production workerd tests) |
+| `pnpm --filter @gadgets/gatekeeper-scheduler test` | Passed after review fixes (117 workerd tests passed, 2 skipped; 18 app tests) |
+| `pnpm --filter @gadgets/gatekeeper-ugc-ads test` | Passed after review fixes (69 Node tests; 1 production workerd test) |
 | `pnpm --filter @gadgets/integration-tests test` | Passed at `18a46f8` (12 files, 113 tests); final rerun pending review |
 | `pnpm lint:check` | Passed after review fixes (warnings only) |
 | `pnpm lint` | Passed at `18a46f8`; final rerun pending review |

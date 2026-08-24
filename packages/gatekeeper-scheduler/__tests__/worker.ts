@@ -6,7 +6,7 @@ import type { HookRunMetadata } from "@gadgets/workshop-shared/gatekeeper";
 export { default } from "../src/worker.js";
 export * from "../src/worker.js";
 // Vitest's ctx.exports analyzer does not follow the production barrel re-export.
-export { ScheduleAccount, ScheduleVerifier } from "../src/scheduler.js";
+export { ScheduleAccount, ScheduleVerifier, SchedulerGatekeeper } from "../src/scheduler.js";
 
 type TestExports = {
   ScheduleDriver: DurableObjectNamespace<ScheduleDriver>;

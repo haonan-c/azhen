@@ -32,6 +32,8 @@ export class UserDurableObject extends ProductionUserDurableObject {
     return {
       attempts,
       usageRecords,
+      modelAttempts: snapshot.modelMeteringAttempts,
+      modelUsageRecords: snapshot.modelUsageRecords,
       replayedAttempt,
       replayMatched: !replayedAttempt || serialize(replayedAttempt) === serialize(attempt),
       chronologyValid: attempts.length > 0 && attempts.every(candidate => (
