@@ -78,6 +78,22 @@ async function expectRejectedWith(
 }
 
 describe("Issue #45 User Registry and administrator Usage Account operations", () => {
+  it("keeps Registry count visible and metrics unavailable when the projection is down", async () => {
+    const user = await createDormantUser("projectiondown");
+    await user.stub.activateUsageAccount();
+
+    const overview = await adminUsage().getOverview();
+    expect(overview).toMatchObject({
+      metrics: null,
+      registeredUsers: 1n,
+      generation: 0n,
+      ingestionWatermark: 0n,
+      health: {state: "unavailable"},
+    });
+    expect(() => adminUsage().requestProjectionRebuild("projection-down-rebuild"))
+      .toThrow("Usage Projection is unavailable.");
+  });
+
   it("refuses to activate a User Durable Object that has no real account", async () => {
     const identity = uniqueIdentity("ghostusage");
     const ghost = users.get(users.idFromName(identity));

@@ -140,6 +140,20 @@ export class UsageUserRegistry {
     });
   }
 
+  /** Return the exact current count from the authoritative deployment User Registry. */
+  count(): bigint {
+    return BigInt(this.storage.sql.exec<{count: number}>(`
+      SELECT COUNT(*) AS count FROM usage_user_registry
+    `).one().count);
+  }
+
+  /** Return the monotonic Registry insertion watermark used to close a stable rebuild pass. */
+  revision(): bigint {
+    return BigInt(this.storage.sql.exec<{revision: number}>(`
+      SELECT COALESCE(MAX(sequence), 0) AS revision FROM usage_user_registry
+    `).one().revision);
+  }
+
   /** Resolve one opaque Registry result into a server-only User Durable Object identifier. */
   resolve(registeredUserRef: string): ResolvedUsageUser | null {
     if (!isOpaqueReference(registeredUserRef)) {

@@ -60,6 +60,22 @@ export function calculateModelChargeSubunits(
   return quotient + (remainder * 2n >= denominator ? 1n : 0n);
 }
 
+/** Calculate exact provider cost in USD rate subunits with one final half-up rounding. */
+export function calculateModelProviderCostUsdSubunits(
+    snapshot: ModelChargeSnapshot, usage: ModelTokenUsage): bigint {
+  validateNonNegativeBigint(usage.cacheHitInputTokens, "cache-hit input tokens");
+  validateNonNegativeBigint(usage.cacheMissInputTokens, "cache-miss input tokens");
+  validateNonNegativeBigint(usage.outputTokens, "output tokens");
+  if (snapshot.pricing === "unpriced") return 0n;
+  const numerator =
+    usage.cacheHitInputTokens * snapshot.tokenRates.cacheHitUsdSubunitsPerMillion +
+    usage.cacheMissInputTokens * snapshot.tokenRates.cacheMissUsdSubunitsPerMillion +
+    usage.outputTokens * snapshot.tokenRates.outputUsdSubunitsPerMillion;
+  const quotient = numerator / 1_000_000n;
+  const remainder = numerator % 1_000_000n;
+  return quotient + (remainder * 2n >= 1_000_000n ? 1n : 0n);
+}
+
 /** Validate and reconstruct one content-free model or Gatekeeper Charge Snapshot. */
 export function normalizeChargeSnapshot(value: unknown): ChargeSnapshot {
   if (typeof value !== "object" || value === null ||

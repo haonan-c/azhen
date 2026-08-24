@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageRecordPageRequest, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageBalanceState, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -20,6 +20,7 @@ import {
   type ResolvedUsageUser,
 } from './usage-user-registry.js';
 import type {UsageUserRegistrationFact} from './usage-account.js';
+import type {UsageProjection} from './usage-projection.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -342,6 +343,16 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   searchRegisteredUsageUsers(
       request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
     return this.usageUsers.search(request);
+  }
+
+  /** Return the exact count from the authoritative User Registry. */
+  countRegisteredUsageUsers(): bigint {
+    return this.usageUsers.count();
+  }
+
+  /** Return the Registry insertion watermark for a stable Usage Projection rebuild pass. */
+  getRegisteredUsageUsersRevision(): bigint {
+    return this.usageUsers.revision();
   }
 
   /** Resolve one opaque registered-User reference for the server-only administrator facade. */
@@ -941,6 +952,38 @@ function hasAsciiControlCharacter(value: string): boolean {
   return false;
 }
 
+function normalizeProjectionRebuildId(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 200 ||
+      hasAsciiControlCharacter(value)) {
+    throw new TypeError("Usage Projection rebuild request ID is invalid.");
+  }
+  return value;
+}
+
+function unavailableUsageOverview(registeredUsers: bigint, asOf: string): AdminUsageOverview {
+  return {
+    metrics: null,
+    registeredUsers,
+    range: {kind: "all-recorded", startedAt: null},
+    generation: 0n,
+    ingestionWatermark: 0n,
+    health: {
+      state: "unavailable",
+      lastIngestedAt: null,
+      latestAppliedSourceAt: null,
+      oldestPendingAt: null,
+      pendingEventCount: 0n,
+      sequenceGapCount: 0n,
+      failedIngestionCount: 0n,
+      failureCode: null,
+      rebuildRequestId: null,
+      rebuildUsersProcessed: 0n,
+      asOf,
+    },
+    asOf,
+  };
+}
+
 /** Administrator-only Registry and User Usage Account correction capability. */
 @validateRpc()
 export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
@@ -948,8 +991,33 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       private admin: DurableObjectStub<AdminSettings>,
       private users: DurableObjectNamespace<UserDurableObject>,
       private adminUserId: string,
-      private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>) {
+      private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>,
+      private projection?: DurableObjectNamespace<UsageProjection>) {
     super();
+  }
+
+  async getOverview(): Promise<AdminUsageOverview> {
+    const registeredUsers = await this.admin.countRegisteredUsageUsers();
+    const asOf = new Date().toISOString();
+    if (!this.projection) return unavailableUsageOverview(registeredUsers, asOf);
+    try {
+      return {
+        ...await this.projection.getByName("").readOverview(),
+        registeredUsers,
+      };
+    } catch {
+      return unavailableUsageOverview(registeredUsers, asOf);
+    }
+  }
+
+  async getBalance(registeredUserRef: string): Promise<AdminUsageBalanceState> {
+    const user = await this.#resolveUser(normalizeRegisteredUserRef(registeredUserRef));
+    return user.getAdminUsageBalanceState();
+  }
+
+  requestProjectionRebuild(requestId: string): Promise<ProjectionRebuildStatus> {
+    if (!this.projection) throw new Error("Usage Projection is unavailable.");
+    return this.projection.getByName("").requestRebuild(normalizeProjectionRebuildId(requestId));
   }
 
   searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
@@ -1059,7 +1127,8 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
       private admin: DurableObjectStub<AdminSettings>,
       private adminUserId: string,
       private users: DurableObjectNamespace<UserDurableObject>,
-      private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>) {
+      private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>,
+      private projection?: DurableObjectNamespace<UsageProjection>) {
     super();
   }
 
@@ -1069,7 +1138,13 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async getUsageApi(): Promise<RpcStub<AdminUsageApi>> {
     // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
-    return new AdminUsageApiImpl(this.admin, this.users, this.adminUserId, this.overseers);
+    return new AdminUsageApiImpl(
+      this.admin,
+      this.users,
+      this.adminUserId,
+      this.overseers,
+      this.projection,
+    );
   }
 
   getUsageRates(): Promise<UsageRateAdminView> {

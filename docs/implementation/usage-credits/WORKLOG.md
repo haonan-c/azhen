@@ -309,3 +309,24 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - Full evidence and limitations are in `ISSUE-45-VERIFICATION.md`. #45 remains open because #43 is
   open and all accepted implementation changes remain local, uncommitted, and unpushed under the
   User's authority boundary.
+
+### 2026-08-24 — Issue #62 isolated Usage Projection candidate
+
+- Used the `implement`, `tdd`, and `code-review` stage gates in the dedicated `issue-62` worktree.
+  The public seam began RED, then the fixed focused workerd, real Cap’n Web, frontend, and privacy
+  tests became GREEN without weakening an assertion.
+- Added the retained per-User projection fact/outbox, bounded alarm delivery, exact SQLite
+  `UsageProjection` generation, stable Registry/User rebuild, authoritative administrator balance
+  path, and the localized 30-second-refresh admin overview.
+- Reviewed the expected backend DO generated type and release-manifest golden changes. Removed
+  unrelated Wrangler generated-type drift from the candidate.
+- Backend package verification passed 533 tests with 4 expected skips; frontend package
+  verification passed 351 tests. After rebase to `0d627e7`, root build/test/lint, the manifest
+  golden, and whitespace checks all exited 0. The Context production tracer also passed 25 tests
+  with a real Projection binding.
+- The affected Workshop Backend production-shape Wrangler dry-run passed (5,874.95 KiB upload,
+  1,117.21 KiB gzip). The complete release builder stopped on an unchanged baseline
+  `gatekeeper-linear` unresolved-generic validation error after the Frontend and six Gatekeeper
+  dry-runs had passed; the exact limitation is retained in `ISSUE-62-VERIFICATION.md`.
+- No push, merge, pull request, Issue closure, upload, promotion, deployment, production charging,
+  production configuration change, or worktree deletion occurred.

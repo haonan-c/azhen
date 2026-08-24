@@ -1172,7 +1172,15 @@ describe("production Context billing runtime", () => {
     });
 
     expect(replayed.duplicate.id).not.toBe(replayed.first.id);
-    expect(replayed.duplicateSnapshot).toEqual(replayed.firstSnapshot);
+    const {
+      projectionOutbox: _firstProjectionDeliveryState,
+      ...firstAuthoritativeSnapshot
+    } = replayed.firstSnapshot;
+    const {
+      projectionOutbox: _duplicateProjectionDeliveryState,
+      ...duplicateAuthoritativeSnapshot
+    } = replayed.duplicateSnapshot;
+    expect(duplicateAuthoritativeSnapshot).toEqual(firstAuthoritativeSnapshot);
     expect(replayed.authorizerEvents).toEqual(["begin", "begin"]);
     const attempts = replayed.duplicateSnapshot.gatekeeperMeteringAttempts.filter(attempt =>
       attempt.attribution.billingMethodKey ===

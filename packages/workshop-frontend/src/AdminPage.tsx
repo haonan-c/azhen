@@ -12,6 +12,7 @@ import AdminFormatsPanel from './components/format/AdminFormatsPanel'
 import AddModelModal from './AddModelModal'
 import { m as messages } from './paraglide/messages.js'
 import { formatLocaleNumber } from './utils/formatNumber'
+import AdminUsageOverview from './components/usage/AdminUsageOverview'
 
 // Preset accent colors offered in the Theme section ('' = default brand).
 const ACCENT_PRESETS: { label: () => string; value: string }[] = [
@@ -464,11 +465,14 @@ export default function AdminPage() {
         tabs={[
           { value: 'general', label: messages.admin_tab_general() },
           { value: 'models', label: messages.admin_tab_models() },
+          { value: 'usage', label: messages.admin_tab_usage() },
           { value: 'gatekeepers', label: messages.admin_tab_gatekeepers() },
           { value: 'formats', label: messages.admin_tab_formats() },
           { value: 'access', label: messages.admin_tab_access() },
         ]}
       />
+
+      {activeTab === 'usage' && <AdminUsageOverview adminApi={admin.api} />}
 
       {activeTab === 'models' && (
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">

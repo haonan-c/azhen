@@ -95,6 +95,7 @@ describe('administrator localization', () => {
       description: 'Deployment-wide settings. Changes apply to all users on their next connection.',
       general: 'General',
       models: 'Models',
+      usage: 'Usage & Credits',
       siteName: 'Site name',
     },
     {
@@ -103,6 +104,7 @@ describe('administrator localization', () => {
       description: '部署级设置。更改会在所有用户下次连接时生效。',
       general: '常规',
       models: '模型',
+      usage: '用量与额度',
       siteName: '站点名称',
     },
   ])('localizes administrator settings at $path without changing configured values', async ({
@@ -111,6 +113,7 @@ describe('administrator localization', () => {
     description,
     general,
     models,
+    usage,
     siteName,
   }) => {
     testState.getAdminApi.mockResolvedValue(adminApi())
@@ -121,6 +124,7 @@ describe('administrator localization', () => {
     expect(container?.textContent).toContain(description)
     expect(container?.textContent).toContain(general)
     expect(container?.textContent).toContain(models)
+    expect(container?.textContent).toContain(usage)
     expect(container?.textContent).toContain(siteName)
     expect(container?.textContent).toContain('ADMIN INSTRUCTIONS 原样')
     expect(container?.querySelector<HTMLInputElement>(`input[aria-label="${siteName}"]`)?.value)

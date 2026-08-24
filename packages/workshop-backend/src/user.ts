@@ -25,6 +25,7 @@ import {
   type UnpricedUsageDecision,
 } from "./usage-account.js";
 import type {
+  AdminUsageBalanceState,
   AdminUsageOperationResult,
   ChargeSnapshot,
   GatekeeperChargeSnapshot,
@@ -34,6 +35,7 @@ import type {
   UserUsageRecordPage,
   UserUsageRecordPageRequest,
 } from "@gadgets/workshop-shared/api";
+import type {UsageProjection} from "./usage-projection.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -318,6 +320,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private usageAccount: UsageAccount;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
+  private usageProjection: DurableObjectNamespace<UsageProjection>;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -343,8 +346,54 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       };
     });
     this.adminSettings = this.ctx.exports.AdminSettings;
+    this.usageProjection = this.ctx.exports.UsageProjection;
 
     this.vendors = buildGatekeeperVendorMap(env);
+  }
+
+  /** Continue at-least-once delivery of retained projection outbox facts. */
+  async alarm(): Promise<void> {
+    await this.#deliverProjectionOutbox();
+  }
+
+  async #scheduleProjectionDelivery(): Promise<void> {
+    try {
+      if (this.usageAccount.listPendingProjectionOutbox(1).length === 0) return;
+      this.ctx.waitUntil(this.#deliverProjectionOutbox());
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    } catch (error) {
+      // The authoritative Usage Account transaction has already committed. Projection scheduling
+      // is best-effort here and must not turn its successful terminal RPC into a failure.
+      logger.warn("Usage Projection delivery could not be scheduled", {
+        event: "usage.projection.delivery.schedule.failed",
+        error,
+      });
+    }
+  }
+
+  async #deliverProjectionOutbox(): Promise<void> {
+    const pending = this.usageAccount.listPendingProjectionOutbox(32);
+    if (pending.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    try {
+      const result = await this.usageProjection.getByName("").ingest(
+        pending.map(entry => entry.fact),
+      );
+      this.usageAccount.acknowledgeProjectionFacts(result.acknowledgedFactIds);
+      this.usageAccount.recordProjectionRejections(result.rejected);
+    } catch (error) {
+      logger.warn("Usage Projection delivery failed", {
+        event: "usage.projection.delivery.failed",
+        error,
+      });
+    }
+    if (this.usageAccount.listPendingProjectionOutbox(1).length === 0) {
+      await this.ctx.storage.deleteAlarm();
+    } else {
+      await this.ctx.storage.setAlarm(Date.now() + 10_000);
+    }
   }
 
   async authenticate(token: string): Promise<void> {
@@ -519,6 +568,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.getBalance();
   }
 
+  /** Return the exact authoritative balance components for an administrator capability. */
+  async getAdminUsageBalanceState(): Promise<AdminUsageBalanceState> {
+    await this.activateUsageAccount();
+    return this.usageAccount.getAdminBalanceState();
+  }
+
+  /** Return one bounded page of retained authoritative facts for a projection rebuild. */
+  async listUsageProjectionFacts(
+      afterSourceSequence: bigint | null,
+      limit: number) {
+    await this.activateUsageAccount();
+    return this.usageAccount.listUsageProjectionFacts(afterSourceSequence, limit);
+  }
+
   /** Return one bounded page of this User's content-free Usage Records. */
   async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
     await this.activateUsageAccount();
@@ -567,13 +630,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Persist the durable provider-start handoff for one trusted Agent model inference. */
   async markModelUsageStarted(operationId: string): Promise<ModelMeteringAttempt> {
     await this.activateUsageAccount();
-    return this.usageAccount.markModelUsageStarted(operationId);
+    try {
+      return this.usageAccount.markModelUsageStarted(operationId);
+    } finally {
+      await this.#scheduleProjectionDelivery();
+    }
   }
 
   /** Release one trusted Agent model inference that did not reach its provider request. */
   async failModelUsageBeforeExecution(operationId: string): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
-    return this.usageAccount.failModelUsageBeforeExecution(operationId);
+    try {
+      return this.usageAccount.failModelUsageBeforeExecution(operationId);
+    } finally {
+      await this.#scheduleProjectionDelivery();
+    }
   }
 
   /** Complete one trusted Agent model inference from explicit provider Usage or no report. */
@@ -581,7 +652,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       usage: ModelUsageCompletion): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
-    return this.usageAccount.completeModelUsage(operationId, usage);
+    try {
+      return this.usageAccount.completeModelUsage(operationId, usage);
+    } finally {
+      await this.#scheduleProjectionDelivery();
+    }
   }
 
   /** Begin one trusted Gatekeeper Billable API Operation before its first upstream call. */
@@ -659,7 +734,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       completion: GatekeeperUsageCompletion): Promise<GatekeeperUsageRecord> {
     await this.activateUsageAccount();
-    return this.usageAccount.completeGatekeeperUsage(operationId, completion);
+    try {
+      return this.usageAccount.completeGatekeeperUsage(operationId, completion);
+    } finally {
+      await this.#scheduleProjectionDelivery();
+    }
   }
 
   /** Settle or release one unknown-held Gatekeeper operation under administrator authority. */
@@ -670,13 +749,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       reason: string,
       actorUserId: string) {
     await this.activateUsageAccount();
-    return this.usageAccount.reconcileUnknownGatekeeperUsage(
-      billingOperationId,
-      reconciliationOperationId,
-      decision,
-      reason,
-      actorUserId,
-    );
+    try {
+      return this.usageAccount.reconcileUnknownGatekeeperUsage(
+        billingOperationId,
+        reconciliationOperationId,
+        decision,
+        reason,
+        actorUserId,
+      );
+    } finally {
+      await this.#scheduleProjectionDelivery();
+    }
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */

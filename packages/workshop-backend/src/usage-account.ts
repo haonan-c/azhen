@@ -15,6 +15,7 @@ import {
 } from "@gadgets/workshop-shared/api";
 import {
   calculateModelChargeSubunits,
+  calculateModelProviderCostUsdSubunits,
   normalizeCanonicalUtcTimestamp,
   normalizeChargeSnapshot,
   normalizeInitialGrantSnapshot,
@@ -26,6 +27,7 @@ import {
   type DirectUserUsageAttribution,
   type UsageAttribution,
 } from "./usage-attribution.js";
+import type {UsageProjectionFact, UsageProjectionRejection} from "./usage-projection.js";
 
 const LEDGER_PREFIX = "usageAccount:ledger:";
 const RESERVATION_PREFIX = "usageAccount:reservation:";
@@ -45,6 +47,8 @@ const GATEKEEPER_USAGE_TIME_INDEX_VERSION_KEY =
   "usageAccount:gatekeeperUsageTimeIndexVersion:v1";
 const GATEKEEPER_USAGE_TIME_INDEX_MIGRATION_CURSOR_KEY =
   "usageAccount:gatekeeperUsageTimeIndexMigrationCursor:v1";
+const PROJECTION_SEQUENCE_KEY = "usageAccount:projectionSequence:v1";
+const PROJECTION_OUTBOX_PREFIX = "usageAccount:projectionOutbox:";
 const GATEKEEPER_RECONCILIATION_PREFIX = "usageAccount:gatekeeperReconciliation:";
 const GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX =
   "usageAccount:gatekeeperReconciliationByUsage:";
@@ -261,6 +265,19 @@ export type UsageUserRegistrationOutbox = {
   deliveredAt?: string;
 };
 
+/** One retained User projection fact and its best-effort delivery state. */
+export type UsageProjectionOutboxEntry = {
+  fact: UsageProjectionFact;
+  deliveredAt?: string;
+  failureCode?: UsageProjectionRejection["code"];
+};
+
+/** One bounded page of retained authoritative projection facts for rebuild. */
+export type UsageProjectionFactPage = {
+  facts: UsageProjectionFact[];
+  nextSourceSequence: bigint | null;
+};
+
 type StoredAdminUsageOperationInput = {
   actorUserId: string;
   reason: string;
@@ -289,6 +306,8 @@ export type UsageAccountSnapshot = UsageCreditBalance & {
   gatekeeperMeteringAttempts: GatekeeperMeteringAttempt[];
   gatekeeperUsageRecords: GatekeeperUsageRecord[];
   billingBlock: UsageBillingBlock | null;
+  projectionFacts: UsageProjectionFact[];
+  projectionOutbox: UsageProjectionOutboxEntry[];
 };
 
 /**
@@ -367,11 +386,77 @@ export class UsageAccount {
     });
   }
 
+  /** Return all exact authoritative balance components for a server-bound admin capability. */
+  getAdminBalanceState(): AdminUsageBalanceState {
+    return this.storage.transactionSync(() => balanceState(this.ensureInitialGrant()));
+  }
+
   /** Reconcile all stored Ledger entries into an internal diagnostic snapshot. */
   getSnapshot(): UsageAccountSnapshot {
     return this.storage.transactionSync(() => {
       const totals = this.ensureInitialGrant();
       return this.readSnapshot(totals);
+    });
+  }
+
+  /** Return a bounded source-sequence page of retained authoritative projection facts. */
+  listUsageProjectionFacts(
+      afterSourceSequence: bigint | null, limit: number): UsageProjectionFactPage {
+    if (afterSourceSequence !== null &&
+        (typeof afterSourceSequence !== "bigint" || afterSourceSequence < 0n)) {
+      throw new TypeError("Usage Projection fact cursor is invalid.");
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new TypeError("Usage Projection fact page size is invalid.");
+    }
+    const entries = this.#projectionOutboxEntries()
+      .filter(entry => entry.fact.sourceSequence > (afterSourceSequence ?? 0n))
+      .slice(0, limit + 1);
+    const hasNext = entries.length > limit;
+    const page = entries.slice(0, limit);
+    return {
+      facts: page.map(entry => entry.fact),
+      nextSourceSequence: hasNext ? page.at(-1)!.fact.sourceSequence : null,
+    };
+  }
+
+  /** Return a bounded delivery batch without deleting the retained rebuild source. */
+  listPendingProjectionOutbox(limit: number): UsageProjectionOutboxEntry[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
+      throw new TypeError("Usage Projection outbox batch size is invalid.");
+    }
+    return this.#projectionOutboxEntries()
+      .filter(entry => entry.deliveredAt === undefined && entry.failureCode === undefined)
+      .slice(0, limit);
+  }
+
+  /** Idempotently mark accepted facts delivered while retaining their immutable source. */
+  acknowledgeProjectionFacts(projectionFactIds: string[]): void {
+    this.storage.transactionSync(() => {
+      const accepted = new Set(projectionFactIds);
+      for (const [key, entry] of this.storage.kv.list<UsageProjectionOutboxEntry>({
+        prefix: PROJECTION_OUTBOX_PREFIX,
+      })) {
+        if (!accepted.has(entry.fact.projectionFactId) || entry.deliveredAt !== undefined) continue;
+        this.storage.kv.put<UsageProjectionOutboxEntry>(key, {
+          fact: entry.fact,
+          deliveredAt: new Date().toISOString(),
+        });
+      }
+    });
+  }
+
+  /** Retain bounded rejection codes on poison facts without dropping later outbox work. */
+  recordProjectionRejections(rejections: UsageProjectionRejection[]): void {
+    this.storage.transactionSync(() => {
+      const rejected = new Map(rejections.map(item => [item.projectionFactId, item.code]));
+      for (const [key, entry] of this.storage.kv.list<UsageProjectionOutboxEntry>({
+        prefix: PROJECTION_OUTBOX_PREFIX,
+      })) {
+        const failureCode = rejected.get(entry.fact.projectionFactId);
+        if (failureCode === undefined || entry.deliveredAt !== undefined) continue;
+        this.storage.kv.put<UsageProjectionOutboxEntry>(key, {...entry, failureCode});
+      }
     });
   }
 
@@ -922,6 +1007,7 @@ export class UsageAccount {
       this.storage.kv.put(recordKey, record);
       this.storage.kv.put(attemptKey, completedAttempt);
       this.storage.kv.put(modelUsageTimeIndexKey(record), operationId);
+      this.#appendModelProjectionFact(record);
       return {value: record};
     });
     return unwrapTransactionResult(result);
@@ -996,6 +1082,7 @@ export class UsageAccount {
     this.storage.kv.put(recordKey, record);
     this.storage.kv.put(MODEL_ATTEMPT_PREFIX + operationId, completedAttempt);
     this.storage.kv.put(modelUsageTimeIndexKey(record), operationId);
+    this.#appendModelProjectionFact(record);
     return record;
   }
 
@@ -1251,9 +1338,107 @@ export class UsageAccount {
         completedAt,
         usageRecordId: recordId,
       });
+      this.#appendGatekeeperProjectionFact(record);
       return {value: record};
     });
     return unwrapTransactionResult(result);
+  }
+
+  #appendModelProjectionFact(record: ModelUsageRecord): void {
+    const confirmedUsage = record.usageStatus === "reported" && record.usage !== null &&
+      (record.outcome === "settled" || record.outcome === "reconciliation-required");
+    const usage = confirmedUsage ? record.usage : null;
+    this.#appendProjectionFact({
+      rowKind: "detail",
+      occurredAt: record.createdAt,
+      source: record.attribution.source,
+      kind: "model",
+      outcome: record.outcome,
+      pricing: record.chargeSnapshot.pricing,
+      deploymentModelId: record.attribution.deploymentModelId,
+      vendorId: null,
+      billingMethodKey: null,
+      externalAccountId: null,
+      gadgetId: record.attribution.gadgetId === undefined
+        ? null : record.attribution.gadgetId.toString(),
+      cacheHitInputTokens: usage?.cacheHitInputTokens ?? 0n,
+      cacheMissInputTokens: usage?.cacheMissInputTokens ?? 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: usage?.outputTokens ?? 0n,
+      reasoningTokens: usage?.reasoningTokens ?? 0n,
+      providerCostUsdSubunits: usage === null
+        ? 0n : calculateModelProviderCostUsdSubunits(record.chargeSnapshot, usage),
+      chargedUsageCreditSubunits: record.outcome === "settled"
+        ? record.chargeSubunits ?? 0n : 0n,
+      billableApiOperations: 0n,
+      activeUserContribution: confirmedUsage ? 1n : 0n,
+      unpricedModelUses: confirmedUsage && record.chargeSnapshot.pricing === "unpriced" ? 1n : 0n,
+      unpricedApiOperations: 0n,
+    });
+  }
+
+  #appendGatekeeperProjectionFact(record: GatekeeperUsageRecord): void {
+    const confirmedUsage = record.outcome === "settled";
+    this.#appendProjectionFact({
+      rowKind: "detail",
+      occurredAt: record.createdAt,
+      source: record.attribution.source,
+      kind: "gatekeeper",
+      outcome: record.outcome,
+      pricing: record.chargeSnapshot.pricing,
+      deploymentModelId: null,
+      vendorId: record.attribution.vendorId,
+      billingMethodKey: record.attribution.billingMethodKey,
+      externalAccountId: record.attribution.externalAccountId,
+      gadgetId: record.attribution.gadgetId === undefined
+        ? null : record.attribution.gadgetId.toString(),
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: confirmedUsage ? record.chargeSubunits ?? 0n : 0n,
+      billableApiOperations: confirmedUsage ? 1n : 0n,
+      activeUserContribution: confirmedUsage ? 1n : 0n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: confirmedUsage && record.chargeSnapshot.pricing === "unpriced"
+        ? 1n : 0n,
+    });
+  }
+
+  #appendGatekeeperReconciliationProjectionFact(
+      record: GatekeeperUsageRecord,
+      decision: "settle" | "release",
+      occurredAt: string,
+      ledgerEntryId: string | null): void {
+    const settled = decision === "settle";
+    this.#appendProjectionFact({
+      rowKind: "detail",
+      occurredAt,
+      source: record.attribution.source,
+      kind: "gatekeeper",
+      outcome: settled ? "reconciled-settled" : "reconciled-released",
+      pricing: record.chargeSnapshot.pricing,
+      deploymentModelId: null,
+      vendorId: record.attribution.vendorId,
+      billingMethodKey: record.attribution.billingMethodKey,
+      externalAccountId: record.attribution.externalAccountId,
+      gadgetId: record.attribution.gadgetId === undefined
+        ? null : record.attribution.gadgetId.toString(),
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: ledgerEntryId === null
+        ? 0n : record.chargeSnapshot.chargeSubunits,
+      billableApiOperations: settled ? 1n : 0n,
+      activeUserContribution: settled ? 1n : 0n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: settled && record.chargeSnapshot.pricing === "unpriced" ? 1n : 0n,
+    });
   }
 
   private settleGatekeeperReservation(
@@ -1426,6 +1611,12 @@ export class UsageAccount {
         this.storage.kv.put(
           GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + billingOperationId,
           reconciliationOperationId,
+        );
+        this.#appendGatekeeperReconciliationProjectionFact(
+          usageRecord,
+          decision,
+          createdAt,
+          ledgerEntryId,
         );
         return {value: reconciliation};
       },
@@ -1871,6 +2062,7 @@ export class UsageAccount {
     ) {
       throw new Error("Usage Credit totals do not reconcile with the Ledger and Reservations.");
     }
+    const projectionOutbox = this.#projectionOutboxEntries();
     return {
       availableSubunits: totals.ledgerBalanceSubunits - totals.reservedSubunits,
       reservedSubunits: totals.reservedSubunits,
@@ -1885,7 +2077,50 @@ export class UsageAccount {
       gatekeeperMeteringAttempts: gatekeeperAttemptRecords.map(([, attempt]) => attempt),
       gatekeeperUsageRecords: gatekeeperUsageRecordRecords.map(([, record]) => record),
       billingBlock,
+      projectionFacts: projectionOutbox.map(entry => entry.fact),
+      projectionOutbox,
     };
+  }
+
+  #appendProjectionFact(
+      contribution: Omit<UsageProjectionFact,
+        "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef">): void {
+    const registration = this.storage.kv.get<UsageUserRegistrationOutbox>(
+      REGISTRATION_OUTBOX_KEY,
+    );
+    if (!registration) throw new Error("Usage User registration outbox is missing.");
+    assertRegistrationOutbox(registration);
+    const previousSequence = this.storage.kv.get<bigint>(PROJECTION_SEQUENCE_KEY) ?? 0n;
+    if (typeof previousSequence !== "bigint" || previousSequence < 0n) {
+      throw new Error("Usage Projection source sequence is invalid.");
+    }
+    const sourceSequence = previousSequence + 1n;
+    const fact: UsageProjectionFact = {
+      schemaVersion: 1,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence,
+      usagePrincipalRef: registration.fact.registeredUserRef,
+      ...contribution,
+    };
+    this.storage.kv.put(PROJECTION_SEQUENCE_KEY, sourceSequence);
+    this.storage.kv.put<UsageProjectionOutboxEntry>(
+      PROJECTION_OUTBOX_PREFIX + sourceSequence.toString().padStart(40, "0"),
+      {fact},
+    );
+  }
+
+  #projectionOutboxEntries(): UsageProjectionOutboxEntry[] {
+    const entries = Array.from(
+      this.storage.kv.list<UsageProjectionOutboxEntry>({prefix: PROJECTION_OUTBOX_PREFIX}),
+      ([, entry]) => entry,
+    );
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index]!;
+      if (entry.fact.sourceSequence !== BigInt(index + 1)) {
+        throw new Error("Usage Projection outbox sequence does not reconcile.");
+      }
+    }
+    return entries;
   }
 }
 

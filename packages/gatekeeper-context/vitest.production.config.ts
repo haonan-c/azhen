@@ -38,6 +38,7 @@ export default defineConfig({
           TEST_CONTEXT_GATEKEEPER: { className: "ContextGatekeeper", useSQLite: true },
           TEST_USER: { className: "UserDurableObject", useSQLite: true },
           TEST_ADMIN_SETTINGS: { className: "AdminSettings", useSQLite: true },
+          TEST_USAGE_PROJECTION: { className: "UsageProjection", useSQLite: true },
         },
         kvNamespaces: ["CONTEXT_COLLECTIONS"],
         serviceBindings: {

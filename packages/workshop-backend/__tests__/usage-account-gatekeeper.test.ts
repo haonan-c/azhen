@@ -151,6 +151,60 @@ describe("Gatekeeper two-stage billing state machine", () => {
     });
   });
 
+  it("commits one immutable projection fact and outbox with the terminal Usage Record", async () => {
+    await withAccount(account => {
+      const operationId = "gatekeeper-operation:projection-outbox";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      const record = account.completeGatekeeperUsage(operationId, "executed");
+      expect(account.completeGatekeeperUsage(operationId, "executed")).toEqual(record);
+
+      const snapshot = account.getSnapshot();
+      expect(snapshot.projectionOutbox).toHaveLength(1);
+      expect(snapshot.projectionOutbox[0]).toMatchObject({
+        fact: {
+          schemaVersion: 1,
+          sourceSequence: 1n,
+          usagePrincipalRef: snapshot.registrationOutbox.fact.registeredUserRef,
+          rowKind: "detail",
+          source: "agent",
+          kind: "gatekeeper",
+          outcome: "settled",
+          pricing: "unpriced",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "context-account-1",
+          chargedUsageCreditSubunits: 0n,
+          billableApiOperations: 1n,
+          activeUserContribution: 1n,
+          unpricedApiOperations: 1n,
+        },
+      });
+      expect(snapshot.projectionFacts).toEqual(snapshot.projectionOutbox.map(item => item.fact));
+    });
+  });
+
+  it("retains a rejected projection fact as poison without retrying it forever", async () => {
+    await withAccount(account => {
+      const operationId = "gatekeeper-operation:projection-poison";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const fact = account.listPendingProjectionOutbox(1)[0]!.fact;
+
+      account.recordProjectionRejections([{
+        projectionFactId: fact.projectionFactId,
+        code: "invalid-fact",
+      }]);
+
+      expect(account.listPendingProjectionOutbox(1)).toEqual([]);
+      expect(account.getSnapshot().projectionOutbox).toEqual([{
+        fact,
+        failureCode: "invalid-fact",
+      }]);
+    });
+  });
+
   it("persists direct User management Usage without a Workspace", async () => {
     await withAccount(account => {
       const attribution: GatekeeperUsageAttribution = {

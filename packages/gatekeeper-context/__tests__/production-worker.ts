@@ -15,6 +15,7 @@ export {
   ContextGatekeeper,
 } from "../src/index.js";
 export { UserDurableObject } from "../../workshop-backend/src/user.js";
+export { UsageProjection } from "../../workshop-backend/src/usage-projection.js";
 
 const artifactTrace: string[] = [];
 let artifactReadTokensEnabled = false;

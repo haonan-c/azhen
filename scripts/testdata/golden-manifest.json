@@ -1161,6 +1161,12 @@
             "PendingLogin"
           ],
           "tag": "v2"
+        },
+        {
+          "new_sqlite_classes": [
+            "UsageProjection"
+          ],
+          "tag": "v3"
         }
       ],
       "modules": [
