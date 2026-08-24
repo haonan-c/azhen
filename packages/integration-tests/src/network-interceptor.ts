@@ -19,6 +19,48 @@ export type Handler =
     (url: URL, method: string, headers: Headers, request: Request) =>
       Response | null | Promise<Response | null>;
 
+const MAX_INSPECTED_BODY_BYTES = 1024 * 1024;
+
+async function readBoundedBody(request: Request): Promise<Uint8Array | undefined> {
+  if (!request.body) return undefined;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_INSPECTED_BODY_BYTES) {
+        await reader.cancel();
+        throw new Error(
+          `Outbound request body exceeds the ${MAX_INSPECTED_BODY_BYTES} byte inspection limit`,
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function inspectedRequest(request: Request, body: Uint8Array | undefined): Request {
+  return new Request(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body,
+    redirect: request.redirect,
+    signal: request.signal,
+  });
+}
+
 export class NetworkInterceptor {
   readonly #handlers: readonly Handler[];
   #realFetch: typeof globalThis.fetch | null = null;
@@ -54,11 +96,20 @@ export class NetworkInterceptor {
       const request = new Request(input, init);
       const { method: rawMethod, headers } = request;
       const method = rawMethod.toUpperCase();
+      let body: Uint8Array | undefined;
+      try {
+        body = await readBoundedBody(request);
+      } catch (error) {
+        this.#unmockedCalls.push(
+          `${method} ${raw} (body exceeds ${MAX_INSPECTED_BODY_BYTES} bytes)`,
+        );
+        throw error;
+      }
 
       for (const handler of this.#handlers) {
-        // Each handler receives a clone so one declining handler can inspect the body without
-        // consuming it for the next handler. The original request is never sent to the network.
-        const response = await handler(url, method, headers, request.clone());
+        // Rebuild the request from bounded bytes so one declining handler can inspect the body
+        // without consuming it for the next handler. The original request is never sent onward.
+        const response = await handler(url, method, headers, inspectedRequest(request, body));
         if (response) return response;
       }
 

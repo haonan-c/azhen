@@ -9,7 +9,7 @@
     "./rpc-client": "./src/rpc-client.ts"
   },
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "tsc --noEmit && tsc --noEmit -p tsconfig.ugc-ads-billing.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },

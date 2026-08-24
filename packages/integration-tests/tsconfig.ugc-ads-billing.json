@@ -1,0 +1,17 @@
+{
+  // This tracer imports the production Session type, so compile it with the same generated Worker
+  // environment instead of the integration fixture Worker's Cloudflare.GlobalProps.mainModule.
+  "extends": "../gatekeeper-ugc-ads/tsconfig.json",
+  "compilerOptions": {
+    "types": [
+      "node",
+      "../gatekeeper-ugc-ads/worker-configuration.d.ts",
+      "../gatekeeper-ugc-ads/src/env.d.ts"
+    ],
+    "noEmit": true,
+    "paths": {
+      "@gadgets/workshop-shared/*": ["../workshop-shared/src/*"]
+    }
+  },
+  "include": ["__tests__/ugc-ads-billing.test.ts"]
+}

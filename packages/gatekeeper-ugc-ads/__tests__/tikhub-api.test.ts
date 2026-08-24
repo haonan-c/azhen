@@ -126,6 +126,21 @@ describe("TikHub Xiaohongshu API", () => {
     });
   });
 
+  it("retries one temporary Xiaohongshu failure", async () => {
+    let fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("unavailable", {status: 503}))
+      .mockResolvedValueOnce(response({
+        code: 0,
+        success: true,
+        next_page: false,
+        data: {items: []},
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(searchXiaohongshuNotes("api-key", "example")).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects a missing API key before making a request", async () => {
     let fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

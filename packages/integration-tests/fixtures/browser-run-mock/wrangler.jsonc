@@ -1,0 +1,7 @@
+{
+  "$schema": "../../../../node_modules/wrangler/config-schema.json",
+  "name": "browser-run-mock",
+  "main": "src/browser-run-mock.ts",
+  "compatibility_date": "2026-02-02",
+  "compatibility_flags": ["nodejs_compat"]
+}
