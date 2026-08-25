@@ -937,14 +937,15 @@ describe("approved Action billing", () => {
     session[Symbol.dispose]();
     gatekeeper[Symbol.dispose]();
     workspace[Symbol.dispose]();
-    user[Symbol.dispose]();
-    publicApi[Symbol.dispose]();
     await usage.deleteUsageUser({
       registeredUserRef: registered.registeredUserRef,
       deletionId: `delete-legacy-action-user-${crypto.randomUUID()}`,
       reason: "Prove deleted identity cannot erase retained unknown financial authority",
     });
     expect((await usage.searchUsers({query: username, limit: 2})).users).toEqual([]);
+    await expect(user.getUsageCreditBalance()).rejects.toThrow("deleted");
+    user[Symbol.dispose]();
+    publicApi[Symbol.dispose]();
     await expect(signInWhenAvailable(username))
       .rejects.toThrow(`Login failed for "${username}".`);
 
