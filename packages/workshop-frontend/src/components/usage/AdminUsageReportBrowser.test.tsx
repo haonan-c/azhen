@@ -3,6 +3,7 @@
 
 import type {
   AdminUsageApi,
+  AdminUsageOperationResult,
   AdminUsageReport,
   AdminUsageReportOverview,
   AdminUsageReportPage,
@@ -111,8 +112,28 @@ function row(id: string): AdminUsageReportRow {
   };
 }
 
+function operationResult(
+  kind: AdminUsageOperationResult["kind"],
+  operationId: string,
+): AdminUsageOperationResult {
+  const balance = {ledgerBalanceSubunits: 10n, reservedSubunits: 0n, availableSubunits: 10n};
+  return {
+    kind,
+    ledgerEntryId: `ledger:${operationId}`,
+    originalLedgerEntryId: kind === "reverse" ? "record-ref:usage-charge" : null,
+    deltaSubunits: 1n,
+    actorUserId: "admin@example.test",
+    reason: "Bounded audit reason",
+    createdAt: "2026-08-24T12:00:00.000Z",
+    before: balance,
+    after: {...balance, ledgerBalanceSubunits: 11n, availableSubunits: 11n},
+    noOp: false,
+  };
+}
+
 function report(rows: AdminUsageReportRow[] = []) {
   const dispose = vi.fn<() => void>();
+  const getOverview = vi.fn<AdminUsageReport["getOverview"]>(async () => reportOverview());
   const listRows = vi.fn<AdminUsageReport["listRows"]>(
     async (): Promise<AdminUsageReportPage> => ({rows, nextCursor: null}),
   );
@@ -120,26 +141,30 @@ function report(rows: AdminUsageReportRow[] = []) {
     async () => new ReadableStream<Uint8Array>(),
   );
   const target = Object.assign(vi.fn<() => void>(), {
-    getOverview: vi.fn<() => Promise<AdminUsageReportOverview>>(async () => reportOverview()),
+    getOverview,
     listRows,
     exportCsv,
     [Symbol.dispose]: dispose,
   }) as unknown as RpcStub<AdminUsageReport>;
-  return {target, dispose, listRows, exportCsv};
+  return {target, dispose, getOverview, listRows, exportCsv};
 }
 
 function usageApi(
   openReport: AdminUsageApi["openReport"],
   getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>(),
+  overrides: Partial<AdminUsageApi> = {},
 ): RpcStub<AdminUsageApi> {
   return Object.assign(vi.fn<() => void>(), {
     openReport,
     getRecordDetail,
+    ...overrides,
   }) as unknown as RpcStub<AdminUsageApi>;
 }
 
-function changeInput(input: HTMLInputElement, value: string): void {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+function changeInput(input: HTMLInputElement | HTMLTextAreaElement, value: string): void {
+  const prototype = input instanceof HTMLTextAreaElement
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
   if (!setter) throw new Error("Expected the native input value setter.");
   setter.call(input, value);
   input.dispatchEvent(new Event("input", {bubbles: true}));
@@ -270,6 +295,25 @@ describe("administrator frozen Usage report browser", () => {
     expect(slow.dispose).toHaveBeenCalledOnce();
   });
 
+  it.each(["overview", "rows"] as const)(
+    "disposes and clears a report when its initial %s request fails",
+    async failure => {
+      const current = report([row("must-not-remain")]);
+      if (failure === "overview") current.getOverview.mockRejectedValue(new Error("overview"));
+      else current.listRows.mockRejectedValue(new Error("rows"));
+      await render(usageApi(
+        vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+      ));
+
+      await vi.waitFor(() => expect(container?.textContent).toContain("could not be loaded"));
+      expect(container?.textContent).not.toContain("must-not-remain");
+      expect(current.dispose).toHaveBeenCalledOnce();
+      const exportButton = Array.from(container!.querySelectorAll("button"))
+        .find(button => button.textContent === "Export CSV");
+      expect(exportButton?.disabled).toBe(true);
+    },
+  );
+
   it("aborts an active export and disposes its report when unmounted", async () => {
     const current = report();
     const api = usageApi(vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target));
@@ -294,6 +338,30 @@ describe("administrator frozen Usage report browser", () => {
     expect(current.dispose).toHaveBeenCalledOnce();
   });
 
+  it("returns a cancelled stale export to idle when a filter opens a new report", async () => {
+    const first = report();
+    const second = report();
+    const openReport = vi.fn<AdminUsageApi["openReport"]>()
+      .mockResolvedValueOnce(first.target)
+      .mockResolvedValueOnce(second.target);
+    transferMocks.saveStreamToFile.mockImplementation((_createStream, _filename, signal) =>
+      new Promise((_resolve, reject) => signal?.addEventListener("abort", () => {
+        reject(new DOMException("Cancelled", "AbortError"));
+      }, {once: true})));
+    await render(usageApi(openReport));
+    await vi.waitFor(() => expect(container?.textContent).toContain("No Usage rows"));
+    const button = (name: string) => Array.from(container!.querySelectorAll("button"))
+      .find(candidate => candidate.textContent === name);
+    await act(async () => button("Export CSV")?.click());
+    await vi.waitFor(() => expect(container?.textContent).toContain("Exporting"));
+
+    await act(async () => button("Clear filters")?.click());
+
+    await vi.waitFor(() => expect(openReport).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(container?.textContent).not.toContain("Exporting"));
+    expect(button("Export CSV")?.disabled).toBe(false);
+  });
+
   it("walks a stable Next and Previous cursor stack without offset pagination", async () => {
     const current = report();
     current.listRows.mockImplementation(async request => request.cursor === "cursor-2"
@@ -311,6 +379,34 @@ describe("administrator frozen Usage report browser", () => {
     await act(async () => button("Previous")?.click());
     await vi.waitFor(() => expect(container?.textContent).toContain("page-one"));
     expect(current.listRows).toHaveBeenLastCalledWith({limit: 50});
+  });
+
+  it("shows exact filtered totals and distinguishes priced-zero from Unpriced rows", async () => {
+    const pricedZero = {...row("priced-zero"), pricingStatus: "priced" as const};
+    const unpriced = {...row("unpriced"), pricingStatus: "unpriced" as const};
+    const current = report([pricedZero, unpriced]);
+    current.getOverview.mockResolvedValue({
+      ...reportOverview(),
+      metrics: {
+        ...reportOverview().metrics,
+        providerCostUsdSubunits: 101n,
+        chargedUsageCreditSubunits: 202n,
+        unpricedModelUses: 2n,
+        unpricedApiOperations: 3n,
+      },
+    });
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+    ));
+
+    await vi.waitFor(() => expect(container?.textContent).toContain("priced-zero"));
+    expect(container?.textContent).toContain("Provider cost");
+    expect(container?.textContent).toContain("101");
+    expect(container?.textContent).toContain("Model tokens");
+    expect(container?.textContent).toContain("Unpriced Use");
+    const rows = Array.from(container!.querySelectorAll("tbody tr"));
+    expect(rows[0]?.textContent).toContain("Priced");
+    expect(rows[1]?.textContent).toContain("Unpriced");
   });
 
   it("shows the authoritative User graph and a clear unavailable-detail error", async () => {
@@ -379,6 +475,198 @@ describe("administrator frozen Usage report browser", () => {
     await act(async () => detailButton.click());
     await vi.waitFor(() => expect(container?.textContent)
       .toContain("This authoritative Usage Record is not available."));
+  });
+
+  it("shows the complete model authority graph without rendering private extra fields", async () => {
+    const usageRow = row("model-authority");
+    const sentinels = [
+      "ISSUE63_PRIVATE_PROMPT",
+      "ISSUE63_PRIVATE_OUTPUT",
+      "ISSUE63_PRIVATE_ARGS",
+      "ISSUE63_PRIVATE_HEADER",
+      "ISSUE63_PRIVATE_TOKEN",
+      "ISSUE63_PRIVATE_BODY",
+      "ISSUE63_PRIVATE_ERROR",
+    ];
+    const detail: import("@gadgets/workshop-shared/api").AdminUsageRecordDetail = {
+      record: {
+        kind: "model",
+        id: usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "unreachable",
+        source: "agent",
+        workspaceId: "workspace",
+        chatId: 7,
+        gadgetId: 1,
+        deploymentModelId: "model-authority",
+        pricing: "priced",
+        outcome: "settled",
+        usageStatus: "reported",
+        usage: {
+          cacheHitInputTokens: 11n,
+          cacheMissInputTokens: 12n,
+          outputTokens: 13n,
+          reasoningTokens: 2n,
+        },
+        chargeSubunits: 99n,
+        createdAt: "2026-08-24T12:00:00.000Z",
+        prompt: sentinels[0],
+        output: sentinels[1],
+        args: sentinels[2],
+      },
+      chargeSnapshot: {
+        kind: "model",
+        pricing: "priced",
+        usageRateVersion: 4n,
+        issuedAt: "2026-08-24T11:59:00.000Z",
+        catalogVersion: "catalog-v1",
+        provider: "workers-ai",
+        model: "provider-model",
+        providerModelVersion: "provider-v2",
+        rateTier: "standard",
+        tokenRates: {
+          cacheHitUsdSubunitsPerMillion: 21n,
+          cacheMissUsdSubunitsPerMillion: 22n,
+          outputUsdSubunitsPerMillion: 23n,
+        },
+        multiplier: {numerator: 3n, denominator: 2n},
+        creditConversion: {numerator: 5n, denominator: 4n},
+        headers: sentinels[3],
+        token: sentinels[4],
+      },
+      reservation: {
+        amountSubunits: 99n,
+        state: "settled",
+        createdAt: "2026-08-24T11:59:30.000Z",
+        settledAt: "2026-08-24T12:00:00.000Z",
+        releasedAt: null,
+        body: sentinels[5],
+      },
+      ledgerEntries: [{
+        id: "safe-record-ref:usage-charge",
+        kind: "usage-charge",
+        deltaSubunits: -99n,
+        createdAt: "2026-08-24T12:00:00.000Z",
+        error: sentinels[6],
+      }],
+      reconciliation: null,
+    } as never;
+    const current = report([usageRow]);
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+      vi.fn<AdminUsageApi["getRecordDetail"]>().mockResolvedValue(detail),
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("model-authority"));
+    const detailButton = Array.from(container!.querySelectorAll("button"))
+      .find(button => button.textContent === "View detail");
+    await act(async () => detailButton?.click());
+
+    await vi.waitFor(() => expect(container?.textContent).toContain("provider-v2"));
+    expect(container?.textContent).toContain("11 / 12 / 13 / 2");
+    expect(container?.textContent).toContain("3/2");
+    expect(container?.textContent).toContain("5/4");
+    expect(container?.textContent).toContain("2026-08-24T11:59:30.000Z");
+    expect(container?.textContent).toContain("2026-08-24T12:00:00.000Z");
+    for (const sentinel of sentinels) expect(container?.textContent).not.toContain(sentinel);
+  });
+
+  it("runs idempotent correction and unknown-action operations then refreshes authority", async () => {
+    const usageRow: AdminUsageReportRow = {
+      ...row("unknown-operation"),
+      meteredKind: "gatekeeper",
+      outcome: "usage-unknown",
+      deploymentModelId: null,
+      gatekeeperId: "vendor",
+      stableMethodKey: "method",
+      externalAccountId: "account",
+    };
+    const detail: import("@gadgets/workshop-shared/api").AdminUsageRecordDetail = {
+      record: {
+        kind: "gatekeeper",
+        id: usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "unreachable",
+        source: "agent",
+        workspaceId: "a".repeat(64),
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        externalAccountId: "account",
+        pricing: "priced",
+        outcome: "usage-unknown",
+        chargeSubunits: null,
+        createdAt: "2026-08-24T12:00:00.000Z",
+      },
+      chargeSnapshot: {
+        kind: "gatekeeper",
+        pricing: "priced",
+        usageRateVersion: 2n,
+        issuedAt: "2026-08-24T11:59:00.000Z",
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        chargeSubunits: 9n,
+      },
+      reservation: {amountSubunits: 9n, state: "reserved", createdAt: "2026-08-24T11:59:30.000Z",
+        settledAt: null, releasedAt: null},
+      ledgerEntries: [{id: `${usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "x"}:usage-charge`,
+        kind: "usage-charge", deltaSubunits: -9n, createdAt: "2026-08-24T12:00:00.000Z"}],
+      reconciliation: null,
+    };
+    const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>().mockResolvedValue(detail);
+    const grant = vi.fn<AdminUsageApi["grant"]>().mockImplementation(async request =>
+      operationResult("grant", request.operationId));
+    const deduct = vi.fn<AdminUsageApi["deduct"]>()
+      .mockRejectedValue(new Error("bounded failure"));
+    const reconcileBalance = vi.fn<AdminUsageApi["reconcileBalance"]>()
+      .mockImplementation(async request => operationResult("reconcile-balance", request.operationId));
+    const reverse = vi.fn<AdminUsageApi["reverse"]>().mockImplementation(async request =>
+      operationResult("reverse", request.operationId));
+    const reconcileAction = vi.fn<AdminUsageApi["reconcileAction"]>().mockResolvedValue({
+      workspaceId: "a".repeat(64), actionId: 17, operationId: "operation", decision: "settle",
+      previousState: "unknown", newState: "accepted", ledgerEntryId: "ledger",
+      actorUserId: "admin@example.test", reason: "Bounded audit reason",
+      createdAt: "2026-08-24T12:00:00.000Z",
+    });
+    const current = report([usageRow]);
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+      getRecordDetail,
+      {grant, deduct, reconcileBalance, reverse, reconcileAction},
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("vendor / method"));
+    const button = (name: string) => Array.from(container!.querySelectorAll("button"))
+      .find(candidate => candidate.textContent === name);
+    await act(async () => button("View detail")?.click());
+    await vi.waitFor(() => expect(container?.textContent).toContain("Administrative operations"));
+    const input = (label: string) => container!.querySelector<HTMLInputElement>(
+      `input[aria-label="${label}"]`,
+    );
+    const reason = container!.querySelector<HTMLTextAreaElement>('textarea[aria-label="Reason"]');
+    if (!reason || !input("Amount or target subunits")) throw new Error("Expected operation inputs.");
+    await act(async () => {
+      changeInput(input("Amount or target subunits")!, "5");
+      changeInput(reason, "Bounded audit reason");
+    });
+
+    await act(async () => button("Grant")?.click());
+    await vi.waitFor(() => expect(grant).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(getRecordDetail).toHaveBeenCalledTimes(2));
+    const firstOperationId = grant.mock.calls[0]![0].operationId;
+    await act(async () => button("Grant")?.click());
+    await vi.waitFor(() => expect(grant).toHaveBeenCalledTimes(2));
+    expect(grant.mock.calls[1]![0].operationId).toBe(firstOperationId);
+
+    await act(async () => button("Deduct")?.click());
+    await vi.waitFor(() => expect(container?.textContent).toContain("Operation failed"));
+    await act(async () => button("Reconcile balance")?.click());
+    await vi.waitFor(() => expect(reconcileBalance).toHaveBeenCalledOnce());
+    await act(async () => button("Reverse selected charge")?.click());
+    await vi.waitFor(() => expect(reverse).toHaveBeenCalledOnce());
+    expect(reverse.mock.calls[0]![0].originalLedgerEntryId).toContain(":usage-charge");
+
+    await act(async () => changeInput(input("Action ID")!, "17"));
+    await act(async () => button("Settle unknown Action")?.click());
+    await vi.waitFor(() => expect(reconcileAction).toHaveBeenCalledOnce());
+    expect(reconcileAction).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: "a".repeat(64), actionId: 17, decision: "settle",
+      reason: "Bounded audit reason",
+    }));
+    expect(button("Release unknown Action")).toBeDefined();
   });
 
   it("shows reconciliation-only authority without an older raw Usage Record", async () => {

@@ -56,6 +56,23 @@ describe('export file transfers', () => {
     expect(click).not.toHaveBeenCalled()
   })
 
+  it('does not create a stream when the selected file cannot become writable', async () => {
+    const failure = new DOMException('Cannot write file', 'NotAllowedError')
+    const createWritable = vi.fn<() => Promise<WritableStream<Uint8Array>>>()
+      .mockRejectedValue(failure)
+    Object.assign(window, {
+      showSaveFilePicker: vi.fn(async () => ({createWritable})),
+    })
+    const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>(async () => (
+      new ReadableStream<Uint8Array>()
+    ))
+
+    await expect(saveStreamToFile(source, 'report.csv')).rejects.toBe(failure)
+
+    expect(createWritable).toHaveBeenCalledOnce()
+    expect(source).not.toHaveBeenCalled()
+  })
+
   it('pipes CSV bytes directly to a Chromium file handle', async () => {
     const written: Uint8Array[] = []
     const writable = new WritableStream<Uint8Array>({
@@ -89,5 +106,33 @@ describe('export file transfers', () => {
       cancel() { cancelled = true },
     }), 'usage.csv')).rejects.toThrow('larger than 16 MiB')
     expect(cancelled).toBe(true)
+  })
+
+  it('does not download partial Blob fallback bytes when a pending read is aborted', async () => {
+    const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:export')
+    const revokeObjectURL = vi.fn<(url: string) => void>()
+    Object.assign(URL, {createObjectURL, revokeObjectURL})
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const abortController = new AbortController()
+    let resolvePendingRead: (() => void) | undefined
+    const pendingRead = new Promise<void>((resolve) => { resolvePendingRead = resolve })
+    let pullCount = 0
+    const transfer = saveStreamToFile(async () => new ReadableStream({
+      pull(controller) {
+        pullCount += 1
+        if (pullCount === 1) {
+          controller.enqueue(new TextEncoder().encode('partial'))
+          return
+        }
+        resolvePendingRead?.()
+      },
+    }), 'usage.csv', abortController.signal)
+
+    await pendingRead
+    abortController.abort()
+
+    await expect(transfer).rejects.toMatchObject({name: 'AbortError'})
+    expect(createObjectURL).not.toHaveBeenCalled()
+    expect(click).not.toHaveBeenCalled()
   })
 })

@@ -46,7 +46,8 @@ export async function saveStreamToFile(
   }).showSaveFilePicker
   if (picker) {
     const handle = await picker({suggestedName: filename})
-    await (await createStream()).pipeTo(await handle.createWritable(), {signal})
+    const writable = await handle.createWritable()
+    await (await createStream()).pipeTo(writable, {signal})
     return
   }
 
@@ -59,6 +60,7 @@ export async function saveStreamToFile(
     while (true) {
       signal?.throwIfAborted()
       const next = await reader.read()
+      signal?.throwIfAborted()
       if (next.done) break
       total += next.value.byteLength
       if (total > STREAM_DOWNLOAD_BLOB_LIMIT_BYTES) {

@@ -76,6 +76,7 @@ export default function AdminUsageReportBrowser({api}: Props) {
   const [cursorIndex, setCursorIndex] = useState(0);
   const [error, setError] = useState(false);
   const [detail, setDetail] = useState<AdminUsageRecordDetail | null>(null);
+  const [detailRow, setDetailRow] = useState<AdminUsageReportRow | null>(null);
   const [detailError, setDetailError] = useState(false);
   const [exportState, setExportState] = useState<"idle" | "exporting" | "failed">("idle");
   const exportAbort = useRef<AbortController | null>(null);
@@ -93,9 +94,13 @@ export default function AdminUsageReportBrowser({api}: Props) {
     setCursorStack([undefined]);
     setCursorIndex(0);
     setError(false);
+    exportAbort.current?.abort();
+    exportAbort.current = null;
+    setExportState("idle");
     detailRevision.current += 1;
     pageRevision.current += 1;
     setDetail(null);
+    setDetailRow(null);
     setDetailError(false);
     void (async () => {
       try {
@@ -114,7 +119,14 @@ export default function AdminUsageReportBrowser({api}: Props) {
         setOverview(nextOverview);
         setPage(nextPage);
       } catch {
-        if (!disposed && revision === requestRevision.current) setError(true);
+        if (!disposed && revision === requestRevision.current) {
+          stub?.[Symbol.dispose]();
+          stub = null;
+          setReport(null);
+          setOverview(null);
+          setPage(null);
+          setError(true);
+        }
       }
     })();
     return () => {
@@ -172,11 +184,12 @@ export default function AdminUsageReportBrowser({api}: Props) {
     }
   };
 
-  const readDetail = async (row: AdminUsageReportRow) => {
+  const readDetail = async (row: AdminUsageReportRow, clear = true) => {
     if (row.rowKind !== "detail") return;
     const reportRevision = requestRevision.current;
     const revision = ++detailRevision.current;
-    setDetail(null);
+    if (clear) setDetail(null);
+    setDetailRow(row);
     setDetailError(false);
     try {
       const next = await api.getRecordDetail({
@@ -243,9 +256,14 @@ export default function AdminUsageReportBrowser({api}: Props) {
         }}>{messages.admin_usage_next_page()}</Button>
       </div>}
       {(detail || detailError) && <DetailPanel detail={detail} error={detailError}
+        api={api}
+        registeredUserRef={detailRow?.registeredUserRef ?? null}
+        onRefresh={detailRow?.rowKind === "detail"
+          ? () => readDetail(detailRow, false) : async () => undefined}
         onClose={() => {
           detailRevision.current += 1;
           setDetail(null);
+          setDetailRow(null);
           setDetailError(false);
         }} />}
     </section>
@@ -310,15 +328,33 @@ function Select({label, value, options, onChange}: {
 
 function ReportSummary({overview}: {overview: AdminUsageReportOverview}) {
   return <div role="status" className="rounded-lg border border-kumo-line p-3 text-xs text-kumo-subtle">
-    <span>{messages.admin_usage_report_rows_summary({
+    <p>{messages.admin_usage_report_rows_summary({
       users: formatReportInteger(overview.metrics.activeUsers),
       uses: formatReportInteger(overview.metrics.meteredUseCount),
       operations: formatReportInteger(overview.metrics.billableApiOperations),
       failures: formatReportInteger(overview.metrics.preExecutionFailures),
       unknown: formatReportInteger(overview.metrics.unknownOperations),
-    })}</span>
-    <span className="ml-3">{overview.snapshot.reportTimeZone}</span>
-    <span className="ml-3">g{overview.snapshot.projectionGeneration.toString()} / w{overview.snapshot.ingestionWatermark.toString()}</span>
+    })}</p>
+    <dl className="mt-2 grid grid-cols-1 gap-x-3 gap-y-1 sm:grid-cols-2 lg:grid-cols-4">
+      <dt>{messages.admin_usage_provider_cost()}</dt>
+      <dd>{formatReportInteger(overview.metrics.providerCostUsdSubunits)}</dd>
+      <dt>{messages.admin_usage_charged_credits()}</dt>
+      <dd>{formatUsageCreditSubunits(overview.metrics.chargedUsageCreditSubunits)}</dd>
+      <dt>{messages.admin_usage_model_tokens()}</dt>
+      <dd>{[
+        overview.metrics.cacheHitInputTokens,
+        overview.metrics.cacheMissInputTokens,
+        overview.metrics.cacheWriteInputTokens,
+        overview.metrics.outputTokens,
+        overview.metrics.reasoningTokens,
+      ].map(formatReportInteger).join(" / ")}</dd>
+      <dt>{messages.admin_usage_unpriced()}</dt>
+      <dd>{formatReportInteger(overview.metrics.unpricedModelUses)} / {
+        formatReportInteger(overview.metrics.unpricedApiOperations)}</dd>
+    </dl>
+    <span>{overview.snapshot.reportTimeZone}</span>
+    <span className="ml-3">g{overview.snapshot.projectionGeneration.toString()} / w{
+      overview.snapshot.ingestionWatermark.toString()}</span>
   </div>;
 }
 
@@ -336,6 +372,7 @@ function ReportTable({page, onDetail}: {
       <th className="p-2">{messages.admin_usage_column_kind()}</th>
       <th className="p-2">{messages.admin_usage_column_source()}</th>
       <th className="p-2">{messages.admin_usage_column_outcome()}</th>
+      <th className="p-2">{messages.admin_usage_filter_pricing()}</th>
       <th className="p-2">{messages.admin_usage_column_target()}</th>
       <th className="p-2">{messages.admin_usage_column_charge()}</th>
       <th className="p-2">{messages.admin_usage_column_detail()}</th>
@@ -349,6 +386,8 @@ function ReportTable({page, onDetail}: {
         : meteredKindLabel(row.meteredKind)}</td>
       <td className="p-2">{sourceLabel(row.source)}</td>
       <td className="p-2">{outcomeLabel(row.outcome)}</td>
+      <td className="p-2">{row.pricingStatus === "priced"
+        ? messages.admin_usage_priced() : messages.admin_usage_unpriced()}</td>
       <td className="p-2">{row.deploymentModelId ?? [row.gatekeeperId, row.stableMethodKey]
         .filter(Boolean).join(" / ")}</td>
       <td className="p-2">{formatUsageCreditSubunits(row.metrics.chargedUsageCreditSubunits)}</td>
@@ -358,9 +397,12 @@ function ReportTable({page, onDetail}: {
   </table></div>;
 }
 
-function DetailPanel({detail, error, onClose}: {
+function DetailPanel({detail, error, api, registeredUserRef, onRefresh, onClose}: {
   detail: AdminUsageRecordDetail | null;
   error: boolean;
+  api: RpcStub<AdminUsageApi>;
+  registeredUserRef: string | null;
+  onRefresh: () => Promise<void>;
   onClose: () => void;
 }) {
   return <aside role={error ? "alert" : "dialog"} aria-label={messages.admin_usage_detail_title()}
@@ -390,14 +432,65 @@ function DetailPanel({detail, error, onClose}: {
       <dt>{messages.admin_usage_detail_pricing()}</dt><dd>{detail.chargeSnapshot.pricing}</dd>
       <dt>{messages.admin_usage_detail_rate_version()}</dt>
       <dd>{detail.chargeSnapshot.usageRateVersion.toString()}</dd>
+      <dt>{messages.admin_usage_detail_snapshot_issued()}</dt>
+      <dd>{detail.chargeSnapshot.issuedAt}</dd>
       <dt>{messages.admin_usage_column_charge()}</dt>
       <dd>{detail.record.chargeSubunits?.toString() ?? "—"}</dd>
+      {detail.record.kind === "model" && <>
+        <dt>{messages.admin_usage_detail_model_token_status()}</dt>
+        <dd>{detail.record.usageStatus}</dd>
+        <dt>{messages.admin_usage_detail_model_token_categories()}</dt><dd>{detail.record.usage
+          ? [
+            detail.record.usage.cacheHitInputTokens,
+            detail.record.usage.cacheMissInputTokens,
+            detail.record.usage.outputTokens,
+            detail.record.usage.reasoningTokens,
+          ].map(value => value.toString()).join(" / ") : "—"}</dd>
+      </>}
+      {detail.chargeSnapshot.kind === "model" && <>
+        <dt>{messages.admin_usage_detail_catalog_provider_model()}</dt>
+        <dd>{detail.chargeSnapshot.catalogVersion} · {
+          detail.chargeSnapshot.provider} / {detail.chargeSnapshot.model}</dd>
+        {detail.chargeSnapshot.pricing === "priced" ? <>
+          <dt>{messages.admin_usage_detail_provider_rate_tier()}</dt>
+          <dd>{detail.chargeSnapshot.providerModelVersion} · {
+            detail.chargeSnapshot.rateTier}</dd>
+          <dt>{messages.admin_usage_detail_token_rates()}</dt><dd>{[
+            detail.chargeSnapshot.tokenRates.cacheHitUsdSubunitsPerMillion,
+            detail.chargeSnapshot.tokenRates.cacheMissUsdSubunitsPerMillion,
+            detail.chargeSnapshot.tokenRates.outputUsdSubunitsPerMillion,
+          ].map(value => value.toString()).join(" / ")}</dd>
+          <dt>{messages.admin_usage_detail_deployment_multiplier()}</dt>
+          <dd>{formatExactRatio(detail.chargeSnapshot.multiplier)}</dd>
+          <dt>{messages.admin_usage_detail_credit_conversion()}</dt><dd>{formatExactRatio(
+            detail.chargeSnapshot.creditConversion)}</dd>
+        </> : <><dt>{messages.admin_usage_detail_configuration_gap()}</dt>
+          <dd>{messages.admin_usage_detail_configuration_gap_present()}</dd></>}
+      </>}
+      {detail.chargeSnapshot.kind === "gatekeeper" && <>
+        <dt>{messages.admin_usage_detail_gatekeeper_rate_target()}</dt>
+        <dd>{detail.chargeSnapshot.vendorId} / {
+          detail.chargeSnapshot.billingMethodKey}</dd>
+        <dt>{messages.admin_usage_detail_gatekeeper_rate_charge()}</dt>
+        <dd>{detail.chargeSnapshot.chargeSubunits.toString()}</dd>
+        {detail.chargeSnapshot.pricing === "unpriced" && <>
+          <dt>{messages.admin_usage_detail_configuration_gap()}</dt>
+          <dd>{messages.admin_usage_detail_configuration_gap_present()}</dd>
+        </>}
+      </>}
       <dt>{messages.admin_usage_detail_reservation()}</dt><dd>{detail.reservation?.state ?? "—"}</dd>
       <dt>{messages.admin_usage_detail_reservation_amount()}</dt>
       <dd>{detail.reservation?.amountSubunits.toString() ?? "—"}</dd>
+      <dt>{messages.admin_usage_detail_reservation_created()}</dt>
+      <dd>{detail.reservation?.createdAt ?? "—"}</dd>
+      <dt>{messages.admin_usage_detail_reservation_settled()}</dt>
+      <dd>{detail.reservation?.settledAt ?? "—"}</dd>
+      <dt>{messages.admin_usage_detail_reservation_released()}</dt>
+      <dd>{detail.reservation?.releasedAt ?? "—"}</dd>
       <dt>{messages.admin_usage_detail_reconciliation()}</dt>
       <dd>{detail.reconciliation
-        ? `${detail.reconciliation.decision} · ${detail.reconciliation.actorUserId} · ${detail.reconciliation.reason}`
+        ? `${detail.reconciliation.decision} · ${detail.reconciliation.actorUserId} · ` +
+          `${detail.reconciliation.reason} · ${detail.reconciliation.createdAt}`
         : "—"}</dd>
     </dl>
     <h5 className="mt-4 text-sm font-semibold text-kumo-strong">
@@ -408,8 +501,157 @@ function DetailPanel({detail, error, onClose}: {
           {entry.kind} · {entry.deltaSubunits.toString()} · {entry.createdAt} · {entry.id}
         </li>)}
       </ul>}
+    {registeredUserRef && <AdminOperationPanel api={api} detail={detail}
+      registeredUserRef={registeredUserRef} onRefresh={onRefresh} />}
     </>}
   </aside>;
+}
+
+function formatExactRatio(ratio: {numerator: bigint; denominator: bigint}): string {
+  return `${ratio.numerator.toString()}/${ratio.denominator.toString()}`;
+}
+
+type AdminOperation =
+  | "grant"
+  | "deduct"
+  | "reconcile"
+  | "reverse"
+  | "settle-unknown"
+  | "release-unknown";
+
+function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
+  api: RpcStub<AdminUsageApi>;
+  detail: AdminUsageRecordDetail;
+  registeredUserRef: string;
+  onRefresh: () => Promise<void>;
+}) {
+  const [amount, setAmount] = useState("");
+  const [reason, setReason] = useState("");
+  const [ledgerRef, setLedgerRef] = useState(
+    detail.ledgerEntries.find(entry => entry.kind === "usage-charge")?.id ?? "",
+  );
+  const [actionId, setActionId] = useState("");
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<"idle" | "succeeded" | "failed">("idle");
+  const retryIdentity = useRef<{signature: string; operationId: string} | null>(null);
+  const workspaceId = detail.record.kind === "gatekeeper-reconciliation"
+    ? null : detail.record.workspaceId ?? null;
+  const unknownAction = detail.record.kind === "gatekeeper" &&
+    detail.record.outcome === "usage-unknown" && workspaceId !== null;
+
+  const run = async (operation: AdminOperation) => {
+    if (running) return;
+    setRunning(true);
+    setResult("idle");
+    try {
+      const normalizedReason = reason.trim();
+      if (normalizedReason.length < 1 || normalizedReason.length > 1_000) {
+        throw new TypeError("A bounded reason is required.");
+      }
+      const signature = JSON.stringify([operation, amount, ledgerRef, actionId, normalizedReason]);
+      if (retryIdentity.current?.signature !== signature) {
+        retryIdentity.current = {
+          signature,
+          operationId: `admin-report-${crypto.randomUUID()}`,
+        };
+      }
+      const operationId = retryIdentity.current.operationId;
+      if (operation === "grant" || operation === "deduct" || operation === "reconcile") {
+        if (!/^-?[0-9]+$/.test(amount)) throw new TypeError("An exact integer amount is required.");
+        const exact = BigInt(amount);
+        if ((operation === "grant" || operation === "deduct") && exact <= 0n) {
+          throw new TypeError("A positive amount is required.");
+        }
+        if (operation === "grant") {
+          await api.grant({registeredUserRef, operationId, amountSubunits: exact,
+            reason: normalizedReason});
+        } else if (operation === "deduct") {
+          await api.deduct({registeredUserRef, operationId, amountSubunits: exact,
+            reason: normalizedReason});
+        } else {
+          await api.reconcileBalance({registeredUserRef, operationId,
+            targetBalanceSubunits: exact, reason: normalizedReason});
+        }
+      } else if (operation === "reverse") {
+        if (ledgerRef.length < 1 || ledgerRef.length > 500) {
+          throw new TypeError("A bounded Ledger reference is required.");
+        }
+        await api.reverse({registeredUserRef, operationId,
+          originalLedgerEntryId: ledgerRef, reason: normalizedReason});
+      } else {
+        if (!unknownAction || workspaceId === null || !/^[0-9]+$/.test(actionId)) {
+          throw new TypeError("A valid unknown Action is required.");
+        }
+        const exactActionId = Number(actionId);
+        if (!Number.isSafeInteger(exactActionId)) throw new TypeError("Action ID is too large.");
+        await api.reconcileAction({
+          workspaceId,
+          actionId: exactActionId,
+          operationId,
+          decision: operation === "settle-unknown" ? "settle" : "release",
+          reason: normalizedReason,
+        });
+      }
+      setResult("succeeded");
+      await onRefresh();
+    } catch {
+      setResult("failed");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return <section className="mt-4 space-y-2 border-t border-kumo-line pt-4">
+    <h5 className="text-sm font-semibold text-kumo-strong">
+      {messages.admin_usage_operations_title()}</h5>
+    <label className="block text-xs text-kumo-subtle">{
+      messages.admin_usage_operations_amount()}
+      <input aria-label={messages.admin_usage_operations_amount()} value={amount}
+        onChange={event => setAmount(event.target.value)} inputMode="numeric"
+        className="mt-1 w-full rounded-md border border-kumo-line bg-kumo-base px-2 py-1" />
+    </label>
+    <label className="block text-xs text-kumo-subtle">{
+      messages.admin_usage_operations_reason()}
+      <textarea aria-label={messages.admin_usage_operations_reason()} value={reason}
+        onChange={event => setReason(event.target.value)} maxLength={1_000}
+        className="mt-1 w-full rounded-md border border-kumo-line bg-kumo-base px-2 py-1" />
+    </label>
+    <div className="flex flex-wrap gap-2">
+      <Button size="sm" disabled={running} onClick={() => void run("grant")}>{
+        messages.admin_usage_operations_grant()}</Button>
+      <Button size="sm" disabled={running} onClick={() => void run("deduct")}>{
+        messages.admin_usage_operations_deduct()}</Button>
+      <Button size="sm" disabled={running} onClick={() => void run("reconcile")}>{
+        messages.admin_usage_operations_reconcile()}</Button>
+    </div>
+    {detail.ledgerEntries.some(entry => entry.kind === "usage-charge") && <>
+      <label className="block text-xs text-kumo-subtle">{
+        messages.admin_usage_operations_ledger_ref()}
+        <input aria-label={messages.admin_usage_operations_ledger_ref()} value={ledgerRef}
+          onChange={event => setLedgerRef(event.target.value)} maxLength={500}
+          className="mt-1 w-full rounded-md border border-kumo-line bg-kumo-base px-2 py-1" />
+      </label>
+      <Button size="sm" disabled={running} onClick={() => void run("reverse")}>{
+        messages.admin_usage_operations_reverse()}</Button>
+    </>}
+    {unknownAction && <>
+      <label className="block text-xs text-kumo-subtle">{
+        messages.admin_usage_operations_action_id()}
+        <input aria-label={messages.admin_usage_operations_action_id()} value={actionId}
+          onChange={event => setActionId(event.target.value)} inputMode="numeric"
+          className="mt-1 w-full rounded-md border border-kumo-line bg-kumo-base px-2 py-1" />
+      </label>
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" disabled={running} onClick={() => void run("settle-unknown")}>{
+          messages.admin_usage_operations_settle_unknown()}</Button>
+        <Button size="sm" disabled={running} onClick={() => void run("release-unknown")}>{
+          messages.admin_usage_operations_release_unknown()}</Button>
+      </div>
+    </>}
+    {running && <p role="status">{messages.admin_usage_operations_running()}</p>}
+    {result === "succeeded" && <p role="status">{messages.admin_usage_operations_succeeded()}</p>}
+    {result === "failed" && <p role="alert">{messages.admin_usage_operations_failed()}</p>}
+  </section>;
 }
 
 function reportFilterFromForm(form: FilterForm): AdminUsageReportFilter {

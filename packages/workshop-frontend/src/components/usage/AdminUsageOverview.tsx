@@ -62,6 +62,9 @@ export default function AdminUsageOverview({adminApi}: Props) {
 
   useEffect(() => {
     mounted.current = true;
+    setUsage(null);
+    setView(null);
+    setError(false);
     let disposed = false;
     let stub: RpcStub<AdminUsageApi> | null = null;
     let interval: ReturnType<typeof setInterval> | undefined;
