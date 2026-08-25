@@ -726,3 +726,31 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - All Issue #65 branch gates are complete. Only main-agent `--no-ff` integration, integration-tree
   gates, push, evidence comment, and Issue closure remain. No pull request, worktree deletion, or
   production mutation occurred in this branch-gate step.
+
+### 2026-08-25 — Issue #63 pre-#65 static checkpoint
+
+- Entered the `implement`, `fable-mode`, and `tdd` gates in the isolated Issue #63 worktree based on
+  the closed Issue #62 checkpoint `98e1963`. Added one frozen `AdminUsageReport` capability over a
+  normalized allowlisted filter, strong report-timezone version, Projection generation, and applied
+  watermark. Overview, keyset rows, and CSV share the same parameterized predicate and immutable
+  snapshot.
+- Added content-free SQLite report indexes and stable keyset pagination, a capability-local bounded
+  opaque cursor map, authoritative User DO drilldown through the Registry, and concurrency limits at
+  both `AdminUsageApi` and report capability boundaries. A later Summary revision is now excluded
+  from an older frozen watermark, including when it became the Projection's current revision.
+- Added a pull-driven Cap'n Web CSV stream with 64-row pages, one queued chunk, a 256 KiB bound,
+  RFC 4180 escaping, spreadsheet-formula mitigation, cancel propagation, and deterministic snapshot
+  metadata. Chromium writes directly through the File System Access API; the fallback cancels above
+  16 MiB instead of buffering without a bound.
+- Added the administrator report browser, all specified stable filters, keyset navigation,
+  authoritative detail, English and Chinese messages, export progress/cancel, stale-response guards,
+  and complete late/replace/unmount stub disposal. The forward-compatible Summary contract now
+  exposes `model | gatekeeper | attempt` and exact `meteredUseCount`; detail remains Model or
+  Gatekeeper only.
+- The current static checkpoint passed shared, Backend, Frontend, and integration-test builds. The
+  focused report/overview/file-transfer Frontend set passed 19/19. The latest frozen-watermark test,
+  final Summary/locator compatibility, focused workerd suites, and real Cap'n Web Harness remain
+  intentionally pending until Issue #65 is integrated and this branch is rebased. The evidence and
+  pending gates are recorded in `ISSUE-63-VERIFICATION.md`.
+- No push, merge, pull request, Issue closure, deployment, upload, promotion, production
+  configuration change, charging change, or worktree deletion occurred.
