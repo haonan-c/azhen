@@ -474,3 +474,14 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   baseline defect is fixed on the rebased `dev` base, and the complete 19-Worker dry-run is GREEN.
 - No push, merge, Issue closure, production contact, upload, promotion, deployment, charging change,
   or worktree deletion occurred in this candidate-gate step.
+
+### 2026-08-24 — Issue #62 `dev` integration gate
+
+- Integrated the reviewed Issue #62 branch into `dev` with `--no-ff` at
+  `6f287fe2dfcc8a2497f60fb5c73821f7b44a7d06`.
+- Repeated the full required merged-tree gate. Root build, root test, root lint, the 4/4 normal
+  release-manifest golden test, and `git diff --check` all passed. Root test again covered the full
+  Backend workerd/Browser Run matrix, 115 integration tests, 353 Frontend tests, and all remaining
+  workspace packages.
+- No deployment, upload, promotion, production configuration, charging change, or worktree deletion
+  occurred.

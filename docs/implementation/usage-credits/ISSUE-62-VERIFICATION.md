@@ -290,6 +290,15 @@ candidate was rebased. The final Issue #62 tree completed every required candida
 - Projection passed 50/50, the final complete Backend package passed 581 tests with 4 expected skips,
   and `git diff --check` exited 0.
 
+### `dev` integration gate — `6f287fe2dfcc8a2497f60fb5c73821f7b44a7d06`
+
+- The reviewed branch was integrated into `dev` with `--no-ff`.
+- On the merged tree, `corepack pnpm build`, `corepack pnpm test`, and `corepack pnpm lint` all
+  exited 0. The full test repeated 117 root tests, Backend workerd and Browser Run suites, 115
+  integration tests, 353 Frontend tests, and every remaining workspace package task.
+- The normal release-manifest golden test passed 4/4, `git diff --check` exited 0, and the worktree
+  was clean before push.
+
 ## Residual limits
 
 - This is the unsharded first projection generation sized for the current 20 records/second target.
