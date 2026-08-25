@@ -265,6 +265,31 @@ this review cycle.
 - All release commands were local builds with controlled bindings. No upload, promotion, or deploy
   command ran.
 
+### Superseding final gate — `ff7929984f50d349b2a0161c28a16d634b3acfb7`
+
+This result supersedes the older checkpoint qualifications and the historical Linear release
+failure above. The independent baseline Linear validation defect was fixed on `dev` before this
+candidate was rebased. The final Issue #62 tree completed every required candidate gate:
+
+- `corepack pnpm types:generate` ran with Node `24.19.0`, pnpm `11.17.0`, and Wrangler `4.119.0`.
+  The Workshop Backend generated type was already current. Unrelated UGC Ads runtime drift was
+  restored, leaving the candidate clean.
+- Golden regeneration and review followed by the normal release-manifest test both passed 4/4.
+  The expected manifest shape contains the `UsageProjection` SQLite Durable Object migration.
+- `node scripts/release/build-release.mjs --out
+  /tmp/azhen-issue62-release.TzPFrS --release-id issue-62-local-final` completed the real local
+  production code path: 19 Workers, 85 modules, and 36 unique asset blobs. Workshop Backend reported
+  5,941.58 KiB upload and 1,127.50 KiB gzip. Controlled external bindings were local mocks. No
+  upload, promotion, deployment, production configuration, or production charging occurred.
+- `corepack pnpm build` completed all 51 workspace build tasks with exit code 0.
+- `corepack pnpm test` exited 0. It included 117 root Node tests, the complete Workshop Backend
+  workerd and Browser Run matrix, 115 integration tests, 353 Frontend tests, and every remaining
+  workspace package test task.
+- `corepack pnpm lint` exited 0. Oxlint emitted only the repository's configured non-blocking warning
+  set; the included type/build gate completed all 51 workspace tasks.
+- Projection passed 50/50, the final complete Backend package passed 581 tests with 4 expected skips,
+  and `git diff --check` exited 0.
+
 ## Residual limits
 
 - This is the unsharded first projection generation sized for the current 20 records/second target.
@@ -273,6 +298,5 @@ this review cycle.
 - Issue #65 owns 15-minute Summary snapshots, 24-month detail retention, anonymizing deletion, and
   Summary-backed lifetime totals. This issue retains delivered detail facts as the rebuild source.
 - No production Deployment was contacted. No release was uploaded, promoted, or deployed.
-- The complete cross-package release dry-run remains blocked by the unchanged Linear Gatekeeper
-  generic-validation failure above. The affected Backend production-shape dry-run is GREEN, but this
-  evidence must not be described as a successful complete release build.
+- The historical Linear Gatekeeper release failure above no longer blocks this candidate. The
+  superseding final gate completed the full 19-Worker local production-shape release build.

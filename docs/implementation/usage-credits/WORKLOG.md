@@ -454,3 +454,23 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   Frontend/shared code did not change in this targeted correction, so their package gates were not
   repeated. Root/release/Wrangler gates were not run in this cycle. No push, merge, Issue closure,
   upload, promotion, deployment, production change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #62 final candidate gates
+
+- Ran `types:generate` with Node `24.19.0`, pnpm `11.17.0`, and Wrangler `4.119.0`. The expected
+  Workshop Backend binding was already current. Restored unrelated UGC Ads runtime-generated drift,
+  leaving no generated-file change outside Issue #62.
+- Regenerated and reviewed the release-manifest golden, then passed the normal manifest test 4/4.
+- Completed the local production-shape release builder with release ID `issue-62-local-final`: 19
+  Workers, 85 modules, and 36 unique asset blobs. Workshop Backend reported 5,941.58 KiB upload and
+  1,127.50 KiB gzip. The run used real local production code paths with controlled external mocks;
+  it did not upload, promote, deploy, change production configuration, or enable charging.
+- Final candidate `ff7929984f50d349b2a0161c28a16d634b3acfb7` passed root build, root test, root lint, and
+  `git diff --check`. Root test included 117 root Node tests, the complete Workshop Backend workerd
+  and Browser Run matrix, 115 integration tests, 353 Frontend tests, and all remaining workspace
+  package tasks. Oxlint reported only configured non-blocking warnings.
+- This final gate supersedes earlier notes that root/release checks had not been repeated and the
+  historical Linear validation failure that stopped an earlier release build. The independent
+  baseline defect is fixed on the rebased `dev` base, and the complete 19-Worker dry-run is GREEN.
+- No push, merge, Issue closure, production contact, upload, promotion, deployment, charging change,
+  or worktree deletion occurred in this candidate-gate step.
