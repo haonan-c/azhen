@@ -585,3 +585,20 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   manifest golden, and whitespace gates remain for main-agent integration. No push, merge, Issue
   closure, release build, upload, promotion, deployment, production change, charging change, or
   worktree deletion occurred.
+
+### 2026-08-25 — Issue #64 dev integration gate
+
+- Merged reviewed candidate `0a86037c6e02b60ac1adb97128507bfc2479bf3b` into `dev` as
+  `68a7beb98e7742f803e15c22acf5e93fcccc1298`. The merged tree passed the root build.
+- The first root test exposed one nondeterministic Harness boundary: the Home Assistant
+  preparation-crash fixture used a 30-second finite block. Under full-suite load that block expired
+  while workerd was still reloading, so the old activation completed normally and the restarted
+  fixture cleared its module-local call log. This produced 114/115 without exercising the intended
+  recovery path.
+- Extended only that fixture block beyond the bounded test timeout. The focused recovery case
+  passed, then one uninterrupted `corepack pnpm test` passed. Its production Harness result was
+  13/13 files and 115/115 tests in 608.85 seconds; the Home Assistant Action file passed 5/5.
+- `corepack pnpm lint` passed with repository warnings only, the release manifest golden passed
+  4/4, and `git diff --check` passed. The evidence is local production code plus controlled external
+  mocks, not a production deployment. No upload, promotion, deployment, production configuration
+  change, charging enablement, or worktree deletion occurred.

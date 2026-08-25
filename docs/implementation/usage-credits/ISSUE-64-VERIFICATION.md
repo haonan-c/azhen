@@ -216,3 +216,32 @@ splitting, parallel workerd fleets, or a retry. The command
 in 659.84 seconds. This complete run closes the branch-level production-Harness gate. The
 coordinated merged-tree root build, root test, lint, manifest golden, and whitespace gates remain
 owned by the main-agent integration step.
+
+## Dev integration gate
+
+The reviewed candidate `0a86037c6e02b60ac1adb97128507bfc2479bf3b` was merged into `dev` with
+merge commit `68a7beb98e7742f803e15c22acf5e93fcccc1298`. The merged tree first passed
+`corepack pnpm build`. Its first root test run passed 114/115 production-Harness tests; the sole
+failure was the Home Assistant preparation-crash test observing zero `call_service` calls after an
+accepted recovery.
+
+The merged tree was byte-for-byte identical to the reviewed candidate at that point, and a focused
+rerun passed. Inspection found that the fixture's 30-second preparation delay could expire while a
+loaded workerd fleet was still applying `server.update()`. The old activation then completed
+normally immediately before the fixture's module-local call log was reset, so the test did not
+actually force the restart path it claimed to verify. The integration correction keeps that
+preparation request blocked beyond the test timeout. The corrected focused case passed, followed by
+an uninterrupted root test in which the Home Assistant Action file passed 5/5 and the complete
+production Harness passed 13/13 files and 115/115 tests in 608.85 seconds.
+
+| Merged-tree check | Result |
+| --- | --- |
+| `corepack pnpm build` | Passed |
+| `corepack pnpm test` | Passed; production Harness 115/115, Workshop Frontend 362/362 plus copy 1/1, and all remaining workspace package tests passed |
+| `corepack pnpm lint` | Passed; repository warnings only, including the build/type gate |
+| Release manifest golden | Passed: 4/4 |
+| `git diff --check` | Passed |
+
+This evidence uses local production code paths and controlled local external-service mocks. It is
+not production deployment verification. No release upload, promotion, deployment, production
+configuration change, or production charging enablement was performed.

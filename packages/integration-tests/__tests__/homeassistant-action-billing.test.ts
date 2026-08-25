@@ -399,7 +399,10 @@ describe("Home Assistant Action billing", () => {
       await upstream.blockNextRequest({
         transport: "rest",
         operation: "GET /api/states",
-        durationMs: 30_000,
+        // Keep the preparation call blocked beyond this test's timeout. Under full-suite load a
+        // 30-second delay could finish while workerd was still reloading, so the old activation
+        // completed normally instead of exercising restart recovery.
+        durationMs: 300_000,
       });
       interruptedApproval = context.workspace.approveAction(action.id).catch(error => error);
       await waitFor("the blocked Home Assistant snapshot", async () =>
