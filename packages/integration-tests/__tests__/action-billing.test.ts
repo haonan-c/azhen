@@ -1,7 +1,7 @@
 // Crash-safe billing for delayed Gatekeeper Actions through the same Workshop RPC seam the browser
 // uses. The fixture is a real Gatekeeper Worker; only its provider HTTP endpoint is replaced.
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import type { RpcStub } from "capnweb";
@@ -159,7 +159,7 @@ async function signInWhenAvailable(username: string): Promise<{
 }
 
 function awaitBeforeDeadline<T>(
-    promise: PromiseLike<T>, deadline: number, failedStep: string,
+    start: () => PromiseLike<T>, deadline: number, failedStep: string,
     disposeLate?: (value: T) => void): Promise<T> {
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
@@ -167,6 +167,7 @@ function awaitBeforeDeadline<T>(
       new Error(`Workshop admin Usage API did not become ready during ${failedStep}.`),
     );
   }
+  const promise = start();
   let timedOut = false;
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -205,23 +206,23 @@ async function openUsageAdminWhenAvailable(): Promise<{
     try {
       failedStep = "signIn";
       user = await awaitBeforeDeadline(
-        signIn(publicApi, ADMIN_USERNAME), deadline, failedStep,
+        () => signIn(publicApi, ADMIN_USERNAME), deadline, failedStep,
         lateUser => lateUser[Symbol.dispose](),
       );
       failedStep = "getAdminApi";
       admin = await awaitBeforeDeadline(
-        user.getAdminApi(), deadline, failedStep,
+        () => user!.getAdminApi(), deadline, failedStep,
         lateAdmin => lateAdmin?.[Symbol.dispose](),
       );
       if (!admin) throw new Error("Expected the deployment administrator capability.");
       failedStep = "getUsageApi";
       usage = await awaitBeforeDeadline(
-        admin.getUsageApi(), deadline, failedStep,
+        () => admin!.getUsageApi(), deadline, failedStep,
         lateUsage => lateUsage[Symbol.dispose](),
       );
       failedStep = "searchUsers";
       await awaitBeforeDeadline(
-        usage.searchUsers({query: ADMIN_USERNAME, limit: 1}), deadline, failedStep,
+        () => usage!.searchUsers({query: ADMIN_USERNAME, limit: 1}), deadline, failedStep,
       );
       return {publicApi, user, admin, usage};
     } catch (error) {
@@ -352,6 +353,31 @@ async function controlUnknownUsageReplayCrash(
   expect(response.status).toBe(200);
   return response.json();
 }
+
+describe("bounded administrator Usage readiness", () => {
+  it("does not start an RPC after its absolute deadline", async () => {
+    const start = vi.fn(() => Promise.resolve("unreachable"));
+    await expect(awaitBeforeDeadline(start, Date.now() - 1, "expired"))
+      .rejects.toThrow("did not become ready during expired");
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("disposes a nested stub that arrives after the absolute deadline", async () => {
+    const dispose = vi.fn();
+    let resolveLate: ((value: { [Symbol.dispose](): void }) => void) | undefined;
+    const lateStub = new Promise<{ [Symbol.dispose](): void }>(resolve => {
+      resolveLate = resolve;
+    });
+    const result = awaitBeforeDeadline(
+      () => lateStub, Date.now() + 5, "late stub",
+      stub => stub[Symbol.dispose](),
+    );
+    await expect(result).rejects.toThrow("did not become ready during late stub");
+    resolveLate?.({[Symbol.dispose]: dispose});
+    await Promise.resolve();
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("approved Action billing", () => {
   it("persists one billing identity without reserving Credit before approval", async () => {
