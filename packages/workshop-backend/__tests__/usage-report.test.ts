@@ -5,7 +5,8 @@ import type {
   AdminUsageReportMetrics,
   AdminUsageReportRow,
 } from "@gadgets/workshop-shared/api";
-import {describe, expect, it} from "vitest";
+import {RpcStub} from "cloudflare:workers";
+import {beforeAll, describe, expect, it} from "vitest";
 import {
   ADMIN_USAGE_CSV_MAX_CHUNK_BYTES,
   ADMIN_USAGE_CSV_PAGE_SIZE,
@@ -170,6 +171,14 @@ function adminUsage(): AdminUsageApi {
     testEnv.TEST_USAGE_PROJECTION,
   );
 }
+
+beforeAll(async () => {
+  await runInDurableObject(testEnv.TEST_USAGE_PROJECTION.getByName(""), (_instance, state) => {
+    state.storage.sql.exec(`
+      UPDATE usage_projection_meta SET bootstrap_state = 'complete' WHERE singleton = 1
+    `);
+  });
+});
 
 describe("Issue #63 frozen administrator Usage reports", () => {
   it("normalizes bounded filter values and rejects client-controlled query material", () => {
@@ -833,6 +842,58 @@ describe("Issue #63 frozen administrator Usage reports", () => {
 
     const replacement = await report.exportCsv();
     await replacement.cancel("prove the operation slot was released");
+  });
+
+  it("terminates an active CSV reader when its report capability is disposed", async () => {
+    const projection = {
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() {
+        return {rows: [CSV_ROW], nextCursor: "next"};
+      },
+    };
+    const report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1n,
+    ));
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    report[Symbol.dispose]();
+
+    await expect(reader.read()).rejects.toThrow("Usage report is closed.");
+    reader.releaseLock();
+  });
+
+  it("fails direct and promise-pipelined report openings closed during bootstrap", async () => {
+    const projection = {async ensureBootstrap() { return false }};
+    const isolatedProjection = {
+      getByName: () => projection,
+    } as DurableObjectNamespace<UsageProjection>;
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      `issue-63-bootstrap-admin-${crypto.randomUUID()}@example.test`,
+      undefined,
+      isolatedProjection,
+    );
+
+    await expect(usage.openReport({}))
+      .rejects.toThrow("Usage Projection bootstrap is incomplete.");
+
+    using rpcUsage = new RpcStub(usage);
+    const opening = rpcUsage.openReport({});
+    const [openingResult, pipelinedResult] = await Promise.allSettled([
+      opening,
+      opening.getOverview(),
+    ]);
+    expect(openingResult).toMatchObject({
+      status: "rejected",
+      reason: {message: "Usage Projection bootstrap is incomplete."},
+    });
+    expect(pipelinedResult).toMatchObject({
+      status: "rejected",
+      reason: {message: "Usage Projection bootstrap is incomplete."},
+    });
   });
 
   it("bounds pipelined report capabilities and releases a slot on disposal", async () => {

@@ -762,6 +762,22 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
       reservation: {state: "settled"},
     });
     expect(detail.ledgerEntries).toHaveLength(1);
+    const publicLedgerRef = detail.ledgerEntries[0]!.id;
+    const rawLedgerId = snapshot.gatekeeperUsageRecords.find(
+      record => record.operationId === operationId,
+    )?.ledgerEntryId;
+    if (rawLedgerId === null || rawLedgerId === undefined) {
+      throw new Error("Expected the authority's raw Ledger link.");
+    }
+    const reversal = await adminUsage().reverse({
+      registeredUserRef: ownerRegistration.registeredUserRef,
+      operationId: "admin-drill-safe-reversal",
+      originalLedgerEntryId: publicLedgerRef,
+      reason: "Reverse through the detail-scoped public Ledger reference",
+    });
+    expect(reversal.originalLedgerEntryId).toBe(publicLedgerRef);
+    expect(JSON.stringify(reversal, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value)).not.toContain(rawLedgerId);
 
     await expectRejectedWith(() => adminUsage().getRecordDetail({
       registeredUserRef: peerRegistration.registeredUserRef,

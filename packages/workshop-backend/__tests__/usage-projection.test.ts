@@ -1789,16 +1789,21 @@ describe("deployment Usage Projection", () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const sentinels = [
       "ISSUE62_PRIVATE_PROMPT_SENTINEL",
+      "ISSUE63_PRIVATE_OUTPUT_SENTINEL",
+      "ISSUE63_PRIVATE_ARGS_SENTINEL",
       "ISSUE62_PRIVATE_HEADER_SENTINEL",
       "ISSUE62_PRIVATE_CREDENTIAL_SENTINEL",
       "ISSUE62_PRIVATE_RESPONSE_BODY_SENTINEL",
+      "ISSUE63_PRIVATE_ERROR_SENTINEL",
     ];
+    const privateFields = [
+      "prompt", "output", "args", "headers", "credential", "responseBody", "errorBody",
+    ] as const;
     await projection.ingest([fact()]);
     for (const [index, sentinel] of sentinels.entries()) {
       const privateInput = {
         ...fact(),
-        [index === 0 ? "prompt" : index === 1 ? "headers"
-          : index === 2 ? "credential" : "responseBody"]: sentinel,
+        [privateFields[index]!]: sentinel,
       } as unknown as UsageProjectionFact;
       expect(await projection.ingest([privateInput])).toEqual({
         acknowledgedFactIds: [],

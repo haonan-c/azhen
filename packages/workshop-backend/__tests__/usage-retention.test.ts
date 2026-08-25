@@ -506,12 +506,25 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.markGatekeeperUsageStarted(operationId);
       const record = account.completeGatekeeperUsage(operationId, "executed");
       if (record.ledgerEntryId === null) throw new Error("Expected a priced Usage Charge.");
-      account.adminReverse(
+      const detailFact = account.getSnapshot().projectionFacts.find(
+        fact => fact.rowKind === "detail",
+      );
+      if (!detailFact || detailFact.rowKind !== "detail") {
+        throw new Error("Expected a safe Usage detail reference.");
+      }
+      const publicLedgerRef = account.getAdminUsageRecordDetail(
+        detailFact.safeRecordRef,
+      ).ledgerEntries.find(entry => entry.kind === "usage-charge")?.id;
+      if (publicLedgerRef === undefined) throw new Error("Expected a public Ledger reference.");
+      const reversal = account.adminReverseByReference(
         "retention-reversal",
-        record.ledgerEntryId,
+        publicLedgerRef,
         "verify retention keeps the reversal link",
         "admin-user",
       );
+      expect(reversal.originalLedgerEntryId).toBe(publicLedgerRef);
+      expect(JSON.stringify(reversal, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value)).not.toContain(record.ledgerEntryId);
       acknowledgeAllProjectionFacts(account);
       const before = account.getSnapshot();
 
@@ -523,6 +536,61 @@ describe("24 UTC calendar month Usage detail retention", () => {
       expect(after.ledgerBalanceSubunits).toBe(before.ledgerBalanceSubunits);
       expect(after.ledgerEntries).toEqual(before.ledgerEntries);
       expect(after.adminOperations).toEqual(before.adminOperations);
+    });
+  });
+
+  it("rejects private content before User detail, Ledger, and outbox persistence", async () => {
+    await withAccount((account, storage) => {
+      const sentinels = [
+        "ISSUE63_PRIVATE_PROMPT_SENTINEL",
+        "ISSUE63_PRIVATE_OUTPUT_SENTINEL",
+        "ISSUE63_PRIVATE_ARGS_SENTINEL",
+        "ISSUE63_PRIVATE_HEADER_SENTINEL",
+        "ISSUE63_PRIVATE_TOKEN_SENTINEL",
+        "ISSUE63_PRIVATE_BODY_SENTINEL",
+        "ISSUE63_PRIVATE_ERROR_SENTINEL",
+      ];
+      let rejected: Error | undefined;
+      try {
+        account.beginGatekeeperUsage(
+          "gatekeeper-operation:private-content-rejected",
+          {
+            ...ATTRIBUTION,
+            prompt: sentinels[0],
+            output: sentinels[1],
+            args: sentinels[2],
+            headers: sentinels[3],
+            token: sentinels[4],
+            body: sentinels[5],
+            error: sentinels[6],
+          } as never,
+          PRICED,
+        );
+      } catch (caught) {
+        rejected = caught instanceof Error ? caught : new Error(String(caught));
+      }
+      expect(rejected?.message).toBe("Gatekeeper Usage attribution is invalid.");
+      const rejectedText = JSON.stringify({message: rejected?.message, stack: rejected?.stack});
+      for (const sentinel of sentinels) expect(rejectedText).not.toContain(sentinel);
+
+      const operationId = "gatekeeper-operation:content-free-authority";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, PRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const snapshot = account.getSnapshot();
+      const detailFact = snapshot.projectionFacts.find(fact => fact.rowKind === "detail");
+      if (!detailFact || detailFact.rowKind !== "detail") {
+        throw new Error("Expected a content-free Usage detail fact.");
+      }
+      const reachable = {
+        detail: account.getAdminUsageRecordDetail(detailFact.safeRecordRef),
+        ledger: snapshot.ledgerEntries,
+        outbox: account.listPendingProjectionOutbox(64),
+        storage: Array.from(storage.kv.list()),
+      };
+      const serialized = JSON.stringify(reachable, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value);
+      for (const sentinel of sentinels) expect(serialized).not.toContain(sentinel);
     });
   });
 

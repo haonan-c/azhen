@@ -1224,18 +1224,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     );
   }
 
-  /** Apply one registered-User exact Credit Reversal without calling AdminSettings. */
+  /** Apply one registered-User exact Credit Reversal through a public Ledger reference. */
   adminReverseUsageCreditEntry(
       operationId: string,
       originalLedgerEntryId: string,
       reason: string,
       actorUserId: string): AdminUsageOperationResult {
-    return this.usageAccount.adminReverse(
-      operationId,
-      originalLedgerEntryId,
-      reason,
-      actorUserId,
-    );
+    return originalLedgerEntryId.endsWith(":usage-charge")
+      ? this.usageAccount.adminReverseByReference(
+        operationId,
+        originalLedgerEntryId,
+        reason,
+        actorUserId,
+      )
+      : this.usageAccount.adminReverse(
+        operationId,
+        originalLedgerEntryId,
+        reason,
+        actorUserId,
+      );
   }
 
   /** Like whoami(), but returns null if the account was never initialized. */

@@ -1183,7 +1183,7 @@ type UsageReportProjection = Pick<DurableObjectStub<UsageProjection>,
 export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport {
   private disposed = false;
   private activeOperations = 0;
-  private activeStreams = new Set<() => void>();
+  private activeStreams = new Set<(error: Error) => void>();
   private pageCursors = new Map<string, string>();
 
   constructor(
@@ -1250,23 +1250,35 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
     let complete = false;
     let cancelled = false;
     let released = false;
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let terminateFromOwner: ((error: Error) => void) | undefined;
     const release = () => {
       if (released) return;
       released = true;
       this.activeOperations -= 1;
-      this.activeStreams.delete(cancel);
+      if (terminateFromOwner !== undefined) this.activeStreams.delete(terminateFromOwner);
     };
     const cancel = () => {
       cancelled = true;
       release();
     };
-    this.activeStreams.add(cancel);
+    terminateFromOwner = error => {
+      if (cancelled || complete) return;
+      cancelled = true;
+      controller?.error(error);
+      release();
+    };
+    this.activeStreams.add(terminateFromOwner);
     const encoder = new TextEncoder();
     return new ReadableStream<Uint8Array>({
-      pull: async controller => {
+      start: streamController => {
+        controller = streamController;
+      },
+      pull: async streamController => {
         if (cancelled || complete) return;
         try {
           await this.assertActive();
+          if (cancelled) return;
           let chunk: Uint8Array;
           if (firstPull) {
             firstPull = false;
@@ -1283,17 +1295,18 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
             if (page.nextCursor === null) complete = true;
           }
           await this.assertActive();
+          if (cancelled) return;
           if (chunk.byteLength > ADMIN_USAGE_CSV_MAX_CHUNK_BYTES) {
             throw new Error("Usage report CSV chunk exceeds its bounded buffer.");
           }
-          if (chunk.byteLength > 0) controller.enqueue(chunk);
+          if (chunk.byteLength > 0) streamController.enqueue(chunk);
           if (complete) {
-            controller.close();
+            streamController.close();
             release();
           }
         } catch (error) {
           release();
-          controller.error(error);
+          if (!cancelled) streamController.error(error);
         }
       },
       cancel,
@@ -1303,7 +1316,9 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
   [Symbol.dispose](): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const cancel of this.activeStreams) cancel();
+    for (const terminate of [...this.activeStreams]) {
+      terminate(new Error("Usage report is closed."));
+    }
     this.pageCursors.clear();
     this.onDispose();
   }
@@ -1513,9 +1528,13 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     }
     this.activeReports += 1;
     try {
+      const projection = this.projection.getByName("");
+      if (!await projection.ensureBootstrap()) {
+        throw new Error("Usage Projection bootstrap is incomplete.");
+      }
       const [rates, coordinates] = await Promise.all([
         this.admin.getUsageRates(),
-        this.projection.getByName("").getReportCoordinates(),
+        projection.getReportCoordinates(),
       ]);
       const query = freezeUsageReportQuery(
         filter,
@@ -1527,7 +1546,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       );
       await assertAdminCapabilityActive(this.users, this.adminUserId);
       // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
-      return new AdminUsageReportImpl(this.projection.getByName(""), query, () => {
+      return new AdminUsageReportImpl(projection, query, () => {
         this.activeReports -= 1;
       }, () => assertAdminCapabilityActive(this.users, this.adminUserId));
     } catch (error) {

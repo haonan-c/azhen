@@ -3082,6 +3082,53 @@ export class UsageAccount {
     });
   }
 
+  /** Resolve one public detail-scoped Ledger reference and append its exact reversal. */
+  adminReverseByReference(
+      operationId: string,
+      originalLedgerEntryRef: string,
+      reason: string,
+      actorUserId: string): AdminUsageOperationResult {
+    const suffix = ":usage-charge";
+    if (typeof originalLedgerEntryRef !== "string" ||
+        !originalLedgerEntryRef.endsWith(suffix)) {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const safeRecordRef = originalLedgerEntryRef.slice(0, -suffix.length);
+    if (!isOpaqueUsageReference(safeRecordRef)) {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator === null) throw new Error("Original Credit Ledger Entry does not exist.");
+    let originalLedgerEntryId: string | null;
+    if (locator.kind === "gatekeeper-reconciliation") {
+      originalLedgerEntryId = this.getGatekeeperReconciliationAuthority(safeRecordRef)
+        ?.ledgerEntryId ?? null;
+    } else {
+      const record = locator.kind === "model"
+        ? this.storage.kv.get<ModelUsageRecord>(MODEL_USAGE_RECORD_PREFIX + locator.operationId)
+        : this.storage.kv.get<GatekeeperUsageRecord>(
+          GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
+        );
+      if (record === undefined) throw new Error("Original Credit Ledger Entry does not exist.");
+      if (locator.kind === "model") {
+        assertModelUsageRecord(record as ModelUsageRecord, locator.operationId);
+      }
+      else assertGatekeeperUsageRecord(record as GatekeeperUsageRecord, locator.operationId);
+      originalLedgerEntryId = record.ledgerEntryId;
+    }
+    if (originalLedgerEntryId === null) {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const original = this.storage.kv.get<CreditLedgerEntry>(
+      LEDGER_PREFIX + originalLedgerEntryId,
+    );
+    if (original === undefined || original.kind !== "usage-charge") {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const result = this.adminReverse(operationId, original.id, reason, actorUserId);
+    return {...result, originalLedgerEntryId: originalLedgerEntryRef};
+  }
+
   private applyAdminOperation(
       operationId: string,
       input: StoredAdminUsageOperationInput): AdminUsageOperationResult {
