@@ -43,6 +43,7 @@ export function UsageCreditProvider({ children }: { children: React.ReactNode })
   const current = snapshot?.api === authenticatedApi ? snapshot : null
 
   useEffect(() => {
+    activeApi.current = authenticatedApi
     let cancelled = false
     let retryTimer: ReturnType<typeof setTimeout> | null = null
     let retryCount = 0

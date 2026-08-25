@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-import { act } from 'react'
+import { act, StrictMode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { UsageCreditBalance, UsageCreditBalanceSubscriber } from '@gadgets/workshop-shared/api'
@@ -101,6 +101,42 @@ describe('UsageCreditProvider subscription lifecycle', () => {
     await act(async () => current.pending.resolve({ [Symbol.dispose]: subscriptionDispose }))
     act(() => root!.unmount())
     expect(subscriptionDispose).toHaveBeenCalledOnce()
+    root = undefined
+  })
+
+  it('rebuilds the balance subscription after a StrictMode effect cleanup', async () => {
+    const first = deferredRpc<{ [Symbol.dispose](): void }>()
+    const second = deferredRpc<{ [Symbol.dispose](): void }>()
+    const subscribers: RpcStub<UsageCreditBalanceSubscriber>[] = []
+    const secondSubscriptionDispose = vi.fn<() => void>()
+    const api = Object.assign(vi.fn<() => void>(), {
+      subscribeUsageCreditBalance: vi.fn<(
+        subscriber: RpcStub<UsageCreditBalanceSubscriber>,
+      ) => typeof first.promise | typeof second.promise>((subscriber) => {
+        subscribers.push(subscriber)
+        return subscribers.length === 1 ? first.promise : second.promise
+      }),
+      acknowledgeUsageActivationNotice: vi.fn<(
+        noticeId: string,
+      ) => Promise<UsageCreditBalance>>(),
+    })
+    testState.api = api
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => root!.render(
+      <StrictMode><UsageCreditProvider><Probe /></UsageCreditProvider></StrictMode>,
+    ))
+
+    expect(api.subscribeUsageCreditBalance).toHaveBeenCalledTimes(2)
+    expect(first.dispose).toHaveBeenCalledOnce()
+    await act(async () => subscribers[1]!.update(balance(9n, 90n)))
+    expect(container.textContent).toBe('90')
+
+    await act(async () => second.resolve({[Symbol.dispose]: secondSubscriptionDispose}))
+    act(() => root!.unmount())
+    expect(secondSubscriptionDispose).toHaveBeenCalledOnce()
     root = undefined
   })
 
