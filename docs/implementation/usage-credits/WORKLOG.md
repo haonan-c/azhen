@@ -509,3 +509,27 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - The correction is not rebased over #62 and no final root test, Wrangler command, release build,
   upload, promotion, deployment, push, Issue closure, or worktree deletion was performed. Final
   root and release gates remain pending until the coordinated post-#62 rebase.
+
+### 2026-08-24 — Issue #64 post-#62 rebase and package gates
+
+- Rebasing `codex/issue-64` onto `98e1963265840f57463727b1b724b562690c00ee` retained both contracts:
+  Issue #62 continues to own deployment Projection delivery and administrator reads, while Issue
+  #64 reads only the current User Durable Object and exposes no target User identifier.
+- The conflict RED phase found a random-UUID ordering assumption in the Ledger pagination test.
+  The corrected test traverses real one-row keyset pages and proves the reversal summary remains
+  safe across pages without assuming that the reversal has a following page. The focused backend
+  group passed 85/85 and real Cap'n Web passed 4/4.
+- Shared and Backend builds passed. The Backend package passed 596 tests with 4 intentional skips.
+  The Frontend production build passed, followed by 361/361 package tests and first-party copy 1/1.
+  Focused Frontend subscription, profile, shell, and privacy tests passed 23/23.
+- Oxlint first rejected one stale `GatekeeperOperationRate` import left by conflict resolution. The
+  import was removed and `corepack pnpm lint:check` passed with repository warnings only.
+- The first complete production-Harness run passed 114/115. The sole timeout was the existing
+  complete DeepSeek Principal tracer. Focused diagnostics proved two provider calls completed, the
+  chat was inactive, no Hook was stored, and two WebSocket reconnects occurred. The test now loads
+  the restarted Gadget through real RPC before `env.APP[restore]`, preventing Worker Loader reload
+  from interrupting the one-shot registration. The original-timeout file passed 9/9.
+- A final complete 115/115 production-Harness run remains mandatory after review. Root build, test,
+  lint, manifest golden, and whitespace gates remain for the coordinated `dev` integration. No
+  push, merge, Issue closure, release build, upload, promotion, deployment, production change,
+  charging change, or worktree deletion occurred.

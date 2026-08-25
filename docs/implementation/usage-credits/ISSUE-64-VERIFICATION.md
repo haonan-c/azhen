@@ -105,19 +105,41 @@ authority in the User Durable Object and adds these regression boundaries:
 - English and Simplified Chinese catalogs contain the same Usage Credit message keys. Statuses and
   warnings use readable text in addition to color.
 
-## Candidate and pending final gates
+## Post-#62 rebase evidence and pending final gates
 
-The table below records the gates that passed for candidate
-`06dd15d736cf4dedcab21ba5f0983552adabc214` before the second review. The second-review corrections
-have the focused evidence above. They have not yet been rebased over the pending #62 integration, so
-the final root build, test, lint, manifest golden, and release dry-run remain pending and are not
-claimed for the corrected tree. No Durable Object class, binding, or Wrangler migration changed.
+The Issue #64 commits were rebased onto `dev` commit
+`98e1963265840f57463727b1b724b562690c00ee`, which already contains the reviewed Issue #62
+Projection contract. Conflict resolution retained the Projection fact/outbox, alarm, rebuild, and
+administrator APIs while keeping every User-facing balance, Reservation, Ledger, Usage Record, and
+subscription read on the current User Durable Object.
 
-| Command | Result |
+The rebase used Node `24.19.0`, pnpm `11.17.0`, and Wrangler `4.119.0`. It introduced no Durable
+Object class, binding, Wrangler migration, or release-manifest entry, so Issue #64 does not require a
+new generated binding review or production-shape release build. The coordinated merged-tree root
+build, test, lint, manifest golden, and whitespace gates remain for the main-agent integration step
+and are not claimed here.
+
+| Rebased-candidate check | Result |
 | --- | --- |
-| `corepack pnpm build` | Candidate passed; corrected tree pending post-#62 rebase rerun |
-| `corepack pnpm test` | Candidate passed; corrected tree pending post-#62 rebase rerun |
-| `corepack pnpm lint` | Candidate passed; corrected tree pending post-#62 rebase rerun |
-| `git diff --check` | Corrected tree passed after the evidence update |
-| `node --test scripts/release-manifest.test.js` | Candidate passed 4/4; corrected tree pending rerun |
-| `corepack pnpm --filter @gadgets/integration-tests test` | Candidate passed 13 files, 115/115; corrected tree pending root gate |
+| Shared and Workshop Backend builds | Passed |
+| User, Usage Account, and Usage Rate focused workerd group | Passed: 3 files, 85/85 |
+| Real Cap'n Web Usage Account integration | Passed: 1 file, 4/4 |
+| Frontend Provider, profile, Settings, and shell tests | Passed: 4 files, 23/23 |
+| Workshop Backend package | Passed: 596 tests with 4 intentional skips |
+| Workshop Frontend build and package | Passed: 77 files, 361/361; first-party copy 1/1 |
+| `corepack pnpm lint:check` | Passed after removing one stale conflict import; repository warnings only |
+| `git diff --check` | Passed before this evidence update |
+
+The first rebased production-Harness package run passed 12 of 13 files and 114 of 115 tests. The
+only failure was the pre-existing complete DeepSeek Principal tracer waiting 30 seconds for a
+Scheduler Hook. A focused diagnostic rerun reproduced the same failure without extending the
+timeout: the Agent completed two provider calls, the chat became inactive, no Hook was stored, and
+two WebSocket reconnects occurred. This showed that the first post-restart `env.APP[restore]` was
+reloading Worker Loader during the one-shot registration call.
+
+The test now preloads the restarted Gadget through its real `getGadget()`, `connectToGadget()`, and
+`getLastFiring()` RPC path before starting the registration chat. It retains bounded failure
+diagnostics for provider calls, chat state, Hook count, and reconnect count. The focused DeepSeek
+file then passed 9/9 with the original timeout and the same three-call expectation. One complete
+115/115 production-Harness rerun on the final reviewed tree is still required before the branch is
+accepted; the focused pass is not presented as a substitute.
