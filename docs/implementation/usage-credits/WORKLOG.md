@@ -405,3 +405,42 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   direct TypeScript exited 0, and the full Backend package passed 562 tests with 4 expected skips
   and 0 failures. Root/release/Wrangler gates were not run in this cycle. No push, merge, Issue
   closure, upload, promotion, deployment, production change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #62 fourth fixed-point review corrections
+
+- Re-entered the `implement`, `tdd`, and `code-review` gates for six findings and the ingress-alarm
+  specialty. Every production correction began with a focused failing test at the real Projection,
+  administrator overview, or alarm seam.
+- Replaced one-User rebuild alarms with a persistent bounded queue: Registry pages contain at most
+  100 Users, each alarm performs at most 100 RPC steps or 250 milliseconds of work, and Registry and
+  User cursors survive restart. A fake-clock alarm-only test walks 10,000 Users and makes the final
+  committed fact visible before the 60-second overview target without a synchronous health scan.
+- Preserved the true `rebuilding` or `failed` state and User progress while bootstrap metrics are
+  unavailable. English, Chinese, and ARIA tests distinguish these states from real Projection
+  unavailability.
+- Persisted rebuild and ingress wakeups before their state can create maintenance work. Restart and
+  consumed-pre-arm tests prove that an extra alarm is safe and the final drain still has a durable
+  wakeup.
+- Added content-free zero-contribution rejection markers for safe invariant poison and same-principal
+  fact-ID conflicts. They advance only the claimed principal/sequence, mirror into a live rebuild,
+  never permit a cross-principal skip, and fail the rebuild if their drain exposes a queued Summary
+  conflict. N+1 proceeds without a one-second poison retry loop.
+- The required standards/specification review added RED coverage for invalid-envelope fact-ID reuse,
+  retained authority replay, and both same-ID and different-ID concurrent rebuild requests. Rebuild
+  request state now uses a transaction-time CAS after alarm pre-arm. A rebuild marker, any Summary it
+  advances, and the corresponding failed state share one SQLite transaction; a controlled trigger
+  crash rolls all of them back. The administrator token total now includes cache-write input while
+  continuing to exclude reasoning detail, which is already part of output.
+- The correction review found one final live-rebuild classification edge. An invalid same-principal
+  fact-ID conflict now mirrors as an internal sequence marker until authority supplies the old fact,
+  instead of occupying that fact's identity and dropping its contribution. Rejected invalid ID and
+  sequence conflicts each increment the failure count exactly once.
+- Made gap health exclude runnable drain work and split exact Projection pending facts from the User
+  delivery watermark, so a delayed-ACK fact is not double counted. The UI reports delivery backlog
+  separately.
+- Final focused Projection verification passed 48/48. Backend and Frontend direct TypeScript and
+  `git diff --check` passed. The Frontend package passed 353/353; the final Backend package passed
+  579 tests with 4 expected skips and 0 failures. The code checkpoint is
+  `b1fbba23673d8374f077c62d8e097f45a1f3533a`. Root/release/Wrangler gates were not run in this cycle.
+  No push, merge, Issue closure, upload, promotion, deployment, production change, or worktree
+  deletion occurred.

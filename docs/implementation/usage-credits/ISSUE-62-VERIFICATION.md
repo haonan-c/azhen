@@ -12,8 +12,8 @@ It does not modify `main` and does not create a pull request.
 
 ## Toolchain and dependency gate
 
-- Baseline: `b3a2c41803781bbcd8eaef0d0fd4496b6e8a95a5`; the final candidate is rebased onto
-  `0d627e7` so the independent #61 Action fixture correction is present.
+- Initial baseline: `b3a2c41803781bbcd8eaef0d0fd4496b6e8a95a5`; the current fixed-point checkpoint
+  is based on `be1f501` and includes the independent #61 Action fixture correction.
 - Node: `24.19.0`.
 - pnpm: `11.17.0`, invoked through `corepack pnpm`.
 - Wrangler: `4.119.0`.
@@ -49,13 +49,22 @@ It does not modify `main` and does not create a pull request.
   dimensions, per-User high-water marks, active-User membership, generation totals, and health.
   Its schema has no balance, Reservation, or Credit Ledger column.
 - Duplicate fact delivery is hash-idempotent. A fact-ID hash conflict and a per-User sequence
-  conflict fail closed. N+1 remains unapplied until N arrives; one User gap does not stop another
-  User.
+  conflict fail closed. An invariant-invalid fact with a complete safe producer envelope, or a
+  same-principal fact-ID conflict at a new sequence, stores a content-free zero-contribution
+  rejection marker. The marker advances only that exact principal/sequence in both active and
+  rebuild generations. It cannot skip a cross-principal sequence, and a queued Summary conflict
+  exposed by the marker fails the rebuild in the same SQLite transaction as marker/Summary/high-water
+  progress. A live conflict uses an internal marker ID in an unscanned rebuild generation, so the old
+  authority fact retains its identity and contribution. Each rejected input increments the exact
+  failure count once. N+1 therefore proceeds after a permanent poison without a one-second retry
+  loop, while a real missing N remains a visible gap.
 - Rebuild reads stable Registry pages and retained User facts. It builds a separate generation,
   dual-writes live facts, rechecks the exact Registry insertion revision, persists cursors, resumes
-  by alarm, and switches generations only after no sequence gap remains. Rebuild failure is exposed
-  by one bounded code. Inactive generations are removed in 64-row, table-by-table alarm steps; the
-  cleanup cursor survives restart and never targets the active generation.
+  by alarm, and switches generations only after no sequence gap remains. After alarm pre-arm, rebuild
+  creation uses the latest metadata in one transaction, so concurrent same-ID retry is idempotent and
+  a different request cannot overwrite the generation. Rebuild failure is exposed by one bounded
+  code. Inactive generations are removed in 64-row, table-by-table alarm steps; the cleanup cursor
+  survives restart and never targets the active generation.
 - Projection facts are a strict `detail | aggregate` union. Detail stores only canonical event time;
   aggregate stores only a canonical 15-minute UTC bucket. Cross-field kind, pricing, outcome,
   active-User, token, API, and Unpriced invariants fail closed before storage.
@@ -70,13 +79,18 @@ It does not modify `main` and does not create a pull request.
   work, so neither a large User backlog nor either bounded state machine can starve another.
 - A fresh Projection binding starts in bootstrap-pending state. The first real administrator
   overview automatically starts stable `bootstrap-v1`; metrics remain `null` during both rebuilding
-  and failed bootstrap until a full Registry/User authority scan completes. Failed bootstrap
-  attempts remain visible and retry after their bounded generation cleanup, without an administrator
-  rebuild click. Later manual rebuilds can continue showing the previously verified generation.
+  and failed bootstrap until a full Registry/User authority scan completes. A persistent queue reads
+  Registry pages of at most 100 Users and performs at most 100 RPC steps or 250 milliseconds of work
+  per alarm. Its Registry cursor, per-User fact cursor, and completion flag survive a crash. A fake
+  clock/support-scale test walks 10,000 Users only through alarms and makes the final User's committed
+  fact visible within 60 seconds; a health query never synchronously scans those User DOs. Failed
+  bootstrap attempts remain visible and retry after bounded generation cleanup, without an
+  administrator rebuild click. Later manual rebuilds can continue showing the verified generation.
 - Each User publishes content-free pending count, oldest pending time, and delivery failure state to
   the Registry owner. The administrator overview merges those deployment watermarks without waking
-  or scanning User Durable Objects. Recovery clearing is itself alarm-retried if the health RPC is
-  temporarily unavailable.
+  or scanning User Durable Objects. Projection-accepted pending facts and User delivery backlog are
+  separate exact fields, so one delayed-ACK fact is not reported as two Projection facts. Recovery
+  clearing is itself alarm-retried if the health RPC is temporarily unavailable.
 - `AdminUsageApi.getOverview()` reads projection totals and the authoritative Registry count.
   `getBalance(registeredUserRef)` always resolves Registry to the User DO and reads the Usage
   Account directly. Projection failure returns `metrics: null`, never a fabricated zero balance or
@@ -94,7 +108,7 @@ It does not modify `main` and does not create a pull request.
 | Non-authoritative and rebuildable projection | SQLite privacy/schema dump contains no balances; generation rebuild preserves User balance and exact totals. Tests cover live facts and a newly registered User during rebuild, alarm restart, failed rebuild health, repeated rebuild, and bounded inactive-generation cleanup. |
 | Complete admin overview | English and Chinese frontend tests cover the six metric cards, Unpriced alert, active/registered split, health, pending/gap detail, safe errors, and retry. |
 | Immediate authoritative admin balance | Real Cap’n Web test keeps projection `lagging`, applies an exact >MAX_SAFE grant, and reads the new balance from the User Usage Account. |
-| Seconds/minute visibility | The production constants are 10 seconds for a User fact and 60 seconds for overview; the persistent alarm is one second and the UI refresh is 30 seconds. Focused tests use real local alarms without long sleeps. |
+| Seconds/minute visibility | The production constants are 10 seconds for a User fact and 60 seconds for overview; the persistent alarm is one second and the UI refresh is 30 seconds. A fake-clock alarm-only test scans 10,000 controlled User stubs and verifies that the last committed fact becomes queryable before 60 seconds. This is a support-scale SLA test, not the #66 capacity claim. |
 | Lag/failure visible without charging blockage | Sequence gaps return `lagging`; invalid/conflicting facts and long User delivery outages return bounded `failed` health. Projection and health-RPC failure do not roll back settlement, and successful recovery clears deployment failure state. |
 | Existing authoritative history | A bounded, resumable test creates settled, unknown, and reconciled records without Projection keys, rebuilds, repeats backfill and ingestion, and proves exact authority-equivalent totals without duplication. |
 | Bounded lifetime operations | A 200-record delivered history test corrupts an old delivered value, then proves pending reads and a late keyset page touch only their bounded indexed batch. ACK response loss is replayed against the real Projection and counted once. |
@@ -111,14 +125,18 @@ All commands below ran from the isolated worktree.
 | `corepack pnpm --dir packages/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the second fixed-point review: 23 tests, including Summary revision/delta, rebuild-side conflict isolation, 64-fact restart-safe drains, alarm deletion concurrency, automatic bootstrap, and the complete Projection privacy sentinel. |
 | `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the third fixed-point review: 31 tests, including atomic drain rollback, exact empty/non-empty pre-arm ownership, unavailable bootstrap metrics, single rebuild-step scheduling, rebuild-drain completion, principal fairness, delayed Summary ACK/rejection, and old-meta migration. |
 | `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-account-gatekeeper.test.ts` | GREEN after the third fixed-point review: 22 tests, including retained queued Summary poison writeback. |
+| `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the fourth fixed-point review and its dual-axis correction: 48 tests, including 10,000-User alarm-only bootstrap timing, rebuild pre-arm/CAS recovery, poison markers, runnable-drain health, split pending watermarks, ingress pre-arm consumption, same/cross-principal fact-ID conflicts, exact rejection counts, atomic rebuild rollback, and rebuild-side Summary rejection. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.usage-admin.config.ts` | GREEN: 15 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.metered-model.config.ts` | GREEN: 35 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.integration.config.ts __integration__/usage-projection-rpc.test.ts` | GREEN: one real WebSocket/Cap’n Web test with promise pipelining and stub disposal. |
 | `corepack pnpm --dir packages/workshop-frontend exec vitest run src/components/usage/AdminUsageOverview.test.tsx src/AdminPage.localization.test.tsx` | GREEN before final rebase; repeated in the final gate below. |
 | `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the second review fixes: Browser Fonts 1; default workerd 472; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; 0 fail. |
 | `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the final third-review alarm correction: Browser Fonts 1; default workerd 481; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; total 562 pass, 4 expected skips, 0 fail. |
-| `corepack pnpm --filter @gadgets/workshop-backend exec tsc --noEmit` | GREEN after the third review fixes. |
+| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN at the final fourth-review checkpoint: Browser Fonts 1; default workerd 498; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; total 579 pass, 4 expected skips, 0 fail. |
+| `corepack pnpm --filter @gadgets/workshop-backend exec tsc -p tsconfig.json --noEmit` | GREEN at the fourth-review checkpoint. |
+| `corepack pnpm --filter @gadgets/workshop-frontend exec tsc -p tsconfig.json --noEmit` | GREEN at the fourth-review checkpoint. |
 | `corepack pnpm --filter @gadgets/workshop-frontend test` | GREEN: 351 pass across the main and first-party-copy runs. |
+| `corepack pnpm --filter @gadgets/workshop-frontend test` | GREEN after the fourth-review UI/DTO change: 353 pass, 0 fail. |
 | `corepack pnpm --dir packages/gatekeeper-context exec vitest run --config vitest.production.config.ts` | GREEN: 25 tests through the real User DO and newly bound Usage Projection DO. |
 
 The first TDD run was RED because the fixed `UsageProjection` seam and `AdminUsageApi` methods did
@@ -168,6 +186,25 @@ direct TypeScript, and the full Backend package matrix are GREEN. Root, release-
 and release-builder gates were intentionally not run in this review cycle and remain coordinated
 main-agent work; no remote or production mutation occurred.
 
+The fourth fixed-point review produced six strict RED slices plus one ingress-alarm specialty. They
+reproduced a one-User-per-alarm bootstrap that missed the 60-second visibility target, bootstrap
+health hidden behind a generic unavailable UI, rebuild state committed without a durable wakeup,
+permanent producer poison that blocked N+1, runnable 64-cap backlog misreported as a gap, delayed ACK
+double counting, and an ingress pre-arm consumed while hashing. Corrections add a persisted bounded
+multi-User rebuild queue, real rebuilding/failed/progress UI in both locales, rebuild and ingress
+pre-arm ownership, content-free rejection markers, drain-aware gap semantics, and separate
+Projection/User pending watermarks. A final RED self-review proved that a fact-ID marker could expose
+a queued Summary conflict in the rebuild generation without failing it; marker drain rejection now
+fails and cleans only the rebuild generation. The required standards/specification dual review then
+added RED cases for invalid-envelope fact-ID reuse, authority-rebuild replay, marker/failure atomicity,
+ordinary invalid-marker Summary rejection, and concurrent rebuild requests. The same correction also
+includes cache-write input in the displayed token total and makes the shared pending-field docs match
+their exact semantics. A final correction preserves the original authority fact ID when a live
+invalid conflict is mirrored into an unscanned rebuild generation, and records exactly one failure
+for each rejected input. Projection 48, direct Backend/Frontend TypeScript, whitespace, the Frontend
+package, and the complete Backend package are GREEN. Root, release-manifest, Wrangler, and
+release-builder gates were intentionally not run in this review cycle.
+
 ## Generated types, migration, and release shape
 
 - `corepack pnpm types:generate` added only the expected `UsageProjection` Durable Object namespace
@@ -190,8 +227,13 @@ main-agent work; no remote or production mutation occurred.
   complete Backend package matrix passed with 562 tests, 4 expected skips, and 0 failures. Root,
   release-manifest, Wrangler, and release dry-run gates have not yet been repeated for this
   checkpoint.
+- The final fourth-review code checkpoint is `b1fbba23673d8374f077c62d8e097f45a1f3533a`, based on
+  `be1f501`. Projection passed 48/48, direct Backend and Frontend TypeScript passed, Frontend passed
+  353/353, and the complete Backend package passed 579 tests with 4 expected skips and 0 failures.
+  Root, release-manifest, Wrangler, and release dry-run gates have not been repeated for this
+  checkpoint.
 - Root build/test/lint, release manifest, and release dry-run evidence below belongs to the earlier
-  accepted candidate. Those root/release gates have not yet been repeated for the second-review
+  accepted candidate. Those root/release gates have not yet been repeated for the fourth-review
   correction checkpoint; no claim below upgrades that evidence to the new checkpoint.
 - `corepack pnpm build` exited 0 for all 51 workspace build tasks.
 - `corepack pnpm test` exited 0. This included 117 root Node tests; the complete Backend matrix
