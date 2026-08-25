@@ -1189,7 +1189,8 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
   constructor(
       private projection: UsageReportProjection,
       private query: FrozenUsageReportQuery,
-      private onDispose: () => void = () => undefined) {
+      private onDispose: () => void = () => undefined,
+      private assertActive: () => Promise<void> = async () => undefined) {
     super();
   }
 
@@ -1231,9 +1232,15 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
 
   async exportCsv(): Promise<ReadableStream<Uint8Array>> {
     if (this.disposed) throw new Error("Usage report is closed.");
+    await this.assertActive();
+    if (this.disposed) throw new Error("Usage report is closed.");
     if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
     this.activeOperations += 1;
     const health = await this.projection.readHealth().catch(error => {
+      this.activeOperations -= 1;
+      throw error;
+    });
+    await this.assertActive().catch(error => {
       this.activeOperations -= 1;
       throw error;
     });
@@ -1259,6 +1266,7 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
       pull: async controller => {
         if (cancelled || complete) return;
         try {
+          await this.assertActive();
           let chunk: Uint8Array;
           if (firstPull) {
             firstPull = false;
@@ -1274,6 +1282,7 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
             cursor = page.nextCursor ?? undefined;
             if (page.nextCursor === null) complete = true;
           }
+          await this.assertActive();
           if (chunk.byteLength > ADMIN_USAGE_CSV_MAX_CHUNK_BYTES) {
             throw new Error("Usage report CSV chunk exceeds its bounded buffer.");
           }
@@ -1288,7 +1297,7 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
         }
       },
       cancel,
-    }, {highWaterMark: 1});
+    }, {highWaterMark: 0});
   }
 
   [Symbol.dispose](): void {
@@ -1301,10 +1310,14 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
 
   async #withOperation<T>(operation: () => Promise<T>): Promise<T> {
     if (this.disposed) throw new Error("Usage report is closed.");
+    await this.assertActive();
+    if (this.disposed) throw new Error("Usage report is closed.");
     if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
     this.activeOperations += 1;
     try {
-      return await operation();
+      const result = await operation();
+      await this.assertActive();
+      return result;
     } finally {
       this.activeOperations -= 1;
     }
@@ -1493,6 +1506,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async openReport(filter: AdminUsageReportFilter): Promise<RpcStub<AdminUsageReport>> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (!this.projection) throw new Error("Usage Projection is unavailable.");
     if (this.activeReports >= ADMIN_USAGE_MAX_OPEN_REPORTS) {
       throw new Error("Too many Usage reports are open.");
@@ -1509,11 +1523,13 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
         rates.current.version,
         coordinates.projectionGeneration,
         coordinates.ingestionWatermark,
+        coordinates.detailRetentionRevision,
       );
+      await assertAdminCapabilityActive(this.users, this.adminUserId);
       // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
       return new AdminUsageReportImpl(this.projection.getByName(""), query, () => {
         this.activeReports -= 1;
-      });
+      }, () => assertAdminCapabilityActive(this.users, this.adminUserId));
     } catch (error) {
       this.activeReports -= 1;
       throw error;
@@ -1521,9 +1537,12 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async getRecordDetail(request: AdminUsageRecordDetailRequest): Promise<AdminUsageRecordDetail> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUsageRecordDetailRequest(request);
     const user = await this.#resolveUser(normalized.registeredUserRef);
-    return user.getAdminUsageRecordDetail(normalized.safeRecordRef);
+    const detail = await user.getAdminUsageRecordDetail(normalized.safeRecordRef);
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return detail;
   }
 
   async grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult> {

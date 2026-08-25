@@ -1506,9 +1506,66 @@ export class UsageAccount {
       throw new TypeError("Usage Record reference is invalid.");
     }
     const locator = this.resolveUsageDetailReference(safeRecordRef);
-    if (!locator || (locator.kind !== "model" && locator.kind !== "gatekeeper") ||
-        operationIdValidationError(locator.operationId) !== undefined) {
+    if (!locator || operationIdValidationError(locator.operationId) !== undefined) {
       throw new Error("Usage Record does not exist.");
+    }
+    if (locator.kind === "gatekeeper-reconciliation") {
+      const authority = this.getGatekeeperReconciliationAuthority(safeRecordRef);
+      if (!authority || authority.usagePrincipalRef !==
+          this.getRegistrationOutbox().fact.registeredUserRef) {
+        throw new Error("Usage Record does not exist.");
+      }
+      const reconciliation = this.storage.kv.get<GatekeeperUsageReconciliation>(
+        GATEKEEPER_RECONCILIATION_PREFIX + locator.operationId,
+      );
+      if (!reconciliation) throw new Error("Usage Record does not exist.");
+      assertGatekeeperUsageReconciliation(reconciliation, locator.operationId);
+      const linkedLedger = authority.ledgerEntryId === null ? undefined
+        : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + authority.ledgerEntryId);
+      if (authority.ledgerEntryId !== null &&
+          (!linkedLedger || linkedLedger.kind !== "usage-charge")) {
+        throw new Error("Usage Record Ledger link does not reconcile.");
+      }
+      const reversalId = authority.ledgerEntryId === null ? undefined
+        : this.storage.kv.get<string>(REVERSAL_PREFIX + authority.ledgerEntryId);
+      const reversal = reversalId === undefined ? undefined
+        : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + reversalId);
+      if (reversalId !== undefined && (!reversal || reversal.kind !== "credit-reversal" ||
+          reversal.adminAudit.originalLedgerEntryId !== authority.ledgerEntryId)) {
+        throw new Error("Usage Record Credit Reversal does not reconcile.");
+      }
+      return {
+        record: {
+          kind: "gatekeeper-reconciliation",
+          id: safeRecordRef,
+          source: authority.source,
+          meteredKind: authority.meteredKind,
+          vendorId: authority.vendorId,
+          billingMethodKey: authority.billingMethodKey,
+          externalAccountId: authority.externalAccountId,
+          gadgetId: authority.gadgetId,
+          pricing: authority.pricing,
+          outcome: authority.outcome,
+          chargeSubunits: authority.chargedUsageCreditSubunits,
+          createdAt: authority.reconciledAtUtc,
+        },
+        chargeSnapshot: authority.chargeSnapshot,
+        reservation: null,
+        ledgerEntries: [linkedLedger, reversal].filter(
+          (entry): entry is CreditLedgerEntry => entry !== undefined,
+        ).map(entry => ({
+          id: `${safeRecordRef}:${entry.kind}`,
+          kind: entry.kind as "usage-charge" | "credit-reversal",
+          deltaSubunits: entry.deltaSubunits,
+          createdAt: entry.createdAt,
+        })),
+        reconciliation: {
+          decision: reconciliation.decision,
+          actorUserId: reconciliation.actorUserId,
+          reason: reconciliation.reason,
+          createdAt: reconciliation.createdAt,
+        },
+      };
     }
     const sourceIdentity = `${locator.kind}:${locator.operationId}`;
     const expectedRef = this.storage.kv.get<string>(
@@ -1566,7 +1623,10 @@ export class UsageAccount {
 
     const record = locator.kind === "model"
       ? userModelUsageRecord(rawRecord as ModelUsageRecord)
-      : userGatekeeperUsageRecord(rawRecord as GatekeeperUsageRecord);
+      : {
+        ...userGatekeeperUsageRecord(rawRecord as GatekeeperUsageRecord),
+        externalAccountId: (rawRecord as GatekeeperUsageRecord).attribution.externalAccountId,
+      };
     return {
       record: {...record, id: safeRecordRef},
       chargeSnapshot: rawRecord.chargeSnapshot,
@@ -1580,7 +1640,7 @@ export class UsageAccount {
       ledgerEntries: [linkedLedger, reversal].filter(
         (entry): entry is CreditLedgerEntry => entry !== undefined,
       ).map(entry => ({
-        id: entry.id,
+        id: `${safeRecordRef}:${entry.kind}`,
         kind: entry.kind as "usage-charge" | "credit-reversal",
         deltaSubunits: entry.deltaSubunits,
         createdAt: entry.createdAt,

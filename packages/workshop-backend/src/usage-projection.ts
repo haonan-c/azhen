@@ -108,6 +108,7 @@ type ProjectionMetaRow = {
   active_generation: string;
   ingestion_watermark: string;
   report_watermark: string;
+  detail_retention_revision: string;
   last_ingested_at: string | null;
   latest_applied_source_at: string | null;
   failed_ingestion_count: string;
@@ -441,12 +442,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
   }
 
-  /** Capture the active generation and its monotonic report-ingestion watermark. */
-  getReportCoordinates(): {projectionGeneration: bigint; ingestionWatermark: bigint} {
+  /** Capture all server-owned coordinates needed to keep one report immutable. */
+  getReportCoordinates(): {
+    projectionGeneration: bigint;
+    ingestionWatermark: bigint;
+    detailRetentionRevision: bigint;
+  } {
     const meta = this.#meta();
     return {
       projectionGeneration: BigInt(meta.active_generation),
       ingestionWatermark: BigInt(meta.report_watermark),
+      detailRetentionRevision: BigInt(meta.detail_retention_revision),
     };
   }
 
@@ -617,7 +623,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   #assertCurrentReportSnapshot(query: FrozenUsageReportQuery): void {
     const meta = this.#meta();
     if (query.snapshot.projectionGeneration.toString() !== meta.active_generation ||
-        query.snapshot.ingestionWatermark > BigInt(meta.report_watermark)) {
+        query.snapshot.ingestionWatermark > BigInt(meta.report_watermark) ||
+        query.detailRetentionRevision !== BigInt(meta.detail_retention_revision)) {
       throw new Error("Usage report snapshot is stale.");
     }
   }
@@ -701,7 +708,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ORDER BY generation, source_sequence_length, source_sequence
         LIMIT ?
       `, usagePrincipalRef, cutoff, usagePrincipalRef, cutoff, limit + 1).toArray();
-      for (const row of rows.slice(0, limit)) {
+      const removed = rows.slice(0, limit);
+      for (const row of removed) {
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_expired_sequences (
             generation, fact_id, principal_ref, source_sequence
@@ -712,6 +720,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           DELETE FROM ${table} WHERE generation = ? AND fact_id = ?
         `, row.generation, row.fact_id);
+      }
+      const meta = this.#meta();
+      if (removed.some(row => row.generation === meta.active_generation)) {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_detail_watermarks (principal_ref, cutoff_utc)
@@ -1869,6 +1883,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   #meta(): ProjectionMetaRow {
     return this.ctx.storage.sql.exec<ProjectionMetaRow>(`
       SELECT active_generation, ingestion_watermark, report_watermark, last_ingested_at,
+             detail_retention_revision,
              latest_applied_source_at, failed_ingestion_count, failure_code,
              rebuild_request_id, rebuild_state, rebuild_generation, rebuild_users_processed,
              rebuild_registry_revision, rebuild_registry_cursor, rebuild_registry_complete,
@@ -1896,6 +1911,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       CREATE TABLE IF NOT EXISTS usage_projection_meta (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1), active_generation TEXT NOT NULL,
         ingestion_watermark TEXT NOT NULL, report_watermark TEXT NOT NULL,
+        detail_retention_revision TEXT NOT NULL,
         last_ingested_at TEXT,
         latest_applied_source_at TEXT, failed_ingestion_count TEXT NOT NULL,
         failure_code TEXT, rebuild_request_id TEXT, rebuild_state TEXT,
@@ -1920,6 +1936,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ADD COLUMN report_watermark TEXT NOT NULL DEFAULT '0'
       `);
     }
+    if (!metaColumns.has("detail_retention_revision")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_meta
+        ADD COLUMN detail_retention_revision TEXT NOT NULL DEFAULT '0'
+      `);
+    }
     if (!metaColumns.has("rebuild_authority_complete")) {
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_meta
@@ -1935,10 +1957,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       INSERT OR IGNORE INTO usage_projection_meta (
         singleton, active_generation, ingestion_watermark, report_watermark,
+        detail_retention_revision,
         failed_ingestion_count,
         rebuild_users_processed, rebuild_current_user_is_last, rebuild_authority_complete,
         rebuild_registry_complete, maintenance_turn, bootstrap_state
-      ) VALUES (1, '1', '0', '0', '0', '0', 0, 0, 0, 'drain', 'pending')
+      ) VALUES (1, '1', '0', '0', '0', '0', '0', 0, 0, 0, 'drain', 'pending')
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_totals (

@@ -1349,10 +1349,50 @@ export type AdminUsageRecordReconciliation = {
   createdAt: string;
 };
 
+/** Administrator-visible Gatekeeper Usage Record with its content-free account dimension. */
+export type AdminGatekeeperUsageRecord = UserGatekeeperUsageRecord & {
+  /** Content-free opaque external account/resource dimension. */
+  externalAccountId: string;
+};
+
+/** Reconciliation authority retained independently from its older raw Gatekeeper Usage Record. */
+export type AdminGatekeeperReconciliationRecord = {
+  /** Reconciliation-record discriminator. */
+  kind: "gatekeeper-reconciliation";
+  /** Random opaque User-local reference returned by a Projection detail row. */
+  id: string;
+  /** Host-attested causal source copied into the retained authority snapshot. */
+  source: UsageSource;
+  /** Confirmed Gatekeeper Use, or an attempt-only release decision. */
+  meteredKind: "gatekeeper" | "attempt";
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Gatekeeper-scoped stable business method. */
+  billingMethodKey: string;
+  /** Content-free opaque external account/resource dimension. */
+  externalAccountId: string;
+  /** Stable Gadget identifier, or null when no Gadget caused this Use. */
+  gadgetId: string | null;
+  /** Whether the immutable Charge Snapshot had a configured Usage Rate. */
+  pricing: "priced" | "unpriced";
+  /** Formal terminal result of the administrator reconciliation. */
+  outcome: "reconciled-settled" | "reconciled-released";
+  /** Exact Usage Credit charged by the reconciliation decision. */
+  chargeSubunits: bigint;
+  /** Canonical UTC reconciliation time, never the older Usage event time. */
+  createdAt: string;
+};
+
+/** Content-free authoritative administrator view of one Usage detail event. */
+export type AdminUsageRecord =
+  | UserModelUsageRecord
+  | AdminGatekeeperUsageRecord
+  | AdminGatekeeperReconciliationRecord;
+
 /** Serializable authoritative graph for one administrator Usage drill-down. */
 export type AdminUsageRecordDetail = {
-  /** User-safe content-free Usage Record. */
-  record: UserUsageRecord;
+  /** Content-free authoritative Usage or reconciliation record. */
+  record: AdminUsageRecord;
   /** Immutable pricing evidence used by the authoritative User Usage Account. */
   chargeSnapshot: ChargeSnapshot;
   /** Linked Credit Reservation, or null for zero-charge and Unpriced Use. */

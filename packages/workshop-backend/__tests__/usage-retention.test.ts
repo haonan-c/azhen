@@ -195,6 +195,13 @@ describe("24 UTC calendar month Usage detail retention", () => {
         kind: "gatekeeper",
         operationId,
       });
+      expect(account.getAdminUsageRecordDetail(legacyDetail.projectionFactId)).toMatchObject({
+        record: {
+          id: legacyDetail.projectionFactId,
+          kind: "gatekeeper",
+          externalAccountId: "context-account-1",
+        },
+      });
       expect(account.getSnapshot().usageSummaryFacts).toHaveLength(1);
       acknowledgeAllProjectionFacts(account);
 
@@ -362,6 +369,7 @@ describe("24 UTC calendar month Usage detail retention", () => {
           !reconciliation || reconciliation.rowKind !== "detail") {
         throw new Error("Expected original and reconciliation detail references.");
       }
+      expect(reconciliation.safeRecordRef).not.toBe(original.safeRecordRef);
       acknowledgeAllProjectionFacts(account);
       const lifetimeSummaries = account.getSnapshot().usageSummaryFacts;
 
@@ -389,6 +397,35 @@ describe("24 UTC calendar month Usage detail retention", () => {
         ledgerEntryId: expect.any(String),
         reconciledAtUtc: "2026-08-23T12:00:00.000Z",
       });
+      const reconciliationDetail = account.getAdminUsageRecordDetail(
+        reconciliation.safeRecordRef,
+      );
+      expect(reconciliationDetail).toMatchObject({
+        record: {
+          id: reconciliation.safeRecordRef,
+          kind: "gatekeeper-reconciliation",
+          source: "agent",
+          meteredKind: "gatekeeper",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "context-account-1",
+          outcome: "reconciled-settled",
+          chargeSubunits: 17n,
+          createdAt: "2026-08-23T12:00:00.000Z",
+        },
+        reservation: null,
+        ledgerEntries: [{kind: "usage-charge", deltaSubunits: -17n}],
+        reconciliation: {
+          decision: "settle",
+          actorUserId: "reconciliation-admin@example.test",
+          reason: "Confirm the old provider operation",
+          createdAt: "2026-08-23T12:00:00.000Z",
+        },
+      });
+      const encodedDetail = JSON.stringify(reconciliationDetail, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value);
+      expect(encodedDetail).not.toContain(billingOperationId);
+      expect(encodedDetail).not.toContain(reconciliationOperationId);
       const encoded = JSON.stringify(authority, (_key, value) =>
         typeof value === "bigint" ? value.toString() : value);
       expect(encoded).not.toContain("2024-08-24T12:00:00.000Z");

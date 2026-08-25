@@ -18,6 +18,7 @@ import type {
   UsageProjection,
   UsageProjectionAggregateFact,
   UsageProjectionDetailFact,
+  UsageProjectionFact,
 } from "../src/usage-projection.js";
 import {
   buildUsageReportPredicate,
@@ -539,6 +540,12 @@ describe("Issue #63 frozen administrator Usage reports", () => {
       providerCostUsdSubunits: 25n,
     });
     await projection.ingest([latest]);
+    const duplicate = {
+      ...latest,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 3n,
+    };
+    await projection.ingest([duplicate]);
 
     using report = await adminUsage().openReport({registeredUserRefs: [principal]});
     expect((await oldReport.getOverview()).metrics.providerCostUsdSubunits).toBe(10n);
@@ -552,6 +559,134 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     const csv = await new Response(await report.exportCsv()).text();
     expect(csv).toContain(latest.projectionFactId);
     expect(csv).not.toContain(first.projectionFactId);
+    expect(csv).not.toContain(duplicate.projectionFactId);
+  });
+
+  it("filters and exports attempt-only Summary rows without inventing event time", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const attempt = aggregate(principal, {
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "failed-before-execution",
+      deploymentModelId: null,
+      vendorId: "attempt-vendor",
+      billingMethodKey: "attempt.method.v1",
+      externalAccountId: "attempt-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      preExecutionFailures: 1n,
+      activeUserContribution: 0n,
+    });
+    await projection.ingest([attempt]);
+
+    using report = await adminUsage().openReport({
+      registeredUserRefs: [principal],
+      meteredKinds: ["attempt"],
+    });
+    expect((await report.getOverview()).metrics).toMatchObject({
+      activeUsers: 0n,
+      meteredUseCount: 0n,
+      preExecutionFailures: 1n,
+    });
+    expect((await report.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({
+        rowKind: "aggregate",
+        rowId: attempt.projectionFactId,
+        meteredKind: "attempt",
+        bucketStartUtc: attempt.bucketStart,
+      }),
+    ]);
+    const csv = await new Response(await report.exportCsv()).text();
+    expect(csv).toContain("\r\naggregate,");
+    expect(csv).toContain(",attempt,");
+    const lines = csv.split("\r\n");
+    const header = lines.find(line => line.startsWith("row_kind,"))!.split(",");
+    const row = lines.find(line => line.startsWith("aggregate,"))!.split(",");
+    expect(row[header.indexOf("occurred_at_utc")]).toBe("");
+    expect(row[header.indexOf("report_local_timestamp")]).toBe("");
+  });
+
+  it("uses the legacy Projection fact identity as its safe detail alias", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const current = detail(principal, {sourceSequence: 1n});
+    const {
+      safeRecordRef: _safeRecordRef,
+      meteredUseCount: _meteredUseCount,
+      preExecutionFailures: _preExecutionFailures,
+      unknownOperations: _unknownOperations,
+      ...legacy
+    } = current;
+    await projection.ingest([legacy as UsageProjectionFact]);
+
+    using report = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({
+        rowKind: "detail",
+        rowId: legacy.projectionFactId,
+        safeRecordRef: legacy.projectionFactId,
+      }),
+    ]);
+  });
+
+  it("fails a frozen report closed after retention removes physical detail", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const expired = detail(principal, {
+      sourceSequence: 1n,
+      occurredAt: "2024-08-24T12:00:00.000Z",
+    });
+    await projection.ingest([expired]);
+    using report = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+
+    expect(await projection.expireDetailBefore(
+      principal, "2026-08-24T12:00:00.000Z",
+    )).toBe(true);
+    await expect(report.listRows({limit: 10}))
+      .rejects.toThrow("Usage report snapshot is stale.");
+
+    using current = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await current.listRows({limit: 10})).rows).toEqual([]);
+  });
+
+  it("revokes an already-minted report when its administrator deletion starts", async () => {
+    const identity = `issue-63-report-admin-${crypto.randomUUID()}@example.test`;
+    const user = testEnv.TEST_USER.getByName(identity);
+    const session = await user.createAccount(
+      identity, "Issue 63 report administrator", new Uint8Array([6, 3]),
+    );
+    if (session === null) throw new Error("Expected a fresh report administrator.");
+    await user.activateUsageAccount();
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      identity,
+      undefined,
+      testEnv.TEST_USAGE_PROJECTION,
+    );
+    using report = await usage.openReport({});
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    await user.beginUsageUserDeletion(
+      `issue-63-delete-${crypto.randomUUID()}`,
+      "Revoke an already-minted Usage report",
+      "other-admin@example.test",
+    );
+
+    await expect(report.getOverview()).rejects.toThrow("capability has been revoked");
+    await expect(report.listRows({limit: 1})).rejects.toThrow("capability has been revoked");
+    await expect(reader.read()).rejects.toThrow("capability has been revoked");
+    reader.releaseLock();
   });
 
   it("keeps same-time keyset pages stable, rejects tampering, and fails closed on generation change",

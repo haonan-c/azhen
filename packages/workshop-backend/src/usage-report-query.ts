@@ -41,7 +41,11 @@ function normalizeReportDimensions(
 
 /** Server-owned report query frozen behind one AdminUsageReport capability. */
 export type FrozenUsageReportQuery = {
+  /** Public filter and generation/watermark coordinates exposed with report results. */
   snapshot: AdminUsageReportSnapshot;
+  /** Server-private retention revision that prevents detail cleanup from changing this report. */
+  detailRetentionRevision: bigint;
+  /** Random capability-local scope used to authenticate keyset cursors. */
   cursorScope: string;
 };
 
@@ -64,10 +68,12 @@ export function freezeUsageReportQuery(
   reportTimeZoneVersion: bigint,
   projectionGeneration: bigint,
   ingestionWatermark: bigint,
+  detailRetentionRevision = 0n,
 ): FrozenUsageReportQuery {
   if (typeof reportTimeZoneVersion !== "bigint" || reportTimeZoneVersion < 1n ||
       typeof projectionGeneration !== "bigint" || projectionGeneration < 1n ||
-      typeof ingestionWatermark !== "bigint" || ingestionWatermark < 0n) {
+      typeof ingestionWatermark !== "bigint" || ingestionWatermark < 0n ||
+      typeof detailRetentionRevision !== "bigint" || detailRetentionRevision < 0n) {
     throw new TypeError("Usage report snapshot is invalid.");
   }
   const normalized = normalizeAdminUsageReportFilter(filter);
@@ -96,6 +102,7 @@ export function freezeUsageReportQuery(
       projectionGeneration,
       ingestionWatermark,
     },
+    detailRetentionRevision,
     cursorScope: crypto.randomUUID(),
   };
 }
