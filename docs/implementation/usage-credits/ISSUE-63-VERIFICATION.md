@@ -178,7 +178,7 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | Focused Usage report workerd | PASS, 23/23 |
 | Focused Summary/retention workerd group | PASS, 25/25 |
 | Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
-| Frontend report/file-transfer follow-up tests | PASS, 29/29 |
+| Frontend report/file-transfer follow-up tests | PASS, 30/30 |
 | Full Frontend package tests | PASS, 78 files and 381 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Real production-Harness second-page legacy/deleted-User coordination | PASS, 1/1; 17 unrelated tests skipped; 15.80 seconds |
@@ -294,3 +294,11 @@ The correction gates passed: Frontend focused 29/29, Usage administrator 18/18, 
 Summary/retention 25/25, the exact retained-detail Harness 1/1, and affected Backend, Frontend, and
 Integration Tests builds. Root test remains prohibited until the next independent fixed-point
 review.
+
+The final P2 follow-up makes authority refresh success explicit. `readDetail()` now returns whether
+the current frozen-row detail was applied. If a post-operation refresh rejects, it clears the stale
+detail before showing the unavailable state. This removes every stale operation control and does
+not retain a success message. A later successful row read restores the terminal reconciliation and
+Credit Reversal graph without settle, release, or reverse controls. Both the RPC-success and
+RPC-conflict paths are covered. Browser focused tests passed 21/21; the combined report and file
+transfer set is 30/30. Frontend build, lint, and `git diff --check` passed.

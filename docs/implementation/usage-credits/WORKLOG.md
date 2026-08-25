@@ -905,3 +905,14 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   builds passed. Root test remains prohibited pending the next independent fixed-point review.
 - No push, merge, pull request, Issue closure, deployment, upload, promotion, production
   configuration change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #63 final browser authority-refresh correction
+
+- The final P2 was reproduced for both a successful administrator RPC and a conflicting RPC. In
+  each RED case, the following authority refresh rejected while stale settle, release, and reverse
+  controls remained usable; the success case also retained a false success status.
+- `readDetail()` now reports whether current authority was applied. A rejected refresh clears the
+  stale detail and removes every operation control until an explicit retry succeeds. The successful
+  retry renders the reconciliation and Credit Reversal terminal graph without the stale controls.
+- Browser focused tests passed 21/21. The Frontend build, lint check, and `git diff --check` passed.
+  Root test remains prohibited until the final independent read-only review.
