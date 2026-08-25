@@ -61,7 +61,9 @@ describe('export file transfers', () => {
     const createWritable = vi.fn<() => Promise<WritableStream<Uint8Array>>>()
       .mockRejectedValue(failure)
     Object.assign(window, {
-      showSaveFilePicker: vi.fn(async () => ({createWritable})),
+      showSaveFilePicker: vi.fn<() => Promise<{createWritable: typeof createWritable}>>(
+        async () => ({createWritable}),
+      ),
     })
     const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>(async () => (
       new ReadableStream<Uint8Array>()
@@ -93,6 +95,31 @@ describe('export file transfers', () => {
 
     expect(new TextDecoder().decode(written[0])).toBe('usage')
     expect(picker).toHaveBeenCalledWith({suggestedName: 'usage.csv'})
+  })
+
+  it('lets pipeTo cancel a Chromium source stream that arrives after abort', async () => {
+    const writable = new WritableStream<Uint8Array>()
+    const createWritable = vi.fn<() => Promise<WritableStream<Uint8Array>>>(async () => writable)
+    const picker = vi.fn<() => Promise<{createWritable: typeof createWritable}>>(async () => ({
+      createWritable,
+    }))
+    Object.assign(window, {showSaveFilePicker: picker})
+    const abortController = new AbortController()
+    let resolveStream!: (stream: ReadableStream<Uint8Array>) => void
+    const streamPromise = new Promise<ReadableStream<Uint8Array>>(resolve => {
+      resolveStream = resolve
+    })
+    const cancel = vi.fn<() => void>()
+    const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>(() => streamPromise)
+    const transfer = saveStreamToFile(source, 'usage.csv', abortController.signal)
+
+    await vi.waitFor(() => expect(source).toHaveBeenCalledOnce())
+    expect(picker).toHaveBeenCalledOnce()
+    abortController.abort()
+    resolveStream(new ReadableStream<Uint8Array>({cancel}))
+
+    await expect(transfer).rejects.toMatchObject({name: 'AbortError'})
+    expect(cancel).toHaveBeenCalledOnce()
   })
 
   it('cancels a Blob fallback above 16 MiB instead of buffering the full export', async () => {
@@ -132,6 +159,28 @@ describe('export file transfers', () => {
     abortController.abort()
 
     await expect(transfer).rejects.toMatchObject({name: 'AbortError'})
+    expect(createObjectURL).not.toHaveBeenCalled()
+    expect(click).not.toHaveBeenCalled()
+  })
+
+  it('cancels a Blob fallback stream that arrives after the download is aborted', async () => {
+    const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:export')
+    const revokeObjectURL = vi.fn<(url: string) => void>()
+    Object.assign(URL, {createObjectURL, revokeObjectURL})
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const abortController = new AbortController()
+    let resolveStream!: (stream: ReadableStream<Uint8Array>) => void
+    const streamPromise = new Promise<ReadableStream<Uint8Array>>(resolve => {
+      resolveStream = resolve
+    })
+    const cancel = vi.fn<() => void>()
+    const transfer = saveStreamToFile(() => streamPromise, 'usage.csv', abortController.signal)
+
+    abortController.abort()
+    resolveStream(new ReadableStream<Uint8Array>({cancel}))
+
+    await expect(transfer).rejects.toMatchObject({name: 'AbortError'})
+    expect(cancel).toHaveBeenCalledOnce()
     expect(createObjectURL).not.toHaveBeenCalled()
     expect(click).not.toHaveBeenCalled()
   })

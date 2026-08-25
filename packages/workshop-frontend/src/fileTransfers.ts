@@ -51,7 +51,15 @@ export async function saveStreamToFile(
     return
   }
 
-  const reader = (await createStream()).getReader()
+  const stream = await createStream()
+  if (signal?.aborted) {
+    try {
+      await stream.cancel(signal.reason)
+    } finally {
+      signal.throwIfAborted()
+    }
+  }
+  const reader = stream.getReader()
   const chunks: ArrayBuffer[] = []
   let total = 0
   const abort = () => { void reader.cancel(signal?.reason) }

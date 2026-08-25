@@ -14,7 +14,10 @@ import {useCallback, useEffect, useRef, useState} from "react";
 import {makeExportFilename, saveStreamToFile} from "../../fileTransfers.js";
 import {m as messages} from "../../paraglide/messages.js";
 import {getLocale} from "../../paraglide/runtime.js";
-import {formatUsageCreditSubunits} from "../billing/formatUsageCredits.js";
+import {
+  formatUsageCreditSubunits,
+  formatUsdRateSubunits,
+} from "../billing/formatUsageCredits.js";
 
 type Props = {api: RpcStub<AdminUsageApi>};
 type ReportState = {api: RpcStub<import("@gadgets/workshop-shared/api").AdminUsageReport>};
@@ -168,6 +171,10 @@ export default function AdminUsageReportBrowser({api}: Props) {
     const controller = new AbortController();
     exportAbort.current = controller;
     setExportState("exporting");
+    const cancelServerExport = () => {
+      void report.api.cancelCsvExports().catch(() => undefined);
+    };
+    controller.signal.addEventListener("abort", cancelServerExport, {once: true});
     try {
       await saveStreamToFile(
         () => report.api.exportCsv(),
@@ -180,6 +187,7 @@ export default function AdminUsageReportBrowser({api}: Props) {
       if (caught instanceof DOMException && caught.name === "AbortError") setExportState("idle");
       else setExportState("failed");
     } finally {
+      controller.signal.removeEventListener("abort", cancelServerExport);
       if (exportAbort.current === controller) exportAbort.current = null;
     }
   };
@@ -337,7 +345,7 @@ function ReportSummary({overview}: {overview: AdminUsageReportOverview}) {
     })}</p>
     <dl className="mt-2 grid grid-cols-1 gap-x-3 gap-y-1 sm:grid-cols-2 lg:grid-cols-4">
       <dt>{messages.admin_usage_provider_cost()}</dt>
-      <dd>{formatReportInteger(overview.metrics.providerCostUsdSubunits)}</dd>
+      <dd>${formatUsdRateSubunits(overview.metrics.providerCostUsdSubunits)}</dd>
       <dt>{messages.admin_usage_charged_credits()}</dt>
       <dd>{formatUsageCreditSubunits(overview.metrics.chargedUsageCreditSubunits)}</dd>
       <dt>{messages.admin_usage_model_tokens()}</dt>
@@ -372,9 +380,12 @@ function ReportTable({page, onDetail}: {
       <th className="p-2">{messages.admin_usage_column_kind()}</th>
       <th className="p-2">{messages.admin_usage_column_source()}</th>
       <th className="p-2">{messages.admin_usage_column_outcome()}</th>
-      <th className="p-2">{messages.admin_usage_filter_pricing()}</th>
+      <th className="p-2">{messages.admin_usage_column_pricing_status()}</th>
       <th className="p-2">{messages.admin_usage_column_target()}</th>
+      <th className="p-2">{messages.admin_usage_column_provider_cost()}</th>
       <th className="p-2">{messages.admin_usage_column_charge()}</th>
+      <th className="p-2">{messages.admin_usage_column_tokens()}</th>
+      <th className="p-2">{messages.admin_usage_column_unpriced_counts()}</th>
       <th className="p-2">{messages.admin_usage_column_detail()}</th>
     </tr></thead>
     <tbody>{page.rows.map(row => <tr key={row.rowId} className="border-b border-kumo-line last:border-0">
@@ -390,7 +401,17 @@ function ReportTable({page, onDetail}: {
         ? messages.admin_usage_priced() : messages.admin_usage_unpriced()}</td>
       <td className="p-2">{row.deploymentModelId ?? [row.gatekeeperId, row.stableMethodKey]
         .filter(Boolean).join(" / ")}</td>
+      <td className="p-2">${formatUsdRateSubunits(row.metrics.providerCostUsdSubunits)}</td>
       <td className="p-2">{formatUsageCreditSubunits(row.metrics.chargedUsageCreditSubunits)}</td>
+      <td className="p-2">{[
+        row.metrics.cacheHitInputTokens,
+        row.metrics.cacheMissInputTokens,
+        row.metrics.cacheWriteInputTokens,
+        row.metrics.outputTokens,
+        row.metrics.reasoningTokens,
+      ].map(formatReportInteger).join(" / ")}</td>
+      <td className="p-2">{formatReportInteger(row.metrics.unpricedModelUses)} / {
+        formatReportInteger(row.metrics.unpricedApiOperations)}</td>
       <td className="p-2">{row.rowKind === "detail" && <Button size="sm" variant="secondary"
         onClick={() => void onDetail(row)}>{messages.admin_usage_view_detail()}</Button>}</td>
     </tr>)}</tbody>
@@ -530,14 +551,11 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
   const [ledgerRef, setLedgerRef] = useState(
     detail.ledgerEntries.find(entry => entry.kind === "usage-charge")?.id ?? "",
   );
-  const [actionId, setActionId] = useState("");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<"idle" | "succeeded" | "failed">("idle");
   const retryIdentity = useRef<{signature: string; operationId: string} | null>(null);
-  const workspaceId = detail.record.kind === "gatekeeper-reconciliation"
-    ? null : detail.record.workspaceId ?? null;
   const unknownAction = detail.record.kind === "gatekeeper" &&
-    detail.record.outcome === "usage-unknown" && workspaceId !== null;
+    detail.record.outcome === "usage-unknown";
 
   const run = async (operation: AdminOperation) => {
     if (running) return;
@@ -548,7 +566,7 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
       if (normalizedReason.length < 1 || normalizedReason.length > 1_000) {
         throw new TypeError("A bounded reason is required.");
       }
-      const signature = JSON.stringify([operation, amount, ledgerRef, actionId, normalizedReason]);
+      const signature = JSON.stringify([operation, amount, ledgerRef, normalizedReason]);
       if (retryIdentity.current?.signature !== signature) {
         retryIdentity.current = {
           signature,
@@ -579,14 +597,10 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
         await api.reverse({registeredUserRef, operationId,
           originalLedgerEntryId: ledgerRef, reason: normalizedReason});
       } else {
-        if (!unknownAction || workspaceId === null || !/^[0-9]+$/.test(actionId)) {
-          throw new TypeError("A valid unknown Action is required.");
-        }
-        const exactActionId = Number(actionId);
-        if (!Number.isSafeInteger(exactActionId)) throw new TypeError("Action ID is too large.");
-        await api.reconcileAction({
-          workspaceId,
-          actionId: exactActionId,
+        if (!unknownAction) throw new TypeError("A valid unknown Usage detail is required.");
+        await api.reconcileUnknownRecord({
+          registeredUserRef,
+          safeRecordRef: detail.record.id,
           operationId,
           decision: operation === "settle-unknown" ? "settle" : "release",
           reason: normalizedReason,
@@ -635,12 +649,6 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
         messages.admin_usage_operations_reverse()}</Button>
     </>}
     {unknownAction && <>
-      <label className="block text-xs text-kumo-subtle">{
-        messages.admin_usage_operations_action_id()}
-        <input aria-label={messages.admin_usage_operations_action_id()} value={actionId}
-          onChange={event => setActionId(event.target.value)} inputMode="numeric"
-          className="mt-1 w-full rounded-md border border-kumo-line bg-kumo-base px-2 py-1" />
-      </label>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" disabled={running} onClick={() => void run("settle-unknown")}>{
           messages.admin_usage_operations_settle_unknown()}</Button>

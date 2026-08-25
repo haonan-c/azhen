@@ -140,13 +140,15 @@ function report(rows: AdminUsageReportRow[] = []) {
   const exportCsv = vi.fn<AdminUsageReport["exportCsv"]>(
     async () => new ReadableStream<Uint8Array>(),
   );
+  const cancelCsvExports = vi.fn<AdminUsageReport["cancelCsvExports"]>(async () => undefined);
   const target = Object.assign(vi.fn<() => void>(), {
     getOverview,
     listRows,
     exportCsv,
+    cancelCsvExports,
     [Symbol.dispose]: dispose,
   }) as unknown as RpcStub<AdminUsageReport>;
-  return {target, dispose, getOverview, listRows, exportCsv};
+  return {target, dispose, getOverview, listRows, exportCsv, cancelCsvExports};
 }
 
 function usageApi(
@@ -338,6 +340,27 @@ describe("administrator frozen Usage report browser", () => {
     expect(current.dispose).toHaveBeenCalledOnce();
   });
 
+  it("uses the report cancel control when the administrator stops an active export", async () => {
+    const current = report();
+    transferMocks.saveStreamToFile.mockImplementation((_createStream, _filename, signal) =>
+      new Promise((_resolve, reject) => signal?.addEventListener("abort", () => {
+        reject(new DOMException("Cancelled", "AbortError"));
+      }, {once: true})));
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("No Usage rows"));
+    const button = (name: string) => Array.from(container!.querySelectorAll("button"))
+      .find(candidate => candidate.textContent === name);
+    await act(async () => button("Export CSV")?.click());
+    await vi.waitFor(() => expect(container?.textContent).toContain("Cancel export"));
+
+    await act(async () => button("Cancel export")?.click());
+
+    await vi.waitFor(() => expect(current.cancelCsvExports).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(container?.textContent).not.toContain("Exporting"));
+  });
+
   it("returns a cancelled stale export to idle when a filter opens a new report", async () => {
     const first = report();
     const second = report();
@@ -382,14 +405,30 @@ describe("administrator frozen Usage report browser", () => {
   });
 
   it("shows exact filtered totals and distinguishes priced-zero from Unpriced rows", async () => {
-    const pricedZero = {...row("priced-zero"), pricingStatus: "priced" as const};
+    const pricedZeroBase = row("priced-zero");
+    const pricedZero = {
+      ...pricedZeroBase,
+      pricingStatus: "priced" as const,
+      metrics: {
+        ...pricedZeroBase.metrics,
+        providerCostUsdSubunits: 2_500_000_000_000_000_000n,
+        chargedUsageCreditSubunits: 3_750_000_000_000_000_000n,
+        cacheHitInputTokens: 101n,
+        cacheMissInputTokens: 102n,
+        cacheWriteInputTokens: 103n,
+        outputTokens: 104n,
+        reasoningTokens: 105n,
+        unpricedModelUses: 106n,
+        unpricedApiOperations: 107n,
+      },
+    };
     const unpriced = {...row("unpriced"), pricingStatus: "unpriced" as const};
     const current = report([pricedZero, unpriced]);
     current.getOverview.mockResolvedValue({
       ...reportOverview(),
       metrics: {
         ...reportOverview().metrics,
-        providerCostUsdSubunits: 101n,
+        providerCostUsdSubunits: 1_250_000_000_000_000_000n,
         chargedUsageCreditSubunits: 202n,
         unpricedModelUses: 2n,
         unpricedApiOperations: 3n,
@@ -401,11 +440,22 @@ describe("administrator frozen Usage report browser", () => {
 
     await vi.waitFor(() => expect(container?.textContent).toContain("priced-zero"));
     expect(container?.textContent).toContain("Provider cost");
-    expect(container?.textContent).toContain("101");
+    const summary = container?.querySelector('[role="status"]');
+    expect(summary?.textContent).toContain("$1.25");
     expect(container?.textContent).toContain("Model tokens");
     expect(container?.textContent).toContain("Unpriced Use");
+    const headings = Array.from(container!.querySelectorAll("thead th"))
+      .map(heading => heading.textContent);
+    expect(headings).toContain("Provider cost (USD)");
+    expect(headings).toContain("Charged credits");
+    expect(headings).toContain("Tokens (hit / miss / write / output / reasoning)");
+    expect(headings).toContain("Unpriced (model / API)");
     const rows = Array.from(container!.querySelectorAll("tbody tr"));
     expect(rows[0]?.textContent).toContain("Priced");
+    expect(rows[0]?.textContent).toContain("$2.5");
+    expect(rows[0]?.textContent).toContain("3.75");
+    expect(rows[0]?.textContent).toContain("101 / 102 / 103 / 104 / 105");
+    expect(rows[0]?.textContent).toContain("106 / 107");
     expect(rows[1]?.textContent).toContain("Unpriced");
   });
 
@@ -616,8 +666,9 @@ describe("administrator frozen Usage report browser", () => {
       .mockImplementation(async request => operationResult("reconcile-balance", request.operationId));
     const reverse = vi.fn<AdminUsageApi["reverse"]>().mockImplementation(async request =>
       operationResult("reverse", request.operationId));
-    const reconcileAction = vi.fn<AdminUsageApi["reconcileAction"]>().mockResolvedValue({
-      workspaceId: "a".repeat(64), actionId: 17, operationId: "operation", decision: "settle",
+    const reconcileUnknownRecord = vi.fn<AdminUsageApi["reconcileUnknownRecord"]>()
+      .mockResolvedValue({
+      operationId: "operation", decision: "settle",
       previousState: "unknown", newState: "accepted", ledgerEntryId: "ledger",
       actorUserId: "admin@example.test", reason: "Bounded audit reason",
       createdAt: "2026-08-24T12:00:00.000Z",
@@ -626,7 +677,7 @@ describe("administrator frozen Usage report browser", () => {
     await render(usageApi(
       vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
       getRecordDetail,
-      {grant, deduct, reconcileBalance, reverse, reconcileAction},
+      {grant, deduct, reconcileBalance, reverse, reconcileUnknownRecord},
     ));
     await vi.waitFor(() => expect(container?.textContent).toContain("vendor / method"));
     const button = (name: string) => Array.from(container!.querySelectorAll("button"))
@@ -659,11 +710,12 @@ describe("administrator frozen Usage report browser", () => {
     await vi.waitFor(() => expect(reverse).toHaveBeenCalledOnce());
     expect(reverse.mock.calls[0]![0].originalLedgerEntryId).toContain(":usage-charge");
 
-    await act(async () => changeInput(input("Action ID")!, "17"));
+    expect(input("Action ID")).toBeNull();
     await act(async () => button("Settle unknown Action")?.click());
-    await vi.waitFor(() => expect(reconcileAction).toHaveBeenCalledOnce());
-    expect(reconcileAction).toHaveBeenCalledWith(expect.objectContaining({
-      workspaceId: "a".repeat(64), actionId: 17, decision: "settle",
+    await vi.waitFor(() => expect(reconcileUnknownRecord).toHaveBeenCalledOnce());
+    expect(reconcileUnknownRecord).toHaveBeenCalledWith(expect.objectContaining({
+      registeredUserRef: usageRow.registeredUserRef, decision: "settle",
+      safeRecordRef: usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "unreachable",
       reason: "Bounded audit reason",
     }));
     expect(button("Release unknown Action")).toBeDefined();
