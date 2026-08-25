@@ -14,8 +14,9 @@ or remove a worktree.
 
 ## Toolchain and fixed point
 
-- Base: `98e1963265840f57463727b1b724b562690c00ee`, the clean `dev` fixed point that includes
-  integrated and closed Issue #62.
+- Rebase base: `4a4b3d27975b9490031c1061571205c8b6fb904a`, the clean `dev` fixed point that includes
+  integrated and closed Issues #62 and #64.
+- Final code fixed point: `9c088ecf86a4423656c76108992b0db6e3aa84f7`.
 - Node: `24.19.0`.
 - pnpm: `11.17.0`, invoked through `corepack pnpm@11.17.0`.
 - Wrangler: `4.119.0`.
@@ -31,7 +32,10 @@ or remove a worktree.
 - A Summary has one random stable `summaryFactId` per canonical UTC bucket and dimension tuple.
   `summaryRevision` is monotonic. It stores absolute counters, not deltas. The Projection replaces a
   stored snapshot by exact new-minus-old arithmetic. Duplicate or older revisions are no-ops, and a
-  conflicting payload at one revision fails closed.
+  conflicting payload at one revision fails closed. Within one generation, the canonical dimension
+  is unique: a second Summary identity for the same dimension is rejected. A higher revision is
+  also rejected if any cumulative exact field decreases. Either rejection leaves the prior
+  snapshot, overview totals, and active-User state unchanged.
 - New Summary-backed generations use only aggregate snapshots for overview totals. Recent detail is
   retained only for report rows. Model tokens, provider-cost subunits, charged Usage Credit
   subunits, API counts, pre-execution failure counts, unknown counts, and Summary revisions remain
@@ -105,12 +109,13 @@ or remove a worktree.
   persisted `deleting` jobs. It cannot choose a target or mint general administrator authority.
   Failure leaves the alarm armed for its own retry and does not depend on future User traffic or an
   administrator replay.
-- The User DO
-  then stores a permanent deletion tombstone, revokes password and sessions, replaces direct profile
-  fields with a safe short pseudonym, and blocks new login, session creation, reserve, Metered Use,
-  profile changes, avatar writes, own balance reads, and own detail reads. Operations already started
-  before deletion can reach a formal terminal result, and unknown-held Usage remains available for
-  administrator reconciliation.
+- The User DO then stores a permanent deletion tombstone, revokes password and sessions, releases
+  retained balance subscribers, replaces direct profile fields with a safe short pseudonym, and
+  blocks new login, session creation, reserve, Metered Use, profile changes, avatar writes, balance
+  subscription, activation acknowledgement, own balance/detail/Reservation/Ledger reads, and
+  discovered-method reads. A capability or subscriber issued before deletion cannot continue to use
+  those own-User surfaces. Operations already started before deletion can reach a formal terminal
+  result, and unknown-held Usage remains available for administrator reconciliation.
 - The User DO keeps the target AVATAR key only as transient local cleanup authority until an
   idempotent KV deletion succeeds; it removes that key before its local tombstone becomes terminal.
   Avatar write, read, and deletion share one Cloudflare KV key validator: the key is non-empty,
@@ -160,11 +165,13 @@ or weakened. The following results are from the isolated worktree:
 | Command or focused gate | Result |
 | --- | --- |
 | `vitest run --config vitest.usage-retention.config.ts` | GREEN: 3 files, 24 tests. Covers absolute Summary revisions, forbidden-data sentinels, exact large integers, attempt/model/gatekeeper counters, released-vs-held Model unknown retention, 24-month boundaries, leap-day scheduling, bounded restart, reconciliation snapshot/replay-tombstone lifetime, deletion ACK-loss recovery, anonymous rebuild, self-delete rejection, capability revocation, and the Cloudflare KV 512 UTF-8 byte Avatar boundary. |
-| `vitest run --config vitest.usage-projection.config.ts` | GREEN: 1 file, 54 tests. Covers Summary-backed bootstrap, duplicate/out-of-order revisions, privacy metadata, bounded generation cleanup, 10,000-User bootstrap, and the staged 33-record restart path. This suite intentionally uses the deployment singleton Registry/Projection and runs in a dedicated config so another singleton test cannot advance its manual alarm boundaries. |
+| `vitest run --config vitest.usage-projection.config.ts` | GREEN twice consecutively: 1 file, 56/56 tests in each run. Covers Summary-backed bootstrap, duplicate/out-of-order revisions, per-generation dimension identity, per-field cumulative monotonicity, privacy metadata, bounded generation cleanup, 10,000-User bootstrap, and the staged 33-record restart path. This suite intentionally uses the deployment singleton Registry/Projection and runs in a dedicated config so another singleton test cannot advance its manual alarm boundaries. |
+| Own-User Usage view focused suite | GREEN: 11/11. Covers live-capability rejection and retained-subscriber release across balance, balance subscription, activation acknowledgement, record, Reservation, Ledger, and discovered-method surfaces after deletion. |
 | `vitest run __tests__/usage-account-gatekeeper.test.ts` | GREEN: 1 file, 23 tests. The legacy reconciliation fixture removes its snapshot and proves bounded upgrade. A second fixture removes both snapshot and original authority and proves fail-closed behavior. |
 | Staged 33-record legacy backfill | GREEN. The first persisted backfill page creates 64 detail/aggregate facts for 32 records. After the controlled restart, delivery advances 16, then 32, then 33 absolute Summary contributions while pending facts move 34, 2, 0. Persistent stages and cursors are monotonic, and duplicate delivery does not increment totals. |
-| Production-shape retention/deletion Cap'n Web test | GREEN: 1 test. It uses the production Worker fetch handler, real WebSocket RPC, production DO/KV bindings, Summary-only post-retention overview, capability-bound deletion, idempotent replay, identity search removal, old-session rejection, login rejection, and stable totals. It is part of the normal Backend `test` entry. |
-| `corepack pnpm@11.17.0 --filter @gadgets/workshop-backend test` | GREEN: 611 passed, 4 expected skips, 0 failed. This includes 451 default workerd tests, 54 singleton Projection tests, 24 serial #65 tests, 15 Admin tests, 35 metered-model tests, 24 production-binding integration tests plus 4 skips, 2 Registry RPC tests, and browser export tests. |
+| Production-shape retention/deletion Cap'n Web test | GREEN: 1/1. It uses the production Worker fetch handler, real WebSocket RPC, production DO/KV bindings, Summary-only post-retention overview, capability-bound deletion, idempotent replay, live capability/subscriber revocation, identity search removal, old-session rejection, login rejection, and stable totals. It runs through its dedicated stable config in the normal Backend `test` entry. |
+| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN: 635 passed, 4 expected skips, 0 failed. This includes the dedicated 56-test singleton Projection suite, 24-test serial retention suite, and 1-test real retention/deletion RPC entry. |
+| Loader restart billing trace | GREEN: the exact focused case passed 3/3 consecutive runs, the complete DeepSeek file passed 9/9, and the final root run also passed that file 9/9. The test classifies the bounded semantic provider calls, permits at most one same-identity transport replay, and retains exact authority Usage Record, balance, and totals assertions. |
 | Frontend administrator overview focused test | GREEN: 1 file, 8 tests. The exact `meteredUseCount` DTO addition remains compatible with Summary-only and unavailable overview states. |
 | Shared, Backend, and Frontend package builds | GREEN. Shared and Backend TypeScript passed; the Frontend TypeScript and production Vite build passed. Vite reported only the existing chunk-size and mixed static/dynamic import warnings. |
 | Integration Tests package build | GREEN: both the main and UGC Ads billing TypeScript programs passed. |
@@ -187,14 +194,42 @@ One early Backend attempt finished 32 default files and 439 tests, then reported
 `Timeout starting cloudflare-pool runner` before one runner started. It had no product assertion
 failure and is recorded only as an infrastructure startup failure. After terminating only the
 diagnostic process tree and confirming a clean fleet, the normal package entry passed. The final
-fixed-point run after the Avatar byte-boundary correction passed the 611/4 matrix above.
+fixed-point run after all review corrections passed the 635/4 matrix above.
+
+## Final review and repository gates
+
+The final dual-axis review first reported two P1 and two P2 findings. Focused RED tests reproduced
+the two implementation findings: a live own-User Usage capability/subscriber survived deletion, and
+the Projection accepted either a second Summary identity for one generation/dimension or a higher
+revision with a cumulative-field rollback. The minimum product changes above made those tests GREEN.
+The integration-test P2 was closed by moving deleted-User RPC failures into a dedicated config with
+an exact allowlist. The documentation P2 is closed by this final evidence update. The follow-up
+implementation review reported zero remaining P0-P2 findings.
+
+All final commands used the real repository entry points at the final code fixed point. External
+provider behavior remained controlled; these results are local verification, not production
+deployment evidence.
+
+| Final gate | Result |
+| --- | --- |
+| `corepack pnpm test` | GREEN in 18m19.79s. Root Node tests: 117/117. Backend preflight: 635 passed, 4 expected skips, 0 failed. Production Harness: 13/13 files and 115/115 tests in 669.28s; DeepSeek passed 9/9 and its billing trace took 30.115s. Frontend passed 362/362 plus first-party copy 1/1. Vite+ completed 36/36 workspace tasks. |
+| `corepack pnpm build` | GREEN in 38.915s. Existing Vite mixed-import and chunk-size warnings were non-blocking. |
+| `corepack pnpm lint` | GREEN in 43.582s with configured non-blocking repository warnings only. |
+| `node --test scripts/release-manifest.test.js` | GREEN: 4/4. |
+| `corepack pnpm types:generate` | Exit 0 in 2m19.84s. No Issue #65 binding, migration, or golden change was generated. The only diff was unrelated UGC Ads workerd metadata drift; it was reviewed and excluded. The final worktree is clean. |
+| `git diff --check` | GREEN at the final code fixed point and after the release dry-run. |
+
+The production-shape release command used Wrangler `4.119.0` in dry-run mode and exited 0 in
+2m37.54s. Release ID `issue-65-local` contains 19 Workers, 85 unique modules, and 36 unique asset
+blobs in a 28 MiB output. The retained local evidence directory is
+`/tmp/azhen-issue65-release.lsQ2DJ/release-out`. The command did not upload, promote, deploy, change
+production configuration, or enable charging.
 
 ## Remaining coordinated gates
 
-The fixed-point focused workerd, complete Workshop Backend package, affected builds, lint, and
-whitespace gates are complete in this worktree. Root build/test/lint, the release-manifest golden,
-and local production-shape release dry-run remain coordinated main-agent integration gates. They
-must be recorded here or in the integration report before Issue #65 is closed. No upload, promotion,
+All branch gates are complete at the fixed point recorded above. The remaining steps belong to the
+main agent: integrate the reviewed branch into `dev` with `--no-ff`, run the required integration-tree
+gates, push `origin/dev`, add the evidence comment, and close Issue #65. No upload, promotion,
 deploy, production configuration change, charging change, or worktree deletion is authorized.
 
 Issue #66 owns the final `usage-capacity-v1` million-record acceptance run. The #65 algorithms are

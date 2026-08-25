@@ -1,6 +1,6 @@
 # Usage Credits delivery work log
 
-Last updated: 2026-08-20
+Last updated: 2026-08-25
 
 ## Objective
 
@@ -693,3 +693,36 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   `lint:check`; and `git diff --check`. The real Cap'n Web retention/deletion RPC remains part of the
   24-test production-binding integration group. No push, merge, pull request, Issue closure, upload,
   promotion, deployment, production change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #65 post-#64 rebase and final branch gates
+
+- Rebasing over `dev` fixed point `4a4b3d27975b9490031c1061571205c8b6fb904a` retained Issue #64's
+  own-User subscription, activation, and DTO isolation and Issue #65's Summary, retention, and
+  deletion authority. The final code fixed point is
+  `9c088ecf86a4423656c76108992b0db6e3aa84f7`.
+- Final dual-axis review first found two P1 and two P2 issues. TDD corrections revoke live own-User
+  Usage capabilities and subscribers after deletion, enforce one Summary identity per generation
+  and dimension, reject every cumulative-field rollback, and isolate expected deleted-User RPC
+  failures in a dedicated integration config. Follow-up implementation review reported zero
+  remaining P0-P2 findings. This final documentation update closes the remaining evidence P2.
+- Focused evidence passed: singleton Projection 56/56 twice consecutively; own-User Usage view
+  11/11; retention serial 24/24; real Cap'n Web retention/deletion RPC 1/1; and the complete Backend
+  package 635 passed with 4 expected skips and 0 failures. Loader restart evidence passed the exact
+  case 3/3 consecutive times, the complete DeepSeek file 9/9, and the final root DeepSeek file 9/9.
+- The final root `corepack pnpm test` passed in 18m19.79s: root Node 117/117, Backend 635/4 expected
+  skips, production Harness 13/13 files and 115/115 tests in 669.28s, Frontend 362/362 plus
+  first-party copy 1/1, and 36/36 Vite+ workspace tasks. DeepSeek passed 9/9; its billing trace took
+  30.115s.
+- Root build passed in 38.915s. Root lint passed in 43.582s with configured non-blocking warnings.
+  Release-manifest golden tests passed 4/4, and `git diff --check` passed.
+- `corepack pnpm types:generate` exited 0 in 2m19.84s. It produced no Issue #65 binding, migration,
+  or golden change. One unrelated UGC Ads workerd metadata drift was reviewed and excluded; the
+  final worktree was clean.
+- The local production-shape release dry-run used release ID `issue-65-local`, exited 0 in 2m37.54s,
+  and produced 19 Workers, 85 unique modules, and 36 unique asset blobs in 28 MiB under the retained
+  `/tmp/azhen-issue65-release.lsQ2DJ/release-out` directory. It did not upload, promote, deploy,
+  change production configuration, or enable charging. This is local execution of production code
+  paths with controlled external mocks, not production deployment verification.
+- All Issue #65 branch gates are complete. Only main-agent `--no-ff` integration, integration-tree
+  gates, push, evidence comment, and Issue closure remain. No pull request, worktree deletion, or
+  production mutation occurred in this branch-gate step.
