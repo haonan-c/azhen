@@ -171,23 +171,33 @@ export default function AdminUsageReportBrowser({api}: Props) {
     const controller = new AbortController();
     exportAbort.current = controller;
     setExportState("exporting");
-    const cancelServerExport = () => {
-      void report.api.cancelCsvExports().catch(() => undefined);
+    let streamCreated = false;
+    const cancelServerExport = async () => {
+      await report.api.cancelCsvExports().catch(() => undefined);
     };
-    controller.signal.addEventListener("abort", cancelServerExport, {once: true});
+    const cancelServerExportOnAbort = () => {
+      void cancelServerExport();
+    };
+    controller.signal.addEventListener("abort", cancelServerExportOnAbort, {once: true});
     try {
       await saveStreamToFile(
-        () => report.api.exportCsv(),
+        async () => {
+          const stream = await report.api.exportCsv();
+          streamCreated = true;
+          return stream;
+        },
         makeExportFilename(`usage-${new Date().toISOString().slice(0, 10)}`, ".csv"),
         controller.signal,
       );
       if (revision === requestRevision.current) setExportState("idle");
     } catch (caught) {
+      const aborted = caught instanceof DOMException && caught.name === "AbortError";
+      if (!aborted && streamCreated) await cancelServerExport();
       if (revision !== requestRevision.current) return;
-      if (caught instanceof DOMException && caught.name === "AbortError") setExportState("idle");
+      if (aborted) setExportState("idle");
       else setExportState("failed");
     } finally {
-      controller.signal.removeEventListener("abort", cancelServerExport);
+      controller.signal.removeEventListener("abort", cancelServerExportOnAbort);
       if (exportAbort.current === controller) exportAbort.current = null;
     }
   };
@@ -386,6 +396,10 @@ function ReportTable({page, onDetail}: {
       <th className="p-2">{messages.admin_usage_column_charge()}</th>
       <th className="p-2">{messages.admin_usage_column_tokens()}</th>
       <th className="p-2">{messages.admin_usage_column_unpriced_counts()}</th>
+      <th className="p-2">{messages.admin_usage_column_metered_uses()}</th>
+      <th className="p-2">{messages.admin_usage_column_billable_operations()}</th>
+      <th className="p-2">{messages.admin_usage_column_pre_execution_failures()}</th>
+      <th className="p-2">{messages.admin_usage_column_unknown_operations()}</th>
       <th className="p-2">{messages.admin_usage_column_detail()}</th>
     </tr></thead>
     <tbody>{page.rows.map(row => <tr key={row.rowId} className="border-b border-kumo-line last:border-0">
@@ -412,6 +426,10 @@ function ReportTable({page, onDetail}: {
       ].map(formatReportInteger).join(" / ")}</td>
       <td className="p-2">{formatReportInteger(row.metrics.unpricedModelUses)} / {
         formatReportInteger(row.metrics.unpricedApiOperations)}</td>
+      <td className="p-2">{formatReportInteger(row.metrics.meteredUseCount)}</td>
+      <td className="p-2">{formatReportInteger(row.metrics.billableApiOperations)}</td>
+      <td className="p-2">{formatReportInteger(row.metrics.preExecutionFailures)}</td>
+      <td className="p-2">{formatReportInteger(row.metrics.unknownOperations)}</td>
       <td className="p-2">{row.rowKind === "detail" && <Button size="sm" variant="secondary"
         onClick={() => void onDetail(row)}>{messages.admin_usage_view_detail()}</Button>}</td>
     </tr>)}</tbody>
@@ -566,7 +584,14 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
       if (normalizedReason.length < 1 || normalizedReason.length > 1_000) {
         throw new TypeError("A bounded reason is required.");
       }
-      const signature = JSON.stringify([operation, amount, ledgerRef, normalizedReason]);
+      const signature = JSON.stringify([
+        registeredUserRef,
+        detail.record.id,
+        operation,
+        amount,
+        ledgerRef,
+        normalizedReason,
+      ]);
       if (retryIdentity.current?.signature !== signature) {
         retryIdentity.current = {
           signature,

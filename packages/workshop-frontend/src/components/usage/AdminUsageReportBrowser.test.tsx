@@ -361,6 +361,36 @@ describe("administrator frozen Usage report browser", () => {
     await vi.waitFor(() => expect(container?.textContent).not.toContain("Exporting"));
   });
 
+  it.each([
+    ["FSA sink", new Error("File system sink failed")],
+    ["Blob size limit", new Error("This export is larger than 16 MiB")],
+    ["stream read", new Error("CSV stream read failed")],
+  ])("releases CSV slots after two %s failures and permits another retry", async (_kind, failure) => {
+    const current = report();
+    let transferAttempt = 0;
+    transferMocks.saveStreamToFile.mockImplementation(async createStream => {
+      await createStream();
+      transferAttempt += 1;
+      if (transferAttempt <= 2) throw failure;
+    });
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("No Usage rows"));
+    const button = (name: string) => Array.from(container!.querySelectorAll("button"))
+      .find(candidate => candidate.textContent === name);
+
+    await act(async () => button("Export CSV")?.click());
+    await vi.waitFor(() => expect(current.cancelCsvExports).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(container?.textContent).toContain("The export failed"));
+    await act(async () => button("Export CSV")?.click());
+    await vi.waitFor(() => expect(current.cancelCsvExports).toHaveBeenCalledTimes(2));
+    await act(async () => button("Export CSV")?.click());
+
+    await vi.waitFor(() => expect(current.exportCsv).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(container?.textContent).not.toContain("The export failed"));
+  });
+
   it("returns a cancelled stale export to idle when a filter opens a new report", async () => {
     const first = report();
     const second = report();
@@ -420,6 +450,10 @@ describe("administrator frozen Usage report browser", () => {
         reasoningTokens: 105n,
         unpricedModelUses: 106n,
         unpricedApiOperations: 107n,
+        meteredUseCount: 9_007_199_254_740_993n,
+        billableApiOperations: 9_007_199_254_740_994n,
+        preExecutionFailures: 9_007_199_254_740_995n,
+        unknownOperations: 9_007_199_254_740_996n,
       },
     };
     const unpriced = {...row("unpriced"), pricingStatus: "unpriced" as const};
@@ -450,12 +484,20 @@ describe("administrator frozen Usage report browser", () => {
     expect(headings).toContain("Charged credits");
     expect(headings).toContain("Tokens (hit / miss / write / output / reasoning)");
     expect(headings).toContain("Unpriced (model / API)");
+    expect(headings).toContain("Metered uses");
+    expect(headings).toContain("Billable API operations");
+    expect(headings).toContain("Pre-execution failures");
+    expect(headings).toContain("Unknown operations");
     const rows = Array.from(container!.querySelectorAll("tbody tr"));
     expect(rows[0]?.textContent).toContain("Priced");
     expect(rows[0]?.textContent).toContain("$2.5");
     expect(rows[0]?.textContent).toContain("3.75");
     expect(rows[0]?.textContent).toContain("101 / 102 / 103 / 104 / 105");
     expect(rows[0]?.textContent).toContain("106 / 107");
+    expect(rows[0]?.textContent).toContain("9,007,199,254,740,993");
+    expect(rows[0]?.textContent).toContain("9,007,199,254,740,994");
+    expect(rows[0]?.textContent).toContain("9,007,199,254,740,995");
+    expect(rows[0]?.textContent).toContain("9,007,199,254,740,996");
     expect(rows[1]?.textContent).toContain("Unpriced");
   });
 
@@ -719,6 +761,88 @@ describe("administrator frozen Usage report browser", () => {
       reason: "Bounded audit reason",
     }));
     expect(button("Release unknown Action")).toBeDefined();
+  });
+
+  it("uses a new unknown-operation ID when refreshed authority changes", async () => {
+    const usageRow: AdminUsageReportRow = {
+      ...row("changing-unknown-authority"),
+      meteredKind: "gatekeeper",
+      outcome: "usage-unknown",
+      deploymentModelId: null,
+      gatekeeperId: "vendor",
+      stableMethodKey: "method",
+      externalAccountId: "account",
+    };
+    const firstRecordId = crypto.randomUUID();
+    const detail: import("@gadgets/workshop-shared/api").AdminUsageRecordDetail = {
+      record: {
+        kind: "gatekeeper",
+        id: firstRecordId,
+        source: "agent",
+        workspaceId: "a".repeat(64),
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        externalAccountId: "account",
+        pricing: "priced",
+        outcome: "usage-unknown",
+        chargeSubunits: null,
+        createdAt: "2026-08-24T12:00:00.000Z",
+      },
+      chargeSnapshot: {
+        kind: "gatekeeper",
+        pricing: "priced",
+        usageRateVersion: 2n,
+        issuedAt: "2026-08-24T11:59:00.000Z",
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        chargeSubunits: 9n,
+      },
+      reservation: null,
+      ledgerEntries: [],
+      reconciliation: null,
+    };
+    const secondDetail = {
+      ...detail,
+      record: {...detail.record, id: crypto.randomUUID()},
+    };
+    const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>()
+      .mockResolvedValueOnce(detail)
+      .mockResolvedValue(secondDetail);
+    const reconcileUnknownRecord = vi.fn<AdminUsageApi["reconcileUnknownRecord"]>()
+      .mockImplementation(async request => ({
+        operationId: request.operationId,
+        decision: request.decision,
+        previousState: "unknown",
+        newState: request.decision === "settle" ? "accepted" : "failed-before-execution",
+        ledgerEntryId: null,
+        actorUserId: "admin@example.test",
+        reason: request.reason,
+        createdAt: "2026-08-24T12:00:00.000Z",
+      }));
+    const current = report([usageRow]);
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+      getRecordDetail,
+      {reconcileUnknownRecord},
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("vendor / method"));
+    const button = (name: string) => Array.from(container!.querySelectorAll("button"))
+      .find(candidate => candidate.textContent === name);
+    await act(async () => button("View detail")?.click());
+    const reason = await vi.waitFor(() => {
+      const input = container!.querySelector<HTMLTextAreaElement>('textarea[aria-label="Reason"]');
+      if (!input) throw new Error("Expected the operation reason.");
+      return input;
+    });
+    await act(async () => changeInput(reason, "Same bounded reason"));
+
+    await act(async () => button("Settle unknown Action")?.click());
+    await vi.waitFor(() => expect(getRecordDetail).toHaveBeenCalledTimes(2));
+    await act(async () => button("Settle unknown Action")?.click());
+    await vi.waitFor(() => expect(reconcileUnknownRecord).toHaveBeenCalledTimes(2));
+
+    expect(reconcileUnknownRecord.mock.calls[1]![0].operationId)
+      .not.toBe(reconcileUnknownRecord.mock.calls[0]![0].operationId);
   });
 
   it("shows reconciliation-only authority without an older raw Usage Record", async () => {
