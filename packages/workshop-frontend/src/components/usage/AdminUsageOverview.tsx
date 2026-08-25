@@ -138,7 +138,7 @@ export default function AdminUsageOverview({adminApi}: Props) {
 
   const metrics = view.metrics;
   const tokenTotal = metrics.cacheHitInputTokens + metrics.cacheMissInputTokens +
-    metrics.outputTokens;
+    metrics.cacheWriteInputTokens + metrics.outputTokens;
   return (
     <section aria-labelledby="admin-usage-heading" className="space-y-4">
       <UsageHeading />

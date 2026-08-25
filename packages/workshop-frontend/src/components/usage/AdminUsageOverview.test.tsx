@@ -83,6 +83,7 @@ describe("administrator Usage and Credits overview", () => {
 
     await vi.waitFor(() => expect(container?.textContent).toContain("未定价用量"));
     expect(container?.textContent).toContain("9,007,199,254,740,993");
+    expect(container?.textContent).toContain("9,007,199,254,741,002");
     expect(container?.textContent).toContain("1.5");
     expect(container?.textContent).toContain("6 / 10");
     expect(container?.querySelector('[role="alert"]')?.textContent).toContain("7");

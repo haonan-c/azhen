@@ -922,11 +922,11 @@ export type AdminUsageProjectionHealth = {
   lastIngestedAt: string | null;
   /** Canonical UTC source time of the latest applied fact, or null before the first fact. */
   latestAppliedSourceAt: string | null;
-  /** Canonical UTC source time of the oldest unapplied fact, or null when none is pending. */
+  /** Canonical UTC source time of the oldest unapplied Projection sequence entry. */
   oldestPendingAt: string | null;
-  /** Exact number of accepted Projection facts still waiting to be applied. */
+  /** Exact number of Projection facts or rejection markers still waiting to be applied. */
   pendingEventCount: bigint;
-  /** Exact Registry watermark for User outbox facts still waiting for Projection acknowledgement. */
+  /** Exact number of User outbox facts still waiting for Projection acknowledgement. */
   deliveryPendingEventCount: bigint;
   /** Exact number of Usage Principals with a source-sequence gap. */
   sequenceGapCount: bigint;

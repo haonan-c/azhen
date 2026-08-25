@@ -302,10 +302,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           if (marker.stored && meta.rebuild_state === "rebuilding" &&
               meta.rebuild_generation !== null &&
               meta.rebuild_generation !== meta.active_generation) {
-            const rebuildMarker = this.#ingestRejectionMarker(
-              envelope, meta.rebuild_generation, false,
-            );
-            if (!rebuildMarker.stored) this.#failRebuild("projection-write-failed");
+            this.#ingestRejectionMarker(envelope, meta.rebuild_generation, false, true);
           }
         }
         rejected.push({projectionFactId, code});
@@ -317,11 +314,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (result.rejection !== null) {
         if (result.sequenceRejectionAccepted && meta.rebuild_state === "rebuilding" &&
             meta.rebuild_generation !== null &&
-            meta.rebuild_generation !== meta.active_generation &&
-            !this.#ingestSequenceRejection(
-              fact, meta.rebuild_generation, result.rejection, false,
-            )) {
-          this.#failRebuild("projection-write-failed");
+            meta.rebuild_generation !== meta.active_generation) {
+          this.#ingestRebuildSequenceRejection(
+            fact, meta.rebuild_generation, result.rejection,
+          );
         }
         rejected.push({projectionFactId: fact.projectionFactId, code: result.rejection});
         continue;
@@ -329,9 +325,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (meta.rebuild_state === "rebuilding" &&
           meta.rebuild_generation !== null && meta.rebuild_generation !== meta.active_generation) {
         try {
-          if (this.#ingestOne(fact, hash, meta.rebuild_generation, false).rejection !== null) {
-            this.#failRebuild("projection-write-failed");
-          }
+          this.#ingestOne(fact, hash, meta.rebuild_generation, false, true);
         } catch {
           this.#failRebuild("projection-write-failed");
         }
@@ -484,12 +478,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     if (refreshed.rebuild_state === "rebuilding") {
       throw new Error("A Usage Projection rebuild is already running.");
     }
-    const generation = (BigInt(refreshed.active_generation) + 1n).toString();
-    const startedAt = new Date().toISOString();
     this.rebuildPreparations += 1;
     try {
       await this.ctx.storage.setAlarm(Date.now());
       this.ctx.storage.transactionSync(() => {
+        const latest = this.#meta();
+        if (latest.rebuild_request_id === requestId && latest.rebuild_state !== null) return;
+        if (latest.rebuild_state === "rebuilding") {
+          throw new Error("A Usage Projection rebuild is already running.");
+        }
+        if (latest.cleanup_generation !== null) {
+          throw new Error("Usage Projection generation cleanup is still running.");
+        }
+        const generation = (BigInt(latest.active_generation) + 1n).toString();
+        const startedAt = new Date().toISOString();
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_facts WHERE generation = ?
         `, generation);
@@ -708,14 +710,14 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           } catch {
             const envelope = normalizeProjectionFactEnvelope(input);
             const marker = this.#ingestRejectionMarker(
-              envelope, meta.rebuild_generation, false,
+              envelope, meta.rebuild_generation, false, true,
             );
-            if (!marker.stored) throw new Error(marker.code);
+            if (!marker.stored) return;
             continue;
           }
           const hash = await hashProjectionFact(fact);
-          const result = this.#ingestOne(fact, hash, meta.rebuild_generation, false);
-          if (result.rejection !== null) throw new Error(result.rejection);
+          const result = this.#ingestOne(fact, hash, meta.rebuild_generation, false, true);
+          if (result.rejection !== null && !result.sequenceRejectionAccepted) return;
         }
       } catch {
         this.#failRebuild("projection-write-failed");
@@ -903,8 +905,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   #ingestRejectionMarker(
       fact: UsageProjectionFact,
       generation: string,
-      updateActiveMeta: boolean): IngestRejectionResult {
+      updateActiveMeta: boolean,
+      failRebuildOnRejection = false): IngestRejectionResult {
     return this.ctx.storage.transactionSync(() => {
+      const complete = (result: IngestRejectionResult): IngestRejectionResult => {
+        if (failRebuildOnRejection && !result.stored) {
+          this.#failRebuild("projection-write-failed");
+        }
+        return result;
+      };
       const existingFactById = this.ctx.storage.sql.exec<{
         principal_ref: string;
         source_sequence: string;
@@ -916,7 +925,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         if (updateActiveMeta) {
           this.#recordFailureInTransaction(this.#meta(), "fact-id-conflict");
         }
-        return {code: "fact-id-conflict", stored: false};
+        const samePrincipalNewSequence =
+          existingFactById.principal_ref === fact.usagePrincipalRef &&
+          existingFactById.source_sequence !== fact.sourceSequence.toString();
+        const stored = samePrincipalNewSequence && this.#ingestSequenceRejection(
+          fact, generation, "fact-id-conflict", updateActiveMeta,
+        );
+        return complete({code: "fact-id-conflict", stored});
       }
       const existingMarkerById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
         SELECT fact_id, principal_ref, source_sequence, source_time, code, applied
@@ -928,10 +943,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         if (!sameSequence && updateActiveMeta) {
           this.#recordFailureInTransaction(this.#meta(), "fact-id-conflict");
         }
-        return {
-          code: sameSequence ? existingMarkerById.code : "fact-id-conflict",
-          stored: sameSequence,
-        };
+        const samePrincipalNewSequence =
+          existingMarkerById.principal_ref === fact.usagePrincipalRef && !sameSequence;
+        const stored = sameSequence || samePrincipalNewSequence &&
+          this.#ingestSequenceRejection(
+            fact, generation, "fact-id-conflict", updateActiveMeta,
+          );
+        return complete({
+          code: sameSequence ? existingMarkerById.code : "fact-id-conflict", stored,
+        });
       }
       const sequenceOccupied = this.ctx.storage.sql.exec<{present: string}>(`
         SELECT CAST(EXISTS(
@@ -948,7 +968,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         if (updateActiveMeta) {
           this.#recordFailureInTransaction(this.#meta(), "source-sequence-conflict");
         }
-        return {code: "source-sequence-conflict", stored: false};
+        return complete({code: "source-sequence-conflict", stored: false});
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_rejections (
@@ -956,10 +976,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ) VALUES (?, ?, ?, ?, ?, 'invalid-fact', 0)
       `, generation, fact.projectionFactId, fact.usagePrincipalRef,
       fact.sourceSequence.toString(), projectionFactSourceTime(fact));
-      this.#applyContiguous(
+      const applied = this.#applyContiguous(
         generation, fact.usagePrincipalRef, updateActiveMeta, fact.projectionFactId,
       );
-      return {code: "invalid-fact", stored: true};
+      return complete({
+        code: "invalid-fact",
+        stored: updateActiveMeta || applied.anyRejection === null,
+      });
     });
   }
 
@@ -967,8 +990,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       fact: UsageProjectionFact,
       hash: string,
       generation: string,
-      updateActiveMeta: boolean): IngestOneResult {
+      updateActiveMeta: boolean,
+      failRebuildOnRejection = false): IngestOneResult {
     return this.ctx.storage.transactionSync(() => {
+      const complete = (result: IngestOneResult): IngestOneResult => {
+        if (failRebuildOnRejection && result.rejection !== null &&
+            !result.sequenceRejectionAccepted) {
+          this.#failRebuild("projection-write-failed");
+        }
+        return result;
+      };
       const meta = this.#meta();
       const existingById = this.ctx.storage.sql.exec<{
         fact_hash: string;
@@ -982,13 +1013,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       `, generation, fact.projectionFactId).toArray()[0];
       if (existingById) {
         if (existingById.fact_hash === hash) {
-          return existingById.applied === -1
+          return complete(existingById.applied === -1
             ? {rejection: "invalid-fact", applied: false, sequenceRejectionAccepted: false}
             : {
                 rejection: null,
                 applied: existingById.applied === 1,
                 sequenceRejectionAccepted: false,
-              };
+              });
         }
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
         const samePrincipalNewSequence =
@@ -998,7 +1029,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           this.#ingestSequenceRejection(
             fact, generation, "fact-id-conflict", updateActiveMeta,
           );
-        return {rejection: "fact-id-conflict", applied: false, sequenceRejectionAccepted};
+        return complete({
+          rejection: "fact-id-conflict", applied: false, sequenceRejectionAccepted,
+        });
       }
       const existingRejectionById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
         SELECT fact_id, principal_ref, source_sequence, source_time, code, applied
@@ -1008,18 +1041,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         const sameSequence = existingRejectionById.principal_ref === fact.usagePrincipalRef &&
           existingRejectionById.source_sequence === fact.sourceSequence.toString();
         if (sameSequence) {
-          return {
+          return complete({
             rejection: existingRejectionById.code,
             applied: false,
             sequenceRejectionAccepted: false,
-          };
+          });
         }
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
         const samePrincipal = existingRejectionById.principal_ref === fact.usagePrincipalRef;
         const sequenceRejectionAccepted = samePrincipal && this.#ingestSequenceRejection(
           fact, generation, "fact-id-conflict", updateActiveMeta,
         );
-        return {rejection: "fact-id-conflict", applied: false, sequenceRejectionAccepted};
+        return complete({
+          rejection: "fact-id-conflict", applied: false, sequenceRejectionAccepted,
+        });
       }
       const existingBySequence = this.ctx.storage.sql.exec<{fact_hash: string}>(`
         SELECT fact_hash FROM usage_projection_facts
@@ -1027,11 +1062,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       `, generation, fact.usagePrincipalRef, fact.sourceSequence.toString()).toArray()[0];
       if (existingBySequence) {
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "source-sequence-conflict");
-        return {
+        return complete({
           rejection: "source-sequence-conflict",
           applied: false,
           sequenceRejectionAccepted: false,
-        };
+        });
       }
       const existingRejectionBySequence = this.ctx.storage.sql.exec<{fact_id: string}>(`
         SELECT fact_id FROM usage_projection_rejections
@@ -1041,11 +1076,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         if (updateActiveMeta) {
           this.#recordFailureInTransaction(meta, "source-sequence-conflict");
         }
-        return {
+        return complete({
           rejection: "source-sequence-conflict",
           applied: false,
           sequenceRejectionAccepted: false,
-        };
+        });
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_facts (
@@ -1086,7 +1121,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       const stored = this.ctx.storage.sql.exec<{applied: number}>(`
         SELECT applied FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
       `, generation, fact.projectionFactId).one();
-      return {rejection, applied: stored.applied === 1, sequenceRejectionAccepted: false};
+      return complete({
+        rejection, applied: stored.applied === 1, sequenceRejectionAccepted: false,
+      });
+    });
+  }
+
+  #ingestRebuildSequenceRejection(
+      fact: UsageProjectionFact,
+      generation: string,
+      code: UsageProjectionRejection["code"]): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const accepted = this.#ingestSequenceRejection(fact, generation, code, false);
+      if (!accepted) this.#failRebuild("projection-write-failed");
+      return accepted;
     });
   }
 

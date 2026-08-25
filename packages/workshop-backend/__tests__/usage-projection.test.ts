@@ -747,6 +747,59 @@ describe("deployment Usage Projection", () => {
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
 
+  it("rebuilds a same-principal fact ID conflict through its sequence marker", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const registeredUserRef = crypto.randomUUID();
+    const usagePrincipalRef = crypto.randomUUID();
+    const first = fact({
+      usagePrincipalRef, sourceSequence: 1n,
+      cacheHitInputTokens: 3n, providerCostUsdSubunits: 3n,
+    });
+    const conflicting = fact({
+      ...first, sourceSequence: 2n,
+      cacheHitInputTokens: 5n, providerCostUsdSubunits: 5n,
+    });
+    const third = fact({
+      usagePrincipalRef, sourceSequence: 3n,
+      cacheHitInputTokens: 7n, providerCostUsdSubunits: 7n,
+    });
+    await runInDurableObject(projection, instance => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => ({
+            users: [{
+              registeredUserRef,
+              identity: "conflict-rebuild@example.test",
+              displayName: "Conflict Rebuild",
+              registeredAt: "2026-08-24T12:00:00.000Z",
+              activatedAt: "2026-08-24T12:00:00.000Z",
+            }],
+            nextCursor: null,
+          }),
+          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
+        }),
+      };
+      (instance as unknown as {users: unknown}).users = {
+        idFromString: (value: string) => value,
+        get: () => ({
+          listUsageProjectionFacts: async () => ({
+            facts: [first, conflicting, third],
+            nextSourceSequence: null,
+            backfillComplete: true,
+          }),
+        }),
+      };
+    });
+
+    const requestId = `fact-id-authority-${crypto.randomUUID()}`;
+    await projection.requestRebuild(requestId);
+    await runDurableObjectAlarm(projection);
+    expect(await projection.requestRebuild(requestId)).toMatchObject({state: "completed"});
+    expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(10n);
+    expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
+  });
+
   it("does not fail a live rebuild when an earlier fact advances a queued poison marker",
       async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
@@ -854,6 +907,32 @@ describe("deployment Usage Projection", () => {
     });
   });
 
+  it("advances an invalid same-principal envelope that reuses a fact ID", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const usagePrincipalRef = crypto.randomUUID();
+    const first = fact({usagePrincipalRef, sourceSequence: 1n});
+    await projection.ingest([first]);
+
+    const poison = fact({
+      ...first,
+      sourceSequence: 2n,
+      reasoningTokens: first.outputTokens + 1n,
+    });
+    expect(await projection.ingest([poison])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{projectionFactId: first.projectionFactId, code: "fact-id-conflict"}],
+    });
+    const third = fact({usagePrincipalRef, sourceSequence: 3n});
+    expect(await projection.ingest([third])).toEqual({
+      acknowledgedFactIds: [third.projectionFactId],
+      rejected: [],
+    });
+    expect(await projection.readHealth()).toMatchObject({
+      pendingEventCount: 0n,
+      sequenceGapCount: 0n,
+    });
+  });
+
   it("does not let a cross-principal fact ID conflict advance a sequence", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const sharedFactId = crypto.randomUUID();
@@ -930,6 +1009,124 @@ describe("deployment Usage Projection", () => {
       sourceSequence: 1n,
     })])).toMatchObject({
       rejected: [{projectionFactId: sharedProjectionFactId, code: "fact-id-conflict"}],
+    });
+    expect(await projection.requestRebuild(requestId)).toMatchObject({
+      state: "failed",
+      failureCode: "projection-write-failed",
+    });
+  });
+
+  it("rolls back a rebuild marker when recording its exposed Summary failure crashes", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const requestId = `marker-atomic-${crypto.randomUUID()}`;
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        INSERT INTO usage_projection_totals (
+          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+          unpriced_model_uses, unpriced_api_operations
+        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET rebuild_request_id = ?, rebuild_state = 'rebuilding',
+          rebuild_generation = '2', rebuild_registry_revision = '0', rebuild_started_at = ?,
+          rebuild_completed_at = NULL, rebuild_failure_code = NULL
+        WHERE singleton = 1
+      `, requestId, new Date().toISOString());
+    });
+    const summaryFactId = crypto.randomUUID();
+    await projection.ingest([aggregateFact({
+      usagePrincipalRef: crypto.randomUUID(),
+      summaryFactId,
+      cacheHitInputTokens: 10n,
+      outputTokens: 10n,
+      reasoningTokens: 10n,
+      providerCostUsdSubunits: 10n,
+      chargedUsageCreditSubunits: 10n,
+    })]);
+    const usagePrincipalRef = crypto.randomUUID();
+    const sharedProjectionFactId = crypto.randomUUID();
+    await projection.ingest([aggregateFact({
+      projectionFactId: sharedProjectionFactId,
+      usagePrincipalRef,
+      sourceSequence: 2n,
+      summaryFactId,
+      cacheHitInputTokens: 11n,
+      outputTokens: 11n,
+      reasoningTokens: 11n,
+      providerCostUsdSubunits: 11n,
+      chargedUsageCreditSubunits: 11n,
+    })]);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        CREATE TRIGGER fail_rebuild_marker_status
+        BEFORE UPDATE OF rebuild_state ON usage_projection_meta
+        WHEN NEW.rebuild_state = 'failed'
+        BEGIN
+          SELECT RAISE(ABORT, 'controlled rebuild marker failure crash');
+        END
+      `);
+    });
+
+    await expect(runInDurableObject(projection, instance => instance.ingest([fact({
+      projectionFactId: sharedProjectionFactId,
+      usagePrincipalRef,
+      sourceSequence: 1n,
+    })]))).rejects.toThrow("controlled rebuild marker failure crash");
+    expect(await runInDurableObject(projection, (_instance, state) => ({
+      applied: state.storage.sql.exec<{applied: number}>(`
+        SELECT applied FROM usage_projection_facts
+        WHERE generation = '2' AND principal_ref = ? AND source_sequence = '2'
+      `, usagePrincipalRef).one().applied,
+      markers: state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_rejections
+        WHERE generation = '2' AND principal_ref = ?
+      `, usagePrincipalRef).one().count,
+    }))).toEqual({applied: 0, markers: 0});
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER fail_rebuild_marker_status");
+    });
+  });
+
+  it("fails a rebuild when an invalid marker exposes a queued Summary conflict", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const requestId = `invalid-marker-summary-${crypto.randomUUID()}`;
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        INSERT INTO usage_projection_totals (
+          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+          unpriced_model_uses, unpriced_api_operations
+        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET rebuild_request_id = ?, rebuild_state = 'rebuilding',
+          rebuild_generation = '2', rebuild_registry_revision = '0', rebuild_started_at = ?,
+          rebuild_completed_at = NULL, rebuild_failure_code = NULL
+        WHERE singleton = 1
+      `, requestId, new Date().toISOString());
+    });
+    const summaryFactId = crypto.randomUUID();
+    await projection.ingest([aggregateFact({
+      usagePrincipalRef: crypto.randomUUID(), summaryFactId,
+      cacheHitInputTokens: 10n, outputTokens: 10n, reasoningTokens: 10n,
+      providerCostUsdSubunits: 10n, chargedUsageCreditSubunits: 10n,
+    })]);
+    const usagePrincipalRef = crypto.randomUUID();
+    await projection.ingest([aggregateFact({
+      usagePrincipalRef, sourceSequence: 2n, summaryFactId,
+      cacheHitInputTokens: 11n, outputTokens: 11n, reasoningTokens: 11n,
+      providerCostUsdSubunits: 11n, chargedUsageCreditSubunits: 11n,
+    })]);
+
+    const poison = fact({
+      usagePrincipalRef,
+      sourceSequence: 1n,
+      reasoningTokens: 4n,
+      outputTokens: 3n,
+    });
+    expect(await projection.ingest([poison])).toMatchObject({
+      rejected: [{projectionFactId: poison.projectionFactId, code: "invalid-fact"}],
     });
     expect(await projection.requestRebuild(requestId)).toMatchObject({
       state: "failed",
@@ -1566,6 +1763,84 @@ describe("deployment Usage Projection", () => {
       state: "rebuilding",
       usersProcessed: 0n,
     });
+  });
+
+  it("does not let a concurrent same-ID rebuild retry erase its generation", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const requestId = `rebuild-cas-${crypto.randomUUID()}`;
+    const bothPrearmed = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    await runInDurableObject(projection, async (instance, state) => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({getRegisteredUsageUsersRevision: async () => 1n}),
+      };
+      const storage = state.storage as DurableObjectStorage & {
+        setAlarm(scheduledTime: number | Date): Promise<void>;
+      };
+      const setAlarm = storage.setAlarm.bind(storage);
+      let prearms = 0;
+      Object.defineProperty(storage, "setAlarm", {
+        configurable: true,
+        value: async (scheduledTime: number | Date) => {
+          await setAlarm(scheduledTime);
+          prearms += 1;
+          if (prearms === 2) bothPrearmed.resolve();
+          await (prearms === 1 ? releaseFirst.promise : releaseSecond.promise);
+        },
+      });
+      const first = instance.requestRebuild(requestId);
+      const second = instance.requestRebuild(requestId);
+      await bothPrearmed.promise;
+      releaseFirst.resolve();
+      await first;
+      state.storage.sql.exec(`
+        INSERT INTO usage_projection_rejections (
+          generation, fact_id, principal_ref, source_sequence, source_time, code, applied
+        ) VALUES ('2', ?, ?, '1', '2026-08-24T12:00:00.000Z', 'invalid-fact', 0)
+      `, crypto.randomUUID(), crypto.randomUUID());
+      releaseSecond.resolve();
+      await second;
+    });
+
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{count: string}>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_projection_rejections
+        WHERE generation = '2'
+      `).one().count)).toBe("1");
+  });
+
+  it("allows only one of two different concurrent rebuild requests to start", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const bothPrearmed = Promise.withResolvers<void>();
+    const releasePrearms = Promise.withResolvers<void>();
+    const settled = await runInDurableObject(projection, async (instance, state) => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({getRegisteredUsageUsersRevision: async () => 1n}),
+      };
+      const storage = state.storage as DurableObjectStorage & {
+        setAlarm(scheduledTime: number | Date): Promise<void>;
+      };
+      const setAlarm = storage.setAlarm.bind(storage);
+      let prearms = 0;
+      Object.defineProperty(storage, "setAlarm", {
+        configurable: true,
+        value: async (scheduledTime: number | Date) => {
+          await setAlarm(scheduledTime);
+          prearms += 1;
+          if (prearms === 2) bothPrearmed.resolve();
+          await releasePrearms.promise;
+        },
+      });
+      const first = instance.requestRebuild(`rebuild-a-${crypto.randomUUID()}`);
+      const second = instance.requestRebuild(`rebuild-b-${crypto.randomUUID()}`);
+      await bothPrearmed.promise;
+      releasePrearms.resolve();
+      return Promise.allSettled([first, second]);
+    });
+
+    expect(settled.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter(result => result.status === "rejected")).toHaveLength(1);
   });
 
   it("keeps a rebuild wakeup when state commits before alarm persistence", async () => {
