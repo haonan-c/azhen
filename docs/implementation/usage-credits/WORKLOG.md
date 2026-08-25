@@ -785,3 +785,34 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   isolated case passed, the full Projection suite passed 56/56 twice, and the final Backend package
   passed without changing the production `LIMIT 64` or weakening the assertion. Independent
   standards/specification review and the coordinated root test remain the final branch gates.
+
+### 2026-08-25 — Issue #63 independent-review correction fixed point
+
+- The first independent Standards/Spec review found no P0 and reported eleven P1/P2 gaps. The
+  correction batch followed `implement` and TDD gates. It added a fail-closed Projection bootstrap
+  gate for direct and promise-pipelined report openings, report-owner termination of active CSV
+  readers, and a real data-page Cap'n Web cancellation tracer.
+- Browser fixes now reject partial Blob downloads after an abort, avoid creating an RPC stream when
+  `createWritable()` fails, dispose a report when either initial request fails, reset stale export
+  state, and clear/dispose old administrator Usage capabilities before a replacement can resolve.
+- The administrator detail panel now renders the complete Charge Snapshot, Model token,
+  Reservation, Ledger, and reconciliation graph. It reuses the existing grant, deduct, reconcile,
+  reverse, and unknown settle/release RPCs. Reasons remain bounded, retry operation IDs are stable,
+  and successful operations refresh authority. Overview and rows now expose provider cost, charged
+  credits, token categories, Unpriced totals, and pricing state in localized English and Chinese.
+- A User-authority safe Ledger alias resolves only inside that registered User before reversal. The
+  existing User RPC remains the boundary, while legacy Initial Grant and administrator-correction
+  Ledger references retain their earlier behavior. The first focused run proved the regression with
+  16/18 tests; the minimal compatibility fix restored 18/18.
+- Seven distinct prompt/output/args/header/token/body/error sentinels are now checked across the
+  Projection database, User detail, Ledger, outbox/storage, UI DOM, and raw CSV. The controlled
+  provider sees all seven values, while every Workshop reporting surface rejects or omits them.
+- Focused gates passed: Usage admin 18/18, report 19/19, retention 25/25, Projection privacy 1/1,
+  Frontend 29/29, full Frontend 381 tests plus copy 1/1, and the real production-Harness tracer 1/1.
+  The Harness produced one unknown plus 65 settled details through production Action authority,
+  read one 64-row SQLite CSV page after metadata, paused, cancelled, and then opened/read two
+  replacement streams. Backend, Frontend, and integration-test builds passed.
+- A follow-up Standards/Spec review is the next fixed-point gate. Complete Backend and root tests are
+  intentionally deferred until that review. No push, merge, pull request, Issue closure, deployment,
+  upload, promotion, production configuration change, charging change, or worktree deletion
+  occurred.

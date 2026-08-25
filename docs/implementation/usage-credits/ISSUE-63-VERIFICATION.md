@@ -17,6 +17,9 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
   Dimensions combine with AND. Values inside one dimension combine with OR. Empty arrays are
   removed, repeated values are deduplicated, and accepted values are sorted. Each dimension has a
   maximum of 32 values and each stable identifier is bounded and content-free.
+- `openReport()` first completes the Projection bootstrap gate. It rejects both a direct call and a
+  promise-pipelined call while bootstrap is incomplete, so it never freezes pending or partial
+  totals as a report snapshot.
 - The resulting `AdminUsageReport` freezes the canonical filter, strongly consistent Deployment
   report timezone and its Usage Rate version, UTC half-open date bounds, Projection generation,
   applied-ingestion watermark, and a server-private detail-retention revision.
@@ -57,14 +60,20 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
   alias. A reconciliation-only authority snapshot remains drillable after retention removes the
   older raw Usage Record. Reconciliation responses do not expose raw billing or reconciliation
   operation identifiers; public Ledger references are safe aliases scoped by `safeRecordRef`.
+- The existing administrator reversal RPC accepts those validated detail-scoped aliases without
+  exposing the raw Usage operation or Ledger identifier. Existing public Initial Grant and
+  administrator-correction Ledger references keep their prior behavior. Actor binding, bounded
+  reason validation, exact `bigint` deltas, replay, and reversal rules remain in the User authority.
 - An administrator deletion revokes an already-minted report and its active CSV stream. Authority
   is checked before and after asynchronous work and on every stream pull. The #64 own-User boundary
   and #65 deleted-User tombstone remain separate and unchanged.
 - `AdminUsageApi` permits at most four open reports. One report permits at most two concurrent
   operations and at most 1,024 public cursors. Slots are reserved before an await and released on
   success, failure, cancel, late return, or capability disposal.
-- The real Cap'n Web tracer seeds a forbidden content sentinel into an Action path. It confirms that
-  Projection rows, authoritative detail, and CSV do not disclose the sentinel.
+- Seven independent forbidden sentinels represent prompt, output, arguments, header, token, body,
+  and error content. Tests search the Projection database, User detail, Ledger, outbox/storage, UI
+  DOM, and raw CSV bytes. The real Cap'n Web tracer confirms that all seven values reached the
+  controlled provider path but none reached report rows, authoritative detail, or CSV.
 
 ## CSV and browser streaming contract
 
@@ -72,6 +81,9 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
   only from `pull()`. Each read uses at most 64 keyset rows, each chunk is at most 256 KiB, and a zero
   high-water mark prevents implicit prefetch. `cancel()` stops reads and releases the operation
   slot.
+- Disposing a report terminates an already-returned active CSV stream with a bounded error. A reader
+  that consumed the preamble cannot wait forever after owner disposal, and the operation slot is
+  released for a later export.
 - The deterministic UTF-8 RFC 4180 stream starts with parseable frozen-snapshot and Projection-health
   metadata. Its data section distinguishes detail and aggregate rows. It includes safe dimensions,
   exact counters, tokens, provider cost, and charged credits. Cells beginning with `=`, `+`, `-`, or
@@ -81,8 +93,13 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
 - Chromium uses the File System Access API and pipes the RPC stream directly to the selected file.
   The fallback buffers at most 16 MiB. It cancels the reader above that limit and asks the
   administrator to narrow the filter. A filter change or page exit aborts an active export.
+- The browser creates the writable file before it creates the RPC stream. A file-picker writable
+  failure therefore cannot leak a server stream. The Blob fallback checks cancellation again after
+  every pending read; an abort throws `AbortError` and never downloads an empty or partial file.
 - React stores a callable report stub only inside `{api}` state. It disposes replaced, late, failed,
-  cancelled, and unmounted capabilities and ignores stale page and detail responses.
+  cancelled, and unmounted capabilities and ignores stale page and detail responses. A failed
+  initial overview or first page disposes the opened report and clears all partial state. A Usage
+  capability or filter change immediately clears the old view and resets an aborted export.
 
 The CSV columns are:
 
@@ -103,10 +120,17 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
   Gatekeeper, Gatekeeper-scoped method, external account, Usage Source, outcome, pricing, and
   `model | gatekeeper | attempt` filters.
 - The UI shows exact active User, Metered Use, operation, pre-execution failure, and unknown
-  counters with the frozen timezone, generation, and watermark. Aggregate identity remains visible.
-  Only detail rows expose authoritative drill-down.
+  counters, provider cost, charged credits, all token categories, and Unpriced Model/API totals with
+  the frozen timezone, generation, and watermark. Rows show pricing state so priced-zero and
+  Unpriced remain distinct. Aggregate identity remains visible. Only detail rows expose
+  authoritative drill-down.
 - Reconciliation-only detail renders without inventing a workspace or conversation and shows its
   content-free external account dimension.
+- Detail renders the complete authority graph: Charge Snapshot rates, multiplier and conversion;
+  Model token status; Reservation lifecycle; Ledger entries; and reconciliation audit. The same
+  panel enters grant, deduction, balance reconciliation, safe reversal, and unknown settle/release
+  through the existing administrator RPCs. Reasons are bounded and retries keep one operation ID;
+  successful operations refresh authoritative detail. All added labels are English/Chinese.
 - Next and Previous maintain an opaque keyset cursor stack. A changed filter resets it. A late old
   opening cannot replace a newer report and its capability is disposed.
 - CSV export shows progress, supports cancel, and uses the current report capability.
@@ -116,20 +140,22 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | Gate | Result |
 | --- | --- |
 | Shared, Backend, Frontend, and Integration Tests package builds | PASS |
-| Focused Usage report workerd | PASS, 17/17 |
-| Focused Summary/retention workerd group | PASS, 24/24 |
-| Frontend report/overview/file-transfer focused tests | PASS, 20/20 |
-| Full Frontend package tests | PASS, 78 files and 372 tests, plus first-party copy 1/1 |
-| Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1 |
+| Focused Usage administrator workerd | PASS, 18/18; recorded RED 16/18 before safe-reference compatibility fix |
+| Focused Usage report workerd | PASS, 19/19 |
+| Focused Summary/retention workerd group | PASS, 25/25 |
+| Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
+| Frontend report/overview/file-transfer focused tests | PASS, 29/29 |
+| Full Frontend package tests | PASS, 78 files and 381 tests, plus first-party copy 1/1 |
+| Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Backend Worker `capnweb-validate` build | PASS |
-| Full Backend package tests | PASS, 654 tests with 4 expected skips |
-| Root `corepack pnpm build` | PASS, 52 tasks |
-| Root `corepack pnpm lint` | PASS, configured non-blocking warnings only |
+| Full Backend package tests | PRE-REVIEW PASS, 654 tests with 4 expected skips; final rerun pending follow-up review |
+| Root `corepack pnpm build` | PRE-REVIEW PASS, 52 tasks; final rerun pending follow-up review |
+| Root `corepack pnpm lint` | PRE-REVIEW PASS, configured non-blocking warnings only; final rerun pending follow-up review |
 | Release-manifest golden | PASS, 4/4 |
 | `corepack pnpm types:generate` | PASS; no Issue #63 generated change |
 | Production-shape release dry-run | PASS, 19 Workers, 85 modules, 37 asset blobs, 28 MiB |
 | Root `corepack pnpm test` | PENDING final coordinated fleet |
-| Standards/specification fixed-point review | PENDING independent dual-axis review |
+| Standards/specification fixed-point review | PENDING follow-up dual-axis review of correction commits |
 | `git diff --check` | PASS |
 
 The first production-shape dry-run stopped because a gitignored Confluence configurator prerequisite
@@ -148,10 +174,23 @@ the required hard `LIMIT 64`. The exact isolated case passed, then the full Proj
 56/56 twice, and the final complete Backend package passed with the same assertion unchanged. No
 production batch bound or assertion was weakened.
 
+## Review-correction fixed point
+
+The first independent Standards/Spec review reported no P0 and eleven P1/P2 gaps. The correction
+batch closed all reported items through RED→GREEN tests. The production Harness created one unknown
+and 65 settled Usage details only through real Action approval and billing paths. Its first CSV data
+page contained 64 rows, both the metadata and data chunks stayed within 256 KiB, and two concurrent
+replacement streams read successfully after the paused reader was cancelled. This is bounded local
+evidence; it is not a production traffic measurement.
+
+The branch now needs a follow-up dual-axis review of these correction commits. Root and complete
+Backend gates remain deliberately pending until that review fixed point.
+
 ## Remaining branch gate
 
-The candidate still requires the independent standards/specification review and one coordinated
-root `corepack pnpm test`. After those gates and any TDD corrections, this document must record the
-final fixed point. No push, merge, pull request, Issue closure, deployment, upload, promotion,
+The candidate still requires the follow-up standards/specification review, final affected/root
+build and lint gates, complete Backend tests, and one coordinated root `corepack pnpm test`. After
+those gates and any TDD corrections, this document must record the final fixed point. No push,
+merge, pull request, Issue closure, deployment, upload, promotion,
 production configuration change, charging change, or worktree deletion is part of this worktree
 step.
