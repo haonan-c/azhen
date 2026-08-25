@@ -561,8 +561,6 @@ export type UserGatekeeperUsageRecord = {
   vendorId: string;
   /** Stable caller-visible business-method key. */
   billingMethodKey: string;
-  /** Opaque connected external-account dimension supplied by the Gatekeeper. */
-  externalAccountId: string;
   /** Whether the immutable Charge Snapshot had a configured rate. */
   pricing: "priced" | "unpriced";
   /** Durable terminal outcome of the Metering Attempt. */
@@ -678,7 +676,7 @@ export type PublishedApiRatePage = {
   rates: PublishedApiRate[];
   /** Opaque cursor for the next page, or null when this page is complete. */
   nextCursor: string | null;
-  /** True when the User's bounded dynamic-method inventory omitted later discoveries. */
+  /** True while the User's bounded dynamic inventory is incomplete or omitted later discoveries. */
   truncated: boolean;
 };
 

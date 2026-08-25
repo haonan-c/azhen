@@ -1,4 +1,4 @@
-import {env, runInDurableObject} from "cloudflare:test";
+import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import {
   ADMIN_USAGE_USER_SEARCH_MAX_LIMIT,
   type AdminUsageRegisteredUser,
@@ -246,6 +246,48 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
     expect(replayed.registrationOutbox.deliveredAt).toBeDefined();
     expect(replayed.ledgerEntries.filter(entry => entry.kind === "initial-grant"))
       .toHaveLength(1);
+  });
+
+  it("keeps the local Usage Account available while Registry delivery retries by alarm",
+      async () => {
+    const user = await createDormantUser("registryfailure", "Registry Failure");
+    const initialGrantSnapshot = await settings.issueInitialGrantSnapshot();
+
+    await runInDurableObject(user.stub, async (instance, state) => {
+      state.storage.kv.delete("usageCreditNativeAccount");
+      Reflect.set(instance, "adminSettings", {
+        getByName: () => ({
+          issueInitialGrantSnapshot: () => initialGrantSnapshot,
+          registerUsageUser: () => Promise.reject(new Error("Registry unavailable")),
+        }),
+      });
+
+      await expect(instance.getUsageCreditBalance()).resolves.toMatchObject({
+        availableSubunits: initialGrantSnapshot.amountSubunits,
+        activationNotice: {grantedSubunits: initialGrantSnapshot.amountSubunits},
+      });
+      await expect(instance.listOwnCreditLedger({limit: 10})).resolves.toMatchObject({
+        entries: [expect.objectContaining({kind: "initial-grant"})],
+      });
+      await expect(instance.listUsageRecords({limit: 10})).resolves.toEqual({
+        records: [],
+        nextCursor: null,
+      });
+
+      const outbox = new UsageAccount(state.storage).getRegistrationOutbox();
+      expect(outbox.deliveredAt).toBeUndefined();
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+    expect((await adminUsage().searchUsers({query: user.identity})).users).toEqual([]);
+
+    await expectRejectedWith(() => runInDurableObject(user.stub, (_instance, state) => {
+      state.abort("restart after Registry delivery failure");
+    }), "restart after Registry delivery failure");
+    const restarted = users.get(user.id);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect((await adminUsage().searchUsers({query: user.identity})).users)
+      .toEqual([expect.objectContaining({identity: user.identity})]);
+    expect((await accountSnapshot(restarted)).registrationOutbox.deliveredAt).toBeDefined();
   });
 
   it("keeps one complete old or new initial-grant snapshot when configuration races activation",
@@ -631,13 +673,17 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
         source: "direct-user",
         vendorId: TEST_CHARGE_SNAPSHOT.vendorId,
         billingMethodKey: TEST_CHARGE_SNAPSHOT.billingMethodKey,
-        externalAccountId: "opaque-account-sentinel",
         pricing: "priced",
         outcome: "settled",
         chargeSubunits: TEST_CHARGE_SNAPSHOT.chargeSubunits,
       }],
       nextCursor: null,
     });
+    expect(JSON.stringify(await adminUsage().listUsageRecords({
+      registeredUserRef: target.registeredUserRef,
+      limit: 1,
+    }), (_key, value) => typeof value === "bigint" ? value.toString() : value))
+      .not.toContain("opaque-account-sentinel");
   });
 
   it("preserves a consumed original, permits the exact negative balance, and blocks paid work",

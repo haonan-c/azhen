@@ -152,6 +152,28 @@ const FIRST_CALL_FAILURES = [
 ] as const satisfies readonly (readonly [FirstCallFailure, string, string])[];
 
 describe("User Usage Account", () => {
+  it("rounds the low-balance threshold up and classifies zero and negative balances", async () => {
+    const {stub} = await newUser();
+
+    await runInDurableObject(stub, (_instance, state) => {
+      const account = usageAccount(state.storage);
+      expect(account.getBalance({
+        ...TEST_INITIAL_GRANT_SNAPSHOT,
+        amountSubunits: 11n,
+      })).toMatchObject({
+        availableSubunits: 11n,
+        lowBalanceThresholdSubunits: 2n,
+        lowBalance: false,
+      });
+      account.adminDeduct("reach-rounded-threshold", 9n, "Boundary", "admin");
+      expect(account.getBalance()).toMatchObject({availableSubunits: 2n, lowBalance: true});
+      account.adminDeduct("reach-zero", 2n, "Zero", "admin");
+      expect(account.getBalance()).toMatchObject({availableSubunits: 0n, lowBalance: true});
+      account.adminDeduct("reach-negative", 1n, "Negative", "admin");
+      expect(account.getBalance()).toMatchObject({availableSubunits: -1n, lowBalance: true});
+    });
+  });
+
   it("does not invent an initial grant without a versioned snapshot", async () => {
     const {stub} = await newUser();
 

@@ -29,7 +29,7 @@ export type DiscoveredPublishedApiMethodPage = {
   methods: Array<Pick<PublishedApiRate, "vendorId" | "billingMethodKey">>;
   /** Composite key for the next owner page, or null. */
   nextCursorKey: string | null;
-  /** True when discoveries after the durable inventory cap were omitted. */
+  /** True while legacy discovery is pending or the durable inventory cap omitted later methods. */
   truncated: boolean;
 };
 

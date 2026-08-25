@@ -143,3 +143,50 @@ diagnostics for provider calls, chat state, Hook count, and reconnect count. The
 file then passed 9/9 with the original timeout and the same three-call expectation. One complete
 115/115 production-Harness rerun on the final reviewed tree is still required before the branch is
 accepted; the focused pass is not presented as a substitute.
+
+## Third fixed-point review corrections
+
+The post-rebase code and specification review found seven remaining boundaries. The correction used
+the same `implement` stage gates and focused TDD loop:
+
+- React Strict Mode first reproduced one subscription setup where two setup phases were required.
+  The provider now re-arms the active API at each effect setup. The lifecycle canary proves that the
+  first pending result is disposed, the second subscriber receives updates, and the resolved second
+  subscription is disposed on unmount.
+- A controlled Registry failure first rejected `getUsageCreditBalance()` after the local Initial
+  Grant, activation notice, and registration fact were already durable. Activation now pre-arms the
+  existing User maintenance alarm, commits local authority, returns local balance/list results, and
+  delivers the stable registration outbox asynchronously. Failure keeps one ten-second alarm;
+  restart replays the same fact and acknowledges the idempotent Registry result.
+- Legacy public-method discovery first failed every bounded 100-record step with a manual Retry
+  error. The first bounded step now returns the current inventory and a truthful truncation signal.
+  The same User alarm advances later 100-record batches. A 301-record repeated-method history
+  completes without another list request and stores one deduplicated method.
+- The User-safe Gatekeeper Usage Record no longer carries the raw connected `externalAccountId`.
+  The value remains internal authority and administrator Projection detail where required. User and
+  administrator list canaries serialize exact `bigint` values safely and prove that the sensitive
+  account marker is absent.
+- Low-balance characterization now covers an Initial Grant of 11 subunits, the rounded-up threshold
+  of 2, the exact threshold, zero balance, and negative balance.
+- Real Cap'n Web coverage now pages own-User Reservations and Ledger entries at limit one, preserves
+  a negative delta whose magnitude exceeds `Number.MAX_SAFE_INTEGER`, and proves a second User sees
+  neither the Reservation nor the charge.
+- The current diff against the post-#62 base contains no quote-only change in `admin-settings.ts`.
+  Only its required bounded configured-rate API remains in that file.
+
+| Third-review check | Result |
+| --- | --- |
+| Strict Mode subscription lifecycle | Passed: 6/6 Provider tests |
+| Registry durable retry | Passed: Usage Admin 16/16 |
+| Legacy method discovery and sensitive DTO | Passed: Gatekeeper Usage Account 25/25 |
+| Low-balance rounding, zero, and negative states | Passed: User Usage Account 38/38 |
+| Real Cap'n Web financial pagination, legacy rates, and isolation | Passed: 5/5 with the combined 301-record legacy-rate canary |
+| Workshop Frontend package and production build | Passed: 77 files, 362/362; first-party copy 1/1; production build passed |
+| Shared and Workshop Backend builds | Passed |
+| `corepack pnpm lint:check` | Passed; repository warnings only |
+| `git diff --check` | Passed before this evidence update |
+
+The original 114/115 production-Harness failure, its exact diagnostic fields, and the bounded
+preload operation remain recorded above. They are not replaced by the focused 9/9 or Cap'n Web 5/5
+passes. After final review, the candidate still requires one uninterrupted full 115/115 run; only
+that run can close this final branch gate.

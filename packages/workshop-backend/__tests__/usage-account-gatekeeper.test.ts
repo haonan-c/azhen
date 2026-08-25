@@ -66,12 +66,16 @@ const ATTRIBUTION: GatekeeperUsageAttribution = {
  * Durable Object's I/O objects from another.
  */
 async function withAccount<T>(
-    body: (account: UsageAccount, storage: DurableObjectStorage) => T): Promise<T> {
+    body: (
+      account: UsageAccount,
+      storage: DurableObjectStorage,
+      user: UserDurableObject,
+    ) => T): Promise<T> {
   const username = `gk-usage-${crypto.randomUUID()}`;
   const stub = users.get(users.idFromName(username));
   const token = await stub.createAccount(username, username, new Uint8Array([2, 4, 6, 8]));
   if (token === null) throw new Error("Failed to create Gatekeeper billing test User.");
-  return runInDurableObject(stub, (_instance, state) => {
+  return runInDurableObject(stub, (instance, state) => {
     const account = new UsageAccount(state.storage, () => ({
       userDoId: "a".repeat(64),
       identity: "gatekeeper-billing@example.test",
@@ -79,7 +83,7 @@ async function withAccount<T>(
     }));
     // Materialize the initial grant so later calls need no snapshot argument.
     account.getBalance(GRANT);
-    return body(account, state.storage);
+    return body(account, state.storage, instance);
   });
 }
 
@@ -147,12 +151,14 @@ describe("Gatekeeper two-stage billing state machine", () => {
         chatId: ATTRIBUTION.chatId,
         vendorId: ATTRIBUTION.vendorId,
         billingMethodKey: ATTRIBUTION.billingMethodKey,
-        externalAccountId: ATTRIBUTION.externalAccountId,
         pricing: "unpriced",
         outcome: "settled",
         chargeSubunits: 0n,
         createdAt: record.createdAt,
       }]);
+      expect(JSON.stringify(account.listUserUsageRecords({limit: 10}),
+        (_key, value) => typeof value === "bigint" ? value.toString() : value))
+        .not.toContain(ATTRIBUTION.externalAccountId);
     });
   });
 
@@ -402,7 +408,6 @@ describe("Gatekeeper two-stage billing state machine", () => {
         source: "direct-user",
         vendorId: "context",
         billingMethodKey: "context.read.v1",
-        externalAccountId: "context-account-1",
         pricing: "unpriced",
         outcome: "settled",
         chargeSubunits: 0n,
@@ -491,16 +496,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       let cursorKey: string | undefined;
       const visible = [];
       do {
-        let page;
-        for (let attempt = 0; ; ++attempt) {
-          try {
-            page = account.listDiscoveredGatekeeperMethodPage({cursorKey, limit: 100});
-            break;
-          } catch (error) {
-            if (attempt >= 5 || !(error instanceof Error) ||
-                !error.message.includes("being prepared")) throw error;
-          }
-        }
+        const page = account.listDiscoveredGatekeeperMethodPage({cursorKey, limit: 100});
         expect(page.truncated).toBe(true);
         visible.push(...page.methods);
         cursorKey = page.nextCursorKey ?? undefined;
@@ -509,6 +505,54 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(visible).toHaveLength(500);
       expect(new Set(visible.map(method => method.billingMethodKey)).size).toBe(500);
       expect(visible.some(method => method.billingMethodKey === "operation.500")).toBe(false);
+    });
+  });
+
+  it("advances a large repeated legacy method inventory without requiring request retries",
+      async () => {
+    await withAccount(async (account, storage, user) => {
+      for (let index = 0; index < 301; ++index) {
+        const operationId = `gatekeeper-operation:legacy-repeat-${index}`;
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+      for (const [key] of storage.kv.list({
+        prefix: "usageAccount:discoveredGatekeeperMethod:v2:",
+      })) {
+        storage.kv.delete(key);
+      }
+      for (const key of [
+        "usageAccount:discoveredGatekeeperMethodVersion:v2",
+        "usageAccount:discoveredGatekeeperMethodMigrationCursor:v2",
+        "usageAccount:discoveredGatekeeperMethodCount:v2",
+        "usageAccount:discoveredGatekeeperMethodTruncated:v2",
+      ]) {
+        storage.kv.delete(key);
+      }
+
+      expect(await user.listOwnDiscoveredGatekeeperMethodPage({limit: 10})).toEqual({
+        methods: [{
+          vendorId: ATTRIBUTION.vendorId,
+          billingMethodKey: ATTRIBUTION.billingMethodKey,
+        }],
+        nextCursorKey: null,
+        truncated: true,
+      });
+      for (let pass = 0; pass < 4 &&
+          storage.kv.get("usageAccount:discoveredGatekeeperMethodVersion:v2") !== true;
+          ++pass) {
+        await user.alarm();
+      }
+      expect(storage.kv.get("usageAccount:discoveredGatekeeperMethodVersion:v2")).toBe(true);
+      expect(account.listDiscoveredGatekeeperMethodPage({limit: 10})).toEqual({
+        methods: [{
+          vendorId: ATTRIBUTION.vendorId,
+          billingMethodKey: ATTRIBUTION.billingMethodKey,
+        }],
+        nextCursorKey: null,
+        truncated: false,
+      });
     });
   });
 

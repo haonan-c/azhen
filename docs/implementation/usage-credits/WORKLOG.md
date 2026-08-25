@@ -533,3 +533,30 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   lint, manifest golden, and whitespace gates remain for the coordinated `dev` integration. No
   push, merge, Issue closure, release build, upload, promotion, deployment, production change,
   charging change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #64 third fixed-point review corrections
+
+- Re-entered the `implement` and TDD gates for the post-rebase findings. A Strict Mode lifecycle RED
+  proved that effect cleanup left the second setup without a balance subscription. Each setup now
+  re-arms the active API; the callback and both pending/resolved subscription paths are disposed.
+- A controlled Registry failure RED proved that synchronous delivery blocked an already-committed
+  local Initial Grant, legacy notice, and registration outbox. Activation now pre-arms and reuses the
+  User's single maintenance alarm. Local User authority remains available, failed Registry delivery
+  retries after ten seconds, and restart delivers and acknowledges the same idempotent fact.
+- Removed manual Retry failures from the bounded 100-record legacy public-method migration. The
+  first request returns current static/configured/discovered data with a truthful truncation signal,
+  while the User alarm advances remaining batches. A 301-record repeated-method history completes
+  without a second list request and deduplicates to one method.
+- Removed raw `externalAccountId` from the User-safe Gatekeeper Usage Record DTO and added sensitive
+  serialization canaries. Added low-balance coverage for a non-divisible 11-subunit Initial Grant,
+  the rounded threshold of 2, zero, and negative balances.
+- Expanded real Cap'n Web evidence to own-User Reservation and Ledger pagination, a negative exact
+  delta larger than `Number.MAX_SAFE_INTEGER`, and two-User isolation. Focused results are Provider
+  6/6, Usage Admin 16/16, Gatekeeper Usage Account 25/25, User Usage Account 38/38, and Cap'n Web 5/5.
+  The real RPC rate case includes the 301-record repeated legacy history, static inventory, and
+  configured priced-zero rate in one pass. The Frontend package passed 362/362 plus copy 1/1, and
+  Shared, Backend, and Frontend production builds passed.
+- Oxlint passed with repository warnings only, `git diff --check` passed, and the diff contains no
+  quote-only `admin-settings.ts` change. The final single uninterrupted 115/115 Harness remains
+  pending. No push, merge, Issue closure, release build,
+  upload, promotion, deployment, production change, charging change, or worktree deletion occurred.

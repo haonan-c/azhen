@@ -840,9 +840,7 @@ export class UsageAccount {
   listDiscoveredGatekeeperMethodPage(
       request: PublishedApiRateSourceRequest): DiscoveredPublishedApiMethodPage {
     const {cursorKey, limit} = normalizePublishedApiRateSourceRequest(request);
-    const ready = this.storage.transactionSync(() =>
-      this.migrateDiscoveredGatekeeperMethodsBatch());
-    if (!ready) throw new Error("Published API methods are being prepared. Retry the request.");
+    const ready = this.advanceDiscoveredGatekeeperMethodMigrationBatch();
     return this.storage.transactionSync(() => {
       const entries = Array.from(this.storage.kv.list<Pick<PublishedApiRate,
         "vendorId" | "billingMethodKey">>({
@@ -866,9 +864,16 @@ export class UsageAccount {
           ? publishedApiRateKey(methods.at(-1)!)
           : null,
         truncated:
+          !ready ||
           this.storage.kv.get<boolean>(DISCOVERED_GATEKEEPER_METHOD_TRUNCATED_KEY) === true,
       };
     });
+  }
+
+  /** Advance one bounded batch of legacy public Gatekeeper method discovery. */
+  advanceDiscoveredGatekeeperMethodMigrationBatch(): boolean {
+    return this.storage.transactionSync(() =>
+      this.migrateDiscoveredGatekeeperMethodsBatch());
   }
 
   private migrateGatekeeperUsageTimeIndexBatch(): boolean {
@@ -3045,7 +3050,6 @@ function userGatekeeperUsageRecord(
       : {}),
     vendorId: record.attribution.vendorId,
     billingMethodKey: record.attribution.billingMethodKey,
-    externalAccountId: record.attribution.externalAccountId,
     pricing: record.chargeSnapshot.pricing,
     outcome: record.outcome,
     chargeSubunits: record.chargeSubunits,

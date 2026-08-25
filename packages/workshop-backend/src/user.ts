@@ -377,7 +377,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.vendors = buildGatekeeperVendorMap(env);
   }
 
-  /** Continue at-least-once delivery of retained projection outbox facts. */
+  /** Continue bounded Usage Account maintenance and retained outbox delivery. */
   async alarm(): Promise<void> {
     await this.#runProjectionMaintenance();
   }
@@ -457,8 +457,32 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       );
     }
     const maintenanceRevision = this.#projectionMaintenanceRevision();
+    const registrationDeliveryFailed = await this.#deliverUsageRegistrationOutbox();
+    const methodDiscoveryComplete =
+      this.usageAccount.advanceDiscoveredGatekeeperMethodMigrationBatch();
     const backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
-    await this.#deliverProjectionOutbox(!backfillComplete, maintenanceRevision);
+    await this.#deliverProjectionOutbox(
+      !backfillComplete || !methodDiscoveryComplete,
+      registrationDeliveryFailed,
+      maintenanceRevision,
+    );
+  }
+
+  async #deliverUsageRegistrationOutbox(): Promise<boolean> {
+    if (!this.usageAccount.isInitialized()) return false;
+    const outbox = this.usageAccount.getRegistrationOutbox();
+    if (outbox.deliveredAt !== undefined) return false;
+    try {
+      await this.adminSettings.getByName("").registerUsageUser(outbox.fact);
+      this.usageAccount.acknowledgeRegistration(outbox.fact.registrationEventId);
+      return false;
+    } catch (error) {
+      logger.warn("Usage User registration delivery failed", {
+        event: "usage.registration.delivery.failed",
+        error,
+      });
+      return true;
+    }
   }
 
   async #deleteProjectionAlarmIfOwned(maintenanceRevision: bigint): Promise<void> {
@@ -490,15 +514,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async #deliverProjectionOutbox(
-      backfillPending: boolean,
+      maintenancePending: boolean,
+      registrationDeliveryFailed: boolean,
       maintenanceRevision: bigint): Promise<void> {
     const pending = this.usageAccount.listPendingProjectionOutbox(32);
     if (pending.length === 0) {
       const healthReported = await this.#reportProjectionDeliveryHealth(false);
       const pendingAfterHealth =
         this.usageAccount.listPendingProjectionOutbox(1).length > 0;
-      if (!healthReported) await this.ctx.storage.setAlarm(Date.now() + 10_000);
-      else if (backfillPending || pendingAfterHealth) {
+      if (!healthReported || registrationDeliveryFailed) {
+        await this.ctx.storage.setAlarm(Date.now() + 10_000);
+      } else if (maintenancePending || pendingAfterHealth) {
         await this.ctx.storage.setAlarm(Date.now() + 1_000);
       } else {
         await this.#deleteProjectionAlarmIfOwned(maintenanceRevision);
@@ -522,9 +548,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       });
     }
     const healthReported = await this.#reportProjectionDeliveryHealth(deliveryFailed);
-    if (deliveryFailed || !healthReported) {
+    if (deliveryFailed || !healthReported || registrationDeliveryFailed) {
       await this.ctx.storage.setAlarm(Date.now() + 10_000);
-    } else if (backfillPending ||
+    } else if (maintenancePending ||
         this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 1_000);
     } else {
@@ -684,24 +710,26 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.storage.profile.get();
   }
 
-  /**
-   * Activate this existing User's Usage Account and deliver its stable registration outbox fact.
-   */
+  /** Activate this existing User's Usage Account and schedule its registration outbox. */
   async activateUsageAccount(): Promise<void> {
     if (!this.storage.created.get()) {
       throw new Error("A User account must exist before its Usage Account can be activated.");
     }
-    const initialGrantSnapshot = this.usageAccount.isInitialized()
+    const initialized = this.usageAccount.isInitialized();
+    if (initialized &&
+        this.usageAccount.getRegistrationOutbox().deliveredAt !== undefined) return;
+    const initialGrantSnapshot = initialized
       ? undefined
       : await this.adminSettings.getByName("").issueInitialGrantSnapshot();
-    const outbox = this.usageAccount.activate(
-      initialGrantSnapshot,
-      !this.storage.usageCreditNativeAccount.get(),
-    );
-    if (outbox.deliveredAt !== undefined) return;
-
-    await this.adminSettings.getByName("").registerUsageUser(outbox.fact);
-    this.usageAccount.acknowledgeRegistration(outbox.fact.registrationEventId);
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      this.usageAccount.activate(
+        initialGrantSnapshot,
+        !this.storage.usageCreditNativeAccount.get(),
+      );
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Return this User's authoritative available and reserved Usage Credit balance. */
@@ -793,7 +821,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async listOwnDiscoveredGatekeeperMethodPage(
       request: PublishedApiRateSourceRequest): Promise<DiscoveredPublishedApiMethodPage> {
     await this.activateUsageAccount();
-    return this.usageAccount.listDiscoveredGatekeeperMethodPage(request);
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.listDiscoveredGatekeeperMethodPage(request);
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
