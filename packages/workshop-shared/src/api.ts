@@ -1053,8 +1053,8 @@ export type AdminUsageProjectionHealth = {
   /** Exact number of failed delivery attempts and rejected invariant-breaking ingestions. */
   failedIngestionCount: bigint;
   /** Bounded machine-readable failure code, or null when no failure is recorded. */
-  failureCode: "delivery-failed" | "fact-id-conflict" | "source-sequence-conflict" |
-    "invalid-fact" | null;
+  failureCode: "delivery-failed" | "retention-failed" | "fact-id-conflict" |
+    "source-sequence-conflict" | "invalid-fact" | null;
   /** Bounded rebuild failure code, or null when the latest rebuild did not fail. */
   rebuildFailureCode:
     "registry-read-failed" | "user-read-failed" | "projection-write-failed" | null;
@@ -1082,6 +1082,8 @@ export type AdminUsageOverviewMetrics = {
   outputTokens: bigint;
   /** Reasoning-token detail already included in outputTokens. */
   reasoningTokens: bigint;
+  /** Exact count of confirmed Model uses and executed or accepted API operations. */
+  meteredUseCount: bigint;
   /** Caller-visible Billable API Operations confirmed as executed or accepted. */
   billableApiOperations: bigint;
   /** Distinct Usage Principals with at least one confirmed Metered Use. */
@@ -1204,6 +1206,32 @@ export type AdminUsageReverseRequest = {
   reason: string;
 };
 
+/** Administrator request to permanently remove one registered User's direct identity links. */
+export type AdminUsageDeleteUserRequest = {
+  /** Opaque active target returned by Registry search. */
+  registeredUserRef: string;
+  /** Stable retry identity for the full cross-Durable-Object deletion workflow. */
+  deletionId: string;
+  /** Required bounded human explanation retained in the deletion audit. */
+  reason: string;
+};
+
+/** Auditable terminal result of one idempotent User deletion workflow. */
+export type AdminUsageDeleteUserResult = {
+  /** Opaque Usage Principal retained for lifetime financial history and rebuilds. */
+  registeredUserRef: string;
+  /** Stable caller-supplied retry identity. */
+  deletionId: string;
+  /** Authenticated administrator identity bound by the server capability. */
+  actorUserId: string;
+  /** Bounded administrator explanation retained for audit. */
+  reason: string;
+  /** Canonical UTC time when the Registry committed the anonymous tombstone. */
+  deletedAt: string;
+  /** Explicit terminal lifecycle state. */
+  state: "deleted";
+};
+
 /** Administrator decision for an Action whose financial state needs explicit coordination. */
 export type AdminActionReconciliationDecision = "settle" | "release" | "reverse";
 
@@ -1277,6 +1305,9 @@ export interface AdminUsageApi {
 
   /** Append one exact linked Credit Reversal for a registered User. */
   reverse(request: AdminUsageReverseRequest): Promise<AdminUsageOperationResult>;
+
+  /** Permanently remove one registered User's direct identity and retain pseudonymous history. */
+  deleteUsageUser(request: AdminUsageDeleteUserRequest): Promise<AdminUsageDeleteUserResult>;
 
   /** Coordinate one unknown Action, or reverse its already-settled Usage Charge exactly. */
   reconcileAction(

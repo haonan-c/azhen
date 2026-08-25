@@ -43,12 +43,14 @@ import type {
   DiscoveredPublishedApiMethodPage,
   PublishedApiRateSourceRequest,
 } from "./public-api-rates.js";
+import {isAvatarStorageKey} from "./avatar-key.js";
 
 const logger = createWorkshopLogger("workshop.user");
 const PROJECTION_MAINTENANCE_REVISION_KEY =
   "usageAccount:projectionMaintenanceRevision:v1";
 const PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY =
   "usageAccount:projectionMaintenanceSettledRevision:v1";
+const USER_DELETION_AVATAR_KEY = "usageAccount:userDeletionAvatarKey:v1";
 
 // How many workspaces one Outputs catch-up pass examines, bounding the Durable Objects a single
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
@@ -460,9 +462,35 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     const registrationDeliveryFailed = await this.#deliverUsageRegistrationOutbox();
     const methodDiscoveryComplete =
       this.usageAccount.advanceDiscoveredGatekeeperMethodMigrationBatch();
-    const backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
+    let backfillComplete: boolean;
+    let retention: ReturnType<UsageAccount["runRetentionMaintenanceBatch"]>;
+    let projectionRetentionPending = false;
+    try {
+      backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
+      retention = this.usageAccount.runRetentionMaintenanceBatch();
+      if (retention.complete) {
+        const principal = this.usageAccount.getRegistrationOutbox().fact.registeredUserRef;
+        projectionRetentionPending = !await this.usageProjection.getByName("").expireDetailBefore(
+          principal,
+          retention.cutoffUtc,
+        );
+        this.usageAccount.clearRetentionFailureRetry();
+      }
+    } catch (error) {
+      const retryAt = Date.now() + 10_000;
+      this.#invalidateProjectionMaintenanceOwnership();
+      this.usageAccount.recordRetentionFailureRetryAt(retryAt);
+      logger.error("Usage retention maintenance failed", {
+        event: "usage.retention.maintenance.failed",
+        error,
+      });
+      await this.#reportProjectionDeliveryHealth(false, true);
+      await this.ctx.storage.setAlarm(retryAt);
+      return;
+    }
     await this.#deliverProjectionOutbox(
-      !backfillComplete || !methodDiscoveryComplete,
+      !backfillComplete || !methodDiscoveryComplete ||
+        !retention.complete || projectionRetentionPending,
       registrationDeliveryFailed,
       maintenanceRevision,
     );
@@ -486,22 +514,48 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async #deleteProjectionAlarmIfOwned(maintenanceRevision: bigint): Promise<void> {
-    if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
-      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    const retentionFailureRetryAt = this.usageAccount.getRetentionFailureRetryAt();
+    if (retentionFailureRetryAt !== null) {
+      await this.ctx.storage.setAlarm(retentionFailureRetryAt);
       return;
     }
-    await this.ctx.storage.deleteAlarm();
     if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
-      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      await this.#scheduleAfterProjectionMaintenanceOwnershipLoss();
+      return;
+    }
+    const nextRetentionAlarmAt = this.usageAccount.getNextRetentionAlarmAt();
+    if (nextRetentionAlarmAt === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Math.max(Date.now(), nextRetentionAlarmAt));
+    if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
+      await this.#scheduleAfterProjectionMaintenanceOwnershipLoss();
     }
   }
 
-  async #reportProjectionDeliveryHealth(deliveryFailed: boolean): Promise<boolean> {
+  #invalidateProjectionMaintenanceOwnership(): void {
+    const revision = this.#projectionMaintenanceRevision() + 1n;
+    this.ctx.storage.kv.put(PROJECTION_MAINTENANCE_REVISION_KEY, revision.toString());
+    if (this.projectionPreparations.size === 0) {
+      this.ctx.storage.kv.put(
+        PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+        revision.toString(),
+      );
+    }
+  }
+
+  async #scheduleAfterProjectionMaintenanceOwnershipLoss(): Promise<void> {
+    const retentionRetryAt = this.usageAccount.getRetentionFailureRetryAt();
+    await this.ctx.storage.setAlarm(retentionRetryAt ?? Date.now() + 1_000);
+  }
+
+  async #reportProjectionDeliveryHealth(
+      deliveryFailed: boolean,
+      retentionFailed = false): Promise<boolean> {
     const health = this.usageAccount.getProjectionDeliveryHealth();
     try {
       await this.adminSettings.getByName("").recordUsageProjectionDeliveryHealth({
         ...health,
         deliveryFailed,
+        retentionFailed,
       });
       return true;
     } catch (error) {
@@ -559,6 +613,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async authenticate(token: string): Promise<void> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw createAuthError(AUTH_ERROR_CODES.invalidSessionToken);
+    }
     let tokenBytes: Uint8Array;
     try {
       tokenBytes = Uint8Array.fromBase64(token);
@@ -581,6 +638,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * existing users can still sign in.
    */
   async authenticateFromCfAccess(email: string, allowCreate: boolean): Promise<boolean> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
     if (!this.storage.created.get()) {
       if (!allowCreate) {
         throw new Error("New sign-ups are currently disabled on this deployment.");
@@ -600,6 +660,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async #newSessionToken(): Promise<string> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
     let sessionToken = new Uint8Array(32);
     crypto.getRandomValues(sessionToken);
 
@@ -610,6 +673,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async login(passwordHash: Uint8Array): Promise<string | null> {
+    if (this.usageAccount.getUserDeletionState() !== null) return null;
     let passwordHashHash = new Uint8Array(await crypto.subtle.digest('SHA-256', passwordHash));
 
     let actualHashHash = this.storage.passwordHashHash.get();
@@ -626,7 +690,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
       : Promise<string | null> {
-    if (this.storage.created.get()) {
+    if (this.storage.created.get() || this.usageAccount.getUserDeletionState() !== null) {
       return null;
     }
 
@@ -673,6 +737,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * returns null instead of creating one — existing users can still sign in.
    */
   async loginOrCreateViaGatekeeper(email: string, allowCreate: boolean): Promise<string | null> {
+    if (this.usageAccount.getUserDeletionState() !== null) return null;
     if (!this.storage.created.get()) {
       if (!allowCreate) return null;
       this.storage.created.put(true);
@@ -692,6 +757,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
     let actualHashHash = this.storage.passwordHashHash.get();
     if (!actualHashHash) {
       throw new Error("This account does not use password login.");
@@ -710,7 +778,72 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.storage.profile.get();
   }
 
-  /** Activate this existing User's Usage Account and schedule its registration outbox. */
+  /** Return whether permanent User identity deletion has started. */
+  isUsageUserDeleted(): boolean {
+    return this.usageAccount.getUserDeletionState() !== null;
+  }
+
+  /** Immediately revoke identity credentials and replace direct profile fields with a pseudonym. */
+  beginUsageUserDeletion(
+      deletionId: string,
+      reason: string,
+      actorUserId: string) {
+    return this.ctx.storage.transactionSync(() => {
+      const existingDeletion = this.usageAccount.getUserDeletionState();
+      if (existingDeletion?.state === "deleted") return existingDeletion;
+      const registration = this.usageAccount.getRegistrationOutbox();
+      if (existingDeletion === null) {
+        this.ctx.storage.kv.put(USER_DELETION_AVATAR_KEY, this.storage.profile.get().id);
+      }
+      const state = this.usageAccount.beginUserDeletionInCurrentTransaction(
+        deletionId,
+        reason,
+        actorUserId,
+      );
+      for (const session of this.storage.sessions.list()) {
+        this.storage.sessions.delete(session.tokenId);
+      }
+      this.storage.passwordHashHash.put(null);
+      this.storage.profile.put({
+        type: "user",
+        name: "Deleted User",
+        id: `deleted:${registration.fact.registeredUserRef.slice(0, 12)}`,
+      });
+      return state;
+    });
+  }
+
+  /** Retry avatar removal and complete the local User tombstone with no Registry authority. */
+  async advanceUsageUserDeletion(
+      deletionId: string,
+      reason: string,
+      actorUserId: string) {
+    const state = this.beginUsageUserDeletion(deletionId, reason, actorUserId);
+    if (state.state === "deleted") return state;
+    const avatarKey = this.ctx.storage.kv.get<unknown>(USER_DELETION_AVATAR_KEY);
+    if (avatarKey !== undefined) {
+      if (typeof avatarKey !== "string") {
+        throw new Error("User deletion avatar key is invalid.");
+      }
+      // Invalid strings could never be present in AVATARS. Skipping one lets a legacy User beyond
+      // the KV byte limit reach its permanent tombstone; every key KV could contain is deleted.
+      if (isAvatarStorageKey(avatarKey)) await this.env.AVATARS.delete(avatarKey);
+    }
+    return this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.kv.delete(USER_DELETION_AVATAR_KEY);
+      return this.usageAccount.completeUserDeletionInCurrentTransaction(deletionId);
+    });
+  }
+
+  /** Mark the User tombstone terminal before the coordinator commits Registry anonymization. */
+  completeUsageUserDeletion(deletionId: string) {
+    return this.ctx.storage.transactionSync(() =>
+      this.usageAccount.completeUserDeletionInCurrentTransaction(deletionId));
+  }
+
+  /**
+   * Activate this existing User's Usage Account and deliver its stable registration outbox fact.
+   */
   async activateUsageAccount(): Promise<void> {
     if (!this.storage.created.get()) {
       throw new Error("A User account must exist before its Usage Account can be activated.");
@@ -739,6 +872,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Return this User's authoritative available and reserved Usage Credit balance. */
   async getUsageCreditBalance(): Promise<UsageCreditBalance> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
     await this.activateUsageAccount();
     return this.usageAccount.getBalance();
   }
@@ -805,6 +941,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Return one bounded page of this User's content-free Usage Records. */
   async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
     await this.activateUsageAccount();
     return this.usageAccount.listUserUsageRecords(request);
   }
@@ -1142,6 +1281,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async setOwnDisplayName(name: string): Promise<void> {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
     let profile = this.storage.profile.get();
     profile.name = name;
     this.storage.profile.put(profile);

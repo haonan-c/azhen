@@ -1,6 +1,7 @@
 import {
   ADMIN_USAGE_USER_SEARCH_DEFAULT_LIMIT,
   ADMIN_USAGE_USER_SEARCH_MAX_LIMIT,
+  type AdminUsageDeleteUserResult,
   type AdminUsageRegisteredUser,
   type AdminUsageUserSearchRequest,
   type AdminUsageUserSearchResult,
@@ -19,6 +20,30 @@ export type ResolvedUsageUser = {
   userDoId: string;
 };
 
+/** One active or deleted Usage Principal target in a stable Registry rebuild page. */
+export type UsageProjectionPrincipal = {
+  sequence: bigint;
+  registeredUserRef: string;
+  userDoId: string;
+};
+
+/** One bounded internal Registry page that never exposes retained direct identity. */
+export type UsageProjectionPrincipalPage = {
+  principals: UsageProjectionPrincipal[];
+  nextSequence: bigint | null;
+};
+
+/** Resumable server-only state for the cross-store deletion coordinator. */
+export type UsageUserDeletionPreparation = {
+  registeredUserRef: string;
+  deletionId: string;
+  userDoId: string;
+  actorUserId: string;
+  reason: string;
+  state: "deleting" | "deleted";
+  deletedAt: string | null;
+};
+
 type RegistryRow = {
   sequence: string;
   registered_user_ref: string;
@@ -28,6 +53,18 @@ type RegistryRow = {
   registered_at: string;
   activated_at: string;
   registration_event_id: string;
+};
+
+type DeletionJobRow = {
+  deletion_id: string;
+  registered_user_ref: string;
+  user_do_id: string;
+  avatar_key: string | null;
+  actor_user_id: string;
+  reason: string;
+  requested_at: string;
+  deleted_at: string | null;
+  state: "deleting" | "deleted";
 };
 
 type CursorPayload = {
@@ -43,6 +80,7 @@ export type UsageProjectionDeliveryHealthReport = {
   pendingEventCount: bigint;
   oldestPendingAt: string | null;
   deliveryFailed: boolean;
+  retentionFailed: boolean;
 };
 
 /** Exact deployment-level User outbox health read without waking User Durable Objects. */
@@ -50,7 +88,7 @@ export type UsageProjectionDeliveryHealth = {
   pendingEventCount: bigint;
   oldestPendingAt: string | null;
   failedDeliveryCount: bigint;
-  failureCode: "delivery-failed" | null;
+  failureCode: "delivery-failed" | "retention-failed" | null;
 };
 
 /**
@@ -69,9 +107,19 @@ export class UsageUserRegistry {
         display_name_search TEXT NOT NULL,
         registered_at TEXT NOT NULL,
         activated_at TEXT NOT NULL,
-        registration_event_id TEXT NOT NULL UNIQUE
+        registration_event_id TEXT NOT NULL UNIQUE,
+        lifecycle_state TEXT NOT NULL DEFAULT 'active'
       )
     `);
+    const registryColumns = new Set(storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_user_registry)",
+    ).toArray().map(column => column.name));
+    if (!registryColumns.has("lifecycle_state")) {
+      storage.sql.exec(`
+        ALTER TABLE usage_user_registry
+        ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'
+      `);
+    }
     storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS usage_user_registry_identity_search
       ON usage_user_registry(identity_search, sequence)
@@ -102,6 +150,27 @@ export class UsageUserRegistry {
         singleton, pending_event_count, failed_delivery_count, failed_principal_count
       ) VALUES (1, '0', '0', '0')
     `);
+    storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_user_anonymous_principals (
+        sequence INTEGER NOT NULL UNIQUE,
+        registered_user_ref TEXT PRIMARY KEY,
+        user_do_id TEXT NOT NULL UNIQUE,
+        deleted_at TEXT NOT NULL
+      )
+    `);
+    storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_user_deletions (
+        deletion_id TEXT PRIMARY KEY,
+        registered_user_ref TEXT NOT NULL UNIQUE,
+        user_do_id TEXT NOT NULL,
+        avatar_key TEXT,
+        actor_user_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        deleted_at TEXT,
+        state TEXT NOT NULL
+      )
+    `);
   }
 
   /** Idempotently consume one stable post-commit User registration outbox fact. */
@@ -117,9 +186,15 @@ export class UsageUserRegistry {
       }
 
       const identityConflict = this.storage.sql.exec<{count: string}>(`
-        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_user_registry
-        WHERE registered_user_ref = ? OR user_do_id = ?
-      `, normalized.registeredUserRef, normalized.userDoId).one().count;
+        SELECT CAST(COUNT(*) AS TEXT) AS count FROM (
+          SELECT 1 FROM usage_user_registry
+          WHERE registered_user_ref = ? OR user_do_id = ?
+          UNION ALL
+          SELECT 1 FROM usage_user_anonymous_principals
+          WHERE registered_user_ref = ? OR user_do_id = ?
+        )
+      `, normalized.registeredUserRef, normalized.userDoId,
+      normalized.registeredUserRef, normalized.userDoId).one().count;
       if (identityConflict !== "0") {
         throw new Error("Usage User registration conflicts with stored Registry state.");
       }
@@ -184,15 +259,193 @@ export class UsageUserRegistry {
   count(): bigint {
     return BigInt(this.storage.sql.exec<{count: string}>(`
       SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_user_registry
+      WHERE lifecycle_state = 'active'
     `).one().count);
   }
 
   /** Return the monotonic Registry insertion watermark used to close a stable rebuild pass. */
   revision(): bigint {
     return BigInt(this.storage.sql.exec<{revision: string}>(`
-      SELECT CAST(COALESCE(MAX(sequence), 0) AS TEXT) AS revision
-      FROM usage_user_registry
+      SELECT CAST(COALESCE(MAX(sequence), 0) AS TEXT) AS revision FROM (
+        SELECT sequence FROM usage_user_registry
+        UNION ALL
+        SELECT sequence FROM usage_user_anonymous_principals
+      )
     `).one().revision);
+  }
+
+  /** List active and anonymously retained principals for one fixed rebuild watermark. */
+  listProjectionPrincipals(
+      afterSequence: bigint | null,
+      maximumSequence: bigint,
+      limit: number): UsageProjectionPrincipalPage {
+    if ((afterSequence !== null && (typeof afterSequence !== "bigint" || afterSequence < 0n)) ||
+        typeof maximumSequence !== "bigint" || maximumSequence < 0n ||
+        !Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new TypeError("Usage Projection Registry page is invalid.");
+    }
+    const rows = this.storage.sql.exec<{
+      sequence: string;
+      registered_user_ref: string;
+      user_do_id: string;
+    }>(`
+      SELECT CAST(sequence AS TEXT) AS sequence, registered_user_ref, user_do_id FROM (
+        SELECT sequence, registered_user_ref, user_do_id FROM usage_user_registry
+        UNION ALL
+        SELECT sequence, registered_user_ref, user_do_id
+        FROM usage_user_anonymous_principals
+      )
+      WHERE sequence > ? AND sequence <= ?
+      ORDER BY sequence
+      LIMIT ?
+    `, (afterSequence ?? 0n).toString(), maximumSequence.toString(), limit + 1).toArray();
+    const hasNext = rows.length > limit;
+    const page = rows.slice(0, limit).map(row => ({
+      sequence: BigInt(row.sequence),
+      registeredUserRef: row.registered_user_ref,
+      userDoId: row.user_do_id,
+    }));
+    return {
+      principals: page,
+      nextSequence: hasNext ? page.at(-1)!.sequence : null,
+    };
+  }
+
+  /** Atomically hide an active identity and persist one resumable deletion job. */
+  prepareDeletion(
+      registeredUserRef: string,
+      deletionId: string,
+      reason: string,
+      actorUserId: string,
+      actorUserDoId: string): UsageUserDeletionPreparation {
+    const normalized = normalizeDeletionInput(
+      registeredUserRef,
+      deletionId,
+      reason,
+      actorUserId,
+      actorUserDoId,
+    );
+    return this.storage.transactionSync(() => {
+      const byId = this.selectDeletionById(normalized.deletionId);
+      if (byId) return deletionPreparation(byId, normalized);
+      const byPrincipal = this.storage.sql.exec<DeletionJobRow>(`
+        SELECT deletion_id, registered_user_ref, user_do_id, avatar_key, actor_user_id,
+               reason, requested_at, deleted_at, state
+        FROM usage_user_deletions WHERE registered_user_ref = ?
+      `, normalized.registeredUserRef).toArray()[0];
+      if (byPrincipal) {
+        throw new Error("Registered User deletion conflicts with its stored request.");
+      }
+      const active = this.storage.sql.exec<{
+        user_do_id: string;
+        lifecycle_state: string;
+      }>(`
+        SELECT user_do_id, lifecycle_state FROM usage_user_registry
+        WHERE registered_user_ref = ?
+      `, normalized.registeredUserRef).toArray()[0];
+      if (!active || active.lifecycle_state !== "active") {
+        throw new Error("Registered User does not exist.");
+      }
+      if (active.user_do_id === normalized.actorUserDoId) {
+        throw new Error("Administrators cannot delete their own User.");
+      }
+      const requestedAt = new Date().toISOString();
+      this.storage.sql.exec(`
+        UPDATE usage_user_registry SET lifecycle_state = 'deleting'
+        WHERE registered_user_ref = ? AND lifecycle_state = 'active'
+      `, normalized.registeredUserRef);
+      this.storage.sql.exec(`
+        INSERT INTO usage_user_deletions (
+          deletion_id, registered_user_ref, user_do_id, actor_user_id,
+          reason, requested_at, state
+        ) VALUES (?, ?, ?, ?, ?, ?, 'deleting')
+      `, normalized.deletionId, normalized.registeredUserRef, active.user_do_id,
+      normalized.actorUserId, normalized.reason, requestedAt);
+      const inserted = this.selectDeletionById(normalized.deletionId);
+      if (!inserted) throw new Error("Registered User deletion could not be stored.");
+      return deletionPreparation(inserted, normalized);
+    });
+  }
+
+  /** Reject a self-target before the coordinator mutates its persisted alarm state. */
+  assertDeletionTargetIsNotActor(registeredUserRef: string, actorUserDoId: string): void {
+    if (!isOpaqueReference(registeredUserRef) || !/^[0-9a-f]{64}$/.test(actorUserDoId)) {
+      throw new TypeError("Registered User deletion request is invalid.");
+    }
+    const target = this.storage.sql.exec<{user_do_id: string}>(`
+      SELECT user_do_id FROM usage_user_registry
+      WHERE registered_user_ref = ? AND lifecycle_state = 'active'
+    `, registeredUserRef).toArray()[0];
+    if (target?.user_do_id === actorUserDoId) {
+      throw new Error("Administrators cannot delete their own User.");
+    }
+  }
+
+  /** Replace a deleting identity row with a permanent anonymous principal tombstone. */
+  completeDeletion(deletionId: string): AdminUsageDeleteUserResult {
+    if (!isDeletionId(deletionId)) throw new TypeError("User deletion ID is invalid.");
+    return this.storage.transactionSync(() => {
+      const job = this.selectDeletionById(deletionId);
+      if (!job) throw new Error("Registered User deletion does not exist.");
+      if (job.state === "deleted") return deletionResult(job);
+      const deletedAt = new Date().toISOString();
+      this.storage.sql.exec(`
+        INSERT INTO usage_user_anonymous_principals (
+          sequence, registered_user_ref, user_do_id, deleted_at
+        )
+        SELECT sequence, registered_user_ref, user_do_id, ?
+        FROM usage_user_registry
+        WHERE registered_user_ref = ? AND lifecycle_state = 'deleting'
+      `, deletedAt, job.registered_user_ref);
+      const inserted = this.storage.sql.exec<{present: string}>(`
+        SELECT CAST(EXISTS(
+          SELECT 1 FROM usage_user_anonymous_principals WHERE registered_user_ref = ?
+        ) AS TEXT) AS present
+      `, job.registered_user_ref).one().present;
+      if (inserted !== "1") {
+        throw new Error("Registered User anonymous tombstone could not be stored.");
+      }
+      this.storage.sql.exec(`
+        DELETE FROM usage_user_registry WHERE registered_user_ref = ?
+      `, job.registered_user_ref);
+      this.storage.sql.exec(`
+        UPDATE usage_user_deletions SET avatar_key = NULL, deleted_at = ?, state = 'deleted'
+        WHERE deletion_id = ?
+      `, deletedAt, deletionId);
+      const completed = this.selectDeletionById(deletionId);
+      if (!completed) throw new Error("Registered User deletion result is missing.");
+      return deletionResult(completed);
+    });
+  }
+
+  /** Read one persisted deletion coordinator job by its idempotency key. */
+  getDeletion(deletionId: string): UsageUserDeletionPreparation | null {
+    if (!isDeletionId(deletionId)) throw new TypeError("User deletion ID is invalid.");
+    const row = this.selectDeletionById(deletionId);
+    return row ? storedDeletionPreparation(row) : null;
+  }
+
+  /** List at most one bounded alarm page of unfinished deletion coordinator jobs. */
+  listPendingDeletions(limit: number): UsageUserDeletionPreparation[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 8) {
+      throw new TypeError("User deletion coordinator page size is invalid.");
+    }
+    return this.storage.sql.exec<DeletionJobRow>(`
+      SELECT deletion_id, registered_user_ref, user_do_id, avatar_key, actor_user_id,
+             reason, requested_at, deleted_at, state
+      FROM usage_user_deletions WHERE state = 'deleting'
+      ORDER BY requested_at, deletion_id
+      LIMIT ?
+    `, limit).toArray().map(storedDeletionPreparation);
+  }
+
+  /** Return whether the authority still owns an unfinished deletion coordinator job. */
+  hasPendingDeletions(): boolean {
+    return this.storage.sql.exec<{present: string}>(`
+      SELECT CAST(EXISTS(
+        SELECT 1 FROM usage_user_deletions WHERE state = 'deleting'
+      ) AS TEXT) AS present
+    `).one().present === "1";
   }
 
   /** Replace one User's bounded outbox health and update exact deployment watermarks. */
@@ -216,7 +469,8 @@ export class UsageUserRegistry {
       `).one();
       const previousPending = BigInt(previous?.pending_event_count ?? "0");
       const previousFailed = previous?.failure_code !== null && previous !== undefined;
-      const failureCode = normalized.deliveryFailed ? "delivery-failed" : null;
+      const failureCode = normalized.retentionFailed ? "retention-failed"
+        : normalized.deliveryFailed ? "delivery-failed" : null;
       const failedPrincipalDelta = (failureCode === null ? 0n : 1n) -
         (previousFailed ? 1n : 0n);
       this.storage.sql.exec(`
@@ -231,7 +485,8 @@ export class UsageUserRegistry {
       `,
       (BigInt(totals.pending_event_count) - previousPending +
         normalized.pendingEventCount).toString(),
-      (BigInt(totals.failed_delivery_count) + (normalized.deliveryFailed ? 1n : 0n)).toString(),
+      (BigInt(totals.failed_delivery_count) +
+        (normalized.deliveryFailed || normalized.retentionFailed ? 1n : 0n)).toString(),
       (BigInt(totals.failed_principal_count) + failedPrincipalDelta).toString());
     });
   }
@@ -250,11 +505,26 @@ export class UsageUserRegistry {
       SELECT MIN(oldest_pending_at) AS oldest FROM usage_projection_delivery_health
       WHERE pending_event_count != '0'
     `).one().oldest;
+    const failure = this.storage.sql.exec<{
+      retention_failed: string;
+      delivery_failed: string;
+    }>(`
+      SELECT
+        CAST(EXISTS(
+          SELECT 1 FROM usage_projection_delivery_health
+          WHERE failure_code = 'retention-failed'
+        ) AS TEXT) AS retention_failed,
+        CAST(EXISTS(
+          SELECT 1 FROM usage_projection_delivery_health
+          WHERE failure_code = 'delivery-failed'
+        ) AS TEXT) AS delivery_failed
+    `).one();
     return {
       pendingEventCount: BigInt(totals.pending_event_count),
       oldestPendingAt: oldest,
       failedDeliveryCount: BigInt(totals.failed_delivery_count),
-      failureCode: BigInt(totals.failed_principal_count) === 0n ? null : "delivery-failed",
+      failureCode: failure.retention_failed === "1" ? "retention-failed"
+        : failure.delivery_failed === "1" ? "delivery-failed" : null,
     };
   }
 
@@ -264,7 +534,8 @@ export class UsageUserRegistry {
       throw new TypeError("Registered User reference is invalid.");
     }
     const row = this.storage.sql.exec<{user_do_id: string}>(`
-      SELECT user_do_id FROM usage_user_registry WHERE registered_user_ref = ?
+      SELECT user_do_id FROM usage_user_registry
+      WHERE registered_user_ref = ? AND lifecycle_state = 'active'
     `, registeredUserRef).toArray()[0];
     return row ? {userDoId: row.user_do_id} : null;
   }
@@ -278,13 +549,21 @@ export class UsageUserRegistry {
     `, registrationEventId).toArray()[0];
   }
 
+  private selectDeletionById(deletionId: string): DeletionJobRow | undefined {
+    return this.storage.sql.exec<DeletionJobRow>(`
+      SELECT deletion_id, registered_user_ref, user_do_id, avatar_key, actor_user_id,
+             reason, requested_at, deleted_at, state
+      FROM usage_user_deletions WHERE deletion_id = ?
+    `, deletionId).toArray()[0];
+  }
+
   private searchAll(after: string, watermark: string, limit: number): RegistryRow[] {
     return this.storage.sql.exec<RegistryRow>(`
       SELECT CAST(sequence AS TEXT) AS sequence, registered_user_ref, user_do_id,
              identity, display_name,
              registered_at, activated_at, registration_event_id
       FROM usage_user_registry
-      WHERE sequence > ? AND sequence <= ?
+      WHERE lifecycle_state = 'active' AND sequence > ? AND sequence <= ?
       ORDER BY sequence ASC
       LIMIT ?
     `, after, watermark, limit).toArray();
@@ -299,11 +578,13 @@ export class UsageUserRegistry {
           SELECT sequence
           FROM usage_user_registry INDEXED BY usage_user_registry_identity_search
           WHERE identity_search >= ?
+            AND lifecycle_state = 'active'
             AND sequence > ? AND sequence <= ?
           UNION
           SELECT sequence
           FROM usage_user_registry INDEXED BY usage_user_registry_display_search
           WHERE display_name_search >= ?
+            AND lifecycle_state = 'active'
             AND sequence > ? AND sequence <= ?
         )
         SELECT CAST(registry.sequence AS TEXT) AS sequence,
@@ -328,11 +609,13 @@ export class UsageUserRegistry {
         SELECT sequence
         FROM usage_user_registry INDEXED BY usage_user_registry_identity_search
         WHERE identity_search >= ? AND identity_search < ?
+          AND lifecycle_state = 'active'
           AND sequence > ? AND sequence <= ?
         UNION
         SELECT sequence
         FROM usage_user_registry INDEXED BY usage_user_registry_display_search
         WHERE display_name_search >= ? AND display_name_search < ?
+          AND lifecycle_state = 'active'
           AND sequence > ? AND sequence <= ?
       )
       SELECT CAST(registry.sequence AS TEXT) AS sequence,
@@ -354,6 +637,95 @@ export class UsageUserRegistry {
     watermark,
     limit).toArray();
   }
+}
+
+function normalizeDeletionInput(
+    registeredUserRef: string,
+    deletionId: string,
+    reason: string,
+    actorUserId: string,
+    actorUserDoId: string) {
+  if (!isOpaqueReference(registeredUserRef) || !isDeletionId(deletionId) ||
+      typeof reason !== "string" || reason.length > 1_000 || reason.trim().length === 0 ||
+      reason.includes("\u0000") ||
+      typeof actorUserId !== "string" || actorUserId.length < 1 || actorUserId.length > 500 ||
+      hasAsciiControlCharacter(actorUserId) || !/^[0-9a-f]{64}$/.test(actorUserDoId)) {
+    throw new TypeError("Registered User deletion request is invalid.");
+  }
+  return {registeredUserRef, deletionId, reason: reason.trim(), actorUserId, actorUserDoId};
+}
+
+function deletionPreparation(
+    row: DeletionJobRow,
+    expected: ReturnType<typeof normalizeDeletionInput>): UsageUserDeletionPreparation {
+  assertDeletionJobRow(row);
+  if (row.registered_user_ref !== expected.registeredUserRef ||
+      row.deletion_id !== expected.deletionId || row.reason !== expected.reason ||
+      row.actor_user_id !== expected.actorUserId) {
+    throw new Error("Registered User deletion conflicts with its stored request.");
+  }
+  return {
+    registeredUserRef: row.registered_user_ref,
+    deletionId: row.deletion_id,
+    userDoId: row.user_do_id,
+    actorUserId: row.actor_user_id,
+    reason: row.reason,
+    state: row.state,
+    deletedAt: row.deleted_at,
+  };
+}
+
+function storedDeletionPreparation(row: DeletionJobRow): UsageUserDeletionPreparation {
+  assertDeletionJobRow(row);
+  return {
+    registeredUserRef: row.registered_user_ref,
+    deletionId: row.deletion_id,
+    userDoId: row.user_do_id,
+    actorUserId: row.actor_user_id,
+    reason: row.reason,
+    state: row.state,
+    deletedAt: row.deleted_at,
+  };
+}
+
+function deletionResult(row: DeletionJobRow): AdminUsageDeleteUserResult {
+  assertDeletionJobRow(row);
+  if (row.state !== "deleted" || row.deleted_at === null || row.avatar_key !== null) {
+    throw new Error("Registered User deletion is not complete.");
+  }
+  return {
+    registeredUserRef: row.registered_user_ref,
+    deletionId: row.deletion_id,
+    actorUserId: row.actor_user_id,
+    reason: row.reason,
+    deletedAt: normalizeCanonicalUtcTimestamp(row.deleted_at, "User deletion time"),
+    state: "deleted",
+  };
+}
+
+function assertDeletionJobRow(row: DeletionJobRow): void {
+  if (!isDeletionId(row.deletion_id) || !isOpaqueReference(row.registered_user_ref) ||
+      !/^[0-9a-f]{64}$/.test(row.user_do_id) ||
+      typeof row.actor_user_id !== "string" || row.actor_user_id.length < 1 ||
+      row.actor_user_id.length > 500 || hasAsciiControlCharacter(row.actor_user_id) ||
+      typeof row.reason !== "string" || row.reason.length > 1_000 ||
+      row.reason.trim().length === 0 || row.reason !== row.reason.trim() ||
+      row.reason.includes("\u0000") ||
+      normalizeCanonicalUtcTimestamp(row.requested_at, "User deletion request time") !==
+        row.requested_at ||
+      (row.state !== "deleting" && row.state !== "deleted") ||
+      (row.deleted_at !== null && normalizeCanonicalUtcTimestamp(
+        row.deleted_at,
+        "User deletion time",
+      ) !== row.deleted_at) ||
+      (row.state === "deleted") !== (row.deleted_at !== null) ||
+      row.avatar_key !== null) {
+    throw new Error("Registered User deletion state is invalid.");
+  }
+}
+
+function isDeletionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value);
 }
 
 function normalizeSearchRequest(request: AdminUsageUserSearchRequest): {
@@ -384,9 +756,10 @@ function normalizeDeliveryHealthReport(
   if (typeof report !== "object" || report === null || Array.isArray(report) ||
       Object.keys(report).toSorted().join("\u0000") !== [
         "deliveryFailed", "oldestPendingAt", "pendingEventCount", "registeredUserRef",
+        "retentionFailed",
       ].join("\u0000") || !isOpaqueReference(report.registeredUserRef) ||
       typeof report.pendingEventCount !== "bigint" || report.pendingEventCount < 0n ||
-      typeof report.deliveryFailed !== "boolean") {
+      typeof report.deliveryFailed !== "boolean" || typeof report.retentionFailed !== "boolean") {
     throw new TypeError("Usage Projection delivery health is invalid.");
   }
   const oldestPendingAt = report.oldestPendingAt === null ? null

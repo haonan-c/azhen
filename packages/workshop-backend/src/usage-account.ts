@@ -34,8 +34,11 @@ import {
   normalizeUsageAttribution,
   type DirectUserUsageAttribution,
   type UsageAttribution,
+  type UsageSource,
 } from "./usage-attribution.js";
 import type {
+  UsageProjectionAggregateFact,
+  UsageProjectionDetailFact,
   UsageProjectionFact,
   UsageProjectionIngestResult,
   UsageProjectionRejection,
@@ -73,6 +76,11 @@ const PROJECTION_OUTBOX_PREFIX = "usageAccount:projectionOutbox:";
 const PROJECTION_PENDING_PREFIX = "usageAccount:projectionPending:";
 const PROJECTION_PENDING_COUNT_KEY = "usageAccount:projectionPendingCount:v1";
 const PROJECTION_SOURCE_MARKER_PREFIX = "usageAccount:projectionSourceMarker:";
+const USAGE_SUMMARY_PREFIX = "usageAccount:summary:";
+const USAGE_SUMMARY_DIMENSION_INDEX_PREFIX = "usageAccount:summaryDimension:";
+const USAGE_SUMMARY_CONTRIBUTION_PREFIX = "usageAccount:summaryContribution:";
+const USAGE_DETAIL_SOURCE_REF_PREFIX = "usageAccount:detailSourceRef:";
+const USAGE_DETAIL_REF_PREFIX = "usageAccount:detailRef:";
 const PROJECTION_BACKFILL_STAGE_KEY = "usageAccount:projectionBackfillStage:v1";
 const PROJECTION_BACKFILL_CURSOR_KEY = "usageAccount:projectionBackfillCursor:v1";
 const DISCOVERED_GATEKEEPER_METHOD_PREFIX = "usageAccount:discoveredGatekeeperMethod:v2:";
@@ -84,9 +92,22 @@ const DISCOVERED_GATEKEEPER_METHOD_COUNT_KEY =
   "usageAccount:discoveredGatekeeperMethodCount:v2";
 const DISCOVERED_GATEKEEPER_METHOD_TRUNCATED_KEY =
   "usageAccount:discoveredGatekeeperMethodTruncated:v2";
+const SUMMARY_BACKFILL_STAGE_KEY = "usageAccount:summaryBackfillStage:v1";
+const SUMMARY_BACKFILL_CURSOR_KEY = "usageAccount:summaryBackfillCursor:v1";
 const GATEKEEPER_RECONCILIATION_PREFIX = "usageAccount:gatekeeperReconciliation:";
 const GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX =
   "usageAccount:gatekeeperReconciliationByUsage:";
+const GATEKEEPER_RECONCILIATION_REPLAY_TOMBSTONE_PREFIX =
+  "usageAccount:gatekeeperReconciliationReplayTombstone:";
+const GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX =
+  "usageAccount:gatekeeperReconciliationTimeIndex:";
+const USAGE_OPERATION_TOMBSTONE_PREFIX = "usageAccount:operationTombstone:";
+const USAGE_USER_DELETION_KEY = "usageAccount:userDeletion:v1";
+const RETENTION_RUN_KEY = "usageAccount:retentionRun:v1";
+const RETENTION_NEXT_RUN_AT_KEY = "usageAccount:retentionNextRunAt:v1";
+const RETENTION_FAILURE_RETRY_AT_KEY = "usageAccount:retentionFailureRetryAt:v1";
+const RETENTION_LAST_RESULT_KEY = "usageAccount:retentionLastResult:v1";
+const RETENTION_SCHEDULE_INITIALIZED_KEY = "usageAccount:retentionScheduleInitialized:v1";
 const BILLING_BLOCK_KEY = "usageAccount:billingBlock:v1";
 const DEFAULT_USER_USAGE_PAGE_LIMIT = 50;
 const MAX_USER_USAGE_PAGE_LIMIT = 100;
@@ -95,6 +116,54 @@ const PROJECTION_BACKFILL_BATCH = 32;
 const MAX_DISCOVERED_GATEKEEPER_METHODS = 500;
 
 type ProjectionBackfillStage = "model" | "gatekeeper" | "reconciliation" | "complete";
+
+/** User-authoritative locator resolved only from an opaque User-local report reference. */
+export type UsageDetailLocator = {
+  kind: "model" | "gatekeeper" | "gatekeeper-reconciliation";
+  operationId: string;
+};
+
+type UsageOperationTombstone = {
+  operationId: string;
+  kind: "model" | "gatekeeper" | "gatekeeper-reconciliation";
+  terminalState: string;
+  ledgerEntryId: string | null;
+};
+
+/** Permanent User lifecycle tombstone that blocks new Metered Use without deleting history. */
+export type UsageUserDeletionState = {
+  deletionId: string;
+  actorUserId: string;
+  reason: string;
+  requestedAt: string;
+  completedAt: string | null;
+  state: "deleting" | "deleted";
+};
+
+type UsageRetentionStage = "model" | "gatekeeper" | "reconciliation";
+type UsageDetailExpiryResult = "deleted" | "retained" | "blocked";
+
+type UsageRetentionRun = {
+  runId: string;
+  runNowUtc: string;
+  cutoffUtc: string;
+  stage: UsageRetentionStage;
+  cursor: string | null;
+  deletedDetailCount: bigint;
+  retainedDetailCount: bigint;
+};
+
+type ProjectionFactContribution =
+  | Omit<UsageProjectionDetailFact,
+      "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef">
+  | Omit<UsageProjectionAggregateFact,
+      "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef">;
+
+type DetailProjectionContribution = Omit<
+  UsageProjectionDetailFact,
+  "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef" |
+    "safeRecordRef"
+>;
 
 type TransactionResult<T> = { value: T } | { error: Error };
 
@@ -229,6 +298,62 @@ export type GatekeeperUsageReconciliation = {
   reason: string;
   ledgerEntryId: string | null;
   createdAt: string;
+  /** Bounded authority needed to drill into this decision after the older Usage Record expires. */
+  authoritySnapshot: GatekeeperUsageReconciliationAuthoritySnapshot;
+};
+
+/**
+ * Content-free authority retained only for the reconciliation record's own 24-month lifetime.
+ *
+ * It deliberately excludes the original Usage Record time, Workspace, conversation, request,
+ * response, arguments, and administrator reason.
+ */
+export type GatekeeperUsageReconciliationAuthoritySnapshot = {
+  /** Stored schema discriminator. */
+  schemaVersion: 1;
+  /** Stable pseudonymous User Usage Principal. */
+  usagePrincipalRef: string;
+  /** Original unknown Gatekeeper operation link, retained only with this reconciliation row. */
+  billingOperationId: string;
+  /** Stable identity of this administrator decision. */
+  reconciliationOperationId: string;
+  /** Host-attested causal source. */
+  source: UsageSource;
+  /** Explicit Metered Use family, or attempt when the decision released Usage. */
+  meteredKind: "gatekeeper" | "attempt";
+  /** Immutable pricing state. */
+  pricing: "priced" | "unpriced";
+  /** Stable Gatekeeper vendor dimension. */
+  vendorId: string;
+  /** Gatekeeper-scoped stable business method. */
+  billingMethodKey: string;
+  /** Content-free external account dimension. */
+  externalAccountId: string;
+  /** Stable Gadget dimension when one exists. */
+  gadgetId: string | null;
+  /** Formal terminal reconciliation outcome. */
+  outcome: "reconciled-settled" | "reconciled-released";
+  /** Administrator decision applied to unknown Usage. */
+  decision: "settle" | "release";
+  /** Immutable pricing evidence used by the original authority. */
+  chargeSnapshot: GatekeeperChargeSnapshot;
+  /** Exact Usage Credit charged by this decision. */
+  chargedUsageCreditSubunits: bigint;
+  /** Exact confirmed Metered Use contribution. */
+  meteredUseCount: bigint;
+  /** Exact confirmed API-operation contribution. */
+  billableApiOperations: bigint;
+  /** Linked immutable Usage Charge entry, if a positive priced charge was written. */
+  ledgerEntryId: string | null;
+  /** Canonical UTC time of this reconciliation, never the original Usage event time. */
+  reconciledAtUtc: string;
+};
+
+type StoredGatekeeperUsageReconciliation = Omit<
+  GatekeeperUsageReconciliation,
+  "authoritySnapshot"
+> & {
+  authoritySnapshot?: GatekeeperUsageReconciliationAuthoritySnapshot;
 };
 
 /** Account-level stop raised when confirmed usage exceeds its reserved upper bound. */
@@ -323,6 +448,23 @@ export type UsageProjectionFactPage = {
   backfillComplete: boolean;
 };
 
+/**
+ * Authoritative content-free aggregate snapshot for one canonical 15-minute UTC bucket and
+ * reporting-dimension tuple. It contains no operation, record, or exact event identity.
+ */
+export type UsageSummaryFact = Omit<
+  UsageProjectionAggregateFact,
+  "projectionFactId" | "sourceSequence"
+>;
+
+/** Result of one bounded, crash-resumable 24-UTC-calendar-month detail-retention step. */
+export type UsageRetentionResult = {
+  runId: string;
+  cutoffUtc: string;
+  deletedDetailCount: bigint;
+  complete: boolean;
+};
+
 type StoredAdminUsageOperationInput = {
   actorUserId: string;
   reason: string;
@@ -353,6 +495,7 @@ export type UsageAccountSnapshot = UsageCreditBalance & {
   billingBlock: UsageBillingBlock | null;
   projectionFacts: UsageProjectionFact[];
   projectionOutbox: UsageProjectionOutboxEntry[];
+  usageSummaryFacts: UsageSummaryFact[];
 };
 
 /**
@@ -401,6 +544,107 @@ export class UsageAccount {
     if (!outbox) throw new Error("Usage User registration outbox is missing.");
     assertRegistrationOutbox(outbox);
     return outbox;
+  }
+
+  /** Mark identity deletion inside the caller's current User transaction. */
+  beginUserDeletionInCurrentTransaction(
+      deletionId: string,
+      reason: string,
+      actorUserId: string): UsageUserDeletionState {
+    const normalized = normalizeUsageUserDeletionInput(deletionId, reason, actorUserId);
+    const existing = this.storage.kv.get<UsageUserDeletionState>(USAGE_USER_DELETION_KEY);
+    if (existing !== undefined) {
+      assertUsageUserDeletionState(existing);
+      if (existing.deletionId !== normalized.deletionId ||
+          existing.reason !== normalized.reason || existing.actorUserId !== normalized.actorUserId) {
+        throw new Error("User deletion conflicts with its stored request.");
+      }
+      return existing;
+    }
+    const state: UsageUserDeletionState = {
+      ...normalized,
+      requestedAt: new Date().toISOString(),
+      completedAt: null,
+      state: "deleting",
+    };
+    this.storage.kv.put(USAGE_USER_DELETION_KEY, state);
+    const registration = this.getRegistrationOutbox();
+    this.storage.kv.put<UsageUserRegistrationOutbox>(REGISTRATION_OUTBOX_KEY, {
+      fact: {
+        ...registration.fact,
+        identity: `deleted:${registration.fact.registeredUserRef.slice(0, 12)}`,
+        displayName: "Deleted User",
+      },
+      deliveredAt: registration.deliveredAt ?? new Date().toISOString(),
+    });
+    return state;
+  }
+
+  /** Complete identity deletion inside the caller's current User transaction. */
+  completeUserDeletionInCurrentTransaction(deletionId: string): UsageUserDeletionState {
+    const existing = this.storage.kv.get<UsageUserDeletionState>(USAGE_USER_DELETION_KEY);
+    if (existing === undefined) throw new Error("User deletion has not started.");
+    assertUsageUserDeletionState(existing);
+    if (existing.deletionId !== deletionId) {
+      throw new Error("User deletion conflicts with its stored request.");
+    }
+    if (existing.state === "deleted") return existing;
+    const completed: UsageUserDeletionState = {
+      ...existing,
+      completedAt: new Date().toISOString(),
+      state: "deleted",
+    };
+    this.storage.kv.put(USAGE_USER_DELETION_KEY, completed);
+    return completed;
+  }
+
+  /** Read the permanent User deletion lifecycle without changing financial authority. */
+  getUserDeletionState(): UsageUserDeletionState | null {
+    const state = this.storage.kv.get<UsageUserDeletionState>(USAGE_USER_DELETION_KEY);
+    if (state === undefined) return null;
+    assertUsageUserDeletionState(state);
+    return state;
+  }
+
+  /** Resolve one opaque report reference only inside this authoritative User Usage Account. */
+  resolveUsageDetailReference(safeRecordRef: string): UsageDetailLocator | null {
+    if (!isOpaqueUsageReference(safeRecordRef)) {
+      throw new TypeError("Usage detail reference is invalid.");
+    }
+    const locator = this.storage.kv.get<UsageDetailLocator>(
+      USAGE_DETAIL_REF_PREFIX + safeRecordRef,
+    );
+    if (locator === undefined) return null;
+    if ((locator.kind !== "model" && locator.kind !== "gatekeeper" &&
+         locator.kind !== "gatekeeper-reconciliation") ||
+        typeof locator.operationId !== "string" || locator.operationId.length === 0) {
+      throw new Error("Usage detail reference does not reconcile.");
+    }
+    return locator;
+  }
+
+  /**
+   * Resolve one reconciliation-only authority snapshot through its random User-local reference.
+   *
+   * Issue #63 maps this server-only result into its public detail DTO. The original Usage Record
+   * is not consulted, so its strict 24-month retention remains independent.
+   */
+  getGatekeeperReconciliationAuthority(
+      safeRecordRef: string): GatekeeperUsageReconciliationAuthoritySnapshot | null {
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator === null || locator.kind !== "gatekeeper-reconciliation") return null;
+    const expectedRef = this.storage.kv.get<string>(
+      USAGE_DETAIL_SOURCE_REF_PREFIX + `reconciliation:${locator.operationId}`,
+    );
+    if (expectedRef !== safeRecordRef) {
+      throw new Error("Usage reconciliation reference does not reconcile.");
+    }
+    const reconciliation = this.storage.kv.get<GatekeeperUsageReconciliation>(
+      GATEKEEPER_RECONCILIATION_PREFIX + locator.operationId,
+    );
+    if (!reconciliation) throw new Error("Usage reconciliation does not exist.");
+    assertGatekeeperUsageReconciliation(reconciliation, locator.operationId);
+    return structuredClone(reconciliation.authoritySnapshot);
   }
 
   /** Idempotently acknowledge Registry delivery without deleting the stable outbox fact. */
@@ -636,7 +880,7 @@ export class UsageAccount {
             stage !== "reconciliation" && stage !== "complete") {
           throw new Error("Usage Projection backfill stage is invalid.");
         }
-        if (stage === "complete") return true;
+        if (stage === "complete") return this.#backfillUsageSummariesBatch(remaining);
         const prefix = stage === "model" ? MODEL_USAGE_RECORD_PREFIX
           : stage === "gatekeeper" ? GATEKEEPER_USAGE_RECORD_PREFIX
             : GATEKEEPER_RECONCILIATION_PREFIX;
@@ -658,21 +902,19 @@ export class UsageAccount {
             assertGatekeeperUsageRecord(record, operationId);
             this.#appendGatekeeperProjectionFact(record);
           } else {
-            const reconciliation = value as GatekeeperUsageReconciliation;
-            assertGatekeeperUsageReconciliation(reconciliation, operationId);
-            const record = this.storage.kv.get<GatekeeperUsageRecord>(
-              GATEKEEPER_USAGE_RECORD_PREFIX + reconciliation.billingOperationId,
-            );
-            if (!record) {
-              throw new Error("Gatekeeper Usage reconciliation record is missing.");
-            }
-            assertGatekeeperUsageRecord(record, reconciliation.billingOperationId);
-            this.#appendGatekeeperReconciliationProjectionFact(
+            const stored = value as StoredGatekeeperUsageReconciliation;
+            assertGatekeeperUsageReconciliationAudit(stored, operationId);
+            const record = stored.authoritySnapshot === undefined
+              ? this.storage.kv.get<GatekeeperUsageRecord>(
+                GATEKEEPER_USAGE_RECORD_PREFIX + stored.billingOperationId,
+              ) : undefined;
+            const reconciliation = this.#ensureGatekeeperReconciliationAuthority(
+              stored,
+              operationId,
               record,
-              reconciliation.reconciliationOperationId,
-              reconciliation.decision,
-              reconciliation.createdAt,
-              reconciliation.ledgerEntryId,
+            );
+            this.#appendGatekeeperReconciliationProjectionFact(
+              reconciliation.authoritySnapshot,
             );
           }
         }
@@ -689,8 +931,390 @@ export class UsageAccount {
         );
       }
       return this.storage.kv.get<ProjectionBackfillStage>(PROJECTION_BACKFILL_STAGE_KEY) ===
-        "complete";
+        "complete" && this.#backfillUsageSummariesBatch(remaining);
     });
+  }
+
+  #backfillUsageSummariesBatch(limit: number): boolean {
+    let remaining = limit;
+    while (remaining > 0) {
+      const stage = this.storage.kv.get<ProjectionBackfillStage>(
+        SUMMARY_BACKFILL_STAGE_KEY,
+      ) ?? "model";
+      if (stage !== "model" && stage !== "gatekeeper" &&
+          stage !== "reconciliation" && stage !== "complete") {
+        throw new Error("Usage Summary backfill stage is invalid.");
+      }
+      if (stage === "complete") return true;
+      const prefix = stage === "model" ? MODEL_USAGE_RECORD_PREFIX
+        : stage === "gatekeeper" ? GATEKEEPER_USAGE_RECORD_PREFIX
+          : GATEKEEPER_RECONCILIATION_PREFIX;
+      const cursor = this.storage.kv.get<string>(SUMMARY_BACKFILL_CURSOR_KEY);
+      const entries = Array.from(this.storage.kv.list<unknown>({
+        prefix,
+        ...(cursor === undefined ? {} : {startAfter: cursor}),
+        limit: remaining + 1,
+      }));
+      const batch = entries.slice(0, remaining);
+      for (const [key, value] of batch) {
+        const operationId = key.slice(prefix.length);
+        if (stage === "model") {
+          const record = value as ModelUsageRecord;
+          assertModelUsageRecord(record, operationId);
+          this.#appendModelProjectionFact(record);
+        } else if (stage === "gatekeeper") {
+          const record = value as GatekeeperUsageRecord;
+          assertGatekeeperUsageRecord(record, operationId);
+          this.#appendGatekeeperProjectionFact(record);
+        } else {
+          const stored = value as StoredGatekeeperUsageReconciliation;
+          assertGatekeeperUsageReconciliationAudit(stored, operationId);
+          const record = stored.authoritySnapshot === undefined
+            ? this.storage.kv.get<GatekeeperUsageRecord>(
+              GATEKEEPER_USAGE_RECORD_PREFIX + stored.billingOperationId,
+            ) : undefined;
+          const reconciliation = this.#ensureGatekeeperReconciliationAuthority(
+            stored,
+            operationId,
+            record,
+          );
+          this.#appendGatekeeperReconciliationProjectionFact(
+            reconciliation.authoritySnapshot,
+          );
+        }
+      }
+      remaining -= batch.length;
+      if (entries.length > batch.length) {
+        this.storage.kv.put(SUMMARY_BACKFILL_CURSOR_KEY, batch.at(-1)![0]);
+        return false;
+      }
+      this.storage.kv.delete(SUMMARY_BACKFILL_CURSOR_KEY);
+      this.storage.kv.put<ProjectionBackfillStage>(
+        SUMMARY_BACKFILL_STAGE_KEY,
+        stage === "model" ? "gatekeeper"
+          : stage === "gatekeeper" ? "reconciliation" : "complete",
+      );
+    }
+    return this.storage.kv.get<ProjectionBackfillStage>(SUMMARY_BACKFILL_STAGE_KEY) ===
+      "complete";
+  }
+
+  /** Remove at most one bounded page of expired raw detail after its Summary is durable. */
+  runRetentionMaintenanceBatch(limit = 32): UsageRetentionResult {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
+      throw new TypeError("Usage retention page size is invalid.");
+    }
+    if (!this.backfillProjectionFactsBatch(limit)) {
+      return {
+        runId: "summary-backfill-v1",
+        cutoffUtc: subtractUtcCalendarMonths(new Date().toISOString(), 24),
+        deletedDetailCount: 0n,
+        complete: false,
+      };
+    }
+    const now = new Date().toISOString();
+    const nextRunAt = this.storage.kv.get<string>(RETENTION_NEXT_RUN_AT_KEY);
+    const last = this.storage.kv.get<UsageRetentionResult>(RETENTION_LAST_RESULT_KEY);
+    if (nextRunAt !== undefined && normalizeCanonicalUtcTimestamp(
+      nextRunAt,
+      "Usage retention next run time",
+    ) > now) {
+      return last ?? {
+        runId: "retention-scheduled-v1",
+        cutoffUtc: subtractUtcCalendarMonths(now, 24),
+        deletedDetailCount: 0n,
+        complete: true,
+      };
+    }
+    return this.storage.transactionSync(() => {
+      let run = this.storage.kv.get<UsageRetentionRun>(RETENTION_RUN_KEY);
+      if (run === undefined) {
+        run = {
+          runId: crypto.randomUUID(),
+          runNowUtc: now,
+          cutoffUtc: subtractUtcCalendarMonths(now, 24),
+          stage: "model",
+          cursor: null,
+          deletedDetailCount: 0n,
+          retainedDetailCount: 0n,
+        };
+        this.storage.kv.put(RETENTION_RUN_KEY, run);
+      } else {
+        assertUsageRetentionRun(run);
+      }
+      let remaining = limit;
+      while (remaining > 0) {
+        const prefix = retentionIndexPrefix(run.stage);
+        const entries: [string, string][] = Array.from(this.storage.kv.list<string>({
+          prefix,
+          ...(run.cursor === null ? {} : {startAfter: run.cursor}),
+          end: prefix + run.cutoffUtc,
+          limit: remaining + 1,
+        }));
+        const batch: [string, string][] = entries.slice(0, remaining);
+        for (const [indexKey, operationId] of batch) {
+          const expiry = this.#expireUsageDetail(run.stage, operationId, indexKey);
+          if (expiry === "blocked") {
+            this.storage.kv.put(RETENTION_RUN_KEY, run);
+            return retentionResult(run, false);
+          }
+          run = {
+            ...run,
+            cursor: indexKey,
+            deletedDetailCount: run.deletedDetailCount + (expiry === "deleted" ? 1n : 0n),
+            retainedDetailCount:
+              run.retainedDetailCount + (expiry === "retained" ? 1n : 0n),
+          };
+          remaining -= 1;
+        }
+        if (entries.length > batch.length) {
+          this.storage.kv.put(RETENTION_RUN_KEY, run);
+          return retentionResult(run, false);
+        }
+        const nextStage = nextRetentionStage(run.stage);
+        if (nextStage === null) {
+          const result = retentionResult(run, true);
+          this.storage.kv.put(RETENTION_LAST_RESULT_KEY, result);
+          this.storage.kv.put(RETENTION_SCHEDULE_INITIALIZED_KEY, true);
+          const nextExpiry = run.retainedDetailCount > 0n
+            ? new Date(new Date(run.runNowUtc).getTime() + 86_400_000).toISOString()
+            : this.#nextRetentionExpiry();
+          if (nextExpiry === null) this.storage.kv.delete(RETENTION_NEXT_RUN_AT_KEY);
+          else this.storage.kv.put(RETENTION_NEXT_RUN_AT_KEY, nextExpiry);
+          this.storage.kv.delete(RETENTION_RUN_KEY);
+          return result;
+        }
+        run = {...run, stage: nextStage, cursor: null};
+        this.storage.kv.put(RETENTION_RUN_KEY, run);
+      }
+      return retentionResult(run, false);
+    });
+  }
+
+  /** Return the next server-owned UTC instant when retention needs an alarm. */
+  getNextRetentionAlarmAt(): number | null {
+    const failureRetryAt = this.getRetentionFailureRetryAt();
+    if (failureRetryAt !== null) return failureRetryAt;
+    if (this.storage.kv.get<UsageRetentionRun>(RETENTION_RUN_KEY) !== undefined ||
+        this.storage.kv.get<ProjectionBackfillStage>(SUMMARY_BACKFILL_STAGE_KEY) !== "complete") {
+      return Date.now() + 1_000;
+    }
+    const next = this.storage.kv.get<string>(RETENTION_NEXT_RUN_AT_KEY);
+    if (next === undefined) {
+      return this.storage.kv.get<boolean>(RETENTION_SCHEDULE_INITIALIZED_KEY) === true
+        ? null : Date.now() + 1_000;
+    }
+    return new Date(normalizeCanonicalUtcTimestamp(
+      next,
+      "Usage retention next run time",
+    )).getTime();
+  }
+
+  /** Return a persisted retention failure retry without considering normal maintenance. */
+  getRetentionFailureRetryAt(): number | null {
+    const failureRetryAt = this.storage.kv.get<string>(RETENTION_FAILURE_RETRY_AT_KEY);
+    if (failureRetryAt === undefined) return null;
+    return new Date(normalizeCanonicalUtcTimestamp(
+      failureRetryAt,
+      "Usage retention failure retry time",
+    )).getTime();
+  }
+
+  /** Persist the server-owned retry deadline after retention maintenance fails. */
+  recordRetentionFailureRetryAt(retryAt: number): void {
+    if (!Number.isFinite(retryAt) || !Number.isInteger(retryAt)) {
+      throw new TypeError("Usage retention failure retry time is invalid.");
+    }
+    this.storage.kv.put(
+      RETENTION_FAILURE_RETRY_AT_KEY,
+      new Date(retryAt).toISOString(),
+    );
+  }
+
+  /** Clear a retention failure retry only after a maintenance batch succeeds. */
+  clearRetentionFailureRetry(): void {
+    this.storage.kv.delete(RETENTION_FAILURE_RETRY_AT_KEY);
+  }
+
+  #nextRetentionExpiry(): string | null {
+    let earliest: string | null = null;
+    for (const prefix of [
+      MODEL_USAGE_TIME_INDEX_PREFIX,
+      GATEKEEPER_USAGE_TIME_INDEX_PREFIX,
+      GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX,
+    ]) {
+      const entry = this.storage.kv.list<string>({prefix, limit: 1})[Symbol.iterator]().next();
+      if (entry.done) continue;
+      const timestamp = retentionTimestampFromIndexKey(entry.value[0], prefix);
+      const expiry = retentionExpiryAfterTimestamp(timestamp);
+      if (earliest === null || expiry < earliest) earliest = expiry;
+    }
+    return earliest;
+  }
+
+  #retainedOperationError(operationId: string): Error | null {
+    const tombstone = this.storage.kv.get<UsageOperationTombstone>(
+      USAGE_OPERATION_TOMBSTONE_PREFIX + operationId,
+    );
+    if (tombstone === undefined) return null;
+    assertUsageOperationTombstone(tombstone, operationId);
+    return new Error("Operation ID is retained by Usage history.");
+  }
+
+  #newUsageAfterDeletionError(): Error | null {
+    const deletion = this.storage.kv.get<UsageUserDeletionState>(USAGE_USER_DELETION_KEY);
+    if (deletion === undefined) return null;
+    assertUsageUserDeletionState(deletion);
+    return new Error("User deletion blocks new Metered Use.");
+  }
+
+  #expireUsageDetail(
+      stage: UsageRetentionStage,
+      operationId: string,
+      indexKey: string): UsageDetailExpiryResult {
+    if (stage === "model") {
+      const record = this.storage.kv.get<ModelUsageRecord>(MODEL_USAGE_RECORD_PREFIX + operationId);
+      if (!record) throw new Error("Expired model Usage Record is missing.");
+      assertModelUsageRecord(record, operationId);
+      if (modelUsageTimeIndexKey(record) !== indexKey) {
+        throw new Error("Model Usage retention index does not reconcile.");
+      }
+      if (record.outcome === "reconciliation-required") {
+        return "retained";
+      }
+      if (record.outcome === "usage-unknown" && record.reservationId !== null) {
+        const reservation = this.storage.kv.get<CreditReservation>(
+          RESERVATION_PREFIX + operationId,
+        );
+        if (!reservation) throw new Error("Unknown Model Usage Reservation is missing.");
+        this.assertStoredReservationConsistency(reservation, operationId);
+        if (reservation.state === "reserved") return "retained";
+        if (reservation.state !== "released") {
+          throw new Error("Unknown Model Usage Reservation is not terminal.");
+        }
+      }
+      if (!this.#archiveProjectionDetail(`model:${operationId}`)) return "blocked";
+      this.storage.kv.put<UsageOperationTombstone>(USAGE_OPERATION_TOMBSTONE_PREFIX + operationId, {
+        operationId,
+        kind: "model",
+        terminalState: record.outcome,
+        ledgerEntryId: record.ledgerEntryId,
+      });
+      this.storage.kv.delete(MODEL_USAGE_RECORD_PREFIX + operationId);
+      this.storage.kv.delete(MODEL_ATTEMPT_PREFIX + operationId);
+      this.storage.kv.delete(RESERVATION_PREFIX + operationId);
+      this.storage.kv.delete(UNPRICED_DECISION_PREFIX + operationId);
+      this.storage.kv.delete(indexKey);
+      return "deleted";
+    }
+    if (stage === "gatekeeper") {
+      const record = this.storage.kv.get<GatekeeperUsageRecord>(
+        GATEKEEPER_USAGE_RECORD_PREFIX + operationId,
+      );
+      if (!record) throw new Error("Expired Gatekeeper Usage Record is missing.");
+      assertGatekeeperUsageRecord(record, operationId);
+      if (gatekeeperUsageTimeIndexKey(record) !== indexKey) {
+        throw new Error("Gatekeeper Usage retention index does not reconcile.");
+      }
+      const reconciliationId = this.storage.kv.get<string>(
+        GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + operationId,
+      );
+      if (record.outcome === "usage-unknown" && reconciliationId === undefined) return "retained";
+      if (!this.#archiveProjectionDetail(`gatekeeper:${operationId}`)) return "blocked";
+      const reservation = this.storage.kv.get<CreditReservation>(RESERVATION_PREFIX + operationId);
+      if (reservation !== undefined) this.assertStoredReservationConsistency(reservation, operationId);
+      const ledgerEntryId = reservation?.state === "settled" ? reservation.ledgerEntryId : null;
+      if (ledgerEntryId === undefined) {
+        throw new Error("Settled Usage retention tombstone has no Ledger link.");
+      }
+      this.storage.kv.put<UsageOperationTombstone>(USAGE_OPERATION_TOMBSTONE_PREFIX + operationId, {
+        operationId,
+        kind: "gatekeeper",
+        terminalState: reconciliationId === undefined ? record.outcome : "reconciled",
+        ledgerEntryId,
+      });
+      this.storage.kv.delete(GATEKEEPER_USAGE_RECORD_PREFIX + operationId);
+      this.storage.kv.delete(GATEKEEPER_ATTEMPT_PREFIX + operationId);
+      this.storage.kv.delete(RESERVATION_PREFIX + operationId);
+      this.storage.kv.delete(UNPRICED_DECISION_PREFIX + operationId);
+      this.storage.kv.delete(indexKey);
+      return "deleted";
+    }
+    const reconciliation = this.storage.kv.get<GatekeeperUsageReconciliation>(
+      GATEKEEPER_RECONCILIATION_PREFIX + operationId,
+    );
+    if (!reconciliation) throw new Error("Expired Usage reconciliation is missing.");
+    assertGatekeeperUsageReconciliation(reconciliation, operationId);
+    if (`${GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX}${reconciliation.createdAt}:${operationId}` !==
+        indexKey) {
+      throw new Error("Usage reconciliation retention index does not reconcile.");
+    }
+    if (!this.#archiveProjectionDetail(`reconciliation:${operationId}`)) return "blocked";
+    const linkedId = this.storage.kv.get<string>(
+      GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + reconciliation.billingOperationId,
+    );
+    if (linkedId !== operationId) {
+      throw new Error("Usage reconciliation replay index does not reconcile.");
+    }
+    this.storage.kv.put(
+      GATEKEEPER_RECONCILIATION_REPLAY_TOMBSTONE_PREFIX +
+        reconciliation.billingOperationId,
+      true,
+    );
+    this.storage.kv.delete(
+      GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + reconciliation.billingOperationId,
+    );
+    this.storage.kv.delete(GATEKEEPER_RECONCILIATION_PREFIX + operationId);
+    this.storage.kv.delete(indexKey);
+    return "deleted";
+  }
+
+  #archiveProjectionDetail(sourceIdentity: string): boolean {
+    const summaryFactId = this.storage.kv.get<string>(
+      USAGE_SUMMARY_CONTRIBUTION_PREFIX + sourceIdentity,
+    );
+    if (summaryFactId === undefined || !isOpaqueUsageReference(summaryFactId)) {
+      throw new Error("Usage detail has no durable Summary contribution.");
+    }
+    const summary = this.storage.kv.get<UsageSummaryFact>(USAGE_SUMMARY_PREFIX + summaryFactId);
+    if (!summary) throw new Error("Usage detail Summary Fact is missing.");
+    const markerKeys = [sourceIdentity, `detail-v2:${sourceIdentity}`]
+      .map(identity => PROJECTION_SOURCE_MARKER_PREFIX + identity);
+    const entries = markerKeys.flatMap(markerKey => {
+      const sequence = this.storage.kv.get<bigint>(markerKey);
+      if (sequence === undefined) return [];
+      if (typeof sequence !== "bigint" || sequence < 1n) {
+        throw new Error("Usage detail Projection marker is invalid.");
+      }
+      const outboxKey = projectionOutboxKey(sequence);
+      const entry = this.storage.kv.get<UsageProjectionOutboxEntry>(outboxKey);
+      if (!entry) throw new Error("Usage detail Projection outbox is missing.");
+      return [{markerKey, outboxKey, sequence, entry}];
+    });
+    if (entries.some(({entry}) =>
+      entry.deliveredAt === undefined && entry.failureCode === undefined)) return false;
+    for (const {markerKey, outboxKey, sequence, entry} of entries) {
+      const fact: UsageProjectionAggregateFact = {
+        ...summary,
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence: sequence,
+      };
+      this.storage.kv.put<UsageProjectionOutboxEntry>(outboxKey, {
+        fact,
+        ...(entry.deliveredAt === undefined ? {} : {deliveredAt: entry.deliveredAt}),
+        ...(entry.failureCode === undefined ? {} : {failureCode: entry.failureCode}),
+      });
+      this.storage.kv.delete(markerKey);
+    }
+    const safeRecordRef = this.storage.kv.get<string>(
+      USAGE_DETAIL_SOURCE_REF_PREFIX + sourceIdentity,
+    );
+    if (safeRecordRef !== undefined) {
+      this.storage.kv.delete(USAGE_DETAIL_REF_PREFIX + safeRecordRef);
+      this.storage.kv.delete(USAGE_DETAIL_SOURCE_REF_PREFIX + sourceIdentity);
+    }
+    this.storage.kv.delete(USAGE_SUMMARY_CONTRIBUTION_PREFIX + sourceIdentity);
+    return true;
   }
 
   /** Return one bounded, content-free page of this User's Usage Records. */
@@ -961,9 +1585,13 @@ export class UsageAccount {
       chargeSnapshot: PricedChargeSnapshot,
       initialGrantSnapshot?: InitialGrantSnapshot): CreditReservation {
     const result = this.balanceTransaction<TransactionResult<CreditReservation>>(() => {
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) return {error: deletionError};
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return { error: operationIdError };
+      const retainedOperationError = this.#retainedOperationError(operationId);
+      if (retainedOperationError) return {error: retainedOperationError};
       if (typeof amountSubunits !== "bigint" || amountSubunits <= 0n) {
         return {
           error: new TypeError("A Credit Reservation amount must be a positive bigint."),
@@ -1028,9 +1656,13 @@ export class UsageAccount {
       chargeSnapshot: UnpricedChargeSnapshot,
       initialGrantSnapshot?: InitialGrantSnapshot): UnpricedUsageDecision {
     const result = this.storage.transactionSync<TransactionResult<UnpricedUsageDecision>>(() => {
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) return {error: deletionError};
       this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
+      const retainedOperationError = this.#retainedOperationError(operationId);
+      if (retainedOperationError) return {error: retainedOperationError};
 
       let normalizedChargeSnapshot: UnpricedChargeSnapshot;
       try {
@@ -1084,9 +1716,13 @@ export class UsageAccount {
       reservationBound: ModelUsageReservationBound,
       initialGrantSnapshot?: InitialGrantSnapshot): ModelMeteringAttempt {
     const result = this.balanceTransaction<TransactionResult<ModelMeteringAttempt>>(() => {
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) return {error: deletionError};
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
+      const retainedOperationError = this.#retainedOperationError(operationId);
+      if (retainedOperationError) return {error: retainedOperationError};
       try {
         assertNoBillingBlock(this.storage.kv.get<UsageBillingBlock>(BILLING_BLOCK_KEY));
       } catch (error) {
@@ -1203,6 +1839,8 @@ export class UsageAccount {
         return {error: error instanceof Error ? error : new Error(String(error))};
       }
       if (attempt.state !== "ready") return {value: attempt};
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) return {error: deletionError};
       if (billingBlock !== undefined && billingBlock.operationId !== operationId) {
         try {
           this.#failModelUsageBeforeExecutionInTransaction(operationId, attempt);
@@ -1503,9 +2141,13 @@ export class UsageAccount {
       initialGrantSnapshot?: InitialGrantSnapshot): GatekeeperMeteringAttempt {
     const result =
         this.balanceTransaction<TransactionResult<GatekeeperMeteringAttempt>>(() => {
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) return {error: deletionError};
       const totals = this.ensureInitialGrant(initialGrantSnapshot);
       const operationIdError = operationIdValidationError(operationId);
       if (operationIdError) return {error: operationIdError};
+      const retainedOperationError = this.#retainedOperationError(operationId);
+      if (retainedOperationError) return {error: retainedOperationError};
 
       let normalizedAttribution: GatekeeperUsageAttribution;
       let normalizedSnapshot: GatekeeperChargeSnapshot;
@@ -1623,6 +2265,8 @@ export class UsageAccount {
       if (attempt.state !== "ready") {
         return {value: {attempt, startedNow: false}};
       }
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) return {error: deletionError};
       const started: GatekeeperMeteringAttempt = {
         ...attempt,
         state: "started",
@@ -1750,7 +2394,10 @@ export class UsageAccount {
     const confirmedUsage = record.usageStatus === "reported" && record.usage !== null &&
       (record.outcome === "settled" || record.outcome === "reconciliation-required");
     const usage = confirmedUsage ? record.usage : null;
-    this.#appendProjectionFact(`model:${record.operationId}`, {
+    this.#appendDetailAndSummary(`model:${record.operationId}`, {
+      kind: "model",
+      operationId: record.operationId,
+    }, {
       rowKind: "detail",
       occurredAt: record.createdAt,
       source: record.attribution.source,
@@ -1772,7 +2419,11 @@ export class UsageAccount {
         ? 0n : calculateModelProviderCostUsdSubunits(record.chargeSnapshot, usage),
       chargedUsageCreditSubunits: record.outcome === "settled"
         ? record.chargeSubunits ?? 0n : 0n,
+      meteredUseCount: confirmedUsage ? 1n : 0n,
       billableApiOperations: 0n,
+      preExecutionFailures: record.outcome === "failed-before-execution" ? 1n : 0n,
+      unknownOperations: record.outcome === "usage-unknown" ||
+        record.outcome === "reconciliation-required" ? 1n : 0n,
       activeUserContribution: confirmedUsage ? 1n : 0n,
       unpricedModelUses: confirmedUsage && record.chargeSnapshot.pricing === "unpriced" ? 1n : 0n,
       unpricedApiOperations: 0n,
@@ -1781,7 +2432,10 @@ export class UsageAccount {
 
   #appendGatekeeperProjectionFact(record: GatekeeperUsageRecord): void {
     const confirmedUsage = record.outcome === "settled";
-    this.#appendProjectionFact(`gatekeeper:${record.operationId}`, {
+    this.#appendDetailAndSummary(`gatekeeper:${record.operationId}`, {
+      kind: "gatekeeper",
+      operationId: record.operationId,
+    }, {
       rowKind: "detail",
       occurredAt: record.createdAt,
       source: record.attribution.source,
@@ -1801,7 +2455,10 @@ export class UsageAccount {
       reasoningTokens: 0n,
       providerCostUsdSubunits: 0n,
       chargedUsageCreditSubunits: confirmedUsage ? record.chargeSubunits ?? 0n : 0n,
+      meteredUseCount: confirmedUsage ? 1n : 0n,
       billableApiOperations: confirmedUsage ? 1n : 0n,
+      preExecutionFailures: record.outcome === "failed-before-execution" ? 1n : 0n,
+      unknownOperations: record.outcome === "usage-unknown" ? 1n : 0n,
       activeUserContribution: confirmedUsage ? 1n : 0n,
       unpricedModelUses: 0n,
       unpricedApiOperations: confirmedUsage && record.chargeSnapshot.pricing === "unpriced"
@@ -1810,37 +2467,43 @@ export class UsageAccount {
   }
 
   #appendGatekeeperReconciliationProjectionFact(
-      record: GatekeeperUsageRecord,
-      reconciliationOperationId: string,
-      decision: "settle" | "release",
-      occurredAt: string,
-      ledgerEntryId: string | null): void {
-    const settled = decision === "settle";
-    this.#appendProjectionFact(`reconciliation:${reconciliationOperationId}`, {
+      authority: GatekeeperUsageReconciliationAuthoritySnapshot): void {
+    const reconciliationOperationId = authority.reconciliationOperationId;
+    const occurredAt = authority.reconciledAtUtc;
+    this.storage.kv.put(
+      `${GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX}${occurredAt}:${reconciliationOperationId}`,
+      reconciliationOperationId,
+    );
+    this.#appendDetailAndSummary(`reconciliation:${reconciliationOperationId}`, {
+      kind: "gatekeeper-reconciliation",
+      operationId: reconciliationOperationId,
+    }, {
       rowKind: "detail",
       occurredAt,
-      source: record.attribution.source,
+      source: authority.source,
       kind: "gatekeeper",
-      outcome: settled ? "reconciled-settled" : "reconciled-released",
-      pricing: record.chargeSnapshot.pricing,
+      outcome: authority.outcome,
+      pricing: authority.pricing,
       deploymentModelId: null,
-      vendorId: record.attribution.vendorId,
-      billingMethodKey: record.attribution.billingMethodKey,
-      externalAccountId: record.attribution.externalAccountId,
-      gadgetId: record.attribution.gadgetId === undefined
-        ? null : record.attribution.gadgetId.toString(),
+      vendorId: authority.vendorId,
+      billingMethodKey: authority.billingMethodKey,
+      externalAccountId: authority.externalAccountId,
+      gadgetId: authority.gadgetId,
       cacheHitInputTokens: 0n,
       cacheMissInputTokens: 0n,
       cacheWriteInputTokens: 0n,
       outputTokens: 0n,
       reasoningTokens: 0n,
       providerCostUsdSubunits: 0n,
-      chargedUsageCreditSubunits: ledgerEntryId === null
-        ? 0n : record.chargeSnapshot.chargeSubunits,
-      billableApiOperations: settled ? 1n : 0n,
-      activeUserContribution: settled ? 1n : 0n,
+      chargedUsageCreditSubunits: authority.chargedUsageCreditSubunits,
+      meteredUseCount: authority.meteredUseCount,
+      billableApiOperations: authority.billableApiOperations,
+      preExecutionFailures: 0n,
+      unknownOperations: 0n,
+      activeUserContribution: authority.meteredUseCount,
       unpricedModelUses: 0n,
-      unpricedApiOperations: settled && record.chargeSnapshot.pricing === "unpriced" ? 1n : 0n,
+      unpricedApiOperations: authority.meteredUseCount > 0n && authority.pricing === "unpriced"
+        ? 1n : 0n,
     });
   }
 
@@ -1927,8 +2590,13 @@ export class UsageAccount {
         }
 
         const key = GATEKEEPER_RECONCILIATION_PREFIX + reconciliationOperationId;
-        const existing = this.storage.kv.get<GatekeeperUsageReconciliation>(key);
+        const existing = this.storage.kv.get<StoredGatekeeperUsageReconciliation>(key);
         if (existing) {
+          try {
+            assertGatekeeperUsageReconciliationAudit(existing, reconciliationOperationId);
+          } catch (error) {
+            return {error: error instanceof Error ? error : new Error(String(error))};
+          }
           if (existing.billingOperationId !== billingOperationId ||
               existing.decision !== decision || existing.reason !== reason ||
               existing.actorUserId !== actorUserId) {
@@ -1936,7 +2604,19 @@ export class UsageAccount {
               "Gatekeeper Usage reconciliation operation conflicts with its stored decision.",
             )};
           }
-          return {value: existing};
+          const original = existing.authoritySnapshot === undefined
+            ? this.storage.kv.get<GatekeeperUsageRecord>(
+              GATEKEEPER_USAGE_RECORD_PREFIX + billingOperationId,
+            ) : undefined;
+          try {
+            return {value: this.#ensureGatekeeperReconciliationAuthority(
+              existing,
+              reconciliationOperationId,
+              original,
+            )};
+          } catch (error) {
+            return {error: error instanceof Error ? error : new Error(String(error))};
+          }
         }
         if (this.storage.kv.get(ADMIN_OPERATION_PREFIX + reconciliationOperationId) !== undefined ||
             this.storage.kv.get(GATEKEEPER_ATTEMPT_PREFIX + reconciliationOperationId) !== undefined ||
@@ -1954,6 +2634,15 @@ export class UsageAccount {
           GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + billingOperationId,
         );
         if (linkedId !== undefined) {
+          return {error: new Error("Gatekeeper Usage already has a reconciliation decision.")};
+        }
+        const replayTombstone = this.storage.kv.get<unknown>(
+          GATEKEEPER_RECONCILIATION_REPLAY_TOMBSTONE_PREFIX + billingOperationId,
+        );
+        if (replayTombstone !== undefined) {
+          if (replayTombstone !== true) {
+            return {error: new Error("Gatekeeper Usage reconciliation tombstone is invalid.")};
+          }
           return {error: new Error("Gatekeeper Usage already has a reconciliation decision.")};
         }
 
@@ -2009,6 +2698,14 @@ export class UsageAccount {
           reason,
           ledgerEntryId,
           createdAt,
+          authoritySnapshot: gatekeeperReconciliationAuthoritySnapshot(
+            this.getRegistrationOutbox().fact.registeredUserRef,
+            usageRecord,
+            reconciliationOperationId,
+            decision,
+            ledgerEntryId,
+            createdAt,
+          ),
         };
         this.storage.kv.put(key, reconciliation);
         this.storage.kv.put(
@@ -2016,16 +2713,45 @@ export class UsageAccount {
           reconciliationOperationId,
         );
         this.#appendGatekeeperReconciliationProjectionFact(
-          usageRecord,
-          reconciliationOperationId,
-          decision,
-          createdAt,
-          ledgerEntryId,
+          reconciliation.authoritySnapshot,
         );
         return {value: reconciliation};
       },
     );
     return unwrapTransactionResult(result);
+  }
+
+  #ensureGatekeeperReconciliationAuthority(
+      stored: StoredGatekeeperUsageReconciliation,
+      expectedOperationId: string,
+      original?: GatekeeperUsageRecord): GatekeeperUsageReconciliation {
+    assertGatekeeperUsageReconciliationAudit(stored, expectedOperationId);
+    if (stored.authoritySnapshot !== undefined) {
+      const current = stored as GatekeeperUsageReconciliation;
+      assertGatekeeperUsageReconciliation(current, expectedOperationId);
+      return current;
+    }
+    if (!original || original.operationId !== stored.billingOperationId) {
+      throw new Error("Gatekeeper Usage reconciliation authority cannot be backfilled.");
+    }
+    assertGatekeeperUsageRecord(original, stored.billingOperationId);
+    const upgraded: GatekeeperUsageReconciliation = {
+      ...stored,
+      authoritySnapshot: gatekeeperReconciliationAuthoritySnapshot(
+        this.getRegistrationOutbox().fact.registeredUserRef,
+        original,
+        stored.reconciliationOperationId,
+        stored.decision,
+        stored.ledgerEntryId,
+        stored.createdAt,
+      ),
+    };
+    assertGatekeeperUsageReconciliation(upgraded, expectedOperationId);
+    this.storage.kv.put(
+      GATEKEEPER_RECONCILIATION_PREFIX + expectedOperationId,
+      upgraded,
+    );
+    return upgraded;
   }
 
   /** Atomically settle a reservation and append its immutable Usage Charge entry. */
@@ -2208,6 +2934,8 @@ export class UsageAccount {
     const operationError = adminOperationIdValidationError(operationId);
     if (operationError) throw operationError;
     return this.balanceTransaction(() => {
+      const deletionError = this.#newUsageAfterDeletionError();
+      if (deletionError) throw deletionError;
       const totals = this.ensureInitialGrant();
       const operationKey = ADMIN_OPERATION_PREFIX + operationId;
       const existing = this.storage.kv.get<StoredAdminUsageOperation>(operationKey);
@@ -2392,6 +3120,7 @@ export class UsageAccount {
     this.storage.kv.put(REGISTRATION_OUTBOX_KEY, outbox);
     this.storage.kv.put(PROJECTION_PENDING_COUNT_KEY, 0n);
     this.storage.kv.put<ProjectionBackfillStage>(PROJECTION_BACKFILL_STAGE_KEY, "complete");
+    this.storage.kv.put<ProjectionBackfillStage>(SUMMARY_BACKFILL_STAGE_KEY, "complete");
     return totals;
   }
 
@@ -2467,6 +3196,9 @@ export class UsageAccount {
       unpricedDecisionRecords,
       adminOperationRecords,
       Array.from(this.storage.kv.list<string>({prefix: REVERSAL_PREFIX})),
+      Array.from(this.storage.kv.list<UsageOperationTombstone>({
+        prefix: USAGE_OPERATION_TOMBSTONE_PREFIX,
+      })),
     );
     assertModelUsageRecordsReconcile(
       modelMeteringAttemptRecords,
@@ -2496,6 +3228,11 @@ export class UsageAccount {
       throw new Error("Usage Credit totals do not reconcile with the Ledger and Reservations.");
     }
     const projectionOutbox = this.#allProjectionOutboxEntriesForSnapshot();
+    const usageSummaryFacts = Array.from(
+      this.storage.kv.list<UsageSummaryFact>({prefix: USAGE_SUMMARY_PREFIX}),
+      ([, fact]) => fact,
+    ).toSorted((a, b) => a.bucketStart.localeCompare(b.bucketStart) ||
+      a.summaryFactId.localeCompare(b.summaryFactId));
     return {
       availableSubunits: totals.ledgerBalanceSubunits - totals.reservedSubunits,
       reservedSubunits: totals.reservedSubunits,
@@ -2517,13 +3254,155 @@ export class UsageAccount {
       billingBlock,
       projectionFacts: projectionOutbox.map(entry => entry.fact),
       projectionOutbox,
+      usageSummaryFacts,
     };
+  }
+
+  #appendDetailAndSummary(
+      sourceIdentity: string,
+      locator: UsageDetailLocator,
+      contribution: DetailProjectionContribution): void {
+    const detailReference = this.#ensureUsageDetailRef(sourceIdentity, locator, contribution);
+    if (!detailReference.legacy) {
+      this.#appendProjectionFact(`detail-v2:${sourceIdentity}`, {
+        ...contribution,
+        safeRecordRef: detailReference.safeRecordRef,
+      });
+    }
+    this.#appendUsageSummaryContribution(sourceIdentity, contribution);
+    this.#scheduleRetentionExpiry(contribution.occurredAt);
+  }
+
+  #scheduleRetentionExpiry(occurredAt: string): void {
+    const expiry = retentionExpiryAfterTimestamp(occurredAt);
+    const current = this.storage.kv.get<string>(RETENTION_NEXT_RUN_AT_KEY);
+    if (current === undefined || normalizeCanonicalUtcTimestamp(
+      current,
+      "Usage retention next run time",
+    ) > expiry) {
+      this.storage.kv.put(RETENTION_NEXT_RUN_AT_KEY, expiry);
+    }
+    this.storage.kv.put(RETENTION_SCHEDULE_INITIALIZED_KEY, true);
+  }
+
+  #ensureUsageDetailRef(
+      sourceIdentity: string,
+      locator: UsageDetailLocator,
+      contribution: DetailProjectionContribution): {safeRecordRef: string; legacy: boolean} {
+    const sourceKey = USAGE_DETAIL_SOURCE_REF_PREFIX + sourceIdentity;
+    const legacyRef = this.#legacyProjectionDetailRef(sourceIdentity, contribution);
+    const existingRef = this.storage.kv.get<string>(sourceKey);
+    if (existingRef !== undefined) {
+      const existingLocator = this.storage.kv.get<UsageDetailLocator>(
+        USAGE_DETAIL_REF_PREFIX + existingRef,
+      );
+      if (!isOpaqueUsageReference(existingRef) || existingLocator?.kind !== locator.kind ||
+          existingLocator.operationId !== locator.operationId ||
+          (legacyRef !== null && existingRef !== legacyRef)) {
+        throw new Error("Usage detail reference does not reconcile.");
+      }
+      return {safeRecordRef: existingRef, legacy: legacyRef !== null};
+    }
+    const safeRecordRef = legacyRef ?? crypto.randomUUID();
+    this.storage.kv.put(sourceKey, safeRecordRef);
+    this.storage.kv.put(USAGE_DETAIL_REF_PREFIX + safeRecordRef, locator);
+    return {safeRecordRef, legacy: legacyRef !== null};
+  }
+
+  #legacyProjectionDetailRef(
+      sourceIdentity: string,
+      contribution: DetailProjectionContribution): string | null {
+    const sourceSequence = this.storage.kv.get<bigint>(
+      PROJECTION_SOURCE_MARKER_PREFIX + sourceIdentity,
+    );
+    if (sourceSequence === undefined) return null;
+    if (typeof sourceSequence !== "bigint" || sourceSequence < 1n) {
+      throw new Error("Legacy Usage Projection source marker is invalid.");
+    }
+    const entry = this.storage.kv.get<UsageProjectionOutboxEntry>(
+      projectionOutboxKey(sourceSequence),
+    );
+    const registeredUserRef = this.getRegistrationOutbox().fact.registeredUserRef;
+    if (!entry || entry.fact.sourceSequence !== sourceSequence ||
+        entry.fact.rowKind !== "detail" ||
+        !isOpaqueUsageReference(entry.fact.projectionFactId) ||
+        entry.fact.usagePrincipalRef !== registeredUserRef ||
+        !legacyProjectionDetailMatches(entry.fact, contribution)) {
+      throw new Error("Legacy Usage Projection detail does not reconcile.");
+    }
+    return entry.fact.projectionFactId;
+  }
+
+  #appendUsageSummaryContribution(
+      sourceIdentity: string,
+      detail: DetailProjectionContribution): void {
+    const contributionMarker = USAGE_SUMMARY_CONTRIBUTION_PREFIX + sourceIdentity;
+    const existingContribution = this.storage.kv.get<string>(contributionMarker);
+    if (existingContribution !== undefined) {
+      if (!isOpaqueUsageReference(existingContribution) ||
+          this.storage.kv.get<UsageSummaryFact>(
+            USAGE_SUMMARY_PREFIX + existingContribution,
+          ) === undefined) {
+        throw new Error("Usage Summary contribution does not reconcile.");
+      }
+      return;
+    }
+    const registration = this.getRegistrationOutbox();
+    const bucketStart = summaryBucketStart(detail.occurredAt);
+    const summaryInput: UsageSummaryInput = {
+      ...detail,
+      meteredKind: detail.meteredUseCount > 0n ? detail.kind : "attempt",
+    };
+    const dimensionKey = usageSummaryDimensionKey(
+      registration.fact.registeredUserRef,
+      bucketStart,
+      summaryInput,
+    );
+    const dimensionIndexKey = USAGE_SUMMARY_DIMENSION_INDEX_PREFIX + dimensionKey;
+    const indexedSummaryFactId = this.storage.kv.get<string>(dimensionIndexKey);
+    let current: UsageSummaryFact | undefined;
+    if (indexedSummaryFactId !== undefined) {
+      if (!isOpaqueUsageReference(indexedSummaryFactId)) {
+        throw new Error("Usage Summary dimension index is invalid.");
+      }
+      current = this.storage.kv.get<UsageSummaryFact>(
+        USAGE_SUMMARY_PREFIX + indexedSummaryFactId,
+      );
+      if (!current || usageSummaryDimensionKey(
+        current.usagePrincipalRef,
+        current.bucketStart,
+        current,
+      ) !== dimensionKey) {
+        throw new Error("Usage Summary dimension index does not reconcile.");
+      }
+    }
+    const summaryFactId = current?.summaryFactId ?? crypto.randomUUID();
+    const updated = addUsageSummaryContribution(
+      current ?? emptyUsageSummaryFact(
+        registration.fact.registeredUserRef,
+        bucketStart,
+        summaryFactId,
+        summaryInput,
+      ),
+      detail,
+    );
+    this.storage.kv.put(USAGE_SUMMARY_PREFIX + summaryFactId, updated);
+    if (current === undefined) this.storage.kv.put(dimensionIndexKey, summaryFactId);
+    const {
+      schemaVersion: _schemaVersion,
+      usagePrincipalRef: _usagePrincipalRef,
+      ...projectionContribution
+    } = updated;
+    this.#appendProjectionFact(
+      `summary:${summaryFactId}:${updated.summaryRevision.toString()}`,
+      projectionContribution,
+    );
+    this.storage.kv.put(contributionMarker, summaryFactId);
   }
 
   #appendProjectionFact(
       sourceIdentity: string,
-      contribution: Omit<Extract<UsageProjectionFact, {rowKind: "detail"}>,
-        "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef">): void {
+      contribution: ProjectionFactContribution): void {
     const registration = this.storage.kv.get<UsageUserRegistrationOutbox>(
       REGISTRATION_OUTBOX_KEY,
     );
@@ -2601,6 +3480,246 @@ function projectionOutboxKey(sourceSequence: bigint): string {
   return PROJECTION_OUTBOX_PREFIX + sourceSequence.toString().padStart(40, "0");
 }
 
+function normalizeUsageUserDeletionInput(
+    deletionId: string,
+    reason: string,
+    actorUserId: string): Pick<
+      UsageUserDeletionState,
+      "deletionId" | "reason" | "actorUserId"
+    > {
+  if (adminOperationIdValidationError(deletionId) !== undefined ||
+      typeof reason !== "string" || reason.length > 1_000 || reason.trim().length === 0 ||
+      reason.includes("\u0000") ||
+      typeof actorUserId !== "string" || actorUserId.length < 1 || actorUserId.length > 500 ||
+      hasAsciiControlCharacter(actorUserId)) {
+    throw new TypeError("User deletion request is invalid.");
+  }
+  return {deletionId, reason: reason.trim(), actorUserId};
+}
+
+function assertUsageUserDeletionState(state: UsageUserDeletionState): void {
+  if (typeof state !== "object" || state === null || Array.isArray(state)) {
+    throw new Error("User deletion state is invalid.");
+  }
+  const normalized = normalizeUsageUserDeletionInput(
+    state.deletionId,
+    state.reason,
+    state.actorUserId,
+  );
+  if (!hasExactKeys(state, [
+        "deletionId", "actorUserId", "reason", "requestedAt", "completedAt", "state",
+      ]) || normalized.reason !== state.reason ||
+      normalizeCanonicalUtcTimestamp(state.requestedAt, "User deletion request time") !==
+        state.requestedAt ||
+      (state.completedAt !== null && normalizeCanonicalUtcTimestamp(
+        state.completedAt,
+        "User deletion completion time",
+      ) !== state.completedAt) ||
+      (state.state !== "deleting" && state.state !== "deleted") ||
+      (state.state === "deleted") !== (state.completedAt !== null)) {
+    throw new Error("User deletion state is invalid.");
+  }
+}
+
+function subtractUtcCalendarMonths(value: string, months: number): string {
+  if (!Number.isInteger(months) || months < 1) {
+    throw new TypeError("Usage retention calendar window is invalid.");
+  }
+  return shiftUtcCalendarMonths(value, -months);
+}
+
+function addUtcCalendarMonths(value: string, months: number): string {
+  if (!Number.isInteger(months) || months < 1) {
+    throw new TypeError("Usage retention calendar window is invalid.");
+  }
+  return shiftUtcCalendarMonths(value, months);
+}
+
+function retentionExpiryAfterTimestamp(value: string): string {
+  const occurredAt = new Date(normalizeCanonicalUtcTimestamp(
+    value,
+    "Usage retention event time",
+  ));
+  const shifted = new Date(addUtcCalendarMonths(occurredAt.toISOString(), 24));
+  if (shifted.getUTCDate() !== occurredAt.getUTCDate()) {
+    return new Date(Date.UTC(
+      shifted.getUTCFullYear(),
+      shifted.getUTCMonth() + 1,
+      1,
+    )).toISOString();
+  }
+  return new Date(shifted.getTime() + 1).toISOString();
+}
+
+function shiftUtcCalendarMonths(value: string, months: number): string {
+  const normalized = normalizeCanonicalUtcTimestamp(value, "Usage retention run time");
+  if (!Number.isInteger(months)) {
+    throw new TypeError("Usage retention calendar window is invalid.");
+  }
+  const source = new Date(normalized);
+  const absoluteMonth = source.getUTCFullYear() * 12 + source.getUTCMonth() + months;
+  const year = Math.floor(absoluteMonth / 12);
+  const month = absoluteMonth - year * 12;
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(
+    year,
+    month,
+    Math.min(source.getUTCDate(), lastDay),
+    source.getUTCHours(),
+    source.getUTCMinutes(),
+    source.getUTCSeconds(),
+    source.getUTCMilliseconds(),
+  )).toISOString();
+}
+
+function retentionTimestampFromIndexKey(key: string, prefix: string): string {
+  if (!key.startsWith(prefix) || key[prefix.length + 24] !== ":") {
+    throw new Error("Usage retention index key is invalid.");
+  }
+  return normalizeCanonicalUtcTimestamp(
+    key.slice(prefix.length, prefix.length + 24),
+    "Usage retention index time",
+  );
+}
+
+function retentionIndexPrefix(stage: UsageRetentionStage): string {
+  return stage === "model" ? MODEL_USAGE_TIME_INDEX_PREFIX
+    : stage === "gatekeeper" ? GATEKEEPER_USAGE_TIME_INDEX_PREFIX
+      : GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX;
+}
+
+function nextRetentionStage(stage: UsageRetentionStage): UsageRetentionStage | null {
+  return stage === "model" ? "gatekeeper" : stage === "gatekeeper" ? "reconciliation" : null;
+}
+
+function assertUsageRetentionRun(run: UsageRetentionRun): void {
+  if (!isOpaqueUsageReference(run.runId) ||
+      normalizeCanonicalUtcTimestamp(run.runNowUtc, "Usage retention run time") !== run.runNowUtc ||
+      normalizeCanonicalUtcTimestamp(run.cutoffUtc, "Usage retention cutoff") !== run.cutoffUtc ||
+      (run.stage !== "model" && run.stage !== "gatekeeper" &&
+       run.stage !== "reconciliation") ||
+      (run.cursor !== null && typeof run.cursor !== "string") ||
+      typeof run.deletedDetailCount !== "bigint" || run.deletedDetailCount < 0n ||
+      typeof run.retainedDetailCount !== "bigint" || run.retainedDetailCount < 0n) {
+    throw new Error("Usage retention run is invalid.");
+  }
+}
+
+function retentionResult(run: UsageRetentionRun, complete: boolean): UsageRetentionResult {
+  return {
+    runId: run.runId,
+    cutoffUtc: run.cutoffUtc,
+    deletedDetailCount: run.deletedDetailCount,
+    complete,
+  };
+}
+
+type UsageSummaryDimensions = Pick<
+  UsageProjectionAggregateFact,
+  "source" | "kind" | "outcome" | "pricing" | "deploymentModelId" | "vendorId" |
+    "billingMethodKey" | "externalAccountId" | "gadgetId" | "meteredKind"
+>;
+
+type UsageSummaryInput = DetailProjectionContribution & Pick<
+  UsageProjectionAggregateFact,
+  "meteredKind"
+>;
+
+function summaryBucketStart(occurredAt: string): string {
+  const normalized = normalizeCanonicalUtcTimestamp(occurredAt, "Usage Summary event time");
+  const epochMs = new Date(normalized).getTime();
+  return new Date(Math.floor(epochMs / 900_000) * 900_000).toISOString();
+}
+
+function usageSummaryDimensionKey(
+    usagePrincipalRef: string,
+    bucketStart: string,
+    dimensions: UsageSummaryDimensions): string {
+  const encoded = new TextEncoder().encode(JSON.stringify([
+    1,
+    usagePrincipalRef,
+    bucketStart,
+    dimensions.source,
+    dimensions.kind,
+    dimensions.meteredKind,
+    dimensions.outcome,
+    dimensions.pricing,
+    dimensions.deploymentModelId,
+    dimensions.vendorId,
+    dimensions.billingMethodKey,
+    dimensions.externalAccountId,
+    dimensions.gadgetId,
+  ])).toBase64();
+  return encoded.replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function emptyUsageSummaryFact(
+    usagePrincipalRef: string,
+    bucketStart: string,
+    summaryFactId: string,
+    dimensions: UsageSummaryInput): UsageSummaryFact {
+  return {
+    schemaVersion: 1,
+    usagePrincipalRef,
+    rowKind: "aggregate",
+    bucketStart,
+    summaryFactId,
+    summaryRevision: 0n,
+    source: dimensions.source,
+    kind: dimensions.kind,
+    meteredKind: dimensions.meteredKind,
+    outcome: dimensions.outcome,
+    pricing: dimensions.pricing,
+    deploymentModelId: dimensions.deploymentModelId,
+    vendorId: dimensions.vendorId,
+    billingMethodKey: dimensions.billingMethodKey,
+    externalAccountId: dimensions.externalAccountId,
+    gadgetId: dimensions.gadgetId,
+    cacheHitInputTokens: 0n,
+    cacheMissInputTokens: 0n,
+    cacheWriteInputTokens: 0n,
+    outputTokens: 0n,
+    reasoningTokens: 0n,
+    providerCostUsdSubunits: 0n,
+    chargedUsageCreditSubunits: 0n,
+    meteredUseCount: 0n,
+    billableApiOperations: 0n,
+    preExecutionFailures: 0n,
+    unknownOperations: 0n,
+    activeUserContribution: 0n,
+    unpricedModelUses: 0n,
+    unpricedApiOperations: 0n,
+  };
+}
+
+function addUsageSummaryContribution(
+    current: UsageSummaryFact,
+    contribution: DetailProjectionContribution): UsageSummaryFact {
+  return {
+    ...current,
+    summaryRevision: current.summaryRevision + 1n,
+    cacheHitInputTokens: current.cacheHitInputTokens + contribution.cacheHitInputTokens,
+    cacheMissInputTokens: current.cacheMissInputTokens + contribution.cacheMissInputTokens,
+    cacheWriteInputTokens: current.cacheWriteInputTokens + contribution.cacheWriteInputTokens,
+    outputTokens: current.outputTokens + contribution.outputTokens,
+    reasoningTokens: current.reasoningTokens + contribution.reasoningTokens,
+    providerCostUsdSubunits:
+      current.providerCostUsdSubunits + contribution.providerCostUsdSubunits,
+    chargedUsageCreditSubunits:
+      current.chargedUsageCreditSubunits + contribution.chargedUsageCreditSubunits,
+    meteredUseCount: current.meteredUseCount + contribution.meteredUseCount,
+    billableApiOperations:
+      current.billableApiOperations + contribution.billableApiOperations,
+    preExecutionFailures:
+      current.preExecutionFailures + contribution.preExecutionFailures,
+    unknownOperations: current.unknownOperations + contribution.unknownOperations,
+    activeUserContribution:
+      current.activeUserContribution + contribution.activeUserContribution,
+    unpricedModelUses: current.unpricedModelUses + contribution.unpricedModelUses,
+    unpricedApiOperations: current.unpricedApiOperations + contribution.unpricedApiOperations,
+  };
+}
+
 function projectionPendingKey(sourceSequence: bigint): string {
   return PROJECTION_PENDING_PREFIX + sourceSequence.toString().padStart(40, "0");
 }
@@ -2628,8 +3747,37 @@ function projectionFactSourceTime(fact: UsageProjectionFact): string {
   return fact.rowKind === "detail" ? fact.occurredAt : fact.bucketStart;
 }
 
-function assertGatekeeperUsageReconciliation(
-    reconciliation: GatekeeperUsageReconciliation,
+function legacyProjectionDetailMatches(
+    fact: UsageProjectionDetailFact,
+    contribution: DetailProjectionContribution): boolean {
+  return fact.schemaVersion === 1 && fact.occurredAt === contribution.occurredAt &&
+    fact.source === contribution.source && fact.kind === contribution.kind &&
+    fact.outcome === contribution.outcome && fact.pricing === contribution.pricing &&
+    fact.deploymentModelId === contribution.deploymentModelId &&
+    fact.vendorId === contribution.vendorId &&
+    fact.billingMethodKey === contribution.billingMethodKey &&
+    fact.externalAccountId === contribution.externalAccountId &&
+    fact.gadgetId === contribution.gadgetId &&
+    fact.cacheHitInputTokens === contribution.cacheHitInputTokens &&
+    fact.cacheMissInputTokens === contribution.cacheMissInputTokens &&
+    fact.cacheWriteInputTokens === contribution.cacheWriteInputTokens &&
+    fact.outputTokens === contribution.outputTokens &&
+    fact.reasoningTokens === contribution.reasoningTokens &&
+    fact.providerCostUsdSubunits === contribution.providerCostUsdSubunits &&
+    fact.chargedUsageCreditSubunits === contribution.chargedUsageCreditSubunits &&
+    fact.billableApiOperations === contribution.billableApiOperations &&
+    fact.activeUserContribution === contribution.activeUserContribution &&
+    fact.unpricedModelUses === contribution.unpricedModelUses &&
+    fact.unpricedApiOperations === contribution.unpricedApiOperations &&
+    (!("meteredUseCount" in fact) || fact.meteredUseCount === contribution.meteredUseCount) &&
+    (!("preExecutionFailures" in fact) ||
+      fact.preExecutionFailures === contribution.preExecutionFailures) &&
+    (!("unknownOperations" in fact) ||
+      fact.unknownOperations === contribution.unknownOperations);
+}
+
+function assertGatekeeperUsageReconciliationAudit(
+    reconciliation: StoredGatekeeperUsageReconciliation,
     expectedOperationId: string): void {
   if (reconciliation.reconciliationOperationId !== expectedOperationId ||
       typeof reconciliation.billingOperationId !== "string" ||
@@ -2647,12 +3795,90 @@ function assertGatekeeperUsageReconciliation(
   }
 }
 
+function assertGatekeeperUsageReconciliation(
+    reconciliation: GatekeeperUsageReconciliation,
+    expectedOperationId: string): void {
+  assertGatekeeperUsageReconciliationAudit(reconciliation, expectedOperationId);
+  const authority = reconciliation.authoritySnapshot;
+  let chargeSnapshot: GatekeeperChargeSnapshot;
+  try {
+    const normalized = normalizeChargeSnapshot(authority.chargeSnapshot);
+    if (normalized.kind !== "gatekeeper") throw new TypeError("Expected Gatekeeper pricing.");
+    chargeSnapshot = normalized;
+  } catch {
+    throw new Error("Gatekeeper Usage reconciliation authority does not reconcile.");
+  }
+  const settled = reconciliation.decision === "settle";
+  const expectedCharge = settled ? chargeSnapshot.chargeSubunits : 0n;
+  if (authority.schemaVersion !== 1 ||
+      !isOpaqueUsageReference(authority.usagePrincipalRef) ||
+      authority.billingOperationId !== reconciliation.billingOperationId ||
+      authority.reconciliationOperationId !== reconciliation.reconciliationOperationId ||
+      (authority.source !== "agent" && authority.source !== "gadget" &&
+       authority.source !== "direct-user" && authority.source !== "system-assistance" &&
+       authority.source !== "hook" && authority.source !== "scheduled") ||
+      authority.meteredKind !== (settled ? "gatekeeper" : "attempt") ||
+      authority.pricing !== chargeSnapshot.pricing ||
+      authority.vendorId !== chargeSnapshot.vendorId ||
+      authority.billingMethodKey !== chargeSnapshot.billingMethodKey ||
+      !isStableUsageDimension(authority.externalAccountId) ||
+      (authority.gadgetId !== null && !/^(?:0|[1-9][0-9]*)$/.test(authority.gadgetId)) ||
+      authority.outcome !== (settled ? "reconciled-settled" : "reconciled-released") ||
+      authority.decision !== reconciliation.decision ||
+      !chargeSnapshotsEqual(authority.chargeSnapshot, chargeSnapshot) ||
+      typeof authority.chargedUsageCreditSubunits !== "bigint" ||
+      authority.chargedUsageCreditSubunits !== expectedCharge ||
+      authority.meteredUseCount !== (settled ? 1n : 0n) ||
+      authority.billableApiOperations !== authority.meteredUseCount ||
+      authority.ledgerEntryId !== reconciliation.ledgerEntryId ||
+      authority.reconciledAtUtc !== reconciliation.createdAt) {
+    throw new Error("Gatekeeper Usage reconciliation authority does not reconcile.");
+  }
+  if ((settled && chargeSnapshot.pricing === "priced" &&
+       chargeSnapshot.chargeSubunits > 0n) !== (authority.ledgerEntryId !== null)) {
+    throw new Error("Gatekeeper Usage reconciliation authority does not reconcile.");
+  }
+}
+
+function gatekeeperReconciliationAuthoritySnapshot(
+    usagePrincipalRef: string,
+    record: GatekeeperUsageRecord,
+    reconciliationOperationId: string,
+    decision: "settle" | "release",
+    ledgerEntryId: string | null,
+    reconciledAtUtc: string): GatekeeperUsageReconciliationAuthoritySnapshot {
+  const settled = decision === "settle";
+  return {
+    schemaVersion: 1,
+    usagePrincipalRef,
+    billingOperationId: record.operationId,
+    reconciliationOperationId,
+    source: record.attribution.source,
+    meteredKind: settled ? "gatekeeper" : "attempt",
+    pricing: record.chargeSnapshot.pricing,
+    vendorId: record.attribution.vendorId,
+    billingMethodKey: record.attribution.billingMethodKey,
+    externalAccountId: record.attribution.externalAccountId,
+    gadgetId: record.attribution.gadgetId === undefined
+      ? null : record.attribution.gadgetId.toString(),
+    outcome: settled ? "reconciled-settled" : "reconciled-released",
+    decision,
+    chargeSnapshot: structuredClone(record.chargeSnapshot),
+    chargedUsageCreditSubunits: settled ? record.chargeSnapshot.chargeSubunits : 0n,
+    meteredUseCount: settled ? 1n : 0n,
+    billableApiOperations: settled ? 1n : 0n,
+    ledgerEntryId,
+    reconciledAtUtc,
+  };
+}
+
 function assertTerminalRecordsReconcile(
   ledgerRecords: [string, CreditLedgerEntry][],
   reservationRecords: [string, CreditReservation][],
   unpricedDecisionRecords: [string, UnpricedUsageDecision][],
   adminOperationRecords: [string, StoredAdminUsageOperation][],
   reversalRecords: [string, string][],
+  operationTombstoneRecords: [string, UsageOperationTombstone][],
 ): void {
   const ledgerById = new Map<string, CreditLedgerEntry>();
   let initialGrantCount = 0;
@@ -2692,6 +3918,21 @@ function assertTerminalRecordsReconcile(
       }
       linkedCharges.add(ledgerEntryId);
     }
+  }
+
+  for (const [key, tombstone] of operationTombstoneRecords) {
+    const operationId = key.slice(USAGE_OPERATION_TOMBSTONE_PREFIX.length);
+    if (key !== USAGE_OPERATION_TOMBSTONE_PREFIX + operationId) {
+      throw new Error("Usage operation tombstone identity does not reconcile.");
+    }
+    assertUsageOperationTombstone(tombstone, operationId);
+    if (tombstone.ledgerEntryId === null) continue;
+    const entry = ledgerById.get(tombstone.ledgerEntryId);
+    if (!entry || entry.kind !== "usage-charge" || entry.operationId !== operationId ||
+        linkedCharges.has(entry.id)) {
+      throw new Error("Usage operation tombstone does not reconcile with its Ledger link.");
+    }
+    linkedCharges.add(entry.id);
   }
 
   for (const entry of ledgerById.values()) {
@@ -2754,6 +3995,22 @@ function assertTerminalRecordsReconcile(
     if (reservationOperationIds.has(decision.operationId)) {
       throw new Error("One operation cannot be both priced and Unpriced.");
     }
+  }
+}
+
+function assertUsageOperationTombstone(
+    tombstone: UsageOperationTombstone,
+    expectedOperationId: string): void {
+  if (typeof tombstone !== "object" || tombstone === null || Array.isArray(tombstone) ||
+      !hasExactKeys(tombstone, ["operationId", "kind", "terminalState", "ledgerEntryId"]) ||
+      tombstone.operationId !== expectedOperationId ||
+      operationIdValidationError(expectedOperationId) !== undefined ||
+      (tombstone.kind !== "model" && tombstone.kind !== "gatekeeper" &&
+       tombstone.kind !== "gatekeeper-reconciliation") ||
+      typeof tombstone.terminalState !== "string" || tombstone.terminalState.length === 0 ||
+      (tombstone.ledgerEntryId !== null &&
+       (typeof tombstone.ledgerEntryId !== "string" || tombstone.ledgerEntryId.length === 0))) {
+    throw new Error("Usage operation tombstone is invalid.");
   }
 }
 
