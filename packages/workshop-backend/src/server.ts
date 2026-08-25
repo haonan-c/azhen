@@ -26,6 +26,7 @@ import { resolveUiFeatureFlags } from "./feature-flags";
 import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { wrapDoStubForTelemetry } from "./do-telemetry";
+import { UsageProjection } from "./usage-projection.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -46,6 +47,9 @@ export { LanguageModelGatekeeper };
 
 // Re-export entrypoint types from admin-settings.ts.
 export { AdminSettings };
+
+// Re-export the replaceable deployment Usage Projection Durable Object.
+export { UsageProjection };
 
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl };
@@ -568,6 +572,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       adminUserId,
       this.users,
       this.overseers,
+      this.ctx.exports.UsageProjection,
     );
   }
 }

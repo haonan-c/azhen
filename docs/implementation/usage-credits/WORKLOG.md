@@ -309,3 +309,168 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - Full evidence and limitations are in `ISSUE-45-VERIFICATION.md`. #45 remains open because #43 is
   open and all accepted implementation changes remain local, uncommitted, and unpushed under the
   User's authority boundary.
+
+### 2026-08-24 — Issue #62 isolated Usage Projection candidate
+
+- Used the `implement`, `tdd`, and `code-review` stage gates in the dedicated `issue-62` worktree.
+  The public seam began RED, then the fixed focused workerd, real Cap’n Web, frontend, and privacy
+  tests became GREEN without weakening an assertion.
+- Added the retained per-User projection fact/outbox, bounded alarm delivery, exact SQLite
+  `UsageProjection` generation, stable Registry/User rebuild, authoritative administrator balance
+  path, and the localized 30-second-refresh admin overview.
+- Reviewed the expected backend DO generated type and release-manifest golden changes. Removed
+  unrelated Wrangler generated-type drift from the candidate.
+- Backend package verification passed 533 tests with 4 expected skips; frontend package
+  verification passed 351 tests. After rebase to `0d627e7`, root build/test/lint, the manifest
+  golden, and whitespace checks all exited 0. The Context production tracer also passed 25 tests
+  with a real Projection binding.
+- The affected Workshop Backend production-shape Wrangler dry-run passed (5,874.95 KiB upload,
+  1,117.21 KiB gzip). The complete release builder stopped on an unchanged baseline
+  `gatekeeper-linear` unresolved-generic validation error after the Frontend and six Gatekeeper
+  dry-runs had passed; the exact limitation is retained in `ISSUE-62-VERIFICATION.md`.
+- No push, merge, pull request, Issue closure, upload, promotion, deployment, production charging,
+  production configuration change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #62 fixed-point review corrections
+
+- Re-entered the `implement` and `tdd` gates after independent specification and standards review.
+  Added failing tests before each correction at the fixed User terminal/alarm, Usage Account outbox,
+  `UsageProjection`, Registry health, and administrator overview seams.
+- Closed the commit-to-alarm window with a persisted pre-transaction alarm. Added exact deployment
+  outbox health in the Registry owner, including alarm-retried recovery reporting, without waking
+  all User Durable Objects or coupling authoritative settlement to Projection availability.
+- Replaced lifetime outbox scans with ordered pending keys, exact counters, keyset pages, and direct
+  ACK/rejection lookup. Added persistent, bounded legacy Model/Gatekeeper/Reconciliation fact
+  backfill with source markers, so rebuild includes pre-#62 authority without duplicating live facts.
+- Made rebuild failure visible through a bounded public code. Added persistent 64-row inactive
+  generation cleanup, guarded duplicate finish, and prevented schema initialization from recreating
+  a deleted generation 1 after restart.
+- Froze facts as a strict detail-event-time or aggregate-15-minute-UTC-bucket union. All required
+  SQL counts and Registry watermarks now cross the JavaScript boundary as canonical text before
+  `bigint` conversion. Kind/pricing/outcome contribution invariants reject inconsistent facts.
+- Focused correction verification is GREEN: core Projection/Usage Account 37, Usage Admin 15,
+  metered-model 35, real Cap'n Web 1, Frontend package 351, Context production tracer 25, and the
+  complete Backend package matrix. Root build/test/lint and final release checks remain the next
+  coordinated gate; no remote or production mutation occurred.
+
+### 2026-08-24 — Issue #62 second fixed-point review corrections
+
+- Re-entered the `implement` and `tdd` gates for seven P1 findings. Each production change followed
+  a focused RED reproduction at the real `UsageProjection`, User alarm, or `AdminUsageApi` seam.
+- Froze aggregate rows as stable Summary identities with monotonic revisions and absolute counters.
+  Projection totals now change by the new-minus-old snapshot delta; duplicate and older revisions
+  are no-ops, while conflicting content at the same revision fails closed. Detail facts retain
+  exact single-event invariants, and aggregate API/Unpriced counts can safely exceed one.
+- A rebuild read now persists and starts User projection maintenance, and successful backlog work
+  continues after one second instead of the ten-second failure delay. A rebuild-generation conflict
+  fails and cleans only that generation; the already-applied active fact is acknowledged.
+- Added a persistent per-generation/User apply-drain queue. Each event applies at most 64 contiguous
+  facts. A persisted round-robin turn alternates drain and rebuild/cleanup work when both are ready,
+  so restart, large gaps, and lifecycle cleanup remain bounded without starvation.
+- Closed the empty-maintenance alarm deletion race by rechecking pending work after the Registry
+  health RPC and after alarm deletion. The regression pauses health, commits a concurrent terminal
+  fact, aborts its late `waitUntil`, restarts the User, and proves the fact is delivered.
+- A new Projection binding is bootstrap-pending. The first real administrator overview starts the
+  stable `bootstrap-v1` bounded Registry/User rebuild and reports `rebuilding` until it completes;
+  failed attempts retry after bounded cleanup. Dormant pre-binding authority no longer needs a
+  manual rebuild click.
+- Focused verification is GREEN: Projection 23, Gatekeeper Usage Account 21, Usage Admin 15, and
+  real Cap'n Web 1. Backend build/TypeScript is GREEN. The complete Backend package is GREEN with
+  553 pass, 4 expected skips, and 0 failures. The correction commits rebased without conflict onto
+  `origin/dev` `be1f501`, and the same focused/build/package gates passed again. Coordinated root and
+  release gates remain; no push, merge, Issue closure, upload, promotion, deployment, or production
+  change occurred.
+
+### 2026-08-24 — Issue #62 third fixed-point review corrections
+
+- Re-entered the `implement`, `tdd`, and `code-review` gates for seven findings. Each correction
+  started from a focused failing test at the real Projection, User alarm, Usage Account outbox, or
+  administrator overview seam.
+- Made apply-drain progress atomic with its totals, Summary, active membership, fact state, and
+  high-water updates. A controlled SQLite trigger crash now rolls the whole batch back, and restart
+  applies it exactly once.
+- Added durable User prepared/settled maintenance revisions and an isolate-active preparation guard.
+  Empty and non-empty maintenance cannot delete the alarm after the same request pre-arms but before
+  it commits; ownership is rechecked after deletion, and abandoned preparations recover on restart.
+- Kept bootstrap metrics unavailable until the first authority scan succeeds. Rebuild steps now run
+  only from persisted alarms, and a persisted authority-complete phase prevents repeated Registry
+  scans while a runnable dual-write drain finishes.
+- Added a persistent row cursor for principal-fair drain selection. Two large User backlogs advance
+  in round-robin order across restart, while lifecycle work retains its existing alternating turn.
+- Changed Projection acknowledgement to mean applied. An out-of-order Summary stays pending; if the
+  closed gap later proves a same-revision/different-snapshot conflict, replay returns `invalid-fact`
+  and the retained User outbox records that bounded poison code.
+- Added an old-metadata restart migration for the rebuild authority-complete column. Focused
+  Projection tests passed 31/31, Gatekeeper Usage Account passed 22/22, Usage Admin passed 15/15,
+  direct TypeScript exited 0, and the full Backend package passed 562 tests with 4 expected skips
+  and 0 failures. Root/release/Wrangler gates were not run in this cycle. No push, merge, Issue
+  closure, upload, promotion, deployment, production change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #62 fourth fixed-point review corrections
+
+- Re-entered the `implement`, `tdd`, and `code-review` gates for six findings and the ingress-alarm
+  specialty. Every production correction began with a focused failing test at the real Projection,
+  administrator overview, or alarm seam.
+- Replaced one-User rebuild alarms with a persistent bounded queue: Registry pages contain at most
+  100 Users, each alarm performs at most 100 RPC steps or 250 milliseconds of work, and Registry and
+  User cursors survive restart. A fake-clock alarm-only test walks 10,000 Users and makes the final
+  committed fact visible before the 60-second overview target without a synchronous health scan.
+- Preserved the true `rebuilding` or `failed` state and User progress while bootstrap metrics are
+  unavailable. English, Chinese, and ARIA tests distinguish these states from real Projection
+  unavailability.
+- Persisted rebuild and ingress wakeups before their state can create maintenance work. Restart and
+  consumed-pre-arm tests prove that an extra alarm is safe and the final drain still has a durable
+  wakeup.
+- Added content-free zero-contribution rejection markers for safe invariant poison and same-principal
+  fact-ID conflicts. They advance only the claimed principal/sequence, mirror into a live rebuild,
+  never permit a cross-principal skip, and fail the rebuild if their drain exposes a queued Summary
+  conflict. N+1 proceeds without a one-second poison retry loop.
+- The required standards/specification review added RED coverage for invalid-envelope fact-ID reuse,
+  retained authority replay, and both same-ID and different-ID concurrent rebuild requests. Rebuild
+  request state now uses a transaction-time CAS after alarm pre-arm. A rebuild marker, any Summary it
+  advances, and the corresponding failed state share one SQLite transaction; a controlled trigger
+  crash rolls all of them back. The administrator token total now includes cache-write input while
+  continuing to exclude reasoning detail, which is already part of output.
+- The correction review found one final live-rebuild classification edge. An invalid same-principal
+  fact-ID conflict now mirrors as an internal sequence marker until authority supplies the old fact,
+  instead of occupying that fact's identity and dropping its contribution. Rejected invalid ID and
+  sequence conflicts each increment the failure count exactly once.
+- Made gap health exclude runnable drain work and split exact Projection pending facts from the User
+  delivery watermark, so a delayed-ACK fact is not double counted. The UI reports delivery backlog
+  separately.
+- Final focused Projection verification passed 48/48. Backend and Frontend direct TypeScript and
+  `git diff --check` passed. The Frontend package passed 353/353; the final Backend package passed
+  579 tests with 4 expected skips and 0 failures. The code checkpoint is
+  `b1fbba23673d8374f077c62d8e097f45a1f3533a`. Root/release/Wrangler gates were not run in this cycle.
+  No push, merge, Issue closure, upload, promotion, deployment, production change, or worktree
+  deletion occurred.
+- A final targeted RED phase proved that active replays of an already applied rejection and a stored
+  rejection marker returned the rejection without counting the new ingestion attempt. Both replay
+  paths now increment `failedIngestionCount` exactly once per active attempt. The same input is not
+  counted twice internally, and rebuild replay does not update the active delivery counter.
+- Final targeted Projection verification passed 50/50. Backend direct TypeScript and
+  `git diff --check` passed. The complete Backend package passed 581 tests with 4 expected skips and
+  0 failures. The code checkpoint is `d06ae593eba975abc6540fcebd68e78c97b59d6d`.
+  Frontend/shared code did not change in this targeted correction, so their package gates were not
+  repeated. Root/release/Wrangler gates were not run in this cycle. No push, merge, Issue closure,
+  upload, promotion, deployment, production change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #62 final candidate gates
+
+- Ran `types:generate` with Node `24.19.0`, pnpm `11.17.0`, and Wrangler `4.119.0`. The expected
+  Workshop Backend binding was already current. Restored unrelated UGC Ads runtime-generated drift,
+  leaving no generated-file change outside Issue #62.
+- Regenerated and reviewed the release-manifest golden, then passed the normal manifest test 4/4.
+- Completed the local production-shape release builder with release ID `issue-62-local-final`: 19
+  Workers, 85 modules, and 36 unique asset blobs. Workshop Backend reported 5,941.58 KiB upload and
+  1,127.50 KiB gzip. The run used real local production code paths with controlled external mocks;
+  it did not upload, promote, deploy, change production configuration, or enable charging.
+- Final candidate `ff7929984f50d349b2a0161c28a16d634b3acfb7` passed root build, root test, root lint, and
+  `git diff --check`. Root test included 117 root Node tests, the complete Workshop Backend workerd
+  and Browser Run matrix, 115 integration tests, 353 Frontend tests, and all remaining workspace
+  package tasks. Oxlint reported only configured non-blocking warnings.
+- This final gate supersedes earlier notes that root/release checks had not been repeated and the
+  historical Linear validation failure that stopped an earlier release build. The independent
+  baseline defect is fixed on the rebased `dev` base, and the complete 19-Worker dry-run is GREEN.
+- No push, merge, Issue closure, production contact, upload, promotion, deployment, charging change,
+  or worktree deletion occurred in this candidate-gate step.

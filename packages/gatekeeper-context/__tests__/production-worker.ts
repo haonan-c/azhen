@@ -3,7 +3,10 @@ import { DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { UsageRateChange } from "@gadgets/workshop-shared/api";
 import type { UsageUserRegistrationFact } from "../../workshop-backend/src/usage-account.js";
 import { UsageRateRegistry } from "../../workshop-backend/src/usage-rates.js";
-import { UsageUserRegistry } from "../../workshop-backend/src/usage-user-registry.js";
+import {
+  UsageUserRegistry,
+  type UsageProjectionDeliveryHealthReport,
+} from "../../workshop-backend/src/usage-user-registry.js";
 
 export default worker;
 export {
@@ -15,6 +18,7 @@ export {
   ContextGatekeeper,
 } from "../src/index.js";
 export { UserDurableObject } from "../../workshop-backend/src/user.js";
+export { UsageProjection } from "../../workshop-backend/src/usage-projection.js";
 
 const artifactTrace: string[] = [];
 let artifactReadTokensEnabled = false;
@@ -288,5 +292,10 @@ export class AdminSettings extends DurableObject {
   /** Persist the production content-free User registration fact. */
   registerUsageUser(fact: UsageUserRegistrationFact) {
     return this.#users.register(fact);
+  }
+
+  /** Store one User's content-free Projection delivery health. */
+  recordUsageProjectionDeliveryHealth(report: UsageProjectionDeliveryHealthReport): void {
+    this.#users.recordProjectionDeliveryHealth(report);
   }
 }

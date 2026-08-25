@@ -25,6 +25,7 @@ import {
   type UnpricedUsageDecision,
 } from "./usage-account.js";
 import type {
+  AdminUsageBalanceState,
   AdminUsageOperationResult,
   ChargeSnapshot,
   GatekeeperChargeSnapshot,
@@ -34,8 +35,13 @@ import type {
   UserUsageRecordPage,
   UserUsageRecordPageRequest,
 } from "@gadgets/workshop-shared/api";
+import type {UsageProjection} from "./usage-projection.js";
 
 const logger = createWorkshopLogger("workshop.user");
+const PROJECTION_MAINTENANCE_REVISION_KEY =
+  "usageAccount:projectionMaintenanceRevision:v1";
+const PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY =
+  "usageAccount:projectionMaintenanceSettledRevision:v1";
 
 // How many workspaces one Outputs catch-up pass examines, bounding the Durable Objects a single
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
@@ -318,6 +324,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private usageAccount: UsageAccount;
   private vendors: Map<string, Service<GatekeeperVendor>>;
   private adminSettings: DurableObjectNamespace<AdminSettings>;
+  private usageProjection: DurableObjectNamespace<UsageProjection>;
+  private projectionPreparations = new Set<bigint>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -343,8 +351,164 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       };
     });
     this.adminSettings = this.ctx.exports.AdminSettings;
+    this.usageProjection = this.ctx.exports.UsageProjection;
 
     this.vendors = buildGatekeeperVendorMap(env);
+  }
+
+  /** Continue at-least-once delivery of retained projection outbox facts. */
+  async alarm(): Promise<void> {
+    await this.#runProjectionMaintenance();
+  }
+
+  async #prepareProjectionDeliveryAlarm(): Promise<bigint> {
+    const revision = this.#projectionMaintenanceRevision() + 1n;
+    this.projectionPreparations.add(revision);
+    this.ctx.storage.kv.put(PROJECTION_MAINTENANCE_REVISION_KEY, revision.toString());
+    try {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return revision;
+    } catch (error) {
+      this.#finishProjectionPreparation(revision);
+      throw error;
+    }
+  }
+
+  #projectionMaintenanceRevision(): bigint {
+    const stored = this.ctx.storage.kv.get<string>(PROJECTION_MAINTENANCE_REVISION_KEY);
+    if (stored === undefined) return 0n;
+    if (!/^(?:0|[1-9][0-9]*)$/.test(stored)) {
+      throw new Error("Usage Projection maintenance revision is invalid.");
+    }
+    return BigInt(stored);
+  }
+
+  #projectionMaintenanceSettledRevision(): bigint {
+    const stored = this.ctx.storage.kv.get<string>(
+      PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+    );
+    if (stored === undefined) return 0n;
+    if (!/^(?:0|[1-9][0-9]*)$/.test(stored)) {
+      throw new Error("Usage Projection settled maintenance revision is invalid.");
+    }
+    return BigInt(stored);
+  }
+
+  #finishProjectionPreparation(revision: bigint): void {
+    if (!this.projectionPreparations.delete(revision)) {
+      throw new Error("Usage Projection preparation revision is not active.");
+    }
+    if (this.projectionPreparations.size === 0) {
+      this.ctx.storage.kv.put(
+        PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+        this.#projectionMaintenanceRevision().toString(),
+      );
+    }
+  }
+
+  #scheduleProjectionDelivery(preparationRevision: bigint): void {
+    this.#finishProjectionPreparation(preparationRevision);
+    try {
+      this.ctx.waitUntil(this.#runProjectionMaintenance());
+    } catch (error) {
+      // The alarm was persisted before the authoritative Usage Account transaction began.
+      logger.warn("Usage Projection delivery could not be scheduled", {
+        event: "usage.projection.delivery.schedule.failed",
+        error,
+      });
+    }
+  }
+
+  async #runProjectionMaintenance(): Promise<void> {
+    if (this.projectionPreparations.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return;
+    }
+    const preparedRevision = this.#projectionMaintenanceRevision();
+    const settledRevision = this.#projectionMaintenanceSettledRevision();
+    if (settledRevision > preparedRevision) {
+      throw new Error("Usage Projection maintenance revisions do not reconcile.");
+    }
+    if (settledRevision !== preparedRevision) {
+      this.ctx.storage.kv.put(
+        PROJECTION_MAINTENANCE_SETTLED_REVISION_KEY,
+        preparedRevision.toString(),
+      );
+    }
+    const maintenanceRevision = this.#projectionMaintenanceRevision();
+    const backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
+    await this.#deliverProjectionOutbox(!backfillComplete, maintenanceRevision);
+  }
+
+  async #deleteProjectionAlarmIfOwned(maintenanceRevision: bigint): Promise<void> {
+    if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return;
+    }
+    await this.ctx.storage.deleteAlarm();
+    if (this.#projectionMaintenanceRevision() !== maintenanceRevision) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    }
+  }
+
+  async #reportProjectionDeliveryHealth(deliveryFailed: boolean): Promise<boolean> {
+    const health = this.usageAccount.getProjectionDeliveryHealth();
+    try {
+      await this.adminSettings.getByName("").recordUsageProjectionDeliveryHealth({
+        ...health,
+        deliveryFailed,
+      });
+      return true;
+    } catch (error) {
+      logger.warn("Usage Projection delivery health could not be recorded", {
+        event: "usage.projection.delivery.health.failed",
+        error,
+      });
+      return false;
+    }
+  }
+
+  async #deliverProjectionOutbox(
+      backfillPending: boolean,
+      maintenanceRevision: bigint): Promise<void> {
+    const pending = this.usageAccount.listPendingProjectionOutbox(32);
+    if (pending.length === 0) {
+      const healthReported = await this.#reportProjectionDeliveryHealth(false);
+      const pendingAfterHealth =
+        this.usageAccount.listPendingProjectionOutbox(1).length > 0;
+      if (!healthReported) await this.ctx.storage.setAlarm(Date.now() + 10_000);
+      else if (backfillPending || pendingAfterHealth) {
+        await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      } else {
+        await this.#deleteProjectionAlarmIfOwned(maintenanceRevision);
+        if (this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
+          await this.ctx.storage.setAlarm(Date.now() + 1_000);
+        }
+      }
+      return;
+    }
+    let deliveryFailed = false;
+    try {
+      const result = await this.usageProjection.getByName("").ingest(
+        pending.map(entry => entry.fact),
+      );
+      this.usageAccount.recordProjectionDeliveryResult(pending, result);
+    } catch (error) {
+      deliveryFailed = true;
+      logger.warn("Usage Projection delivery failed", {
+        event: "usage.projection.delivery.failed",
+        error,
+      });
+    }
+    const healthReported = await this.#reportProjectionDeliveryHealth(deliveryFailed);
+    if (deliveryFailed || !healthReported) {
+      await this.ctx.storage.setAlarm(Date.now() + 10_000);
+    } else if (backfillPending ||
+        this.usageAccount.listPendingProjectionOutbox(1).length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    } else {
+      await this.#deleteProjectionAlarmIfOwned(maintenanceRevision);
+    }
   }
 
   async authenticate(token: string): Promise<void> {
@@ -519,6 +683,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.getBalance();
   }
 
+  /** Return the exact authoritative balance components for an administrator capability. */
+  async getAdminUsageBalanceState(): Promise<AdminUsageBalanceState> {
+    await this.activateUsageAccount();
+    return this.usageAccount.getAdminBalanceState();
+  }
+
+  /** Return one bounded page of retained authoritative facts for a projection rebuild. */
+  async listUsageProjectionFacts(
+      afterSourceSequence: bigint | null,
+      limit: number) {
+    await this.activateUsageAccount();
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.listUsageProjectionFacts(afterSourceSequence, limit);
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
+  }
+
   /** Return one bounded page of this User's content-free Usage Records. */
   async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
     await this.activateUsageAccount();
@@ -567,13 +750,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Persist the durable provider-start handoff for one trusted Agent model inference. */
   async markModelUsageStarted(operationId: string): Promise<ModelMeteringAttempt> {
     await this.activateUsageAccount();
-    return this.usageAccount.markModelUsageStarted(operationId);
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.markModelUsageStarted(operationId);
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Release one trusted Agent model inference that did not reach its provider request. */
   async failModelUsageBeforeExecution(operationId: string): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
-    return this.usageAccount.failModelUsageBeforeExecution(operationId);
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.failModelUsageBeforeExecution(operationId);
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Complete one trusted Agent model inference from explicit provider Usage or no report. */
@@ -581,7 +774,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       usage: ModelUsageCompletion): Promise<ModelUsageRecord> {
     await this.activateUsageAccount();
-    return this.usageAccount.completeModelUsage(operationId, usage);
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.completeModelUsage(operationId, usage);
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Begin one trusted Gatekeeper Billable API Operation before its first upstream call. */
@@ -659,7 +857,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       completion: GatekeeperUsageCompletion): Promise<GatekeeperUsageRecord> {
     await this.activateUsageAccount();
-    return this.usageAccount.completeGatekeeperUsage(operationId, completion);
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.completeGatekeeperUsage(operationId, completion);
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Settle or release one unknown-held Gatekeeper operation under administrator authority. */
@@ -670,13 +873,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       reason: string,
       actorUserId: string) {
     await this.activateUsageAccount();
-    return this.usageAccount.reconcileUnknownGatekeeperUsage(
-      billingOperationId,
-      reconciliationOperationId,
-      decision,
-      reason,
-      actorUserId,
-    );
+    const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+    try {
+      return this.usageAccount.reconcileUnknownGatekeeperUsage(
+        billingOperationId,
+        reconciliationOperationId,
+        decision,
+        reason,
+        actorUserId,
+      );
+    } finally {
+      this.#scheduleProjectionDelivery(preparationRevision);
+    }
   }
 
   /** Settle this User's reservation for a trusted internal metering operation. */

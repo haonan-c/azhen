@@ -78,6 +78,43 @@ async function expectRejectedWith(
 }
 
 describe("Issue #45 User Registry and administrator Usage Account operations", () => {
+  it("returns Registry count and revision from canonical SQL text without number coercion",
+      async () => {
+    const isolated = testEnv.TEST_ADMIN_SETTINGS.getByName(crypto.randomUUID());
+    await isolated.registerUsageUser({
+      registrationEventId: crypto.randomUUID(),
+      registeredUserRef: crypto.randomUUID(),
+      userDoId: "f".repeat(64),
+      identity: "exact-registry@example.test",
+      displayName: "Exact Registry",
+      registeredAt: "2026-08-24T12:00:00.000Z",
+      activatedAt: "2026-08-24T12:00:00.000Z",
+    });
+    await runInDurableObject(isolated, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_user_registry SET sequence = 9007199254740993
+      `);
+    });
+    expect(await isolated.countRegisteredUsageUsers()).toBe(1n);
+    expect(await isolated.getRegisteredUsageUsersRevision()).toBe(9_007_199_254_740_993n);
+  });
+
+  it("keeps Registry count visible and metrics unavailable when the projection is down", async () => {
+    const user = await createDormantUser("projectiondown");
+    await user.stub.activateUsageAccount();
+
+    const overview = await adminUsage().getOverview();
+    expect(overview).toMatchObject({
+      metrics: null,
+      registeredUsers: 1n,
+      generation: 0n,
+      ingestionWatermark: 0n,
+      health: {state: "unavailable"},
+    });
+    expect(() => adminUsage().requestProjectionRebuild("projection-down-rebuild"))
+      .toThrow("Usage Projection is unavailable.");
+  });
+
   it("refuses to activate a User Durable Object that has no real account", async () => {
     const identity = uniqueIdentity("ghostusage");
     const ghost = users.get(users.idFromName(identity));

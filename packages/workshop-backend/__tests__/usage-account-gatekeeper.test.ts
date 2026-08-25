@@ -7,10 +7,15 @@ import {
 } from "@gadgets/workshop-shared/api";
 import { describe, expect, it } from "vitest";
 import { UsageAccount, type GatekeeperUsageAttribution } from "../src/usage-account.js";
+import type {
+  UsageProjection,
+  UsageProjectionAggregateFact,
+} from "../src/usage-projection.js";
 import type { UserDurableObject } from "../src/user.js";
 
 const testEnv = env as unknown as {
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
+  TEST_USAGE_PROJECTION: DurableObjectNamespace<UsageProjection>;
 };
 const users = testEnv.TEST_USER;
 const INITIAL_BALANCE = 1_000n * USAGE_CREDIT_SUBUNITS_PER_CREDIT;
@@ -148,6 +153,232 @@ describe("Gatekeeper two-stage billing state machine", () => {
         chargeSubunits: 0n,
         createdAt: record.createdAt,
       }]);
+    });
+  });
+
+  it("commits one immutable projection fact and outbox with the terminal Usage Record", async () => {
+    await withAccount(account => {
+      const operationId = "gatekeeper-operation:projection-outbox";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      const record = account.completeGatekeeperUsage(operationId, "executed");
+      expect(account.completeGatekeeperUsage(operationId, "executed")).toEqual(record);
+
+      const snapshot = account.getSnapshot();
+      expect(snapshot.projectionOutbox).toHaveLength(1);
+      expect(snapshot.projectionOutbox[0]).toMatchObject({
+        fact: {
+          schemaVersion: 1,
+          sourceSequence: 1n,
+          usagePrincipalRef: snapshot.registrationOutbox.fact.registeredUserRef,
+          rowKind: "detail",
+          source: "agent",
+          kind: "gatekeeper",
+          outcome: "settled",
+          pricing: "unpriced",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "context-account-1",
+          chargedUsageCreditSubunits: 0n,
+          billableApiOperations: 1n,
+          activeUserContribution: 1n,
+          unpricedApiOperations: 1n,
+        },
+      });
+      expect(snapshot.projectionFacts).toEqual(snapshot.projectionOutbox.map(item => item.fact));
+    });
+  });
+
+  it("retains a rejected projection fact as poison without retrying it forever", async () => {
+    await withAccount(account => {
+      const operationId = "gatekeeper-operation:projection-poison";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const pending = account.listPendingProjectionOutbox(1)[0]!;
+      const fact = pending.fact;
+
+      account.recordProjectionDeliveryResult([pending], {
+        acknowledgedFactIds: [],
+        rejected: [{projectionFactId: fact.projectionFactId, code: "invalid-fact"}],
+      });
+
+      expect(account.listPendingProjectionOutbox(1)).toEqual([]);
+      expect(account.getSnapshot().projectionOutbox).toEqual([{
+        fact,
+        failureCode: "invalid-fact",
+      }]);
+    });
+  });
+
+  it("replays an accepted fact after acknowledgement response loss without double counting",
+      async () => {
+    await withAccount(async account => {
+      const operationId = "gatekeeper-operation:projection-ack-loss";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const pending = account.listPendingProjectionOutbox(1)[0]!;
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+
+      expect(await projection.ingest([pending.fact])).toEqual({
+        acknowledgedFactIds: [pending.fact.projectionFactId],
+        rejected: [],
+      });
+      // The response is deliberately not recorded locally. A retry receives the same ACK.
+      const replay = await projection.ingest([pending.fact]);
+      account.recordProjectionDeliveryResult([pending], replay);
+
+      expect(account.listPendingProjectionOutbox(1)).toEqual([]);
+      expect((await projection.readOverview()).metrics).toMatchObject({
+        billableApiOperations: 1n,
+        unpricedApiOperations: 1n,
+      });
+    });
+  });
+
+  it("retains a queued Summary until a later conflict is written back as poison", async () => {
+    await withAccount(async (account, storage) => {
+      const usagePrincipalRef = account.getRegistrationOutbox().fact.registeredUserRef;
+      const summaryFactId = crypto.randomUUID();
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      const summary = (
+          sourceSequence: bigint,
+          cacheHitInputTokens: bigint): UsageProjectionAggregateFact => ({
+        schemaVersion: 1,
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence,
+        usagePrincipalRef,
+        rowKind: "aggregate",
+        bucketStart: "2026-08-24T12:00:00.000Z",
+        summaryFactId,
+        summaryRevision: 1n,
+        source: "agent",
+        kind: "model",
+        outcome: "settled",
+        pricing: "priced",
+        deploymentModelId: "model-1",
+        vendorId: null,
+        billingMethodKey: null,
+        externalAccountId: null,
+        gadgetId: null,
+        cacheHitInputTokens,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: cacheHitInputTokens,
+        chargedUsageCreditSubunits: cacheHitInputTokens,
+        billableApiOperations: 0n,
+        activeUserContribution: 1n,
+        unpricedModelUses: 0n,
+        unpricedApiOperations: 0n,
+      });
+      const first = summary(1n, 1n);
+      const second = summary(2n, 2n);
+      const key = (prefix: string, sequence: bigint) =>
+        prefix + sequence.toString().padStart(40, "0");
+      const outboxPrefix = "usageAccount:projectionOutbox:";
+      const pendingPrefix = "usageAccount:projectionPending:";
+      storage.kv.put(key(outboxPrefix, 2n), {fact: second});
+      storage.kv.put(key(pendingPrefix, 2n), second.projectionFactId);
+      storage.kv.put("usageAccount:projectionPendingCount:v1", 1n);
+      storage.kv.put("usageAccount:projectionSequence:v1", 2n);
+      const secondOnly = account.listPendingProjectionOutbox(1);
+
+      const queued = await projection.ingest([second]);
+      expect(queued).toEqual({acknowledgedFactIds: [], rejected: []});
+      account.recordProjectionDeliveryResult(secondOnly, queued);
+      expect(account.listPendingProjectionOutbox(1)).toEqual(secondOnly);
+
+      storage.kv.put(key(outboxPrefix, 1n), {fact: first});
+      storage.kv.put(key(pendingPrefix, 1n), first.projectionFactId);
+      storage.kv.put("usageAccount:projectionPendingCount:v1", 2n);
+      const pending = account.listPendingProjectionOutbox(2);
+      const resolved = await projection.ingest(pending.map(entry => entry.fact));
+      expect(resolved).toEqual({
+        acknowledgedFactIds: [first.projectionFactId],
+        rejected: [{projectionFactId: second.projectionFactId, code: "invalid-fact"}],
+      });
+      account.recordProjectionDeliveryResult(pending, resolved);
+
+      expect(account.getSnapshot().projectionOutbox).toEqual([
+        {fact: first, deliveredAt: expect.any(String)},
+        {fact: second, failureCode: "invalid-fact"},
+      ]);
+    });
+  });
+
+  it("reads pending and rebuild pages without touching delivered lifetime history", async () => {
+    await withAccount((account, storage) => {
+      for (let index = 1; index <= 200; index += 1) {
+        const operationId = `gatekeeper-operation:bounded-${index.toString().padStart(3, "0")}`;
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+        const pending = account.listPendingProjectionOutbox(1)[0]!;
+        account.recordProjectionDeliveryResult([pending], {
+          acknowledgedFactIds: [pending.fact.projectionFactId],
+          rejected: [],
+        });
+      }
+      const finalOperation = "gatekeeper-operation:bounded-final";
+      account.beginGatekeeperUsage(finalOperation, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(finalOperation);
+      account.completeGatekeeperUsage(finalOperation, "executed");
+      const finalPending = account.listPendingProjectionOutbox(1)[0]!;
+
+      const firstKey = `usageAccount:projectionOutbox:${"1".padStart(40, "0")}`;
+      storage.kv.put(firstKey, {corruptDeliveredHistory: true});
+      expect(account.listPendingProjectionOutbox(1)).toEqual([finalPending]);
+      expect(account.listUsageProjectionFacts(200n, 1)).toEqual({
+        facts: [finalPending.fact],
+        nextSourceSequence: null,
+        backfillComplete: true,
+      });
+    });
+  });
+
+  it("backfills legacy terminal and reconciliation authority once across interruption", async () => {
+    await withAccount(async (account, storage) => {
+      const settledId = "gatekeeper-operation:legacy-settled";
+      account.beginGatekeeperUsage(settledId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(settledId);
+      account.completeGatekeeperUsage(settledId, "executed");
+      const unknownId = "gatekeeper-operation:legacy-unknown";
+      account.beginGatekeeperUsage(unknownId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(unknownId);
+      account.completeGatekeeperUsage(unknownId, "unknown");
+      account.reconcileUnknownGatekeeperUsage(
+        unknownId, "gatekeeper-operation:legacy-reconcile", "settle",
+        "Recover legacy authority", "legacy-admin",
+      );
+
+      for (const [key] of Array.from(storage.kv.list({prefix: "usageAccount:projection"}))) {
+        storage.kv.delete(key);
+      }
+      expect(account.getSnapshot().projectionFacts).toEqual([]);
+      expect(account.backfillProjectionFactsBatch(1)).toBe(false);
+
+      const restarted = new UsageAccount(storage);
+      for (let index = 0; index < 8 && !restarted.backfillProjectionFactsBatch(1); index += 1) {
+        // Each call is one bounded alarm-sized recovery step.
+      }
+      expect(restarted.backfillProjectionFactsBatch(1)).toBe(true);
+      const facts = restarted.listUsageProjectionFacts(null, 10).facts;
+      expect(facts.map(item => item.outcome).toSorted()).toEqual([
+        "reconciled-settled", "settled", "usage-unknown",
+      ]);
+      expect(restarted.listUsageProjectionFacts(null, 10).facts).toEqual(facts);
+
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      await projection.ingest(facts);
+      await projection.ingest(facts);
+      expect((await projection.readOverview()).metrics).toMatchObject({
+        activeUsers: 1n,
+        billableApiOperations: 2n,
+        unpricedApiOperations: 2n,
+      });
     });
   });
 

@@ -906,6 +906,108 @@ export type AdminUsageBalanceState = {
   availableSubunits: bigint;
 };
 
+/** Operational state of the replaceable deployment Usage Projection. */
+export type AdminUsageProjectionState =
+  | "healthy"
+  | "lagging"
+  | "rebuilding"
+  | "failed"
+  | "unavailable";
+
+/** Content-free health and progress of the replaceable deployment Usage Projection. */
+export type AdminUsageProjectionHealth = {
+  /** Current projection state. */
+  state: AdminUsageProjectionState;
+  /** Canonical UTC time of the latest accepted fact, or null before the first fact. */
+  lastIngestedAt: string | null;
+  /** Canonical UTC source time of the latest applied fact, or null before the first fact. */
+  latestAppliedSourceAt: string | null;
+  /** Canonical UTC source time of the oldest unapplied Projection sequence entry. */
+  oldestPendingAt: string | null;
+  /** Exact number of Projection facts or rejection markers still waiting to be applied. */
+  pendingEventCount: bigint;
+  /** Exact number of User outbox facts still waiting for Projection acknowledgement. */
+  deliveryPendingEventCount: bigint;
+  /** Exact number of Usage Principals with a source-sequence gap. */
+  sequenceGapCount: bigint;
+  /** Exact number of failed delivery attempts and rejected invariant-breaking ingestions. */
+  failedIngestionCount: bigint;
+  /** Bounded machine-readable failure code, or null when no failure is recorded. */
+  failureCode: "delivery-failed" | "fact-id-conflict" | "source-sequence-conflict" |
+    "invalid-fact" | null;
+  /** Bounded rebuild failure code, or null when the latest rebuild did not fail. */
+  rebuildFailureCode:
+    "registry-read-failed" | "user-read-failed" | "projection-write-failed" | null;
+  /** Stable rebuild request identity, or null when no rebuild is active. */
+  rebuildRequestId: string | null;
+  /** Exact number of Registry Users completed by the active rebuild. */
+  rebuildUsersProcessed: bigint;
+  /** Canonical UTC observation time. */
+  asOf: string;
+};
+
+/** Exact all-recorded totals held by the replaceable deployment Usage Projection. */
+export type AdminUsageOverviewMetrics = {
+  /** Provider model cost in exact USD rate subunits. */
+  providerCostUsdSubunits: bigint;
+  /** Usage Charges in exact Usage Credit subunits. */
+  chargedUsageCreditSubunits: bigint;
+  /** Model input tokens reported as cache hits. */
+  cacheHitInputTokens: bigint;
+  /** Model input tokens not reported as cache hits. */
+  cacheMissInputTokens: bigint;
+  /** Model input tokens written to a provider cache, when reported. */
+  cacheWriteInputTokens: bigint;
+  /** Total model output tokens, already including reasoning-token detail. */
+  outputTokens: bigint;
+  /** Reasoning-token detail already included in outputTokens. */
+  reasoningTokens: bigint;
+  /** Caller-visible Billable API Operations confirmed as executed or accepted. */
+  billableApiOperations: bigint;
+  /** Distinct Usage Principals with at least one confirmed Metered Use. */
+  activeUsers: bigint;
+  /** Unpriced model uses with confirmed provider Usage. */
+  unpricedModelUses: bigint;
+  /** Unpriced Gatekeeper Billable API Operations confirmed as executed or accepted. */
+  unpricedApiOperations: bigint;
+};
+
+/** Administrator overview of all Usage Projection facts recorded since metering activation. */
+export type AdminUsageOverview = {
+  /** Exact totals, or null when the projection is unavailable. */
+  metrics: AdminUsageOverviewMetrics | null;
+  /** Exact count read from the authoritative User Registry, not the projection. */
+  registeredUsers: bigint;
+  /** Explicit range contract that #63 can later extend with frozen report filters. */
+  range: {kind: "all-recorded"; startedAt: string | null};
+  /** Active projection generation. */
+  generation: bigint;
+  /** Exact count of applied facts in the active generation. */
+  ingestionWatermark: bigint;
+  /** Structured projection health. */
+  health: AdminUsageProjectionHealth;
+  /** Canonical UTC observation time. */
+  asOf: string;
+};
+
+/** Durable status of an idempotent Usage Projection rebuild request. */
+export type ProjectionRebuildStatus = {
+  /** Stable caller-supplied rebuild identity. */
+  requestId: string;
+  /** Current rebuild state. */
+  state: "rebuilding" | "completed" | "failed";
+  /** Generation being built or activated. */
+  generation: bigint;
+  /** Exact number of Registry Users completed so far. */
+  usersProcessed: bigint;
+  /** Canonical UTC time when this rebuild began. */
+  startedAt: string;
+  /** Canonical UTC completion time, or null while the rebuild is active. */
+  completedAt: string | null;
+  /** Bounded machine-readable failure code, or null before a failure. */
+  failureCode: "registry-read-failed" | "user-read-failed" | "projection-write-failed" | null;
+};
+
 /** Supported append-only administrator Usage Account correction. */
 export type AdminUsageOperationKind =
     "grant" | "deduct" | "reconcile-balance" | "reverse";
@@ -1029,6 +1131,15 @@ export type AdminActionReconciliationResult = {
  * Durable Object capability.
  */
 export interface AdminUsageApi {
+  /** Read all-recorded deployment totals and structured projection health. */
+  getOverview(): Promise<AdminUsageOverview>;
+
+  /** Read one registered User's balance directly from its authoritative Usage Account. */
+  getBalance(registeredUserRef: string): Promise<AdminUsageBalanceState>;
+
+  /** Idempotently start or resume a replaceable projection rebuild from User authority. */
+  requestProjectionRebuild(requestId: string): Promise<ProjectionRebuildStatus>;
+
   /** Search only the authoritative Registry without waking or fabricating User Durable Objects. */
   searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult>;
 

@@ -9,6 +9,7 @@ import {
   normalizeUsageUserRegistrationFact,
   type UsageUserRegistrationFact,
 } from "./usage-account.js";
+import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 
 const MAX_REGISTRY_CURSOR_LENGTH = 512;
 const OPAQUE_REFERENCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -19,7 +20,7 @@ export type ResolvedUsageUser = {
 };
 
 type RegistryRow = {
-  sequence: number;
+  sequence: string;
   registered_user_ref: string;
   user_do_id: string;
   identity: string;
@@ -31,9 +32,25 @@ type RegistryRow = {
 
 type CursorPayload = {
   v: 1;
-  watermark: number;
-  after: number;
+  watermark: string;
+  after: string;
   queryHash: string;
+};
+
+/** Content-free User outbox state reported to the deployment Registry owner. */
+export type UsageProjectionDeliveryHealthReport = {
+  registeredUserRef: string;
+  pendingEventCount: bigint;
+  oldestPendingAt: string | null;
+  deliveryFailed: boolean;
+};
+
+/** Exact deployment-level User outbox health read without waking User Durable Objects. */
+export type UsageProjectionDeliveryHealth = {
+  pendingEventCount: bigint;
+  oldestPendingAt: string | null;
+  failedDeliveryCount: bigint;
+  failureCode: "delivery-failed" | null;
 };
 
 /**
@@ -63,6 +80,28 @@ export class UsageUserRegistry {
       CREATE INDEX IF NOT EXISTS usage_user_registry_display_search
       ON usage_user_registry(display_name_search, sequence)
     `);
+    storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_delivery_health (
+        registered_user_ref TEXT PRIMARY KEY, pending_event_count TEXT NOT NULL,
+        oldest_pending_at TEXT, failure_code TEXT, updated_at TEXT NOT NULL
+      )
+    `);
+    storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS usage_projection_delivery_health_oldest
+      ON usage_projection_delivery_health(oldest_pending_at)
+    `);
+    storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_delivery_totals (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        pending_event_count TEXT NOT NULL, failed_delivery_count TEXT NOT NULL,
+        failed_principal_count TEXT NOT NULL
+      )
+    `);
+    storage.sql.exec(`
+      INSERT OR IGNORE INTO usage_projection_delivery_totals (
+        singleton, pending_event_count, failed_delivery_count, failed_principal_count
+      ) VALUES (1, '0', '0', '0')
+    `);
   }
 
   /** Idempotently consume one stable post-commit User registration outbox fact. */
@@ -77,11 +116,11 @@ export class UsageUserRegistry {
         return publicRegistryRow(existing);
       }
 
-      const identityConflict = this.storage.sql.exec<{count: number}>(`
-        SELECT COUNT(*) AS count FROM usage_user_registry
+      const identityConflict = this.storage.sql.exec<{count: string}>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_user_registry
         WHERE registered_user_ref = ? OR user_do_id = ?
       `, normalized.registeredUserRef, normalized.userDoId).one().count;
-      if (identityConflict !== 0) {
+      if (identityConflict !== "0") {
         throw new Error("Usage User registration conflicts with stored Registry state.");
       }
 
@@ -121,10 +160,11 @@ export class UsageUserRegistry {
       : decodeCursor(normalizedRequest.cursor, queryHash);
 
     return this.storage.transactionSync(() => {
-      const watermark = cursor?.watermark ?? this.storage.sql.exec<{watermark: number}>(`
-        SELECT COALESCE(MAX(sequence), 0) AS watermark FROM usage_user_registry
+      const watermark = cursor?.watermark ?? this.storage.sql.exec<{watermark: string}>(`
+        SELECT CAST(COALESCE(MAX(sequence), 0) AS TEXT) AS watermark
+        FROM usage_user_registry
       `).one().watermark;
-      const after = cursor?.after ?? 0;
+      const after = cursor?.after ?? "0";
       const rows = query === ""
         ? this.searchAll(after, watermark, normalizedRequest.limit + 1)
         : this.searchPrefix(query, after, watermark, normalizedRequest.limit + 1);
@@ -140,6 +180,84 @@ export class UsageUserRegistry {
     });
   }
 
+  /** Return the exact current count from the authoritative deployment User Registry. */
+  count(): bigint {
+    return BigInt(this.storage.sql.exec<{count: string}>(`
+      SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_user_registry
+    `).one().count);
+  }
+
+  /** Return the monotonic Registry insertion watermark used to close a stable rebuild pass. */
+  revision(): bigint {
+    return BigInt(this.storage.sql.exec<{revision: string}>(`
+      SELECT CAST(COALESCE(MAX(sequence), 0) AS TEXT) AS revision
+      FROM usage_user_registry
+    `).one().revision);
+  }
+
+  /** Replace one User's bounded outbox health and update exact deployment watermarks. */
+  recordProjectionDeliveryHealth(report: UsageProjectionDeliveryHealthReport): void {
+    const normalized = normalizeDeliveryHealthReport(report);
+    this.storage.transactionSync(() => {
+      const previous = this.storage.sql.exec<{
+        pending_event_count: string;
+        failure_code: "delivery-failed" | null;
+      }>(`
+        SELECT pending_event_count, failure_code FROM usage_projection_delivery_health
+        WHERE registered_user_ref = ?
+      `, normalized.registeredUserRef).toArray()[0];
+      const totals = this.storage.sql.exec<{
+        pending_event_count: string;
+        failed_delivery_count: string;
+        failed_principal_count: string;
+      }>(`
+        SELECT pending_event_count, failed_delivery_count, failed_principal_count
+        FROM usage_projection_delivery_totals WHERE singleton = 1
+      `).one();
+      const previousPending = BigInt(previous?.pending_event_count ?? "0");
+      const previousFailed = previous?.failure_code !== null && previous !== undefined;
+      const failureCode = normalized.deliveryFailed ? "delivery-failed" : null;
+      const failedPrincipalDelta = (failureCode === null ? 0n : 1n) -
+        (previousFailed ? 1n : 0n);
+      this.storage.sql.exec(`
+        INSERT OR REPLACE INTO usage_projection_delivery_health (
+          registered_user_ref, pending_event_count, oldest_pending_at, failure_code, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `, normalized.registeredUserRef, normalized.pendingEventCount.toString(),
+      normalized.oldestPendingAt, failureCode, new Date().toISOString());
+      this.storage.sql.exec(`
+        UPDATE usage_projection_delivery_totals SET pending_event_count = ?,
+          failed_delivery_count = ?, failed_principal_count = ? WHERE singleton = 1
+      `,
+      (BigInt(totals.pending_event_count) - previousPending +
+        normalized.pendingEventCount).toString(),
+      (BigInt(totals.failed_delivery_count) + (normalized.deliveryFailed ? 1n : 0n)).toString(),
+      (BigInt(totals.failed_principal_count) + failedPrincipalDelta).toString());
+    });
+  }
+
+  /** Read deployment outbox health from the Registry owner without waking any User. */
+  projectionDeliveryHealth(): UsageProjectionDeliveryHealth {
+    const totals = this.storage.sql.exec<{
+      pending_event_count: string;
+      failed_delivery_count: string;
+      failed_principal_count: string;
+    }>(`
+      SELECT pending_event_count, failed_delivery_count, failed_principal_count
+      FROM usage_projection_delivery_totals WHERE singleton = 1
+    `).one();
+    const oldest = this.storage.sql.exec<{oldest: string | null}>(`
+      SELECT MIN(oldest_pending_at) AS oldest FROM usage_projection_delivery_health
+      WHERE pending_event_count != '0'
+    `).one().oldest;
+    return {
+      pendingEventCount: BigInt(totals.pending_event_count),
+      oldestPendingAt: oldest,
+      failedDeliveryCount: BigInt(totals.failed_delivery_count),
+      failureCode: BigInt(totals.failed_principal_count) === 0n ? null : "delivery-failed",
+    };
+  }
+
   /** Resolve one opaque Registry result into a server-only User Durable Object identifier. */
   resolve(registeredUserRef: string): ResolvedUsageUser | null {
     if (!isOpaqueReference(registeredUserRef)) {
@@ -153,15 +271,17 @@ export class UsageUserRegistry {
 
   private selectByEventId(registrationEventId: string): RegistryRow | undefined {
     return this.storage.sql.exec<RegistryRow>(`
-      SELECT sequence, registered_user_ref, user_do_id, identity, display_name,
+      SELECT CAST(sequence AS TEXT) AS sequence, registered_user_ref, user_do_id,
+             identity, display_name,
              registered_at, activated_at, registration_event_id
       FROM usage_user_registry WHERE registration_event_id = ?
     `, registrationEventId).toArray()[0];
   }
 
-  private searchAll(after: number, watermark: number, limit: number): RegistryRow[] {
+  private searchAll(after: string, watermark: string, limit: number): RegistryRow[] {
     return this.storage.sql.exec<RegistryRow>(`
-      SELECT sequence, registered_user_ref, user_do_id, identity, display_name,
+      SELECT CAST(sequence AS TEXT) AS sequence, registered_user_ref, user_do_id,
+             identity, display_name,
              registered_at, activated_at, registration_event_id
       FROM usage_user_registry
       WHERE sequence > ? AND sequence <= ?
@@ -171,7 +291,7 @@ export class UsageUserRegistry {
   }
 
   private searchPrefix(
-      query: string, after: number, watermark: number, limit: number): RegistryRow[] {
+      query: string, after: string, watermark: string, limit: number): RegistryRow[] {
     const upperBound = nextUnicodePrefix(query);
     if (upperBound === null) {
       return this.storage.sql.exec<RegistryRow>(`
@@ -186,7 +306,8 @@ export class UsageUserRegistry {
           WHERE display_name_search >= ?
             AND sequence > ? AND sequence <= ?
         )
-        SELECT registry.sequence, registry.registered_user_ref, registry.user_do_id,
+        SELECT CAST(registry.sequence AS TEXT) AS sequence,
+               registry.registered_user_ref, registry.user_do_id,
                registry.identity, registry.display_name, registry.registered_at,
                registry.activated_at, registry.registration_event_id
         FROM matching
@@ -214,7 +335,8 @@ export class UsageUserRegistry {
         WHERE display_name_search >= ? AND display_name_search < ?
           AND sequence > ? AND sequence <= ?
       )
-      SELECT registry.sequence, registry.registered_user_ref, registry.user_do_id,
+      SELECT CAST(registry.sequence AS TEXT) AS sequence,
+             registry.registered_user_ref, registry.user_do_id,
              registry.identity, registry.display_name, registry.registered_at,
              registry.activated_at, registry.registration_event_id
       FROM matching
@@ -255,6 +377,25 @@ function normalizeSearchRequest(request: AdminUsageUserSearchRequest): {
     throw new TypeError("Registry search page size is invalid.");
   }
   return {query: query.trim(), cursor: request.cursor, limit};
+}
+
+function normalizeDeliveryHealthReport(
+    report: UsageProjectionDeliveryHealthReport): UsageProjectionDeliveryHealthReport {
+  if (typeof report !== "object" || report === null || Array.isArray(report) ||
+      Object.keys(report).toSorted().join("\u0000") !== [
+        "deliveryFailed", "oldestPendingAt", "pendingEventCount", "registeredUserRef",
+      ].join("\u0000") || !isOpaqueReference(report.registeredUserRef) ||
+      typeof report.pendingEventCount !== "bigint" || report.pendingEventCount < 0n ||
+      typeof report.deliveryFailed !== "boolean") {
+    throw new TypeError("Usage Projection delivery health is invalid.");
+  }
+  const oldestPendingAt = report.oldestPendingAt === null ? null
+    : normalizeCanonicalUtcTimestamp(report.oldestPendingAt, "oldest Projection outbox time");
+  if ((report.pendingEventCount === 0n) !== (oldestPendingAt === null) ||
+      (report.deliveryFailed && report.pendingEventCount === 0n)) {
+    throw new TypeError("Usage Projection delivery health is invalid.");
+  }
+  return {...report, oldestPendingAt};
 }
 
 function hasAsciiControlCharacter(value: string): boolean {
@@ -301,9 +442,10 @@ function decodeCursor(value: string, expectedQueryHash: string): CursorPayload {
     const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
     const parsed: unknown = JSON.parse(new TextDecoder().decode(Uint8Array.fromBase64(padded)));
     assertExactObject(parsed, ["v", "watermark", "after", "queryHash"], "Registry cursor");
-    if (parsed.v !== 1 || !Number.isSafeInteger(parsed.watermark) || parsed.watermark < 0 ||
-        !Number.isSafeInteger(parsed.after) || parsed.after < 0 ||
-        parsed.after > parsed.watermark || typeof parsed.queryHash !== "string" ||
+    if (parsed.v !== 1 || !isCanonicalUnsignedDecimal(parsed.watermark) ||
+        !isCanonicalUnsignedDecimal(parsed.after) ||
+        BigInt(parsed.after) > BigInt(parsed.watermark) ||
+        typeof parsed.queryHash !== "string" ||
         !/^[0-9a-f]{64}$/.test(parsed.queryHash) ||
         parsed.queryHash !== expectedQueryHash) {
       throw new TypeError("invalid cursor");
@@ -312,6 +454,10 @@ function decodeCursor(value: string, expectedQueryHash: string): CursorPayload {
   } catch {
     throw new TypeError("Registry search cursor is invalid.");
   }
+}
+
+function isCanonicalUnsignedDecimal(value: unknown): value is string {
+  return typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value);
 }
 
 function publicRegistryRow(row: RegistryRow): AdminUsageRegisteredUser {
