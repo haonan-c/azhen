@@ -66,13 +66,26 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
   locator fields. The older Action-ID RPC rejects settle/release and remains available only for an
   exact reversal. Tests reject a wrong registered User, a non-unknown detail, and the old Action-ID
   bypass; a valid selected detail is idempotent under its stable operation ID.
+- The User authority freezes the selected detail, server-private Action target, administrator,
+  decision, reason, and retry ID before it calls the Overseer. It retains one bounded safe result
+  until the reconciliation row's own retention boundary. A lost response can therefore replay
+  after the older detail locator is physically removed, without restoring that detail or emitting
+  another Projection fact. The public result uses `${safeRecordRef}:usage-charge` instead of a raw
+  billing-operation Ledger identifier.
+- Pre-upgrade unknown rows that have no stored Action ID use a server-only compatibility index.
+  Each migration call examines at most 64 Action rows. New Actions write the index directly. A
+  local production-Harness test placed the target at Action 64: the first request stopped after the
+  first bounded page with an explicit retry signal, and the identical second request reached the
+  target through the next page.
 - The existing administrator reversal RPC accepts those validated detail-scoped aliases without
   exposing the raw Usage operation or Ledger identifier. Existing public Initial Grant and
   administrator-correction Ledger references keep their prior behavior. Actor binding, bounded
   reason validation, exact `bigint` deltas, replay, and reversal rules remain in the User authority.
 - An administrator deletion revokes an already-minted report and its active CSV stream. Authority
-  is checked before and after asynchronous work and on every stream pull. The #64 own-User boundary
-  and #65 deleted-User tombstone remain separate and unchanged.
+  is checked before and after asynchronous work and on every stream pull. A separate server-only
+  Registry resolver can reach the anonymous tombstone only for retained unknown coordination; it
+  cannot search identity, read the own-User surface, reserve, grant, issue another Initial Grant,
+  or start new Metered Use. Focused workerd and real Harness tests exercise this boundary.
 - `AdminUsageApi` permits at most four open reports. One report permits at most two concurrent
   operations and at most 1,024 public cursors. Slots are reserved before an await and released on
   success, failure, cancel, late return, or capability disposal.
@@ -93,6 +106,9 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
 - Disposing a report terminates an already-returned active CSV stream with a bounded error. A reader
   that consumed the preamble cannot wait forever after owner disposal, and the operation slot is
   released for a later export.
+- The stream terminator and operation slot are registered before the first asynchronous authority
+  check. Explicit cancellation during that first check rejects the pending `exportCsv()` call and
+  leaves a replacement stream usable.
 - The deterministic UTF-8 RFC 4180 stream starts with parseable frozen-snapshot and Projection-health
   metadata. Its data section distinguishes detail and aggregate rows. It includes safe dimensions,
   exact counters, tokens, provider cost, and charged credits. Cells beginning with `=`, `+`, `-`, or
@@ -147,6 +163,11 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 - Next and Previous maintain an opaque keyset cursor stack. A changed filter resets it. A late old
   opening cannot replace a newer report and its capability is disposed.
 - CSV export shows progress, supports cancel, and uses the current report capability.
+- Every post-stream export failure, including a writable sink rejection, the 16 MiB fallback limit,
+  and a non-Abort read failure, explicitly cancels the server export before it reports failure.
+  The row table also shows exact Metered Use, Billable API Operation, pre-execution failure, and
+  unknown-operation counters. Unknown retry identity includes both the registered User and the
+  current authoritative detail reference.
 
 ## Verification matrix
 
@@ -154,12 +175,13 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | --- | --- |
 | Shared, Backend, Frontend, and Integration Tests package builds | PASS |
 | Focused Usage administrator workerd | PASS, 18/18; recorded RED 16/18 before safe-reference compatibility fix |
-| Focused Usage report workerd | PASS, 22/22 |
+| Focused Usage report workerd | PASS, 23/23 |
 | Focused Summary/retention workerd group | PASS, 25/25 |
 | Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
-| Frontend report/file-transfer follow-up tests | PASS, 23/23 |
+| Frontend report/file-transfer follow-up tests | PASS, 27/27 |
 | Full Frontend package tests | PASS, 78 files and 381 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
+| Real production-Harness second-page legacy/deleted-User coordination | PASS, 1/1; 17 unrelated tests skipped; 15.80 seconds |
 | Backend Worker `capnweb-validate` build | PASS |
 | Full Backend package tests | PRE-REVIEW PASS, 654 tests with 4 expected skips; final rerun pending follow-up review |
 | Root `corepack pnpm build` | PRE-REVIEW PASS, 52 tasks; final rerun pending follow-up review |
@@ -224,12 +246,23 @@ successfully. The exact observed maximum was 64 rows per query and 29,888 bytes 
 chunk, below the hard 256 KiB chunk limit. This is bounded local evidence over production code paths
 with controlled external mocks, not a production traffic measurement.
 
-The branch now needs a third dual-axis review of this second correction batch. Root and complete
-Backend gates remain deliberately pending until that review fixed point.
+The third dual-axis review of the second correction batch reported no P0 and nine P1/P2 gaps. The
+third correction batch closed all nine with RED→GREEN coverage: first-await CSV termination,
+retention-safe decision replay, a bounded legacy Action authority index, anonymous-tombstone-only
+coordination, safe Ledger aliases, reverse-only raw Action requests, complete non-Abort browser
+cancellation, current-detail retry identity, and the four missing row counters.
+
+The new production Harness used 65 real `submitAction()` calls. It did not insert Action or Usage
+rows directly. A test-only seam removed only the post-upgrade User Action locator and cleared only
+the new compatibility index. The target was at Action ID 64. The first identical administrator
+request migrated 64 rows and returned the bounded retry signal. The second request reached the next
+batch, coordinated the retained unknown authority after permanent User deletion, and returned the
+safe `${safeRecordRef}:usage-charge` alias. A third identical request returned the same stored
+result. Registry identity search stayed empty and the deleted User capability stayed revoked.
 
 ## Remaining branch gate
 
-The candidate still requires the third standards/specification review, final affected/root
+The candidate still requires the next standards/specification follow-up review, final affected/root
 build and lint gates, complete Backend tests, and one coordinated root `corepack pnpm test`. After
 those gates and any TDD corrections, this document must record the final fixed point. No push,
 merge, pull request, Issue closure, deployment, upload, promotion,

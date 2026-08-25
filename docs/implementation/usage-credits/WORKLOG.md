@@ -855,3 +855,32 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   the third dual-axis fixed-point review. No push, merge, pull request, Issue closure, deployment,
   upload, promotion, production configuration change, charging change, or worktree deletion
   occurred.
+
+### 2026-08-25 — Issue #63 third review correction candidate
+
+- The third Standards/Spec review found nine P1/P2 seams and no P0. The TDD correction registers a
+  CSV terminator before the first await, so cancellation during the initial authority check rejects
+  the pending export and releases its slot.
+- Detail-scoped unknown coordination now freezes one bounded User-authoritative retry record before
+  crossing Durable Objects. It retains only the safe result until the reconciliation row expires.
+  The same operation can replay after the original detail locator is deleted, without resurrecting
+  detail or duplicating Projection facts. Results return `${safeRecordRef}:usage-charge`, never the
+  raw billing-operation Ledger ID.
+- The public raw Action request and runtime accept only `reverse`. Unknown settle/release accepts a
+  registered User and selected safe detail only. Browser retry identity includes both values. Sink,
+  16 MiB, and non-Abort read failures explicitly cancel the server export. Rows now show exact
+  Metered Use, Billable API Operation, pre-execution failure, and unknown-operation counters.
+- A separate Registry authority resolver reaches active or anonymous-tombstoned financial
+  authority only for retained unknown coordination. It does not restore Registry identity, login,
+  own-User balance, reserve, grant, Initial Grant, or new Metered Use surfaces. Focused deletion
+  tests retain those fail-closed boundaries.
+- Pre-upgrade unknown records without a User-side Action ID use a new server-only compatibility
+  index. New Actions write it directly. Migration reads no more than 64 Action rows per request.
+  The production Harness created 65 real Actions, put the target at Action ID 64, and proved that
+  the first identical request stops after the first page while the second reaches the next page.
+- Focused gates are GREEN: Usage report 23/23, Summary/retention/anonymization 25/25, Usage admin
+  18/18, and Frontend report/file transfer 27/27. Shared, Backend, Frontend, and integration-test
+  builds pass. The new legacy/deleted-User Harness passed 1/1 in 15.80 seconds with 17 unrelated
+  tests skipped. Root test remains prohibited until the next independent dual-axis fixed point.
+- No push, merge, pull request, Issue closure, deployment, upload, promotion, production
+  configuration change, charging change, or worktree deletion occurred.
