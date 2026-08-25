@@ -5,7 +5,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import type { RpcStub } from "capnweb";
-import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
+import type {
+  AdminApi, AdminUsageApi, AuthenticatedApi,
+} from "@gadgets/workshop-shared/api";
 import type {
   TestPrivateActionContent, TestSession,
 } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
@@ -154,6 +156,46 @@ async function signInWhenAvailable(username: string): Promise<{
     }
   }
   throw connectionFailure ?? new Error("Workshop did not accept a WebSocket connection.");
+}
+
+async function openUsageAdminWhenAvailable(): Promise<{
+  publicApi: ReturnType<typeof connect>;
+  user: RpcStub<AuthenticatedApi>;
+  admin: RpcStub<AdminApi>;
+  usage: RpcStub<AdminUsageApi>;
+}> {
+  const deadline = Date.now() + 15_000;
+  let connectionFailure: Error | undefined;
+  let failedStep = "connect";
+  while (Date.now() < deadline) {
+    const publicApi = connect(harness.url);
+    let user: RpcStub<AuthenticatedApi> | undefined;
+    let admin: RpcStub<AdminApi> | null | undefined;
+    let usage: RpcStub<AdminUsageApi> | undefined;
+    try {
+      failedStep = "signIn";
+      user = await signIn(publicApi, ADMIN_USERNAME);
+      failedStep = "getAdminApi";
+      admin = await user.getAdminApi();
+      if (!admin) throw new Error("Expected the deployment administrator capability.");
+      failedStep = "getUsageApi";
+      usage = await admin.getUsageApi();
+      failedStep = "searchUsers";
+      await usage.searchUsers({query: ADMIN_USERNAME, limit: 1});
+      return {publicApi, user, admin, usage};
+    } catch (error) {
+      usage?.[Symbol.dispose]();
+      admin?.[Symbol.dispose]();
+      user?.[Symbol.dispose]();
+      publicApi[Symbol.dispose]();
+      if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
+      connectionFailure = error;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  throw new Error(`Workshop admin Usage API did not become ready during ${failedStep}.`, {
+    cause: connectionFailure,
+  });
 }
 
 async function setActionRate(amountSubunits: bigint, reason: string): Promise<void> {
@@ -1034,12 +1076,11 @@ describe("approved Action billing", () => {
       safeRecordRef,
     })).rejects.toThrow();
 
-    const replaySession = await signInWhenAvailable(ADMIN_USERNAME);
+    const replaySession = await openUsageAdminWhenAvailable();
     using _replayPublicApi = replaySession.publicApi;
-    using replayAuthenticatedAdmin = replaySession.user;
-    using replayAdmin = await replayAuthenticatedAdmin.getAdminApi();
-    if (!replayAdmin) throw new Error("Expected the deployment administrator capability.");
-    using replayUsage = await replayAdmin.getUsageApi();
+    using _replayAuthenticatedAdmin = replaySession.user;
+    using _replayAdmin = replaySession.admin;
+    using replayUsage = replaySession.usage;
     const replayed = await replayUsage.reconcileUnknownRecord(request);
     expect(await replayUsage.reconcileUnknownRecord(request)).toEqual(replayed);
     expect(replayed).toMatchObject({
