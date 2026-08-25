@@ -1436,13 +1436,13 @@ describe("DeepSeek Agent billing", () => {
     ]);
 
     const finalOwnerSession = await signInWhenAvailable(ownerName);
-    using finalOwnerPublicApi = finalOwnerSession.publicApi;
+    using _finalOwnerPublicApi = finalOwnerSession.publicApi;
     using finalOwner = finalOwnerSession.user;
     const finalFirstSession = await signInWhenAvailable(firstName);
-    using finalFirstPublicApi = finalFirstSession.publicApi;
+    using _finalFirstPublicApi = finalFirstSession.publicApi;
     using finalFirst = finalFirstSession.user;
     const finalSecondSession = await signInWhenAvailable(secondName);
-    using finalSecondPublicApi = finalSecondSession.publicApi;
+    using _finalSecondPublicApi = finalSecondSession.publicApi;
     using finalSecond = finalSecondSession.user;
     const [ownerRecords, firstRecords, secondRecords] = await waitFor(
       "all complete Principal tracer Records",
