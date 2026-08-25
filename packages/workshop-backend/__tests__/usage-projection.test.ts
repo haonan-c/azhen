@@ -930,7 +930,81 @@ describe("deployment Usage Projection", () => {
     expect(await projection.readHealth()).toMatchObject({
       pendingEventCount: 0n,
       sequenceGapCount: 0n,
+      failedIngestionCount: 1n,
     });
+
+    const sequencePoison = fact({
+      usagePrincipalRef,
+      sourceSequence: 3n,
+      reasoningTokens: 4n,
+      outputTokens: 3n,
+    });
+    expect(await projection.ingest([sequencePoison])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{
+        projectionFactId: sequencePoison.projectionFactId,
+        code: "source-sequence-conflict",
+      }],
+    });
+    expect((await projection.readHealth()).failedIngestionCount).toBe(2n);
+  });
+
+  it("preserves the old fact contribution after a live invalid fact ID conflict", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const registeredUserRef = crypto.randomUUID();
+    const usagePrincipalRef = crypto.randomUUID();
+    const first = fact({
+      usagePrincipalRef, sourceSequence: 1n,
+      cacheHitInputTokens: 3n, providerCostUsdSubunits: 3n,
+    });
+    const poison = fact({
+      ...first,
+      sourceSequence: 2n,
+      reasoningTokens: first.outputTokens + 1n,
+    });
+    const third = fact({
+      usagePrincipalRef, sourceSequence: 3n,
+      cacheHitInputTokens: 7n, providerCostUsdSubunits: 7n,
+    });
+    await projection.ingest([first]);
+    await runInDurableObject(projection, instance => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          searchRegisteredUsageUsers: async () => ({
+            users: [{
+              registeredUserRef,
+              identity: "live-invalid-conflict@example.test",
+              displayName: "Live Invalid Conflict",
+              registeredAt: "2026-08-24T12:00:00.000Z",
+              activatedAt: "2026-08-24T12:00:00.000Z",
+            }],
+            nextCursor: null,
+          }),
+          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
+        }),
+      };
+      (instance as unknown as {users: unknown}).users = {
+        idFromString: (value: string) => value,
+        get: () => ({
+          listUsageProjectionFacts: async () => ({
+            facts: [first, poison, third],
+            nextSourceSequence: null,
+            backfillComplete: true,
+          }),
+        }),
+      };
+    });
+    const requestId = `live-invalid-conflict-${crypto.randomUUID()}`;
+    await projection.requestRebuild(requestId);
+    expect(await projection.ingest([poison])).toMatchObject({
+      rejected: [{projectionFactId: first.projectionFactId, code: "fact-id-conflict"}],
+    });
+    await projection.ingest([third]);
+    await runDurableObjectAlarm(projection);
+
+    expect(await projection.requestRebuild(requestId)).toMatchObject({state: "completed"});
+    expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(10n);
   });
 
   it("does not let a cross-principal fact ID conflict advance a sequence", async () => {

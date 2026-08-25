@@ -291,7 +291,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         } catch {
           // Only a complete, bounded producer envelope can advance its claimed sequence.
         }
-        this.#recordFailure("invalid-fact");
         let code: UsageProjectionRejection["code"] = "invalid-fact";
         if (envelope !== null) {
           const meta = this.#meta();
@@ -302,8 +301,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           if (marker.stored && meta.rebuild_state === "rebuilding" &&
               meta.rebuild_generation !== null &&
               meta.rebuild_generation !== meta.active_generation) {
-            this.#ingestRejectionMarker(envelope, meta.rebuild_generation, false, true);
+            if (marker.code === "fact-id-conflict") {
+              this.#ingestRebuildSequenceRejection(
+                envelope, meta.rebuild_generation, marker.code,
+              );
+            } else {
+              this.#ingestRejectionMarker(envelope, meta.rebuild_generation, false, true);
+            }
           }
+        } else {
+          this.#recordFailure("invalid-fact");
         }
         rejected.push({projectionFactId, code});
         continue;
@@ -909,6 +916,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       failRebuildOnRejection = false): IngestRejectionResult {
     return this.ctx.storage.transactionSync(() => {
       const complete = (result: IngestRejectionResult): IngestRejectionResult => {
+        if (updateActiveMeta) {
+          this.#recordFailureInTransaction(this.#meta(), result.code);
+        }
         if (failRebuildOnRejection && !result.stored) {
           this.#failRebuild("projection-write-failed");
         }
@@ -922,9 +932,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         WHERE generation = ? AND fact_id = ?
       `, generation, fact.projectionFactId).toArray()[0];
       if (existingFactById) {
-        if (updateActiveMeta) {
-          this.#recordFailureInTransaction(this.#meta(), "fact-id-conflict");
-        }
         const samePrincipalNewSequence =
           existingFactById.principal_ref === fact.usagePrincipalRef &&
           existingFactById.source_sequence !== fact.sourceSequence.toString();
@@ -940,9 +947,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (existingMarkerById) {
         const sameSequence = existingMarkerById.principal_ref === fact.usagePrincipalRef &&
           existingMarkerById.source_sequence === fact.sourceSequence.toString();
-        if (!sameSequence && updateActiveMeta) {
-          this.#recordFailureInTransaction(this.#meta(), "fact-id-conflict");
-        }
         const samePrincipalNewSequence =
           existingMarkerById.principal_ref === fact.usagePrincipalRef && !sameSequence;
         const stored = sameSequence || samePrincipalNewSequence &&
@@ -965,9 +969,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       `, generation, fact.usagePrincipalRef, fact.sourceSequence.toString(),
       generation, fact.usagePrincipalRef, fact.sourceSequence.toString()).one().present === "1";
       if (sequenceOccupied) {
-        if (updateActiveMeta) {
-          this.#recordFailureInTransaction(this.#meta(), "source-sequence-conflict");
-        }
         return complete({code: "source-sequence-conflict", stored: false});
       }
       this.ctx.storage.sql.exec(`
