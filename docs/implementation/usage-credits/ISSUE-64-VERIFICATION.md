@@ -140,9 +140,8 @@ reloading Worker Loader during the one-shot registration call.
 The test now preloads the restarted Gadget through its real `getGadget()`, `connectToGadget()`, and
 `getLastFiring()` RPC path before starting the registration chat. It retains bounded failure
 diagnostics for provider calls, chat state, Hook count, and reconnect count. The focused DeepSeek
-file then passed 9/9 with the original timeout and the same three-call expectation. One complete
-115/115 production-Harness rerun on the final reviewed tree is still required before the branch is
-accepted; the focused pass is not presented as a substitute.
+file then passed 9/9 with the original timeout and the same three-call expectation. That focused
+pass was diagnostic evidence only; the final uninterrupted package gate is recorded below.
 
 ## Third fixed-point review corrections
 
@@ -194,5 +193,26 @@ the same `implement` stage gates and focused TDD loop:
 
 The original 114/115 production-Harness failure, its exact diagnostic fields, and the bounded
 preload operation remain recorded above. They are not replaced by the focused 9/9 or Cap'n Web 5/5
-passes. After final review, the candidate still requires one uninterrupted full 115/115 run; only
-that run can close this final branch gate.
+passes.
+
+## Final production-Harness gate
+
+The first uninterrupted run on the final reviewed production code passed 12 of 13 files and 113 of
+115 tests in 645.35 seconds. Both failures were stale UGC Ads Harness expectations for the raw
+`externalAccountId` on the User-safe Usage Record DTO. The priced lifecycle, charge, method, and
+internal authoritative metering assertions all matched. No production code changed in response.
+
+The test-only correction removed those two stale positive expectations, added negative sensitive
+canaries, and retained the remaining lifecycle fields. The integration-package build then exposed
+two compile-time stale field reads in the GitHub and Spotify User-safe DTO checks. Those checks now
+assert that the field is absent while retaining their method, lifecycle, identity, and User
+isolation evidence. Both integration TypeScript programs passed, `git diff --check` passed, and the
+focused UGC Ads production Harness passed 23/23.
+
+After the specification review reported no P0-P2 findings, commit
+`b2c3068483f562fc8983229915222c75bd5f2256` ran the required full package once, without prewarming,
+splitting, parallel workerd fleets, or a retry. The command
+`corepack pnpm --filter @gadgets/integration-tests test` exited 0 with 13/13 files and 115/115 tests
+in 659.84 seconds. This complete run closes the branch-level production-Harness gate. The
+coordinated merged-tree root build, root test, lint, manifest golden, and whitespace gates remain
+owned by the main-agent integration step.

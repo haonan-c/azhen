@@ -565,3 +565,23 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   quote-only `admin-settings.ts` change. The final single uninterrupted 115/115 Harness remains
   pending. No push, merge, Issue closure, release build, upload, promotion, deployment, production
   change, charging change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #64 final production-Harness gate
+
+- The first uninterrupted final-candidate package run passed 12/13 files and 113/115 tests in
+  645.35 seconds. Its two failures were stale UGC Ads expectations for the removed raw
+  `externalAccountId` on the User-safe Usage Record DTO. The remaining priced lifecycle and
+  internal authoritative metering fields matched, so no production code changed.
+- Updated only three production-Harness test files. The two UGC Ads checks now retain source,
+  vendor, method, pricing, outcome, and exact charge assertions while rejecting the sensitive
+  account canary. GitHub and Spotify now prove the User-safe field is absent while retaining their
+  method and User-isolation checks. Both integration TypeScript programs passed,
+  `git diff --check` passed, and focused UGC Ads passed 23/23.
+- After specification review found no P0-P2 findings, committed the test-only correction as
+  `b2c3068483f562fc8983229915222c75bd5f2256` and ran one complete, uninterrupted package command.
+  It passed 13/13 files and 115/115 tests in 659.84 seconds without prewarming, splitting, a
+  parallel workerd fleet, or a retry.
+- This closes the Issue #64 branch production-Harness gate. Merged-tree root build, test, lint,
+  manifest golden, and whitespace gates remain for main-agent integration. No push, merge, Issue
+  closure, release build, upload, promotion, deployment, production change, charging change, or
+  worktree deletion occurred.
