@@ -789,14 +789,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       deletionId: string,
       reason: string,
       actorUserId: string) {
-    return this.ctx.storage.transactionSync(() => {
+    const result = this.ctx.storage.transactionSync(() => {
       const existingDeletion = this.usageAccount.getUserDeletionState();
       if (existingDeletion?.state === "deleted") return existingDeletion;
       const registration = this.usageAccount.getRegistrationOutbox();
       if (existingDeletion === null) {
         this.ctx.storage.kv.put(USER_DELETION_AVATAR_KEY, this.storage.profile.get().id);
       }
-      const state = this.usageAccount.beginUserDeletionInCurrentTransaction(
+      const deletionState = this.usageAccount.beginUserDeletionInCurrentTransaction(
         deletionId,
         reason,
         actorUserId,
@@ -810,8 +810,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         name: "Deleted User",
         id: `deleted:${registration.fact.registeredUserRef.slice(0, 12)}`,
       });
-      return state;
+      return deletionState;
     });
+    this.#releaseUsageBalanceSubscribers();
+    return result;
   }
 
   /** Retry avatar removal and complete the local User tombstone with no Registry authority. */
@@ -873,10 +875,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Return this User's authoritative available and reserved Usage Credit balance. */
   async getUsageCreditBalance(): Promise<UsageCreditBalance> {
-    if (this.usageAccount.getUserDeletionState() !== null) {
-      throw new Error("This User has been deleted.");
-    }
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     return this.usageAccount.getBalance();
   }
 
@@ -903,7 +902,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async subscribeUsageCreditBalance(
       subscriber: RpcStub<UsageCreditBalanceSubscriber>):
       Promise<NativeRpcStub<UsageCreditBalanceSubscription>> {
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     const retained = subscriber.dup();
     this.usageBalanceSubscribers.add(retained);
     const unsubscribe = () => {
@@ -912,6 +911,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     };
     try {
       await retained.update(this.usageAccount.getBalance());
+      this.#assertOwnUsageSurfaceActive();
+      if (!this.usageBalanceSubscribers.has(retained)) {
+        throw new Error("This User has been deleted.");
+      }
     } catch (error) {
       unsubscribe();
       throw error;
@@ -921,8 +924,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Idempotently acknowledge this User's pending legacy activation notice. */
   async acknowledgeUsageActivationNotice(noticeId: string): Promise<UsageCreditBalance> {
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     return this.usageAccount.acknowledgeActivationNotice(noticeId);
+  }
+
+  async #activateOwnUsageSurface(): Promise<void> {
+    this.#assertOwnUsageSurfaceActive();
+    await this.activateUsageAccount();
+    this.#assertOwnUsageSurfaceActive();
+  }
+
+  #assertOwnUsageSurfaceActive(): void {
+    if (this.usageAccount.getUserDeletionState() !== null) {
+      throw new Error("This User has been deleted.");
+    }
+  }
+
+  #releaseUsageBalanceSubscribers(): void {
+    for (const subscriber of this.usageBalanceSubscribers) {
+      subscriber[Symbol.dispose]();
+    }
+    this.usageBalanceSubscribers.clear();
   }
 
   private publishUsageCreditBalance(balance: UsageCreditBalance): void {
@@ -942,30 +964,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   /** Return one bounded page of this User's content-free Usage Records. */
   async listUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage> {
-    if (this.usageAccount.getUserDeletionState() !== null) {
-      throw new Error("This User has been deleted.");
-    }
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     return this.usageAccount.listUserUsageRecords(request);
   }
 
   /** Return one bounded page of this User's Credit Reservations. */
   async listOwnCreditReservations(
       request: UserCreditPageRequest): Promise<UserCreditReservationPage> {
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     return this.usageAccount.listUserCreditReservations(request);
   }
 
   /** Return one bounded page of this User's safe Credit Ledger projection. */
   async listOwnCreditLedger(request: UserCreditPageRequest): Promise<UserCreditLedgerPage> {
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     return this.usageAccount.listUserCreditLedger(request);
   }
 
   /** Return one bounded keyset page of safe Gatekeeper methods observed for this User. */
   async listOwnDiscoveredGatekeeperMethodPage(
       request: PublishedApiRateSourceRequest): Promise<DiscoveredPublishedApiMethodPage> {
-    await this.activateUsageAccount();
+    await this.#activateOwnUsageSurface();
     const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.listDiscoveredGatekeeperMethodPage(request);
