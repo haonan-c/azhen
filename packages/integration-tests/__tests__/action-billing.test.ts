@@ -239,6 +239,66 @@ async function openUsageAdminWhenAvailable(): Promise<{
   });
 }
 
+type NewUserReadinessOperations = {
+  open: () => ReturnType<typeof connect>;
+  signIn: typeof signIn;
+  signUp: typeof signUp;
+  readBalance: (user: RpcStub<AuthenticatedApi>) => PromiseLike<unknown>;
+};
+
+const productionNewUserReadiness: NewUserReadinessOperations = {
+  open: () => connect(harness.url),
+  signIn,
+  signUp,
+  readBalance: user => user.getUsageCreditBalance(),
+};
+
+async function openNewUserWhenAvailable(
+    username: string,
+    operations: NewUserReadinessOperations = productionNewUserReadiness): Promise<{
+  publicApi: ReturnType<typeof connect>;
+  user: RpcStub<AuthenticatedApi>;
+}> {
+  const deadline = Date.now() + 15_000;
+  let connectionFailure: Error | undefined;
+  let failedStep = "connect";
+  while (Date.now() < deadline) {
+    const publicApi = operations.open();
+    let user: RpcStub<AuthenticatedApi> | undefined;
+    try {
+      failedStep = "signIn";
+      try {
+        user = await awaitBeforeDeadline(
+          () => operations.signIn(publicApi, username), deadline, failedStep,
+          lateUser => lateUser[Symbol.dispose](),
+        );
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== `Login failed for "${username}".`) {
+          throw error;
+        }
+        failedStep = "signUp";
+        user = await awaitBeforeDeadline(
+          () => operations.signUp(publicApi, username), deadline, failedStep,
+          lateUser => lateUser[Symbol.dispose](),
+        );
+      }
+      failedStep = "getUsageCreditBalance";
+      await awaitBeforeDeadline(
+        () => operations.readBalance(user!), deadline, failedStep,
+      );
+      return {publicApi, user};
+    } catch (error) {
+      user?.[Symbol.dispose]();
+      publicApi[Symbol.dispose]();
+      if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
+      connectionFailure = error;
+    }
+  }
+  throw new Error(`New User RPC did not become ready during ${failedStep}.`, {
+    cause: connectionFailure,
+  });
+}
+
 async function setActionRate(amountSubunits: bigint, reason: string): Promise<void> {
   using publicApi = connect(harness.url);
   using authenticatedAdmin = await signIn(publicApi, ADMIN_USERNAME);
@@ -376,6 +436,65 @@ describe("bounded administrator Usage readiness", () => {
     resolveLate?.({[Symbol.dispose]: dispose});
     await Promise.resolve();
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a committed signup after its WebSocket response is lost", async () => {
+    const username = "readinessrecover";
+    const firstPublicDispose = vi.fn();
+    const secondPublicDispose = vi.fn();
+    const recoveredUserDispose = vi.fn();
+    const firstPublicApi = {
+      [Symbol.dispose]: firstPublicDispose,
+    } as unknown as ReturnType<typeof connect>;
+    const secondPublicApi = {
+      [Symbol.dispose]: secondPublicDispose,
+    } as unknown as ReturnType<typeof connect>;
+    const publicApis = [firstPublicApi, secondPublicApi];
+    const recoveredUser = {
+      [Symbol.dispose]: recoveredUserDispose,
+    } as unknown as RpcStub<AuthenticatedApi>;
+    const operations: NewUserReadinessOperations = {
+      open: vi.fn(() => publicApis.shift()!),
+      signIn: vi.fn()
+        .mockRejectedValueOnce(new Error(`Login failed for "${username}".`))
+        .mockResolvedValueOnce(recoveredUser),
+      signUp: vi.fn().mockRejectedValueOnce(new Error("WebSocket connection failed.")),
+      readBalance: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const result = await openNewUserWhenAvailable(username, operations);
+
+    expect(result).toEqual({publicApi: secondPublicApi, user: recoveredUser});
+    expect(operations.open).toHaveBeenCalledTimes(2);
+    expect(operations.signIn).toHaveBeenCalledTimes(2);
+    expect(operations.signUp).toHaveBeenCalledTimes(1);
+    expect(operations.readBalance).toHaveBeenCalledWith(recoveredUser);
+    expect(firstPublicDispose).toHaveBeenCalledTimes(1);
+    expect(recoveredUserDispose).not.toHaveBeenCalled();
+    result.user[Symbol.dispose]();
+    result.publicApi[Symbol.dispose]();
+    expect(recoveredUserDispose).toHaveBeenCalledTimes(1);
+    expect(secondPublicDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed on an unexpected authentication error", async () => {
+    const publicDispose = vi.fn();
+    const publicApi = {
+      [Symbol.dispose]: publicDispose,
+    } as unknown as ReturnType<typeof connect>;
+    const operations: NewUserReadinessOperations = {
+      open: vi.fn(() => publicApi),
+      signIn: vi.fn().mockRejectedValue(new Error("unexpected authentication failure")),
+      signUp: vi.fn(),
+      readBalance: vi.fn(),
+    };
+
+    await expect(openNewUserWhenAvailable("readinessclosed", operations))
+      .rejects.toThrow("unexpected authentication failure");
+    expect(operations.open).toHaveBeenCalledTimes(1);
+    expect(operations.signUp).not.toHaveBeenCalled();
+    expect(operations.readBalance).not.toHaveBeenCalled();
+    expect(publicDispose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1086,12 +1205,10 @@ describe("approved Action billing", () => {
   });
 
   it("replays a committed unknown decision after its raw detail is retained away", async () => {
-    const readySession = await signInWhenAvailable(ADMIN_USERNAME);
-    readySession.user[Symbol.dispose]();
-    readySession.publicApi[Symbol.dispose]();
-    using publicApi = connect(harness.url);
     const [username] = nextUsernames("actionretainedreplay");
-    using user = await signUp(publicApi, username);
+    const userSession = await openNewUserWhenAvailable(username);
+    using _publicApi = userSession.publicApi;
+    using user = userSession.user;
     const account = await provisionAccount(user);
     using workspace = await user.newGadget();
     using gatekeeper = await workspace.newGatekeeper(
@@ -1109,11 +1226,11 @@ describe("approved Action billing", () => {
     expect(await workspace.approveAction(action.id)).toBe("unknown");
     const safeRecordRef = await waitForNextUnknownUsageReference(username, new Set());
 
-    using adminPublicApi = connect(harness.url);
-    using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
-    using admin = await authenticatedAdmin.getAdminApi();
-    if (!admin) throw new Error("Expected the deployment administrator capability.");
-    using usage = await admin.getUsageApi();
+    const adminSession = await openUsageAdminWhenAvailable();
+    using _adminPublicApi = adminSession.publicApi;
+    using _authenticatedAdmin = adminSession.user;
+    using _admin = adminSession.admin;
+    using usage = adminSession.usage;
     const registered = await waitFor("the retained replay User Registry entry", async () =>
       (await usage.searchUsers({query: username, limit: 2})).users
         .find(candidate => candidate.identity === username) ?? null);
