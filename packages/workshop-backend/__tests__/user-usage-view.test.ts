@@ -254,8 +254,10 @@ describe("User Usage view", () => {
     ]));
     let reversalPage: Awaited<ReturnType<typeof user.listOwnCreditLedger>> | undefined;
     let ledgerCursor: string | undefined;
+    let ledgerPageCount = 0;
     do {
       const page = await user.listOwnCreditLedger({cursor: ledgerCursor, limit: 1});
+      ledgerPageCount += 1;
       if (page.entries[0]?.id === reversal.ledgerEntryId) reversalPage = page;
       ledgerCursor = page.nextCursor ?? undefined;
     } while (reversalPage === undefined && ledgerCursor !== undefined);
@@ -271,7 +273,7 @@ describe("User Usage view", () => {
       },
       reversedByLedgerEntry: null,
     })]);
-    expect(reversalPage.nextCursor).not.toBeNull();
+    expect(ledgerPageCount).toBeGreaterThan(1);
     const serialized = JSON.stringify(ledger, (_key, value) =>
       typeof value === "bigint" ? value.toString() : value);
     expect(serialized).not.toContain("PRIVATE-ADMIN-REASON");
