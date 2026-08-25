@@ -27,6 +27,22 @@ import type {
   ConfiguredPublishedApiRatePage,
   PublishedApiRateSourceRequest,
 } from './public-api-rates.js';
+import {
+  ADMIN_USAGE_REPORT_DEFAULT_LIMIT,
+  ADMIN_USAGE_REPORT_MAX_LIMIT,
+  type AdminUsageRecordDetail,
+  type AdminUsageRecordDetailRequest,
+  type AdminUsageReport,
+  type AdminUsageReportFilter,
+  type AdminUsageReportOverview,
+  type AdminUsageReportPage,
+  type AdminUsageReportPageRequest,
+  type AdminUsageReportRow,
+} from "@gadgets/workshop-shared/api";
+import {
+  freezeUsageReportQuery,
+  type FrozenUsageReportQuery,
+} from "./usage-report-query.js";
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -1148,9 +1164,269 @@ async function assertAdminCapabilityActive(
   }
 }
 
+/** Maximum number of Usage rows encoded into one CSV stream chunk. */
+export const ADMIN_USAGE_CSV_PAGE_SIZE = 64;
+
+/** Maximum encoded byte length held by one Usage CSV stream chunk. */
+export const ADMIN_USAGE_CSV_MAX_CHUNK_BYTES = 256 * 1024;
+
+/** Maximum live report capabilities minted by one administrator Usage capability. */
+export const ADMIN_USAGE_MAX_OPEN_REPORTS = 4;
+
+const ADMIN_USAGE_REPORT_CURSOR_LIMIT = 1_024;
+
+type UsageReportProjection = Pick<DurableObjectStub<UsageProjection>,
+  "readHealth" | "readReportMetrics" | "listReportRows">;
+
+/** Frozen administrator Usage report backed by one Projection generation and watermark. */
+@validateRpc()
+export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport {
+  private disposed = false;
+  private activeOperations = 0;
+  private activeStreams = new Set<() => void>();
+  private pageCursors = new Map<string, string>();
+
+  constructor(
+      private projection: UsageReportProjection,
+      private query: FrozenUsageReportQuery,
+      private onDispose: () => void = () => undefined) {
+    super();
+  }
+
+  async getOverview(): Promise<AdminUsageReportOverview> {
+    return this.#withOperation(async () => {
+      const [metrics, health] = await Promise.all([
+        this.projection.readReportMetrics(this.query),
+        this.projection.readHealth(),
+      ]);
+      return {
+        metrics,
+        snapshot: this.query.snapshot,
+        health,
+        asOf: new Date().toISOString(),
+      };
+    });
+  }
+
+  async listRows(request: AdminUsageReportPageRequest): Promise<AdminUsageReportPage> {
+    const normalized = normalizeAdminUsageReportPageRequest(request);
+    const internalCursor = normalized.cursor === undefined ? undefined
+      : this.pageCursors.get(normalized.cursor);
+    if (normalized.cursor !== undefined && internalCursor === undefined) {
+      throw new TypeError("Usage report cursor is invalid.");
+    }
+    const page = await this.#withOperation(() => this.projection.listReportRows(
+      this.query,
+      internalCursor,
+      normalized.limit,
+    ));
+    if (page.nextCursor === null) return page;
+    const publicCursor = crypto.randomUUID();
+    this.pageCursors.set(publicCursor, page.nextCursor);
+    while (this.pageCursors.size > ADMIN_USAGE_REPORT_CURSOR_LIMIT) {
+      this.pageCursors.delete(this.pageCursors.keys().next().value!);
+    }
+    return {...page, nextCursor: publicCursor};
+  }
+
+  async exportCsv(): Promise<ReadableStream<Uint8Array>> {
+    if (this.disposed) throw new Error("Usage report is closed.");
+    if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
+    this.activeOperations += 1;
+    const health = await this.projection.readHealth().catch(error => {
+      this.activeOperations -= 1;
+      throw error;
+    });
+    const generatedAt = new Date().toISOString();
+    let cursor: string | undefined;
+    let firstPull = true;
+    let complete = false;
+    let cancelled = false;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.activeOperations -= 1;
+      this.activeStreams.delete(cancel);
+    };
+    const cancel = () => {
+      cancelled = true;
+      release();
+    };
+    this.activeStreams.add(cancel);
+    const encoder = new TextEncoder();
+    return new ReadableStream<Uint8Array>({
+      pull: async controller => {
+        if (cancelled || complete) return;
+        try {
+          let chunk: Uint8Array;
+          if (firstPull) {
+            firstPull = false;
+            chunk = encoder.encode(csvPreamble(this.query, generatedAt, health));
+          } else {
+            const page = await this.projection.listReportRows(
+              this.query,
+              cursor,
+              ADMIN_USAGE_CSV_PAGE_SIZE,
+            );
+            if (cancelled) return;
+            chunk = encoder.encode(page.rows.map(csvReportRow).join(""));
+            cursor = page.nextCursor ?? undefined;
+            if (page.nextCursor === null) complete = true;
+          }
+          if (chunk.byteLength > ADMIN_USAGE_CSV_MAX_CHUNK_BYTES) {
+            throw new Error("Usage report CSV chunk exceeds its bounded buffer.");
+          }
+          if (chunk.byteLength > 0) controller.enqueue(chunk);
+          if (complete) {
+            controller.close();
+            release();
+          }
+        } catch (error) {
+          release();
+          controller.error(error);
+        }
+      },
+      cancel,
+    }, {highWaterMark: 1});
+  }
+
+  [Symbol.dispose](): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const cancel of this.activeStreams) cancel();
+    this.pageCursors.clear();
+    this.onDispose();
+  }
+
+  async #withOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.disposed) throw new Error("Usage report is closed.");
+    if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
+    this.activeOperations += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeOperations -= 1;
+    }
+  }
+}
+
+function normalizeAdminUsageReportPageRequest(
+    value: AdminUsageReportPageRequest): {cursor?: string; limit: number} {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).some(key => key !== "cursor" && key !== "limit")) {
+    throw new TypeError("Usage report page request is invalid.");
+  }
+  if (value.cursor !== undefined &&
+      (typeof value.cursor !== "string" || value.cursor.length < 1 || value.cursor.length > 1_024)) {
+    throw new TypeError("Usage report cursor is invalid.");
+  }
+  const limit = value.limit ?? ADMIN_USAGE_REPORT_DEFAULT_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > ADMIN_USAGE_REPORT_MAX_LIMIT) {
+    throw new TypeError("Usage report page limit is invalid.");
+  }
+  return {limit, ...(value.cursor === undefined ? {} : {cursor: value.cursor})};
+}
+
+function normalizeAdminUsageRecordDetailRequest(
+    value: AdminUsageRecordDetailRequest): AdminUsageRecordDetailRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).toSorted().join("\0") !== "registeredUserRef\0safeRecordRef") {
+    throw new TypeError("Usage Record detail request is invalid.");
+  }
+  const registeredUserRef = normalizeRegisteredUserRef(value.registeredUserRef);
+  if (typeof value.safeRecordRef !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        value.safeRecordRef,
+      )) {
+    throw new TypeError("Usage Record reference is invalid.");
+  }
+  return {registeredUserRef, safeRecordRef: value.safeRecordRef};
+}
+
+function csvPreamble(
+    query: FrozenUsageReportQuery,
+    generatedAt: string,
+    health: AdminUsageOverview["health"]): string {
+  const snapshot = query.snapshot;
+  const metadata = [
+    ["schema_version", "admin-usage-v1"],
+    ["generated_at", generatedAt],
+    ["projection_generation", snapshot.projectionGeneration.toString()],
+    ["ingestion_watermark", snapshot.ingestionWatermark.toString()],
+    ["report_time_zone", snapshot.reportTimeZone],
+    ["report_time_zone_version", snapshot.reportTimeZoneVersion.toString()],
+    ["start_at_utc_inclusive", snapshot.startAtUtcInclusive ?? ""],
+    ["end_at_utc_exclusive", snapshot.endAtUtcExclusive ?? ""],
+    ["active_filter", JSON.stringify(snapshot.filter)],
+    ["projection_state", health.state],
+    ["projection_last_ingested_at", health.lastIngestedAt ?? ""],
+    ["projection_latest_applied_source_at", health.latestAppliedSourceAt ?? ""],
+  ];
+  const lines = ["metadata_key,metadata_value\r\n"];
+  for (const row of metadata) lines.push(`${csvCell(row[0]!)},${csvCell(row[1]!)}\r\n`);
+  lines.push("\r\n");
+  lines.push([
+    "row_kind", "row_id", "registered_user_ref", "safe_record_ref", "summary_fact_id",
+    "summary_revision", "metered_kind", "source", "outcome", "pricing_status",
+    "gadget_id", "deployment_model_id", "gatekeeper_id", "stable_method_key",
+    "external_account_id", "occurred_at_utc", "report_local_timestamp",
+    "bucket_start_utc", "report_local_bucket_start", "cache_hit_input_tokens",
+    "cache_miss_input_tokens", "cache_write_input_tokens", "output_tokens",
+    "reasoning_tokens", "metered_use_count", "billable_api_operations", "pre_execution_failures",
+    "unknown_operations", "unpriced_model_uses", "unpriced_api_operations",
+    "provider_cost_usd_subunits", "charged_usage_credit_subunits",
+  ].join(",") + "\r\n");
+  return lines.join("");
+}
+
+function csvReportRow(row: AdminUsageReportRow): string {
+  const values = [
+    row.rowKind,
+    row.rowId,
+    row.registeredUserRef,
+    row.rowKind === "detail" ? row.safeRecordRef : "",
+    row.rowKind === "aggregate" ? row.summaryFactId : "",
+    row.rowKind === "aggregate" ? row.summaryRevision.toString() : "",
+    row.meteredKind,
+    row.source,
+    row.outcome,
+    row.pricingStatus,
+    row.gadgetId ?? "",
+    row.deploymentModelId ?? "",
+    row.gatekeeperId ?? "",
+    row.stableMethodKey ?? "",
+    row.externalAccountId ?? "",
+    row.rowKind === "detail" ? row.occurredAtUtc : "",
+    row.rowKind === "detail" ? row.reportLocalTimestamp : "",
+    row.rowKind === "aggregate" ? row.bucketStartUtc : "",
+    row.rowKind === "aggregate" ? row.reportLocalBucketStart : "",
+    row.metrics.cacheHitInputTokens.toString(),
+    row.metrics.cacheMissInputTokens.toString(),
+    row.metrics.cacheWriteInputTokens.toString(),
+    row.metrics.outputTokens.toString(),
+    row.metrics.reasoningTokens.toString(),
+    row.metrics.meteredUseCount.toString(),
+    row.metrics.billableApiOperations.toString(),
+    row.metrics.preExecutionFailures.toString(),
+    row.metrics.unknownOperations.toString(),
+    row.metrics.unpricedModelUses.toString(),
+    row.metrics.unpricedApiOperations.toString(),
+    row.metrics.providerCostUsdSubunits.toString(),
+    row.metrics.chargedUsageCreditSubunits.toString(),
+  ];
+  return values.map(csvCell).join(",") + "\r\n";
+}
+
+function csvCell(value: string): string {
+  const safe = /^[=+\-@]/.test(value) ? `'${value}` : value;
+  return /[",\r\n]/.test(safe) ? `"${safe.replaceAll('"', '""')}"` : safe;
+}
 /** Administrator-only Registry and User Usage Account correction capability. */
 @validateRpc()
 export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
+  private activeReports = 0;
+
   constructor(
       private admin: DurableObjectStub<AdminSettings>,
       private users: DurableObjectNamespace<UserDurableObject>,
@@ -1214,6 +1490,40 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       ...(normalized.cursor === undefined ? {} : {cursor: normalized.cursor}),
       ...(normalized.limit === undefined ? {} : {limit: normalized.limit}),
     });
+  }
+
+  async openReport(filter: AdminUsageReportFilter): Promise<RpcStub<AdminUsageReport>> {
+    if (!this.projection) throw new Error("Usage Projection is unavailable.");
+    if (this.activeReports >= ADMIN_USAGE_MAX_OPEN_REPORTS) {
+      throw new Error("Too many Usage reports are open.");
+    }
+    this.activeReports += 1;
+    try {
+      const [rates, coordinates] = await Promise.all([
+        this.admin.getUsageRates(),
+        this.projection.getByName("").getReportCoordinates(),
+      ]);
+      const query = freezeUsageReportQuery(
+        filter,
+        rates.current.reportTimeZone,
+        rates.current.version,
+        coordinates.projectionGeneration,
+        coordinates.ingestionWatermark,
+      );
+      // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
+      return new AdminUsageReportImpl(this.projection.getByName(""), query, () => {
+        this.activeReports -= 1;
+      });
+    } catch (error) {
+      this.activeReports -= 1;
+      throw error;
+    }
+  }
+
+  async getRecordDetail(request: AdminUsageRecordDetailRequest): Promise<AdminUsageRecordDetail> {
+    const normalized = normalizeAdminUsageRecordDetailRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    return user.getAdminUsageRecordDetail(normalized.safeRecordRef);
   }
 
   async grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult> {

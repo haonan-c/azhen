@@ -724,6 +724,51 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
       .not.toContain("opaque-account-sentinel");
   });
 
+  it("drills through a random record reference only inside the registered User authority", async () => {
+    const owner = await createDormantUser("admindrillowner", "Admin Drill Owner");
+    const peer = await createDormantUser("admindrillpeer", "Admin Drill Peer");
+    await owner.stub.activateUsageAccount();
+    await peer.stub.activateUsageAccount();
+    const ownerRegistration = await findRegistered(owner.identity);
+    const peerRegistration = await findRegistered(peer.identity);
+    const operationId = "gatekeeper-operation:admin-drill";
+    await owner.stub.beginGatekeeperUsage(operationId, {
+      principal: {version: 1, kind: "user", userId: owner.id.toString()},
+      source: "agent",
+      workspaceId: "c".repeat(64),
+      vendorId: TEST_CHARGE_SNAPSHOT.vendorId,
+      billingMethodKey: TEST_CHARGE_SNAPSHOT.billingMethodKey,
+      externalAccountId: "opaque-account-drill",
+    }, TEST_CHARGE_SNAPSHOT);
+    await owner.stub.markGatekeeperUsageStarted(operationId);
+    await owner.stub.completeGatekeeperUsage(operationId, "executed");
+    const snapshot = await accountSnapshot(owner.stub);
+    const fact = snapshot.projectionFacts.find(item => item.rowKind === "detail" &&
+      item.kind === "gatekeeper" && item.externalAccountId === "opaque-account-drill");
+    if (!fact || fact.rowKind !== "detail") throw new Error("Expected a detail Projection fact.");
+
+    const detail = await adminUsage().getRecordDetail({
+      registeredUserRef: ownerRegistration.registeredUserRef,
+      safeRecordRef: fact.safeRecordRef,
+    });
+    expect(detail).toMatchObject({
+      record: {
+        id: fact.safeRecordRef,
+        kind: "gatekeeper",
+        outcome: "settled",
+        externalAccountId: "opaque-account-drill",
+      },
+      chargeSnapshot: TEST_CHARGE_SNAPSHOT,
+      reservation: {state: "settled"},
+    });
+    expect(detail.ledgerEntries).toHaveLength(1);
+
+    await expectRejectedWith(() => adminUsage().getRecordDetail({
+      registeredUserRef: peerRegistration.registeredUserRef,
+      safeRecordRef: fact.safeRecordRef,
+    }), "Usage Record does not exist.");
+  });
+
   it("preserves a consumed original, permits the exact negative balance, and blocks paid work",
       async () => {
     const user = await createDormantUser("negativebalance", "Negative Balance");

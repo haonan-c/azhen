@@ -26,6 +26,7 @@ import {
 } from "./usage-account.js";
 import type {
   AdminUsageBalanceState,
+  AdminUsageRecordDetail,
   AdminUsageOperationResult,
   ChargeSnapshot,
   GatekeeperChargeSnapshot,
@@ -991,6 +992,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     } finally {
       this.#scheduleProjectionDelivery(preparationRevision);
     }
+  }
+
+  /** Read one authoritative Usage graph through this User's bounded random record index. */
+  async getAdminUsageRecordDetail(safeRecordRef: string): Promise<AdminUsageRecordDetail> {
+    await this.activateUsageAccount();
+    return this.usageAccount.getAdminUsageRecordDetail(safeRecordRef);
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */

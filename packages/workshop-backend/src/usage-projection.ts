@@ -1,5 +1,8 @@
 import {DurableObject} from "cloudflare:workers";
 import type {
+  AdminUsageReportMetrics,
+  AdminUsageReportPage,
+  AdminUsageReportRow,
   AdminUsageOverview,
   AdminUsageOverviewMetrics,
   AdminUsageProjectionHealth,
@@ -9,6 +12,14 @@ import type {
 import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import type {AdminSettings} from "./admin-settings.js";
 import type {UserDurableObject} from "./user.js";
+import {
+  buildUsageReportPredicate,
+  decodeUsageReportCursor,
+  encodeUsageReportCursor,
+  reportLocalTimestamp,
+  type FrozenUsageReportQuery,
+  type UsageReportCursor,
+} from "./usage-report-query.js";
 
 /** Seconds within which a committed User projection fact should reach the deployment projection. */
 export const USAGE_PROJECTION_FACT_TARGET_SECONDS = 10;
@@ -59,11 +70,14 @@ export type UsageProjectionDetailFact = UsageProjectionFactContribution & {
   /** Canonical UTC event time owned by the authoritative Usage Record. */
   occurredAt: string;
   bucketStart?: never;
+  summaryFactId?: never;
+  summaryRevision?: never;
 };
 
 /** Immutable Summary contribution for one canonical 15-minute UTC bucket. */
 export type UsageProjectionAggregateFact = UsageProjectionFactContribution & {
   rowKind: "aggregate";
+  safeRecordRef?: never;
   occurredAt?: never;
   /** Whether this Summary counts Model use, Gatekeeper use, or only a terminal attempt. */
   meteredKind: "model" | "gatekeeper" | "attempt";
@@ -93,6 +107,7 @@ export type UsageProjectionIngestResult = {
 type ProjectionMetaRow = {
   active_generation: string;
   ingestion_watermark: string;
+  report_watermark: string;
   last_ingested_at: string | null;
   latest_applied_source_at: string | null;
   failed_ingestion_count: string;
@@ -207,6 +222,7 @@ type StoredFactRow = {
   unpriced_model_uses: string;
   unpriced_api_operations: string;
   applied: number;
+  applied_watermark: string | null;
 };
 
 type StoredSummaryRow = {
@@ -423,6 +439,187 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       health,
       asOf: health.asOf,
     };
+  }
+
+  /** Capture the active generation and its monotonic report-ingestion watermark. */
+  getReportCoordinates(): {projectionGeneration: bigint; ingestionWatermark: bigint} {
+    const meta = this.#meta();
+    return {
+      projectionGeneration: BigInt(meta.active_generation),
+      ingestionWatermark: BigInt(meta.report_watermark),
+    };
+  }
+
+  /** Read one stable keyset page through the shared normalized report predicate. */
+  listReportRows(
+      query: FrozenUsageReportQuery,
+      cursorValue: string | undefined,
+      limit: number): AdminUsageReportPage {
+    this.#assertCurrentReportSnapshot(query);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+      throw new TypeError("Usage report page limit is invalid.");
+    }
+    const cursor = cursorValue === undefined
+      ? undefined : decodeUsageReportCursor(query, cursorValue);
+    const stored = this.#readStoredReportRows(query, cursor, limit + 1, "all");
+    const visible = stored.slice(0, limit);
+    const rows = visible.map(row => this.#publicReportRow(query, row));
+    const last = visible.at(-1);
+    return {
+      rows,
+      nextCursor: stored.length > limit && last
+        ? encodeUsageReportCursor(query, {
+          sourceTime: storedFactSourceTime(last),
+          rowId: last.fact_id,
+        }) : null,
+    };
+  }
+
+  /** Read exact filtered Summary totals without materializing an unbounded row collection. */
+  readReportMetrics(query: FrozenUsageReportQuery): AdminUsageReportMetrics {
+    this.#assertCurrentReportSnapshot(query);
+    const totals: AdminUsageReportMetrics = {
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      billableApiOperations: 0n,
+      meteredUseCount: 0n,
+      preExecutionFailures: 0n,
+      unknownOperations: 0n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: 0n,
+      activeUsers: 0n,
+    };
+    let cursor: UsageReportCursor | undefined;
+    while (true) {
+      const page = this.#readStoredReportRows(query, cursor, 256, "aggregate");
+      for (const row of page) {
+        totals.providerCostUsdSubunits += BigInt(row.provider_cost);
+        totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
+        totals.cacheHitInputTokens += BigInt(row.cache_hit_input);
+        totals.cacheMissInputTokens += BigInt(row.cache_miss_input);
+        totals.cacheWriteInputTokens += BigInt(row.cache_write_input);
+        totals.outputTokens += BigInt(row.output_tokens);
+        totals.reasoningTokens += BigInt(row.reasoning_tokens);
+        totals.billableApiOperations += BigInt(row.billable_api_operations);
+        totals.meteredUseCount += BigInt(row.metered_use_count);
+        totals.preExecutionFailures += BigInt(row.pre_execution_failures);
+        totals.unknownOperations += BigInt(row.unknown_operations);
+        totals.unpricedModelUses += BigInt(row.unpriced_model_uses);
+        totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
+      }
+      const last = page.at(-1);
+      if (page.length < 256 || !last) break;
+      cursor = {sourceTime: storedFactSourceTime(last), rowId: last.fact_id};
+    }
+    const predicate = buildUsageReportPredicate(query, "aggregate");
+    const activeUsers = this.ctx.storage.sql.exec<{count: string}>(`
+      SELECT CAST(COUNT(DISTINCT facts.principal_ref) AS TEXT) AS count
+      FROM usage_projection_facts AS facts
+      WHERE ${predicate.sql} AND facts.active_user_contribution <> '0'
+    `, ...predicate.params).one().count;
+    totals.activeUsers = BigInt(activeUsers);
+    return totals;
+  }
+
+  #readStoredReportRows(
+      query: FrozenUsageReportQuery,
+      cursor: UsageReportCursor | undefined,
+      limit: number,
+      rowKind: "all" | "aggregate"): StoredFactRow[] {
+    const predicate = buildUsageReportPredicate(query, rowKind, cursor);
+    return this.ctx.storage.sql.exec<StoredFactRow>(`
+      SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
+             bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
+             summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
+             deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
+             cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+             reasoning_tokens, provider_cost, charged_credits, metered_use_count,
+             billable_api_operations, pre_execution_failures, unknown_operations,
+             active_user_contribution,
+             unpriced_model_uses, unpriced_api_operations, applied, applied_watermark
+      FROM usage_projection_facts AS facts
+      WHERE ${predicate.sql}
+      ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+      LIMIT ?
+    `, ...predicate.params, limit).toArray();
+  }
+
+  #publicReportRow(query: FrozenUsageReportQuery, row: StoredFactRow): AdminUsageReportRow {
+    const meteredKind = row.row_kind === "aggregate" ? row.metered_kind : row.usage_kind;
+    if (meteredKind === null) throw new Error("Usage Projection row kind is incomplete.");
+    const dimensions = {
+      registeredUserRef: row.principal_ref,
+      source: row.source,
+      meteredKind,
+      outcome: row.outcome,
+      pricingStatus: row.pricing,
+      deploymentModelId: row.deployment_model_id,
+      gatekeeperId: row.vendor_id,
+      stableMethodKey: row.billing_method_key,
+      externalAccountId: row.external_account_id,
+      gadgetId: row.gadget_id,
+    };
+    const metrics = {
+      providerCostUsdSubunits: BigInt(row.provider_cost),
+      chargedUsageCreditSubunits: BigInt(row.charged_credits),
+      cacheHitInputTokens: BigInt(row.cache_hit_input),
+      cacheMissInputTokens: BigInt(row.cache_miss_input),
+      cacheWriteInputTokens: BigInt(row.cache_write_input),
+      outputTokens: BigInt(row.output_tokens),
+      reasoningTokens: BigInt(row.reasoning_tokens),
+      billableApiOperations: BigInt(row.billable_api_operations),
+      meteredUseCount: BigInt(row.metered_use_count),
+      preExecutionFailures: BigInt(row.pre_execution_failures),
+      unknownOperations: BigInt(row.unknown_operations),
+      unpricedModelUses: BigInt(row.unpriced_model_uses),
+      unpricedApiOperations: BigInt(row.unpriced_api_operations),
+    };
+    if (row.row_kind === "detail") {
+      if (row.occurred_at === null) {
+        throw new Error("Usage Projection detail row is incomplete.");
+      }
+      return {
+        ...dimensions,
+        meteredKind: row.usage_kind,
+        rowKind: "detail",
+        rowId: row.fact_id,
+        safeRecordRef: row.safe_record_ref ?? row.fact_id,
+        occurredAtUtc: row.occurred_at,
+        reportLocalTimestamp: reportLocalTimestamp(
+          row.occurred_at, query.snapshot.reportTimeZone,
+        ),
+        metrics,
+      };
+    }
+    if (row.bucket_start === null || row.summary_fact_id === null ||
+        row.summary_revision === null) {
+      throw new Error("Usage Projection aggregate row is incomplete.");
+    }
+    return {
+      ...dimensions,
+      rowKind: "aggregate",
+      rowId: row.fact_id,
+      summaryFactId: row.summary_fact_id,
+      summaryRevision: BigInt(row.summary_revision),
+      bucketStartUtc: row.bucket_start,
+      reportLocalBucketStart: reportLocalTimestamp(
+        row.bucket_start, query.snapshot.reportTimeZone,
+      ),
+      metrics,
+    };
+  }
+
+  #assertCurrentReportSnapshot(query: FrozenUsageReportQuery): void {
+    const meta = this.#meta();
+    if (query.snapshot.projectionGeneration.toString() !== meta.active_generation ||
+        query.snapshot.ingestionWatermark > BigInt(meta.report_watermark)) {
+      throw new Error("Usage report snapshot is stale.");
+    }
   }
 
   /** Read structured projection health without scanning User Durable Objects. */
@@ -1527,9 +1724,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     totalsSourceTime, totalsSourceTime, totalsSourceTime, generation);
     this.#applyActiveUserContribution(generation, fact.principal_ref,
       metrics.activeUserContribution);
+    const meta = this.#meta();
+    const reportWatermark = BigInt(meta.report_watermark) + 1n;
     this.ctx.storage.sql.exec(`
-      UPDATE usage_projection_facts SET applied = 1 WHERE generation = ? AND fact_id = ?
-    `, generation, fact.fact_id);
+      UPDATE usage_projection_facts SET applied = 1, applied_watermark = ?
+      WHERE generation = ? AND fact_id = ?
+    `, reportWatermark.toString(), generation, fact.fact_id);
+    this.ctx.storage.sql.exec(`
+      UPDATE usage_projection_meta SET report_watermark = ? WHERE singleton = 1
+    `, reportWatermark.toString());
     if (updateActiveMeta) {
       const meta = this.#meta();
       const latestApplied = totalsSourceTime !== null &&
@@ -1665,7 +1868,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
   #meta(): ProjectionMetaRow {
     return this.ctx.storage.sql.exec<ProjectionMetaRow>(`
-      SELECT active_generation, ingestion_watermark, last_ingested_at,
+      SELECT active_generation, ingestion_watermark, report_watermark, last_ingested_at,
              latest_applied_source_at, failed_ingestion_count, failure_code,
              rebuild_request_id, rebuild_state, rebuild_generation, rebuild_users_processed,
              rebuild_registry_revision, rebuild_registry_cursor, rebuild_registry_complete,
@@ -1692,7 +1895,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_meta (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1), active_generation TEXT NOT NULL,
-        ingestion_watermark TEXT NOT NULL, last_ingested_at TEXT,
+        ingestion_watermark TEXT NOT NULL, report_watermark TEXT NOT NULL,
+        last_ingested_at TEXT,
         latest_applied_source_at TEXT, failed_ingestion_count TEXT NOT NULL,
         failure_code TEXT, rebuild_request_id TEXT, rebuild_state TEXT,
         rebuild_generation TEXT, rebuild_users_processed TEXT NOT NULL,
@@ -1709,6 +1913,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const metaColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
       "PRAGMA table_info(usage_projection_meta)",
     ).toArray().map(column => column.name));
+    const needsReportWatermarkMigration = !metaColumns.has("report_watermark");
+    if (needsReportWatermarkMigration) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_meta
+        ADD COLUMN report_watermark TEXT NOT NULL DEFAULT '0'
+      `);
+    }
     if (!metaColumns.has("rebuild_authority_complete")) {
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_meta
@@ -1723,10 +1934,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     }
     this.ctx.storage.sql.exec(`
       INSERT OR IGNORE INTO usage_projection_meta (
-        singleton, active_generation, ingestion_watermark, failed_ingestion_count,
+        singleton, active_generation, ingestion_watermark, report_watermark,
+        failed_ingestion_count,
         rebuild_users_processed, rebuild_current_user_is_last, rebuild_authority_complete,
         rebuild_registry_complete, maintenance_turn, bootstrap_state
-      ) VALUES (1, '1', '0', '0', '0', 0, 0, 0, 'drain', 'pending')
+      ) VALUES (1, '1', '0', '0', '0', '0', 0, 0, 0, 'drain', 'pending')
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_totals (
@@ -1869,6 +2081,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
         active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
         unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
+        applied_watermark TEXT,
         PRIMARY KEY (generation, fact_id), UNIQUE (generation, principal_ref, source_sequence),
         CHECK ((row_kind = 'detail' AND occurred_at IS NOT NULL AND bucket_start IS NULL AND
                 metered_kind IS NULL AND
@@ -1915,6 +2128,24 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
       `);
     }
+    if (!factColumns.has("applied_watermark")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE usage_projection_facts ADD COLUMN applied_watermark TEXT",
+      );
+    }
+    if (needsReportWatermarkMigration || !factColumns.has("applied_watermark")) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_facts SET applied_watermark = CAST(rowid AS TEXT)
+          WHERE applied = 1 AND applied_watermark IS NULL
+        `);
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET report_watermark = (
+            SELECT CAST(COALESCE(MAX(rowid), 0) AS TEXT) FROM usage_projection_facts
+          ) WHERE singleton = 1
+        `);
+      });
+    }
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v2
       ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start))
@@ -1930,6 +2161,40 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_detail_watermarks (
         principal_ref TEXT PRIMARY KEY, cutoff_utc TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS usage_projection_report_time
+      ON usage_projection_facts(
+        generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
+      );
+      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time
+      ON usage_projection_facts(generation, principal_ref,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time
+      ON usage_projection_facts(generation, gadget_id,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time
+      ON usage_projection_facts(generation, deployment_model_id,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time
+      ON usage_projection_facts(generation, vendor_id, billing_method_key,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time
+      ON usage_projection_facts(generation, external_account_id,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time
+      ON usage_projection_facts(generation, source,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time
+      ON usage_projection_facts(generation, outcome,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time
+      ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision
+      ON usage_projection_facts(
+        generation, summary_fact_id, applied, applied_watermark, summary_revision
       )
     `);
     this.ctx.storage.sql.exec(`
@@ -2236,6 +2501,12 @@ async function hashProjectionFact(
 
 function projectionFactSourceTime(fact: UsageProjectionFact): string {
   return fact.rowKind === "detail" ? fact.occurredAt : fact.bucketStart;
+}
+
+function storedFactSourceTime(fact: StoredFactRow): string {
+  const sourceTime = fact.row_kind === "detail" ? fact.occurred_at : fact.bucket_start;
+  if (sourceTime === null) throw new Error("Usage Projection fact source time is missing.");
+  return sourceTime;
 }
 
 function aggregateDimensionKey(fact: UsageProjectionAggregateFact): string {

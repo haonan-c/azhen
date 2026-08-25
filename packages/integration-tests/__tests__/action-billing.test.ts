@@ -801,4 +801,88 @@ describe("approved Action billing", () => {
       .toBe("accepted");
     expect(await user.getUsageCreditBalance()).toEqual(afterCharge);
   });
+
+  it("streams a frozen administrator Usage report through real Cap'n Web and cancels cleanly",
+      async () => {
+    using publicApi = connect(harness.url);
+    const [username] = nextUsernames("usagereport");
+    using user = await signUp(publicApi, username);
+    expect(await user.getAdminApi()).toBeNull();
+    const account = await provisionAccount(user);
+    using workspace = await user.newGadget();
+    using gatekeeper = await workspace.newGatekeeper(
+      account.id,
+      `https://gadgets-test.example/things/report-${crypto.randomUUID()}`,
+    );
+    if (!gatekeeper) throw new Error("Expected the test Gatekeeper.");
+    using session = await gatekeeper.openSession() as RpcStub<TestSession>;
+    const forbiddenSentinel = `ISSUE63_PRIVATE_CONTENT_${crypto.randomUUID()}`;
+    await session.requestBillableAction(forbiddenSentinel);
+    const action = (await workspace.listActions()).find(entry =>
+      entry.type === "action" && entry.description.title === `Test action ${forbiddenSentinel}`);
+    if (!action) throw new Error("Expected the report Action.");
+    await workspace.approveAction(action.id);
+
+    using adminPublicApi = connect(harness.url);
+    using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected the deployment administrator capability.");
+    using usage = await admin.getUsageApi();
+    const registered = await waitFor("the report User to enter the authoritative Registry", async () =>
+      (await usage.searchUsers({query: username, limit: 2})).users
+        .find(candidate => candidate.identity === username) ?? null);
+    const opened = await waitFor("the Usage detail fact to reach Projection", async () => {
+      const candidate = await usage.openReport({
+        registeredUserRefs: [registered.registeredUserRef],
+        gatekeeperIds: [TEST_VENDOR_ID],
+        methods: [{gatekeeperId: TEST_VENDOR_ID, stableMethodKey: ACTION_METHOD_KEY}],
+        meteredKinds: ["gatekeeper"],
+      });
+      const page = await candidate.listRows({limit: 50});
+      const row = page.rows.find(item => item.rowKind === "detail" &&
+        item.gatekeeperId === TEST_VENDOR_ID && item.stableMethodKey === ACTION_METHOD_KEY);
+      if (!row || row.rowKind !== "detail") {
+        candidate[Symbol.dispose]();
+        return null;
+      }
+      return {candidate, row};
+    });
+    using report = opened.candidate;
+    expect(opened.row.metrics.billableApiOperations).toBe(1n);
+    expect(opened.row.metrics.chargedUsageCreditSubunits).toBe(ACTION_CHARGE);
+    expect(JSON.stringify(opened.row, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value)).not.toContain(forbiddenSentinel);
+
+    const detail = await usage.getRecordDetail({
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: opened.row.safeRecordRef,
+    });
+    expect(detail).toMatchObject({
+      record: {
+        id: opened.row.safeRecordRef,
+        kind: "gatekeeper",
+        vendorId: TEST_VENDOR_ID,
+        billingMethodKey: ACTION_METHOD_KEY,
+        outcome: "settled",
+        chargeSubunits: ACTION_CHARGE,
+      },
+      reservation: {state: "settled"},
+    });
+    expect(JSON.stringify(detail, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value)).not.toContain(forbiddenSentinel);
+
+    const slowReader = (await report.exportCsv()).getReader();
+    const firstChunk = await slowReader.read();
+    if (firstChunk.done) throw new Error("Expected the report metadata chunk.");
+    expect(firstChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await slowReader.cancel("Issue #63 slow-consumer cancellation");
+    expect((await report.listRows({limit: 1})).rows).toHaveLength(1);
+
+    const csv = await new Response(await report.exportCsv()).text();
+    expect(csv).toContain("schema_version,admin-usage-v1\r\n");
+    expect(csv).toContain(opened.row.safeRecordRef);
+    expect(csv).toContain(ACTION_CHARGE.toString());
+    expect(csv).not.toContain(forbiddenSentinel);
+  });
 });

@@ -1,4 +1,5 @@
 import {
+  type AdminUsageRecordDetail,
   type AdminUsageBalanceState,
   type AdminUsageOperationKind,
   type AdminUsageOperationResult,
@@ -164,7 +165,6 @@ type DetailProjectionContribution = Omit<
   "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef" |
     "safeRecordRef"
 >;
-
 type TransactionResult<T> = { value: T } | { error: Error };
 
 type UsageAccountTotals = {
@@ -1498,6 +1498,100 @@ export class UsageAccount {
   advanceDiscoveredGatekeeperMethodMigrationBatch(): boolean {
     return this.storage.transactionSync(() =>
       this.migrateDiscoveredGatekeeperMethodsBatch());
+  }
+
+  /** Read one content-free authoritative graph through a random User-local record reference. */
+  getAdminUsageRecordDetail(safeRecordRef: string): AdminUsageRecordDetail {
+    if (!isOpaqueUsageReference(safeRecordRef)) {
+      throw new TypeError("Usage Record reference is invalid.");
+    }
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (!locator || (locator.kind !== "model" && locator.kind !== "gatekeeper") ||
+        operationIdValidationError(locator.operationId) !== undefined) {
+      throw new Error("Usage Record does not exist.");
+    }
+    const sourceIdentity = `${locator.kind}:${locator.operationId}`;
+    const expectedRef = this.storage.kv.get<string>(
+      USAGE_DETAIL_SOURCE_REF_PREFIX + sourceIdentity,
+    );
+    if (expectedRef !== safeRecordRef) {
+      throw new Error("Usage Record reference does not reconcile.");
+    }
+    const rawRecord = locator.kind === "model"
+      ? this.storage.kv.get<ModelUsageRecord>(MODEL_USAGE_RECORD_PREFIX + locator.operationId)
+      : this.storage.kv.get<GatekeeperUsageRecord>(
+        GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
+      );
+    if (!rawRecord) throw new Error("Usage Record does not exist.");
+    if (locator.kind === "model") {
+      assertModelUsageRecord(rawRecord as ModelUsageRecord, locator.operationId);
+    } else {
+      assertGatekeeperUsageRecord(rawRecord as GatekeeperUsageRecord, locator.operationId);
+    }
+
+    const reservation = rawRecord.reservationId === null ? null
+      : this.storage.kv.get<CreditReservation>(RESERVATION_PREFIX + locator.operationId);
+    if (rawRecord.reservationId !== null && !reservation) {
+      throw new Error("Usage Record Reservation does not reconcile.");
+    }
+    if (reservation) this.assertStoredReservationConsistency(reservation, locator.operationId);
+
+    const reconciliationId = locator.kind === "gatekeeper"
+      ? this.storage.kv.get<string>(
+        GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + locator.operationId,
+      ) : undefined;
+    const reconciliation = reconciliationId === undefined ? undefined
+      : this.storage.kv.get<GatekeeperUsageReconciliation>(
+        GATEKEEPER_RECONCILIATION_PREFIX + reconciliationId,
+      );
+    if (reconciliationId !== undefined && (!reconciliation ||
+        reconciliation.billingOperationId !== locator.operationId)) {
+      throw new Error("Usage Record reconciliation does not reconcile.");
+    }
+
+    const linkedLedgerId = rawRecord.ledgerEntryId ?? reconciliation?.ledgerEntryId ?? null;
+    const linkedLedger = linkedLedgerId === null ? undefined
+      : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + linkedLedgerId);
+    if (linkedLedgerId !== null && (!linkedLedger || linkedLedger.kind !== "usage-charge")) {
+      throw new Error("Usage Record Ledger link does not reconcile.");
+    }
+    const reversalId = linkedLedgerId === null ? undefined
+      : this.storage.kv.get<string>(REVERSAL_PREFIX + linkedLedgerId);
+    const reversal = reversalId === undefined ? undefined
+      : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + reversalId);
+    if (reversalId !== undefined && (!reversal || reversal.kind !== "credit-reversal" ||
+        reversal.adminAudit.originalLedgerEntryId !== linkedLedgerId)) {
+      throw new Error("Usage Record Credit Reversal does not reconcile.");
+    }
+
+    const record = locator.kind === "model"
+      ? userModelUsageRecord(rawRecord as ModelUsageRecord)
+      : userGatekeeperUsageRecord(rawRecord as GatekeeperUsageRecord);
+    return {
+      record: {...record, id: safeRecordRef},
+      chargeSnapshot: rawRecord.chargeSnapshot,
+      reservation: reservation ? {
+        amountSubunits: reservation.amountSubunits,
+        state: reservation.state,
+        createdAt: reservation.createdAt,
+        settledAt: reservation.settledAt ?? null,
+        releasedAt: reservation.releasedAt ?? null,
+      } : null,
+      ledgerEntries: [linkedLedger, reversal].filter(
+        (entry): entry is CreditLedgerEntry => entry !== undefined,
+      ).map(entry => ({
+        id: entry.id,
+        kind: entry.kind as "usage-charge" | "credit-reversal",
+        deltaSubunits: entry.deltaSubunits,
+        createdAt: entry.createdAt,
+      })),
+      reconciliation: reconciliation ? {
+        decision: reconciliation.decision,
+        actorUserId: reconciliation.actorUserId,
+        reason: reconciliation.reason,
+        createdAt: reconciliation.createdAt,
+      } : null,
+    };
   }
 
   private migrateGatekeeperUsageTimeIndexBatch(): boolean {
