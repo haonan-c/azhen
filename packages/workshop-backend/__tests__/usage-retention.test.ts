@@ -552,13 +552,15 @@ describe("24 UTC calendar month Usage detail retention", () => {
     const identity = `retention-projection-outage-${crypto.randomUUID()}`;
     const user = users.get(users.idFromName(identity));
     expect(await user.createAccount(identity, identity, new Uint8Array([3]))).not.toBeNull();
-    await user.activateUsageAccount();
     const registeredUserRef = await runInDurableObject(user, (_instance, state) => {
       const account = new UsageAccount(state.storage, () => ({
         userDoId: users.idFromName(identity).toString(),
         identity,
         displayName: identity,
       }));
+      // Initialize authority directly so this fixture owns the only maintenance alarm invocation.
+      // Calling activateUsageAccount() here would also schedule a background pass.
+      account.getBalance(GRANT);
       completeUnpriced(account, "gatekeeper-operation:projection-cleanup-outage");
       acknowledgeAllProjectionFacts(account);
       return account.getRegistrationOutbox().fact.registeredUserRef;
