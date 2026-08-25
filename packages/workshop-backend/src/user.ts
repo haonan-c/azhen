@@ -460,12 +460,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
     const maintenanceRevision = this.#projectionMaintenanceRevision();
     const registrationDeliveryFailed = await this.#deliverUsageRegistrationOutbox();
-    const methodDiscoveryComplete =
-      this.usageAccount.advanceDiscoveredGatekeeperMethodMigrationBatch();
+    let methodDiscoveryComplete: boolean;
     let backfillComplete: boolean;
     let retention: ReturnType<UsageAccount["runRetentionMaintenanceBatch"]>;
     let projectionRetentionPending = false;
     try {
+      methodDiscoveryComplete =
+        this.usageAccount.advanceDiscoveredGatekeeperMethodMigrationBatch();
       backfillComplete = this.usageAccount.backfillProjectionFactsBatch();
       retention = this.usageAccount.runRetentionMaintenanceBatch();
       if (retention.complete) {

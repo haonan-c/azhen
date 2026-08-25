@@ -503,12 +503,14 @@ describe("24 UTC calendar month Usage detail retention", () => {
       }));
       account.getBalance(GRANT);
       completeUnpriced(account, "gatekeeper-operation:retention-poison");
+      // Finish the independent #64 method-inventory migration before corrupting the row. This test
+      // targets retention poison handling; a migration failure uses the same bounded retry path.
+      expect(account.advanceDiscoveredGatekeeperMethodMigrationBatch()).toBe(true);
       const key = "usageAccount:gatekeeperUsageRecord:gatekeeper-operation:retention-poison";
       const record = state.storage.kv.get<Record<string, unknown>>(key);
       if (!record) throw new Error("Expected a retained Usage Record.");
       state.storage.kv.put(key, {...record, outcome: "corrupt"});
     });
-    await user.activateUsageAccount();
 
     vi.useRealTimers();
     const healthBefore = await testEnv.TEST_ADMIN_SETTINGS.getByName("")
