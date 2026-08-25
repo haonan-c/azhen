@@ -1,6 +1,6 @@
 # Usage Credits delivery work log
 
-Last updated: 2026-08-20
+Last updated: 2026-08-25
 
 ## Objective
 
@@ -602,3 +602,127 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   4/4, and `git diff --check` passed. The evidence is local production code plus controlled external
   mocks, not a production deployment. No upload, promotion, deployment, production configuration
   change, charging enablement, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #65 isolated Summary, retention, and deletion candidate
+
+- Used the `implement`, `fable-mode`, `tdd`, and fixed-point review gates in the dedicated
+  `issue-65` worktree based on integrated Issue #62 commit `98e1963`.
+- Added authoritative 15-minute UTC Summary snapshots and revisions in the same terminal User DO
+  transaction as Usage detail, Ledger changes, and retained Projection outbox facts. Added bounded,
+  resumable legacy Summary backfill and switched new Projection generations to Summary-only totals.
+- Added strict 24-UTC-calendar-month event-detail retention with keyset stages, exact boundary and
+  month-end behavior, permanent operation tombstones, Projection detail watermarks, late-delivery
+  suppression, bounded poison health, and self-scheduled alarms. Ledger, Reversal, balance, active,
+  started, and unknown-held authority remains intact.
+- Added the capability-bound `AdminUsageApi.deleteUsageUser()` production coordinator. It removes
+  Registry search identity, User profile identity, credentials, sessions, and `AVATARS`; preserves a
+  permanent anonymous Registry principal; blocks re-login, new Metered Use, and a second Initial
+  Grant; and keeps pseudonymous Ledger, Summary, and rebuild totals.
+- Froze report-facing rows as `detail | aggregate`: only detail has random `safeRecordRef` and event
+  time; only aggregate has UTC bucket, stable Summary identity, and monotonic absolute revision.
+  Aggregate Summary rows also have explicit `model | gatekeeper | attempt` `meteredKind`; attempt-
+  only outcomes remain separate without adding use, tokens, cost, or active membership. Explicit
+  Metered Use, confirmed API, pre-execution, and unknown operation counters are exact and separate.
+  Legacy detail reuses its random fact ID as an authoritative locator alias instead of creating a
+  duplicate migration detail.
+- Focused workerd Summary/retention/anonymization verification passed 12 tests. The old-schema clean
+  Summary-generation migration passed its focused Projection test. The real production-shape
+  WebSocket Cap'n Web retention/deletion test passed 1/1 after generating its required gitignored
+  browser-runtime prerequisite and correcting a test assertion that raced a valid background alarm.
+  Direct Backend/Shared TypeScript and `git diff --check` passed.
+- Full fixed-point workerd/package/root/release gates remain coordinated main-agent work. Evidence
+  and limitations are in `ISSUE-65-VERIFICATION.md`. No push, merge, pull request, Issue closure,
+  upload, promotion, deployment, production change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #65 snapshot-first rebuild and fixed-point gates
+
+- Re-entered the `implement`, `tdd`, and fixed-point review gates for the reconciliation retention
+  seam. A RED test proved that backfill still required the older Gatekeeper Usage Record even when a
+  valid newer reconciliation authority snapshot existed. Projection and Summary backfill now use
+  the bounded content-free snapshot directly; only a legacy reconciliation without that snapshot
+  reads the original raw record, and missing legacy authority fails closed.
+- Added restart coverage after the original raw record expires. Two repeated backfills preserve the
+  same detail/aggregate fact set and Summary revisions, retain one reconciliation detail, and keep
+  exact aggregate Metered Use/API/charge totals at 1/1/17. A legacy fixture verifies bounded snapshot
+  upgrade; a second fixture verifies that neither a reference nor Summary is invented when both
+  snapshot and original authority are absent.
+- Isolated `usage-projection.test.ts` in a stable package-called workerd config. The suite deliberately
+  validates the deployment singleton Registry/Projection rebuild and manual alarm boundaries, so it
+  cannot run concurrently with other tests that mutate the same singleton. The config has no broad
+  unhandled-error allowlist and keeps the workerd startup assertion.
+- Final focused evidence is GREEN: Gatekeeper Usage Account 23/23, singleton Projection 54/54, and
+  Summary/retention/anonymization 18/18. The normal Backend package entry, including the real Cap'n
+  Web retention/deletion RPC, passed 605 tests with 4 expected skips and 0 failures. A prior run's
+  single `cloudflare-pool` runner startup timeout had no assertion failure and was superseded by the
+  clean-fleet result.
+- Shared, Backend, Frontend, and Integration Tests builds passed. Root `lint:check` and
+  `git diff --check` passed; lint reported only configured non-blocking warnings. The first
+  Integration Tests build lacked the normal gitignored UGC Ads generated skills prerequisite; the
+  formal generator produced it, and the unchanged build then passed.
+- Root test, release-manifest golden, and production-shape release dry-run remain main-agent
+  integration gates. No push, merge, pull request, Issue closure, upload, promotion, deployment,
+  production change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #65 fixed-point review corrections
+
+- Standards review found that a capability-bound administrator could delete its own User and revoke
+  the only manual retry path. Registry prepare now compares the target's stored User DO locator with
+  the server-derived actor locator in the same transaction before hiding identity or writing a job.
+  Focused tests prove repeated same/different deletion IDs have no side effects and a different
+  administrator can still delete the target.
+- Spec review found three retention/recovery gaps. A RED test proved released Model
+  `usage-unknown` was retained indefinitely; retention now consults the authoritative Reservation,
+  deletes released terminal detail strictly before the cutoff, retains equality, and keeps only
+  genuinely held/reconciliation-required state. A second RED proved reconciliation expiry retained
+  its event-level reverse index; cleanup now replaces it with a boolean billing-operation replay
+  tombstone that contains no second event ID or event time. Replay after both raw events expire does
+  not change Projection facts or Summary totals.
+- A third RED proved Registry prepare could persist `deleting` without any automatic User tombstone
+  recovery. AdminSettings now pre-arms an alarm before prepare, enumerates only persisted deletion
+  jobs in batches of at most four, and retries without future User traffic. Jobs retain no target
+  identity/search/AVATAR key. The User DO owns a transient AVATAR cleanup key only until idempotent KV
+  deletion succeeds. Prepare, User tombstone, AVATAR, and Registry final response-loss tests all
+  converge automatically with one job and unchanged Ledger/Summary authority.
+- A final P2 review found the Avatar cleanup key used a 500-character check that was narrower than
+  Cloudflare KV. Avatar write, read, and User deletion now share one validator for non-empty keys
+  other than `.`/`..` with a maximum of 512 UTF-8 bytes. Focused restart tests prove 501/512-byte
+  ASCII and 512-byte multibyte keys are written and removed; 513-byte ASCII and multibyte keys are
+  rejected on write and cannot strand the bounded deletion coordinator.
+- The corrected fixed point is GREEN: #65 serial workerd 24/24; normal Backend package entry 611
+  passed with 4 expected skips; Shared, Backend, Frontend, and Integration Tests builds; root
+  `lint:check`; and `git diff --check`. The real Cap'n Web retention/deletion RPC remains part of the
+  24-test production-binding integration group. No push, merge, pull request, Issue closure, upload,
+  promotion, deployment, production change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #65 post-#64 rebase and final branch gates
+
+- Rebasing over `dev` fixed point `4a4b3d27975b9490031c1061571205c8b6fb904a` retained Issue #64's
+  own-User subscription, activation, and DTO isolation and Issue #65's Summary, retention, and
+  deletion authority. The final code fixed point is
+  `9c088ecf86a4423656c76108992b0db6e3aa84f7`.
+- Final dual-axis review first found two P1 and two P2 issues. TDD corrections revoke live own-User
+  Usage capabilities and subscribers after deletion, enforce one Summary identity per generation
+  and dimension, reject every cumulative-field rollback, and isolate expected deleted-User RPC
+  failures in a dedicated integration config. Follow-up implementation review reported zero
+  remaining P0-P2 findings. This final documentation update closes the remaining evidence P2.
+- Focused evidence passed: singleton Projection 56/56 twice consecutively; own-User Usage view
+  11/11; retention serial 24/24; real Cap'n Web retention/deletion RPC 1/1; and the complete Backend
+  package 635 passed with 4 expected skips and 0 failures. Loader restart evidence passed the exact
+  case 3/3 consecutive times, the complete DeepSeek file 9/9, and the final root DeepSeek file 9/9.
+- The final root `corepack pnpm test` passed in 18m19.79s: root Node 117/117, Backend 635/4 expected
+  skips, production Harness 13/13 files and 115/115 tests in 669.28s, Frontend 362/362 plus
+  first-party copy 1/1, and 36/36 Vite+ workspace tasks. DeepSeek passed 9/9; its billing trace took
+  30.115s.
+- Root build passed in 38.915s. Root lint passed in 43.582s with configured non-blocking warnings.
+  Release-manifest golden tests passed 4/4, and `git diff --check` passed.
+- `corepack pnpm types:generate` exited 0 in 2m19.84s. It produced no Issue #65 binding, migration,
+  or golden change. One unrelated UGC Ads workerd metadata drift was reviewed and excluded; the
+  final worktree was clean.
+- The local production-shape release dry-run used release ID `issue-65-local`, exited 0 in 2m37.54s,
+  and produced 19 Workers, 85 unique modules, and 36 unique asset blobs in 28 MiB under the retained
+  `/tmp/azhen-issue65-release.lsQ2DJ/release-out` directory. It did not upload, promote, deploy,
+  change production configuration, or enable charging. This is local execution of production code
+  paths with controlled external mocks, not production deployment verification.
+- All Issue #65 branch gates are complete. Only main-agent `--no-ff` integration, integration-tree
+  gates, push, evidence comment, and Issue closure remain. No pull request, worktree deletion, or
+  production mutation occurred in this branch-gate step.

@@ -42,8 +42,11 @@ type UsageProjectionFactContribution = {
   reasoningTokens: bigint;
   providerCostUsdSubunits: bigint;
   chargedUsageCreditSubunits: bigint;
+  meteredUseCount: bigint;
   billableApiOperations: bigint;
-  activeUserContribution: 0n | 1n;
+  preExecutionFailures: bigint;
+  unknownOperations: bigint;
+  activeUserContribution: bigint;
   unpricedModelUses: bigint;
   unpricedApiOperations: bigint;
 };
@@ -51,6 +54,8 @@ type UsageProjectionFactContribution = {
 /** Immutable event contribution emitted by one authoritative User Usage Account. */
 export type UsageProjectionDetailFact = UsageProjectionFactContribution & {
   rowKind: "detail";
+  /** Random opaque reference resolved only inside the authoritative User Durable Object. */
+  safeRecordRef: string;
   /** Canonical UTC event time owned by the authoritative Usage Record. */
   occurredAt: string;
   bucketStart?: never;
@@ -60,6 +65,8 @@ export type UsageProjectionDetailFact = UsageProjectionFactContribution & {
 export type UsageProjectionAggregateFact = UsageProjectionFactContribution & {
   rowKind: "aggregate";
   occurredAt?: never;
+  /** Whether this Summary counts Model use, Gatekeeper use, or only a terminal attempt. */
+  meteredKind: "model" | "gatekeeper" | "attempt";
   /** Canonical UTC inclusive start of the 15-minute Summary bucket. */
   bucketStart: string;
   /** Stable bucket/dimension identity across revisions, distinct from each delivery fact ID. */
@@ -106,8 +113,8 @@ type ProjectionMetaRow = {
   rebuild_failure_code: ProjectionRebuildStatus["failureCode"];
   cleanup_generation: string | null;
   cleanup_stage:
-    "facts" | "rejections" | "drains" | "principals" | "active-users" | "summaries" |
-    "rebuild-users" | "totals" | null;
+    "facts" | "expired-sequences" | "rejections" | "drains" | "principals" |
+    "active-users" | "summaries" | "rebuild-users" | "totals" | null;
   maintenance_turn: "drain" | "lifecycle";
   bootstrap_state: "pending" | "complete";
 };
@@ -131,6 +138,7 @@ type IngestRejectionResult = {
 type RebuildUserRow = {
   queue_id: string;
   registered_user_ref: string;
+  user_do_id: string | null;
   fact_cursor: string | null;
 };
 
@@ -144,6 +152,7 @@ type StoredRejectionRow = {
 };
 
 type ProjectionTotalsRow = {
+  totals_source: "legacy" | "summary";
   provider_cost: string;
   charged_credits: string;
   cache_hit_input: string;
@@ -151,7 +160,10 @@ type ProjectionTotalsRow = {
   cache_write_input: string;
   output_tokens: string;
   reasoning_tokens: string;
+  metered_use_count: string;
   billable_api_operations: string;
+  pre_execution_failures: string;
+  unknown_operations: string;
   unpriced_model_uses: string;
   unpriced_api_operations: string;
   started_at: string | null;
@@ -163,6 +175,7 @@ type StoredFactRow = {
   principal_ref: string;
   source_sequence: string;
   occurred_at: string | null;
+  safe_record_ref: string | null;
   bucket_start: string | null;
   summary_fact_id: string | null;
   summary_revision: string | null;
@@ -170,6 +183,7 @@ type StoredFactRow = {
   summary_snapshot_value: string | null;
   source: UsageSource;
   row_kind: UsageProjectionFact["rowKind"];
+  metered_kind: UsageProjectionAggregateFact["meteredKind"] | null;
   usage_kind: UsageProjectionFact["kind"];
   outcome: UsageProjectionFact["outcome"];
   pricing: UsageProjectionFact["pricing"];
@@ -185,7 +199,10 @@ type StoredFactRow = {
   reasoning_tokens: string;
   provider_cost: string;
   charged_credits: string;
+  metered_use_count: string;
   billable_api_operations: string;
+  pre_execution_failures: string;
+  unknown_operations: string;
   active_user_contribution: string;
   unpriced_model_uses: string;
   unpriced_api_operations: string;
@@ -193,9 +210,11 @@ type StoredFactRow = {
 };
 
 type StoredSummaryRow = {
+  summary_fact_id: string;
   summary_revision: string;
   dimension_key: string;
   snapshot_value: string;
+  metered_kind: UsageProjectionAggregateFact["meteredKind"];
   cache_hit_input: string;
   cache_miss_input: string;
   cache_write_input: string;
@@ -203,7 +222,10 @@ type StoredSummaryRow = {
   reasoning_tokens: string;
   provider_cost: string;
   charged_credits: string;
+  metered_use_count: string;
   billable_api_operations: string;
+  pre_execution_failures: string;
+  unknown_operations: string;
   active_user_contribution: string;
   unpriced_model_uses: string;
   unpriced_api_operations: string;
@@ -217,7 +239,10 @@ type ProjectionMetricSnapshot = {
   reasoningTokens: bigint;
   providerCost: bigint;
   chargedCredits: bigint;
+  meteredUseCount: bigint;
   billableApiOperations: bigint;
+  preExecutionFailures: bigint;
+  unknownOperations: bigint;
   activeUserContribution: bigint;
   unpricedModelUses: bigint;
   unpricedApiOperations: bigint;
@@ -228,12 +253,35 @@ const FACT_BASE_KEYS = [
   "source", "kind", "outcome", "pricing", "deploymentModelId", "vendorId",
   "billingMethodKey", "externalAccountId", "gadgetId", "cacheHitInputTokens",
   "cacheMissInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningTokens",
-  "providerCostUsdSubunits", "chargedUsageCreditSubunits", "billableApiOperations",
-  "activeUserContribution", "unpricedModelUses", "unpricedApiOperations",
+  "providerCostUsdSubunits", "chargedUsageCreditSubunits", "meteredUseCount",
+  "billableApiOperations",
+  "preExecutionFailures", "unknownOperations", "activeUserContribution", "unpricedModelUses",
+  "unpricedApiOperations",
 ] as const;
-const DETAIL_FACT_KEYS = new Set<string>([...FACT_BASE_KEYS, "occurredAt"]);
+const PRE_METER_FACT_BASE_KEYS = FACT_BASE_KEYS.filter(key => key !== "meteredUseCount");
+const LEGACY_FACT_BASE_KEYS = FACT_BASE_KEYS.filter(key =>
+  key !== "meteredUseCount" && key !== "preExecutionFailures" && key !== "unknownOperations");
+const DETAIL_FACT_KEYS = new Set<string>([...FACT_BASE_KEYS, "safeRecordRef", "occurredAt"]);
+const PRE_METER_DETAIL_FACT_KEYS = new Set<string>([
+  ...PRE_METER_FACT_BASE_KEYS, "safeRecordRef", "occurredAt",
+]);
+const PRE_COUNTER_DETAIL_FACT_KEYS = new Set<string>([
+  ...LEGACY_FACT_BASE_KEYS, "safeRecordRef", "occurredAt",
+]);
+const LEGACY_PRE_COUNTER_DETAIL_FACT_KEYS = new Set<string>([
+  ...LEGACY_FACT_BASE_KEYS, "occurredAt",
+]);
 const AGGREGATE_FACT_KEYS = new Set<string>([
-  ...FACT_BASE_KEYS, "bucketStart", "summaryFactId", "summaryRevision",
+  ...FACT_BASE_KEYS, "meteredKind", "bucketStart", "summaryFactId", "summaryRevision",
+]);
+const PRE_METER_AGGREGATE_FACT_KEYS = new Set<string>([
+  ...PRE_METER_FACT_BASE_KEYS, "meteredKind", "bucketStart", "summaryFactId", "summaryRevision",
+]);
+const PRE_COUNTER_AGGREGATE_FACT_KEYS = new Set<string>([
+  ...LEGACY_FACT_BASE_KEYS, "meteredKind", "bucketStart", "summaryFactId", "summaryRevision",
+]);
+const LEGACY_PRE_COUNTER_AGGREGATE_FACT_KEYS = new Set<string>([
+  ...LEGACY_FACT_BASE_KEYS, "bucketStart", "summaryFactId", "summaryRevision",
 ]);
 const SOURCES = new Set<UsageSource>([
   "agent", "gadget", "direct-user", "system-assistance", "hook", "scheduled",
@@ -315,7 +363,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         rejected.push({projectionFactId, code});
         continue;
       }
-      const hash = await hashProjectionFact(fact);
+      const hash = await hashProjectionFact(fact, projectionFactHashVersion(input));
       const meta = this.#meta();
       const result = this.#ingestOne(fact, hash, meta.active_generation, true);
       if (result.rejection !== null) {
@@ -360,6 +408,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       cacheWriteInputTokens: BigInt(totals.cache_write_input),
       outputTokens: BigInt(totals.output_tokens),
       reasoningTokens: BigInt(totals.reasoning_tokens),
+      meteredUseCount: BigInt(totals.metered_use_count),
       billableApiOperations: BigInt(totals.billable_api_operations),
       activeUsers: BigInt(activeUsers),
       unpricedModelUses: BigInt(totals.unpriced_model_uses),
@@ -419,6 +468,62 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       rebuildUsersProcessed: BigInt(meta.rebuild_users_processed),
       asOf: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Replace at most one bounded page of expired event detail with content-free sequence markers.
+   * Summary-backed totals are not changed, and a delayed replay of a removed fact is acknowledged
+   * without restoring its event timestamp or dimensions.
+   */
+  expireDetailBefore(
+      usagePrincipalRef: string,
+      cutoffUtc: string,
+      limit = 64): boolean {
+    if (!UUID_PATTERN.test(usagePrincipalRef) || !Number.isInteger(limit) ||
+        limit < 1 || limit > 64) {
+      throw new TypeError("Usage Projection detail-retention request is invalid.");
+    }
+    const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection detail cutoff");
+    return this.ctx.storage.transactionSync(() => {
+      const rows = this.ctx.storage.sql.exec<{
+        generation: string;
+        fact_id: string;
+        source_sequence: string;
+        source_sequence_length: number;
+        storage_kind: "fact" | "rejection";
+      }>(`
+        SELECT generation, fact_id, source_sequence, length(source_sequence) AS source_sequence_length,
+               'fact' AS storage_kind
+        FROM usage_projection_facts
+        WHERE principal_ref = ? AND row_kind = 'detail' AND occurred_at < ?
+        UNION ALL
+        SELECT generation, fact_id, source_sequence, length(source_sequence) AS source_sequence_length,
+               'rejection' AS storage_kind
+        FROM usage_projection_rejections
+        WHERE principal_ref = ? AND source_time < ?
+        ORDER BY generation, source_sequence_length, source_sequence
+        LIMIT ?
+      `, usagePrincipalRef, cutoff, usagePrincipalRef, cutoff, limit + 1).toArray();
+      for (const row of rows.slice(0, limit)) {
+        this.ctx.storage.sql.exec(`
+          INSERT OR REPLACE INTO usage_projection_expired_sequences (
+            generation, fact_id, principal_ref, source_sequence
+          ) VALUES (?, ?, ?, ?)
+        `, row.generation, row.fact_id, usagePrincipalRef, row.source_sequence);
+        const table = row.storage_kind === "fact"
+          ? "usage_projection_facts" : "usage_projection_rejections";
+        this.ctx.storage.sql.exec(`
+          DELETE FROM ${table} WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+      }
+      this.ctx.storage.sql.exec(`
+        INSERT INTO usage_projection_detail_watermarks (principal_ref, cutoff_utc)
+        VALUES (?, ?)
+        ON CONFLICT(principal_ref) DO UPDATE SET cutoff_utc =
+          CASE WHEN cutoff_utc < excluded.cutoff_utc THEN excluded.cutoff_utc ELSE cutoff_utc END
+      `, usagePrincipalRef, cutoff);
+      return rows.length <= limit;
+    });
   }
 
   /** Start or resume the first bounded authority scan and report whether its totals are verified. */
@@ -522,10 +627,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         `, generation);
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_totals (
-            generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-            cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+            generation, totals_source, provider_cost, charged_credits,
+            cache_hit_input, cache_miss_input,
+            cache_write_input, output_tokens, reasoning_tokens, metered_use_count,
+            billable_api_operations, pre_execution_failures, unknown_operations,
             unpriced_model_uses, unpriced_api_operations, started_at
-          ) VALUES (?, '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', NULL)
+          ) VALUES (?, 'summary', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', NULL)
         `, generation);
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_meta SET rebuild_request_id = ?, rebuild_state = 'rebuilding',
@@ -646,7 +753,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         return;
       }
       const queued = this.ctx.storage.sql.exec<RebuildUserRow>(`
-        SELECT CAST(queue_id AS TEXT) AS queue_id, registered_user_ref, fact_cursor
+        SELECT CAST(queue_id AS TEXT) AS queue_id, registered_user_ref, user_do_id, fact_cursor
         FROM usage_projection_rebuild_users WHERE generation = ?
         ORDER BY queue_id LIMIT 1
       `, meta.rebuild_generation).toArray()[0];
@@ -657,11 +764,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         }
         let page;
         try {
-          page = await this.admin.getByName("").searchRegisteredUsageUsers({
-            ...(meta.rebuild_registry_cursor === null
-              ? {} : {cursor: meta.rebuild_registry_cursor}),
-            limit: REBUILD_REGISTRY_PAGE_LIMIT,
-          });
+          page = await this.admin.getByName("").listUsageProjectionPrincipals(
+            meta.rebuild_registry_cursor === null ? null : BigInt(meta.rebuild_registry_cursor),
+            BigInt(meta.rebuild_registry_revision!),
+            REBUILD_REGISTRY_PAGE_LIMIT,
+          );
         } catch {
           this.#failRebuild("registry-read-failed");
           return;
@@ -671,19 +778,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
             refreshed.rebuild_generation !== meta.rebuild_generation ||
             refreshed.rebuild_registry_cursor !== meta.rebuild_registry_cursor) return;
         this.ctx.storage.transactionSync(() => {
-          for (const registered of page.users) {
+          for (const registered of page.principals) {
             this.ctx.storage.sql.exec(`
               INSERT INTO usage_projection_rebuild_users (
-                generation, registered_user_ref, fact_cursor
-              ) VALUES (?, ?, NULL)
-            `, meta.rebuild_generation, registered.registeredUserRef);
+                generation, registered_user_ref, user_do_id, fact_cursor
+              ) VALUES (?, ?, ?, NULL)
+            `, meta.rebuild_generation, registered.registeredUserRef, registered.userDoId);
           }
           this.ctx.storage.sql.exec(`
             UPDATE usage_projection_meta SET rebuild_registry_cursor = ?,
               rebuild_registry_complete = ?
             WHERE singleton = 1 AND rebuild_state = 'rebuilding' AND
               rebuild_generation = ?
-          `, page.nextCursor, page.nextCursor === null ? 1 : 0, meta.rebuild_generation);
+          `, page.nextSequence?.toString() ?? null, page.nextSequence === null ? 1 : 0,
+          meta.rebuild_generation);
         });
         steps += 1;
         continue;
@@ -691,10 +799,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
       let user: DurableObjectStub<UserDurableObject>;
       try {
-        const resolved = await this.admin.getByName("")
-          .resolveRegisteredUsageUser(queued.registered_user_ref);
-        if (!resolved) throw new Error("registered User disappeared");
-        user = this.users.get(this.users.idFromString(resolved.userDoId));
+        const userDoId = queued.user_do_id ?? (await this.admin.getByName("")
+          .resolveRegisteredUsageUser(queued.registered_user_ref))?.userDoId;
+        if (!userDoId) throw new Error("registered User disappeared");
+        user = this.users.get(this.users.idFromString(userDoId));
       } catch {
         this.#failRebuild("registry-read-failed");
         return;
@@ -722,7 +830,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
             if (!marker.stored) return;
             continue;
           }
-          const hash = await hashProjectionFact(fact);
+          const hash = await hashProjectionFact(fact, projectionFactHashVersion(input));
           const result = this.#ingestOne(fact, hash, meta.rebuild_generation, false, true);
           if (result.rejection !== null && !result.sequenceRejectionAccepted) return;
         }
@@ -860,7 +968,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     }
     const generation = meta.cleanup_generation;
     const table = meta.cleanup_stage === "facts" ? "usage_projection_facts"
-      : meta.cleanup_stage === "rejections" ? "usage_projection_rejections"
+      : meta.cleanup_stage === "expired-sequences" ? "usage_projection_expired_sequences"
+        : meta.cleanup_stage === "rejections" ? "usage_projection_rejections"
         : meta.cleanup_stage === "drains" ? "usage_projection_drains"
         : meta.cleanup_stage === "principals" ? "usage_projection_principals"
           : meta.cleanup_stage === "active-users" ? "usage_projection_active_users"
@@ -879,7 +988,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       await this.ctx.storage.setAlarm(Date.now());
       return;
     }
-    const next = meta.cleanup_stage === "facts" ? "rejections"
+    const next = meta.cleanup_stage === "facts" ? "expired-sequences"
+      : meta.cleanup_stage === "expired-sequences" ? "rejections"
       : meta.cleanup_stage === "rejections" ? "drains"
         : meta.cleanup_stage === "drains" ? "principals"
         : meta.cleanup_stage === "principals" ? "active-users"
@@ -940,6 +1050,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         );
         return complete({code: "fact-id-conflict", stored});
       }
+      const expiredById = this.ctx.storage.sql.exec<{
+        principal_ref: string;
+        source_sequence: string;
+      }>(`
+        SELECT principal_ref, source_sequence FROM usage_projection_expired_sequences
+        WHERE generation = ? AND fact_id = ?
+      `, generation, fact.projectionFactId).toArray()[0];
+      if (expiredById) {
+        const sameSequence = expiredById.principal_ref === fact.usagePrincipalRef &&
+          expiredById.source_sequence === fact.sourceSequence.toString();
+        return complete({code: sameSequence ? "invalid-fact" : "fact-id-conflict", stored: true});
+      }
       const existingMarkerById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
         SELECT fact_id, principal_ref, source_sequence, source_time, code, applied
         FROM usage_projection_rejections WHERE generation = ? AND fact_id = ?
@@ -962,11 +1084,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           SELECT 1 FROM usage_projection_facts
           WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
           UNION ALL
+          SELECT 1 FROM usage_projection_expired_sequences
+          WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
+          UNION ALL
           SELECT 1 FROM usage_projection_rejections
           WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
           LIMIT 1
         ) AS TEXT) AS present
       `, generation, fact.usagePrincipalRef, fact.sourceSequence.toString(),
+      generation, fact.usagePrincipalRef, fact.sourceSequence.toString(),
       generation, fact.usagePrincipalRef, fact.sourceSequence.toString()).one().present === "1";
       if (sequenceOccupied) {
         return complete({code: "source-sequence-conflict", stored: false});
@@ -1040,6 +1166,25 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           rejection: "fact-id-conflict", applied: false, sequenceRejectionAccepted,
         });
       }
+      const expiredById = this.ctx.storage.sql.exec<{
+        principal_ref: string;
+        source_sequence: string;
+      }>(`
+        SELECT principal_ref, source_sequence FROM usage_projection_expired_sequences
+        WHERE generation = ? AND fact_id = ?
+      `, generation, fact.projectionFactId).toArray()[0];
+      if (expiredById) {
+        if (expiredById.principal_ref === fact.usagePrincipalRef &&
+            expiredById.source_sequence === fact.sourceSequence.toString()) {
+          return complete({rejection: null, applied: true, sequenceRejectionAccepted: false});
+        }
+        if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
+        return complete({
+          rejection: "fact-id-conflict",
+          applied: false,
+          sequenceRejectionAccepted: false,
+        });
+      }
       const existingRejectionById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
         SELECT fact_id, principal_ref, source_sequence, source_time, code, applied
         FROM usage_projection_rejections WHERE generation = ? AND fact_id = ?
@@ -1075,6 +1220,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           sequenceRejectionAccepted: false,
         });
       }
+      const expiredBySequence = this.ctx.storage.sql.exec<{fact_id: string}>(`
+        SELECT fact_id FROM usage_projection_expired_sequences
+        WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
+      `, generation, fact.usagePrincipalRef, fact.sourceSequence.toString()).toArray()[0];
+      if (expiredBySequence) {
+        if (updateActiveMeta) {
+          this.#recordFailureInTransaction(meta, "source-sequence-conflict");
+        }
+        return complete({
+          rejection: "source-sequence-conflict",
+          applied: false,
+          sequenceRejectionAccepted: false,
+        });
+      }
       const existingRejectionBySequence = this.ctx.storage.sql.exec<{fact_id: string}>(`
         SELECT fact_id FROM usage_projection_rejections
         WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
@@ -1089,31 +1248,57 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           sequenceRejectionAccepted: false,
         });
       }
+      if (fact.rowKind === "detail") {
+        const detailWatermark = this.ctx.storage.sql.exec<{cutoff_utc: string}>(`
+          SELECT cutoff_utc FROM usage_projection_detail_watermarks WHERE principal_ref = ?
+        `, fact.usagePrincipalRef).toArray()[0]?.cutoff_utc;
+        if (detailWatermark !== undefined && fact.occurredAt < detailWatermark) {
+          this.ctx.storage.sql.exec(`
+            INSERT INTO usage_projection_expired_sequences (
+              generation, fact_id, principal_ref, source_sequence
+            ) VALUES (?, ?, ?, ?)
+          `, generation, fact.projectionFactId, fact.usagePrincipalRef,
+          fact.sourceSequence.toString());
+          this.#applyContiguous(
+            generation, fact.usagePrincipalRef, updateActiveMeta, fact.projectionFactId,
+          );
+          return complete({
+            rejection: null,
+            applied: true,
+            sequenceRejectionAccepted: false,
+          });
+        }
+      }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_facts (
           generation, fact_id, fact_hash, principal_ref, source_sequence, occurred_at,
-          bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
-          summary_snapshot_value, source, row_kind, usage_kind, outcome, pricing,
+          safe_record_ref, bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
+          summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
           deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
           cache_hit_input, cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
-          provider_cost, charged_credits, billable_api_operations, active_user_contribution,
-          unpriced_model_uses, unpriced_api_operations, applied
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+          provider_cost, charged_credits, metered_use_count, billable_api_operations,
+          pre_execution_failures, unknown_operations, active_user_contribution, unpriced_model_uses,
+          unpriced_api_operations, applied
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
       `,
       generation, fact.projectionFactId, hash, fact.usagePrincipalRef,
       fact.sourceSequence.toString(), fact.rowKind === "detail" ? fact.occurredAt : null,
+      fact.rowKind === "detail" && typeof fact.safeRecordRef === "string"
+        ? fact.safeRecordRef : null,
       fact.rowKind === "aggregate" ? fact.bucketStart : null,
       fact.rowKind === "aggregate" ? fact.summaryFactId : null,
       fact.rowKind === "aggregate" ? fact.summaryRevision.toString() : null,
       fact.rowKind === "aggregate" ? aggregateDimensionKey(fact) : null,
       fact.rowKind === "aggregate" ? aggregateSnapshotValue(fact) : null,
-      fact.source, fact.rowKind, fact.kind,
+      fact.source, fact.rowKind, fact.rowKind === "aggregate" ? fact.meteredKind : null, fact.kind,
       fact.outcome, fact.pricing, fact.deploymentModelId, fact.vendorId, fact.billingMethodKey,
       fact.externalAccountId, fact.gadgetId, fact.cacheHitInputTokens.toString(),
       fact.cacheMissInputTokens.toString(), fact.cacheWriteInputTokens.toString(),
       fact.outputTokens.toString(), fact.reasoningTokens.toString(),
       fact.providerCostUsdSubunits.toString(), fact.chargedUsageCreditSubunits.toString(),
-      fact.billableApiOperations.toString(), fact.activeUserContribution.toString(),
+      fact.meteredUseCount.toString(), fact.billableApiOperations.toString(),
+      fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
+      fact.activeUserContribution.toString(),
       fact.unpricedModelUses.toString(), fact.unpricedApiOperations.toString());
       if (updateActiveMeta) {
         this.ctx.storage.sql.exec(`
@@ -1154,8 +1339,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       SELECT CAST(EXISTS(
         SELECT 1 FROM usage_projection_facts
         WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
+        UNION ALL
+        SELECT 1 FROM usage_projection_expired_sequences
+        WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
       ) AS TEXT) AS present
-    `, generation, fact.usagePrincipalRef, fact.sourceSequence.toString()).one().present === "1";
+    `, generation, fact.usagePrincipalRef, fact.sourceSequence.toString(),
+    generation, fact.usagePrincipalRef, fact.sourceSequence.toString()).one().present === "1";
     if (existingFact) return false;
     const existingMarker = this.ctx.storage.sql.exec<{code: UsageProjectionRejection["code"]}>(`
       SELECT code FROM usage_projection_rejections
@@ -1197,13 +1386,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     while (appliedCount < 64) {
       const nextSequence = (highWater + 1n).toString();
       const next = this.ctx.storage.sql.exec<StoredFactRow>(`
-        SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, bucket_start,
+        SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
+               bucket_start,
                summary_fact_id, summary_revision, summary_dimension_key,
-               summary_snapshot_value, source, row_kind,
+               summary_snapshot_value, source, row_kind, metered_kind,
                usage_kind, outcome, pricing, deployment_model_id, vendor_id, billing_method_key,
                external_account_id, gadget_id, cache_hit_input, cache_miss_input,
                cache_write_input, output_tokens, reasoning_tokens, provider_cost, charged_credits,
-               billable_api_operations, active_user_contribution, unpriced_model_uses,
+               metered_use_count, billable_api_operations, pre_execution_failures,
+               unknown_operations, active_user_contribution, unpriced_model_uses,
                unpriced_api_operations, applied
         FROM usage_projection_facts
         WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
@@ -1213,20 +1404,27 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         FROM usage_projection_rejections
         WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
       `, generation, principalRef, nextSequence).toArray()[0];
-      if ((!next || next.applied !== 0) && (!marker || marker.applied !== 0)) break;
+      const expired = next || marker ? undefined : this.ctx.storage.sql.exec<{fact_id: string}>(`
+        SELECT fact_id FROM usage_projection_expired_sequences
+        WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
+      `, generation, principalRef, nextSequence).toArray()[0];
+      if ((!next || next.applied !== 0) && (!marker || marker.applied !== 0) && !expired) break;
       let rejection: UsageProjectionRejection["code"] | null;
       let appliedFactId: string;
       if (next) {
         rejection = this.#applyFact(generation, next, updateActiveMeta);
         appliedFactId = next.fact_id;
         anyRejection ??= rejection;
-      } else {
+      } else if (marker) {
         rejection = marker!.code;
         appliedFactId = marker!.fact_id;
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_rejections SET applied = 1
           WHERE generation = ? AND fact_id = ?
         `, generation, appliedFactId);
+      } else {
+        rejection = null;
+        appliedFactId = expired!.fact_id;
       }
       if (appliedFactId === targetFactId) targetRejection = rejection;
       highWater += 1n;
@@ -1243,9 +1441,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         UNION ALL
         SELECT 1 FROM usage_projection_rejections
         WHERE generation = ? AND principal_ref = ? AND source_sequence = ? AND applied = 0
+        UNION ALL
+        SELECT 1 FROM usage_projection_expired_sequences
+        WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
         LIMIT 1
       ) AS TEXT) AS present
     `, generation, principalRef, (highWater + 1n).toString(),
+    generation, principalRef, (highWater + 1n).toString(),
     generation, principalRef, (highWater + 1n).toString()).one().present === "1";
     if (hasMore) {
       this.ctx.storage.sql.exec(`
@@ -1280,6 +1482,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       }
       metrics = replacement;
     }
+    if (totals.totals_source === "summary" && fact.row_kind !== "aggregate") {
+      metrics = emptyMetricSnapshot();
+    }
+    const totalsSourceTime = totals.totals_source === "summary" && fact.row_kind !== "aggregate"
+      ? null : sourceTime;
     const updatedTotals = {
       providerCost: BigInt(totals.provider_cost) + metrics.providerCost,
       chargedCredits: BigInt(totals.charged_credits) + metrics.chargedCredits,
@@ -1288,8 +1495,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       cacheWriteInput: BigInt(totals.cache_write_input) + metrics.cacheWriteInput,
       outputTokens: BigInt(totals.output_tokens) + metrics.outputTokens,
       reasoningTokens: BigInt(totals.reasoning_tokens) + metrics.reasoningTokens,
+      meteredUseCount: BigInt(totals.metered_use_count) + metrics.meteredUseCount,
       billableApiOperations:
         BigInt(totals.billable_api_operations) + metrics.billableApiOperations,
+      preExecutionFailures:
+        BigInt(totals.pre_execution_failures) + metrics.preExecutionFailures,
+      unknownOperations: BigInt(totals.unknown_operations) + metrics.unknownOperations,
       unpricedModelUses: BigInt(totals.unpriced_model_uses) + metrics.unpricedModelUses,
       unpricedApiOperations: BigInt(totals.unpriced_api_operations) + metrics.unpricedApiOperations,
     };
@@ -1299,17 +1510,21 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       UPDATE usage_projection_totals SET provider_cost = ?, charged_credits = ?,
         cache_hit_input = ?, cache_miss_input = ?, cache_write_input = ?, output_tokens = ?,
-        reasoning_tokens = ?, billable_api_operations = ?, unpriced_model_uses = ?,
+        reasoning_tokens = ?, metered_use_count = ?, billable_api_operations = ?,
+        pre_execution_failures = ?, unknown_operations = ?, unpriced_model_uses = ?,
         unpriced_api_operations = ?,
-        started_at = CASE WHEN started_at IS NULL OR started_at > ? THEN ? ELSE started_at END
+        started_at = CASE WHEN ? IS NULL THEN started_at
+          WHEN started_at IS NULL OR started_at > ? THEN ? ELSE started_at END
       WHERE generation = ?
     `,
     updatedTotals.providerCost.toString(), updatedTotals.chargedCredits.toString(),
     updatedTotals.cacheHitInput.toString(), updatedTotals.cacheMissInput.toString(),
     updatedTotals.cacheWriteInput.toString(), updatedTotals.outputTokens.toString(),
-    updatedTotals.reasoningTokens.toString(), updatedTotals.billableApiOperations.toString(),
+    updatedTotals.reasoningTokens.toString(), updatedTotals.meteredUseCount.toString(),
+    updatedTotals.billableApiOperations.toString(),
+    updatedTotals.preExecutionFailures.toString(), updatedTotals.unknownOperations.toString(),
     updatedTotals.unpricedModelUses.toString(), updatedTotals.unpricedApiOperations.toString(),
-    sourceTime, sourceTime, generation);
+    totalsSourceTime, totalsSourceTime, totalsSourceTime, generation);
     this.#applyActiveUserContribution(generation, fact.principal_ref,
       metrics.activeUserContribution);
     this.ctx.storage.sql.exec(`
@@ -1317,9 +1532,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, generation, fact.fact_id);
     if (updateActiveMeta) {
       const meta = this.#meta();
-      const latestApplied = meta.latest_applied_source_at === null ||
-          meta.latest_applied_source_at < sourceTime
-        ? sourceTime : meta.latest_applied_source_at;
+      const latestApplied = totalsSourceTime !== null &&
+          (meta.latest_applied_source_at === null ||
+           meta.latest_applied_source_at < totalsSourceTime)
+        ? totalsSourceTime : meta.latest_applied_source_at;
       this.ctx.storage.sql.exec(`
         UPDATE usage_projection_meta SET ingestion_watermark = ?, latest_applied_source_at = ?
         WHERE singleton = 1
@@ -1333,21 +1549,31 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       fact: StoredFactRow,
       incoming: ProjectionMetricSnapshot): ProjectionMetricSnapshot | null {
     if (fact.summary_fact_id === null || fact.summary_revision === null ||
-        fact.summary_dimension_key === null || fact.summary_snapshot_value === null) {
+        fact.summary_dimension_key === null || fact.summary_snapshot_value === null ||
+        fact.metered_kind === null) {
       throw new Error("Usage Projection Summary identity is missing.");
     }
     const existing = this.ctx.storage.sql.exec<StoredSummaryRow>(`
-      SELECT summary_revision, dimension_key, snapshot_value, cache_hit_input,
+      SELECT summary_fact_id, summary_revision, dimension_key, snapshot_value, metered_kind,
+             cache_hit_input,
              cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
-             provider_cost, charged_credits, billable_api_operations,
-             active_user_contribution, unpriced_model_uses, unpriced_api_operations
+             provider_cost, charged_credits, metered_use_count, billable_api_operations,
+             pre_execution_failures, unknown_operations, active_user_contribution, unpriced_model_uses,
+             unpriced_api_operations
       FROM usage_projection_summaries WHERE generation = ? AND summary_fact_id = ?
     `, generation, fact.summary_fact_id).toArray()[0];
+    const existingDimension = this.ctx.storage.sql.exec<{summary_fact_id: string}>(`
+      SELECT summary_fact_id FROM usage_projection_summaries
+      WHERE generation = ? AND dimension_key = ?
+    `, generation, fact.summary_dimension_key).toArray()[0];
+    if (existingDimension !== undefined &&
+        existingDimension.summary_fact_id !== fact.summary_fact_id) return null;
     if (!existing) {
       this.#writeAggregateSnapshot(generation, fact, incoming);
       return incoming;
     }
-    if (existing.dimension_key !== fact.summary_dimension_key) return null;
+    if (existing.dimension_key !== fact.summary_dimension_key ||
+        existing.metered_kind !== fact.metered_kind) return null;
     const revision = BigInt(fact.summary_revision);
     const previousRevision = BigInt(existing.summary_revision);
     if (revision < previousRevision) return emptyMetricSnapshot();
@@ -1356,25 +1582,49 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ? emptyMetricSnapshot() : null;
     }
     const previous = storedSummaryMetricSnapshot(existing);
+    const delta = subtractMetricSnapshots(incoming, previous);
+    if (Object.values(delta).some(value => value < 0n)) return null;
     this.#writeAggregateSnapshot(generation, fact, incoming);
-    return subtractMetricSnapshots(incoming, previous);
+    return delta;
   }
 
   #writeAggregateSnapshot(
       generation: string, fact: StoredFactRow, metrics: ProjectionMetricSnapshot): void {
     this.ctx.storage.sql.exec(`
-      INSERT OR REPLACE INTO usage_projection_summaries (
-        generation, summary_fact_id, summary_revision, dimension_key, snapshot_value,
+      INSERT INTO usage_projection_summaries (
+        generation, summary_fact_id, summary_revision, dimension_key, snapshot_value, metered_kind,
         cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
-        reasoning_tokens, provider_cost, charged_credits, billable_api_operations,
-        active_user_contribution, unpriced_model_uses, unpriced_api_operations
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        reasoning_tokens, provider_cost, charged_credits, metered_use_count,
+        billable_api_operations, pre_execution_failures, unknown_operations, active_user_contribution,
+        unpriced_model_uses, unpriced_api_operations
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (generation, summary_fact_id) DO UPDATE SET
+        summary_revision = excluded.summary_revision,
+        dimension_key = excluded.dimension_key,
+        snapshot_value = excluded.snapshot_value,
+        metered_kind = excluded.metered_kind,
+        cache_hit_input = excluded.cache_hit_input,
+        cache_miss_input = excluded.cache_miss_input,
+        cache_write_input = excluded.cache_write_input,
+        output_tokens = excluded.output_tokens,
+        reasoning_tokens = excluded.reasoning_tokens,
+        provider_cost = excluded.provider_cost,
+        charged_credits = excluded.charged_credits,
+        metered_use_count = excluded.metered_use_count,
+        billable_api_operations = excluded.billable_api_operations,
+        pre_execution_failures = excluded.pre_execution_failures,
+        unknown_operations = excluded.unknown_operations,
+        active_user_contribution = excluded.active_user_contribution,
+        unpriced_model_uses = excluded.unpriced_model_uses,
+        unpriced_api_operations = excluded.unpriced_api_operations
     `, generation, fact.summary_fact_id, fact.summary_revision, fact.summary_dimension_key,
-    fact.summary_snapshot_value, metrics.cacheHitInput.toString(),
+    fact.summary_snapshot_value, fact.metered_kind, metrics.cacheHitInput.toString(),
     metrics.cacheMissInput.toString(), metrics.cacheWriteInput.toString(),
     metrics.outputTokens.toString(), metrics.reasoningTokens.toString(),
     metrics.providerCost.toString(), metrics.chargedCredits.toString(),
-    metrics.billableApiOperations.toString(), metrics.activeUserContribution.toString(),
+    metrics.meteredUseCount.toString(), metrics.billableApiOperations.toString(),
+    metrics.preExecutionFailures.toString(),
+    metrics.unknownOperations.toString(), metrics.activeUserContribution.toString(),
     metrics.unpricedModelUses.toString(), metrics.unpricedApiOperations.toString());
   }
 
@@ -1430,9 +1680,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
   #totals(generation: string): ProjectionTotalsRow {
     return this.ctx.storage.sql.exec<ProjectionTotalsRow>(`
-      SELECT provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-             cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-             unpriced_model_uses, unpriced_api_operations, started_at
+      SELECT totals_source, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+             cache_write_input, output_tokens, reasoning_tokens, metered_use_count,
+             billable_api_operations, pre_execution_failures, unknown_operations, unpriced_model_uses,
+             unpriced_api_operations, started_at
       FROM usage_projection_totals WHERE generation = ?
     `, generation).one();
   }
@@ -1479,19 +1730,65 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_totals (
-        generation TEXT PRIMARY KEY, provider_cost TEXT NOT NULL, charged_credits TEXT NOT NULL,
+        generation TEXT PRIMARY KEY, totals_source TEXT NOT NULL,
+        provider_cost TEXT NOT NULL, charged_credits TEXT NOT NULL,
         cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
         cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
-        reasoning_tokens TEXT NOT NULL, billable_api_operations TEXT NOT NULL,
+        reasoning_tokens TEXT NOT NULL, metered_use_count TEXT NOT NULL,
+        billable_api_operations TEXT NOT NULL,
+        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
         unpriced_model_uses TEXT NOT NULL, unpriced_api_operations TEXT NOT NULL, started_at TEXT
       )
     `);
+    const totalColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_projection_totals)",
+    ).toArray().map(column => column.name));
+    if (!totalColumns.has("totals_source")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_totals
+        ADD COLUMN totals_source TEXT NOT NULL DEFAULT 'legacy'
+      `);
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'pending',
+          cleanup_generation = CASE WHEN rebuild_state = 'rebuilding'
+            THEN rebuild_generation ELSE cleanup_generation END,
+          cleanup_stage = CASE WHEN rebuild_state = 'rebuilding'
+            THEN 'facts' ELSE cleanup_stage END,
+          rebuild_request_id = NULL, rebuild_state = NULL, rebuild_generation = NULL,
+          rebuild_registry_revision = NULL, rebuild_registry_cursor = NULL,
+          rebuild_registry_complete = 0, rebuild_current_user_ref = NULL,
+          rebuild_current_user_fact_cursor = NULL, rebuild_current_user_is_last = 0,
+          rebuild_authority_complete = 0, rebuild_started_at = NULL,
+          rebuild_completed_at = NULL, rebuild_failure_code = NULL
+        WHERE singleton = 1
+      `);
+    }
+    if (!totalColumns.has("pre_execution_failures")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_totals
+        ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
+      `);
+    }
+    if (!totalColumns.has("metered_use_count")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_totals
+        ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
+      `);
+    }
+    if (!totalColumns.has("unknown_operations")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_totals
+        ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
+      `);
+    }
     this.ctx.storage.sql.exec(`
       INSERT OR IGNORE INTO usage_projection_totals (
-        generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-        cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+        generation, totals_source, provider_cost, charged_credits,
+        cache_hit_input, cache_miss_input,
+        cache_write_input, output_tokens, reasoning_tokens, metered_use_count,
+        billable_api_operations, pre_execution_failures, unknown_operations,
         unpriced_model_uses, unpriced_api_operations
-      ) SELECT '1', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0'
+      ) SELECT '1', 'legacy', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0'
         FROM usage_projection_meta WHERE singleton = 1 AND active_generation = '1'
     `);
     this.ctx.storage.sql.exec(`
@@ -1509,9 +1806,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_rebuild_users (
         queue_id INTEGER PRIMARY KEY AUTOINCREMENT, generation TEXT NOT NULL,
-        registered_user_ref TEXT NOT NULL, fact_cursor TEXT
+        registered_user_ref TEXT NOT NULL, user_do_id TEXT, fact_cursor TEXT
       )
     `);
+    const rebuildUserColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_projection_rebuild_users)",
+    ).toArray().map(column => column.name));
+    if (!rebuildUserColumns.has("user_do_id")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_rebuild_users ADD COLUMN user_do_id TEXT
+      `);
+    }
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS usage_projection_rebuild_users_generation
       ON usage_projection_rebuild_users(generation, queue_id)
@@ -1519,9 +1824,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_rebuild_users (
-          generation, registered_user_ref, fact_cursor
+          generation, registered_user_ref, user_do_id, fact_cursor
         )
-        SELECT rebuild_generation, rebuild_current_user_ref, rebuild_current_user_fact_cursor
+        SELECT rebuild_generation, rebuild_current_user_ref, NULL, rebuild_current_user_fact_cursor
         FROM usage_projection_meta
         WHERE singleton = 1 AND rebuild_generation IS NOT NULL AND
           rebuild_current_user_ref IS NOT NULL AND NOT EXISTS (
@@ -1551,29 +1856,81 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       CREATE TABLE IF NOT EXISTS usage_projection_facts (
         generation TEXT NOT NULL, fact_id TEXT NOT NULL, fact_hash TEXT NOT NULL,
         principal_ref TEXT NOT NULL, source_sequence TEXT NOT NULL, occurred_at TEXT,
-        bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
+        safe_record_ref TEXT, bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
         summary_dimension_key TEXT, summary_snapshot_value TEXT,
-        source TEXT NOT NULL, row_kind TEXT NOT NULL, usage_kind TEXT NOT NULL,
+        source TEXT NOT NULL, row_kind TEXT NOT NULL, metered_kind TEXT, usage_kind TEXT NOT NULL,
         outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT, vendor_id TEXT,
         billing_method_key TEXT, external_account_id TEXT, gadget_id TEXT,
         cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
         cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
         reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, billable_api_operations TEXT NOT NULL,
+        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
+        billable_api_operations TEXT NOT NULL,
+        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
         active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
         unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
         PRIMARY KEY (generation, fact_id), UNIQUE (generation, principal_ref, source_sequence),
         CHECK ((row_kind = 'detail' AND occurred_at IS NOT NULL AND bucket_start IS NULL AND
+                metered_kind IS NULL AND
                 summary_fact_id IS NULL AND summary_revision IS NULL AND
                 summary_dimension_key IS NULL AND summary_snapshot_value IS NULL) OR
-               (row_kind = 'aggregate' AND occurred_at IS NULL AND bucket_start IS NOT NULL AND
+               (row_kind = 'aggregate' AND occurred_at IS NULL AND safe_record_ref IS NULL AND
+                metered_kind IS NOT NULL AND
+                bucket_start IS NOT NULL AND
                 summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
                 summary_dimension_key IS NOT NULL AND summary_snapshot_value IS NOT NULL))
       )
     `);
+    const factColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_projection_facts)",
+    ).toArray().map(column => column.name));
+    if (!factColumns.has("safe_record_ref")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts ADD COLUMN safe_record_ref TEXT
+      `);
+    }
+    if (!factColumns.has("metered_kind")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts ADD COLUMN metered_kind TEXT
+      `);
+    }
+    if (!factColumns.has("pre_execution_failures")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts
+        ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
+      `);
+    }
+    if (!factColumns.has("metered_use_count")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts
+        ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
+      `);
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_facts SET metered_use_count = active_user_contribution
+      `);
+    }
+    if (!factColumns.has("unknown_operations")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts
+        ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
+      `);
+    }
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v2
       ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start))
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_expired_sequences (
+        generation TEXT NOT NULL, fact_id TEXT NOT NULL, principal_ref TEXT NOT NULL,
+        source_sequence TEXT NOT NULL,
+        PRIMARY KEY (generation, fact_id),
+        UNIQUE (generation, principal_ref, source_sequence)
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_detail_watermarks (
+        principal_ref TEXT PRIMARY KEY, cutoff_utc TEXT NOT NULL
+      )
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_rejections (
@@ -1597,15 +1954,51 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_summaries (
         generation TEXT NOT NULL, summary_fact_id TEXT NOT NULL, summary_revision TEXT NOT NULL,
-        dimension_key TEXT NOT NULL, snapshot_value TEXT NOT NULL,
+        dimension_key TEXT NOT NULL, snapshot_value TEXT NOT NULL, metered_kind TEXT NOT NULL,
         cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
         cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
         reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, billable_api_operations TEXT NOT NULL,
+        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
+        billable_api_operations TEXT NOT NULL,
+        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
         active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
         unpriced_api_operations TEXT NOT NULL,
         PRIMARY KEY (generation, summary_fact_id)
       )
+    `);
+    const summaryColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_projection_summaries)",
+    ).toArray().map(column => column.name));
+    if (!summaryColumns.has("metered_kind")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_summaries
+        ADD COLUMN metered_kind TEXT NOT NULL DEFAULT 'attempt'
+      `);
+    }
+    if (!summaryColumns.has("pre_execution_failures")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_summaries
+        ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
+      `);
+    }
+    if (!summaryColumns.has("metered_use_count")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_summaries
+        ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
+      `);
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_summaries SET metered_use_count = active_user_contribution
+      `);
+    }
+    if (!summaryColumns.has("unknown_operations")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_summaries
+        ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
+      `);
+    }
+    this.ctx.storage.sql.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension
+      ON usage_projection_summaries(generation, dimension_key)
     `);
   }
 }
@@ -1623,13 +2016,36 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
-  const fact = value as UsageProjectionFact;
-  const expectedKeys = fact.rowKind === "detail" ? DETAIL_FACT_KEYS
-    : fact.rowKind === "aggregate" ? AGGREGATE_FACT_KEYS : null;
-  if (expectedKeys === null || Object.keys(value).length !== expectedKeys.size ||
-      Object.keys(value).some(key => !expectedKeys.has(key))) {
+  const input = value as UsageProjectionFact;
+  const inputKeys = Object.keys(value);
+  const allowedKeys = input.rowKind === "detail"
+    ? [DETAIL_FACT_KEYS, PRE_METER_DETAIL_FACT_KEYS, PRE_COUNTER_DETAIL_FACT_KEYS,
+        LEGACY_PRE_COUNTER_DETAIL_FACT_KEYS]
+    : input.rowKind === "aggregate"
+      ? [AGGREGATE_FACT_KEYS, PRE_METER_AGGREGATE_FACT_KEYS,
+          PRE_COUNTER_AGGREGATE_FACT_KEYS, LEGACY_PRE_COUNTER_AGGREGATE_FACT_KEYS] : [];
+  const hasExpectedKeys = allowedKeys.some(expectedKeys =>
+    inputKeys.length === expectedKeys.size && inputKeys.every(key => expectedKeys.has(key)));
+  if (!hasExpectedKeys) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
+  const fact = {
+    ...input,
+    ...(input.rowKind === "aggregate" ? {
+      meteredKind: inputKeys.includes("meteredKind")
+        ? input.meteredKind
+        : input.activeUserContribution > 0n ? input.kind : "attempt",
+    } : {}),
+    meteredUseCount: inputKeys.includes("meteredUseCount")
+      ? input.meteredUseCount : input.activeUserContribution,
+    preExecutionFailures: inputKeys.includes("preExecutionFailures")
+      ? input.preExecutionFailures
+      : input.outcome === "failed-before-execution" ? 1n : 0n,
+    unknownOperations: inputKeys.includes("unknownOperations")
+      ? input.unknownOperations
+      : input.outcome === "usage-unknown" || input.outcome === "reconciliation-required"
+        ? 1n : 0n,
+  } as UsageProjectionFact;
   if (fact.schemaVersion !== 1 || !UUID_PATTERN.test(fact.projectionFactId) ||
       typeof fact.sourceSequence !== "bigint" || fact.sourceSequence < 1n ||
       !UUID_PATTERN.test(fact.usagePrincipalRef) ||
@@ -1638,7 +2054,13 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   if (fact.rowKind === "aggregate" && (!UUID_PATTERN.test(fact.summaryFactId) ||
-      typeof fact.summaryRevision !== "bigint" || fact.summaryRevision < 1n)) {
+      typeof fact.summaryRevision !== "bigint" || fact.summaryRevision < 1n ||
+      (fact.meteredKind !== "model" && fact.meteredKind !== "gatekeeper" &&
+       fact.meteredKind !== "attempt"))) {
+    throw new TypeError("Usage Projection fact is invalid.");
+  }
+  if (fact.rowKind === "detail" && "safeRecordRef" in fact &&
+      !UUID_PATTERN.test(fact.safeRecordRef)) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   const sourceTime = fact.rowKind === "detail"
@@ -1659,10 +2081,13 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
   const exactFields = [fact.cacheHitInputTokens, fact.cacheMissInputTokens,
     fact.cacheWriteInputTokens, fact.outputTokens, fact.reasoningTokens,
     fact.providerCostUsdSubunits, fact.chargedUsageCreditSubunits,
-    fact.billableApiOperations, fact.activeUserContribution, fact.unpricedModelUses,
-    fact.unpricedApiOperations];
+    fact.meteredUseCount, fact.billableApiOperations,
+    fact.preExecutionFailures, fact.unknownOperations,
+    fact.activeUserContribution, fact.unpricedModelUses, fact.unpricedApiOperations];
   if (exactFields.some(item => typeof item !== "bigint" || item < 0n) ||
-      (fact.activeUserContribution !== 0n && fact.activeUserContribution !== 1n)) {
+      fact.meteredUseCount !== fact.activeUserContribution ||
+      (fact.rowKind === "detail" && fact.activeUserContribution !== 0n &&
+       fact.activeUserContribution !== 1n)) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   return fact.rowKind === "detail"
@@ -1696,9 +2121,16 @@ function assertProjectionContributionInvariants(fact: UsageProjectionFact): void
   }
   const confirmed = fact.outcome === "settled" || fact.outcome === "reconciled-settled" ||
     (fact.kind === "model" && fact.outcome === "reconciliation-required" &&
-     fact.activeUserContribution === 1n);
+     fact.activeUserContribution > 0n);
+  if (fact.rowKind === "aggregate" &&
+      (fact.meteredKind !== (fact.activeUserContribution > 0n ? fact.kind : "attempt"))) {
+    throw new TypeError("Usage Projection fact is invalid.");
+  }
   if (fact.rowKind === "detail") {
     const expectedApiOperations = fact.kind === "gatekeeper" && confirmed ? 1n : 0n;
+    const expectedPreExecutionFailures = fact.outcome === "failed-before-execution" ? 1n : 0n;
+    const expectedUnknownOperations = fact.outcome === "usage-unknown" ||
+      fact.outcome === "reconciliation-required" ? 1n : 0n;
     const expectedUnpricedModel = fact.kind === "model" && confirmed &&
       fact.pricing === "unpriced" ? 1n : 0n;
     const expectedUnpricedApi = fact.kind === "gatekeeper" && confirmed &&
@@ -1706,24 +2138,32 @@ function assertProjectionContributionInvariants(fact: UsageProjectionFact): void
     if ((confirmed && fact.activeUserContribution !== 1n) ||
         (!confirmed && fact.activeUserContribution !== 0n) ||
         fact.billableApiOperations !== expectedApiOperations ||
+        fact.preExecutionFailures !== expectedPreExecutionFailures ||
+        fact.unknownOperations !== expectedUnknownOperations ||
         fact.unpricedModelUses !== expectedUnpricedModel ||
         fact.unpricedApiOperations !== expectedUnpricedApi) {
       throw new TypeError("Usage Projection fact is invalid.");
     }
-  } else if ((!confirmed && fact.activeUserContribution !== 0n) ||
+  } else if ((confirmed && fact.activeUserContribution === 0n) ||
+      (!confirmed && fact.activeUserContribution !== 0n) ||
       (fact.activeUserContribution === 0n &&
        (modelOnly.some(value => value !== 0n) || gatekeeperOnly.some(value => value !== 0n) ||
         fact.chargedUsageCreditSubunits !== 0n)) ||
       (fact.kind === "model" && fact.pricing === "priced" &&
        fact.unpricedModelUses !== 0n) ||
       (fact.kind === "model" && fact.pricing === "unpriced" &&
-       (fact.unpricedModelUses === 0n) !== (fact.activeUserContribution === 0n)) ||
+       fact.unpricedModelUses !== fact.meteredUseCount) ||
       (fact.kind === "gatekeeper" &&
-       (fact.billableApiOperations === 0n) !== (fact.activeUserContribution === 0n)) ||
+       fact.billableApiOperations !== fact.meteredUseCount) ||
       (fact.kind === "gatekeeper" && fact.pricing === "priced" &&
        fact.unpricedApiOperations !== 0n) ||
       (fact.kind === "gatekeeper" && fact.pricing === "unpriced" &&
        fact.unpricedApiOperations !== fact.billableApiOperations)) {
+    throw new TypeError("Usage Projection fact is invalid.");
+  }
+  if ((fact.outcome === "failed-before-execution") !== (fact.preExecutionFailures > 0n) ||
+      ((fact.outcome === "usage-unknown" || fact.outcome === "reconciliation-required") !==
+       (fact.unknownOperations > 0n))) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   if ((fact.pricing === "unpriced" &&
@@ -1752,19 +2192,41 @@ function isSafeRequestId(value: unknown): value is string {
     });
 }
 
-async function hashProjectionFact(fact: UsageProjectionFact): Promise<string> {
+type ProjectionFactHashVersion = "legacy" | "pre-meter" | "current";
+
+function projectionFactHashVersion(input: UsageProjectionFact): ProjectionFactHashVersion {
+  const keys = new Set(Object.keys(input));
+  if (keys.has("meteredUseCount")) return "current";
+  return keys.has("safeRecordRef") || keys.has("preExecutionFailures") ||
+      keys.has("unknownOperations")
+    ? "pre-meter" : "legacy";
+}
+
+async function hashProjectionFact(
+    fact: UsageProjectionFact,
+    version: ProjectionFactHashVersion): Promise<string> {
   const canonical = JSON.stringify([
     fact.schemaVersion, fact.projectionFactId, fact.sourceSequence.toString(),
     fact.usagePrincipalRef, fact.rowKind, projectionFactSourceTime(fact),
+    ...(version === "legacy" ? [] : [
+      fact.rowKind === "detail" && typeof fact.safeRecordRef === "string"
+        ? fact.safeRecordRef : null,
+    ]),
     fact.rowKind === "aggregate" ? fact.summaryFactId : null,
     fact.rowKind === "aggregate" ? fact.summaryRevision.toString() : null,
+    ...(version !== "legacy" && fact.rowKind === "aggregate" ? [fact.meteredKind] : []),
     fact.source, fact.kind, fact.outcome,
     fact.pricing, fact.deploymentModelId, fact.vendorId, fact.billingMethodKey,
     fact.externalAccountId, fact.gadgetId, fact.cacheHitInputTokens.toString(),
     fact.cacheMissInputTokens.toString(), fact.cacheWriteInputTokens.toString(),
     fact.outputTokens.toString(), fact.reasoningTokens.toString(),
     fact.providerCostUsdSubunits.toString(), fact.chargedUsageCreditSubunits.toString(),
-    fact.billableApiOperations.toString(), fact.activeUserContribution.toString(),
+    ...(version === "current" ? [fact.meteredUseCount.toString()] : []),
+    fact.billableApiOperations.toString(),
+    ...(version === "legacy" ? [] : [
+      fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
+    ]),
+    fact.activeUserContribution.toString(),
     fact.unpricedModelUses.toString(), fact.unpricedApiOperations.toString(),
   ]);
   return new Uint8Array(await crypto.subtle.digest(
@@ -1779,7 +2241,7 @@ function projectionFactSourceTime(fact: UsageProjectionFact): string {
 function aggregateDimensionKey(fact: UsageProjectionAggregateFact): string {
   return JSON.stringify([
     fact.schemaVersion, fact.usagePrincipalRef, fact.bucketStart,
-    fact.source, fact.kind, fact.outcome, fact.pricing, fact.deploymentModelId,
+    fact.source, fact.kind, fact.meteredKind, fact.outcome, fact.pricing, fact.deploymentModelId,
     fact.vendorId, fact.billingMethodKey, fact.externalAccountId, fact.gadgetId,
   ]);
 }
@@ -1789,7 +2251,9 @@ function aggregateSnapshotValue(fact: UsageProjectionAggregateFact): string {
     fact.cacheHitInputTokens.toString(), fact.cacheMissInputTokens.toString(),
     fact.cacheWriteInputTokens.toString(), fact.outputTokens.toString(),
     fact.reasoningTokens.toString(), fact.providerCostUsdSubunits.toString(),
-    fact.chargedUsageCreditSubunits.toString(), fact.billableApiOperations.toString(),
+    fact.chargedUsageCreditSubunits.toString(), fact.meteredUseCount.toString(),
+    fact.billableApiOperations.toString(),
+    fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
     fact.activeUserContribution.toString(), fact.unpricedModelUses.toString(),
     fact.unpricedApiOperations.toString(),
   ]);
@@ -1804,7 +2268,10 @@ function storedFactMetricSnapshot(fact: StoredFactRow): ProjectionMetricSnapshot
     reasoningTokens: BigInt(fact.reasoning_tokens),
     providerCost: BigInt(fact.provider_cost),
     chargedCredits: BigInt(fact.charged_credits),
+    meteredUseCount: BigInt(fact.metered_use_count),
     billableApiOperations: BigInt(fact.billable_api_operations),
+    preExecutionFailures: BigInt(fact.pre_execution_failures),
+    unknownOperations: BigInt(fact.unknown_operations),
     activeUserContribution: BigInt(fact.active_user_contribution),
     unpricedModelUses: BigInt(fact.unpriced_model_uses),
     unpricedApiOperations: BigInt(fact.unpriced_api_operations),
@@ -1820,7 +2287,10 @@ function storedSummaryMetricSnapshot(summary: StoredSummaryRow): ProjectionMetri
     reasoningTokens: BigInt(summary.reasoning_tokens),
     providerCost: BigInt(summary.provider_cost),
     chargedCredits: BigInt(summary.charged_credits),
+    meteredUseCount: BigInt(summary.metered_use_count),
     billableApiOperations: BigInt(summary.billable_api_operations),
+    preExecutionFailures: BigInt(summary.pre_execution_failures),
+    unknownOperations: BigInt(summary.unknown_operations),
     activeUserContribution: BigInt(summary.active_user_contribution),
     unpricedModelUses: BigInt(summary.unpriced_model_uses),
     unpricedApiOperations: BigInt(summary.unpriced_api_operations),
@@ -1836,7 +2306,10 @@ function emptyMetricSnapshot(): ProjectionMetricSnapshot {
     reasoningTokens: 0n,
     providerCost: 0n,
     chargedCredits: 0n,
+    meteredUseCount: 0n,
     billableApiOperations: 0n,
+    preExecutionFailures: 0n,
+    unknownOperations: 0n,
     activeUserContribution: 0n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -1854,7 +2327,10 @@ function subtractMetricSnapshots(
     reasoningTokens: next.reasoningTokens - previous.reasoningTokens,
     providerCost: next.providerCost - previous.providerCost,
     chargedCredits: next.chargedCredits - previous.chargedCredits,
+    meteredUseCount: next.meteredUseCount - previous.meteredUseCount,
     billableApiOperations: next.billableApiOperations - previous.billableApiOperations,
+    preExecutionFailures: next.preExecutionFailures - previous.preExecutionFailures,
+    unknownOperations: next.unknownOperations - previous.unknownOperations,
     activeUserContribution: next.activeUserContribution - previous.activeUserContribution,
     unpricedModelUses: next.unpricedModelUses - previous.unpricedModelUses,
     unpricedApiOperations: next.unpricedApiOperations - previous.unpricedApiOperations,

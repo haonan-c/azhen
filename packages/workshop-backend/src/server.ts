@@ -34,6 +34,7 @@ import {
   type ConfiguredPublishedApiRatePage,
   type DiscoveredPublishedApiMethodPage,
 } from "./public-api-rates.js";
+import {isAvatarStorageKey} from "./avatar-key.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -225,6 +226,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async setAvatar(data: Uint8Array | null): Promise<void> {
+    if (await this.#user.isUsageUserDeleted()) {
+      throw new Error("This User has been deleted.");
+    }
     if (data) {
       if (data.byteLength > 100 * 1024) {
         throw new Error("Avatar too large (max 100 KB)");
@@ -239,13 +243,22 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // Avatar data lives in KV (global), not the user's DO storage, so we
     // read/write it directly here to avoid routing through the DO location.
     let userId = this.#userId.name!;
+    if (!isAvatarStorageKey(userId)) {
+      if (data) throw new Error("Avatar storage key is invalid.");
+      return;
+    }
     if (data) {
       await this.env.AVATARS.put(userId, data);
+      if (await this.#user.isUsageUserDeleted()) {
+        await this.env.AVATARS.delete(userId);
+        throw new Error("This User has been deleted.");
+      }
     } else {
       await this.env.AVATARS.delete(userId);
     }
   }
   async getAvatar(userId: string): Promise<Uint8Array | null> {
+    if (!isAvatarStorageKey(userId)) return null;
     let result = await this.env.AVATARS.get(userId, "arrayBuffer");
     if (!result) return null;
     return new Uint8Array(result);
@@ -666,11 +679,11 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   // --- Deployment admin ---
 
   async amIAdmin(): Promise<boolean> {
-    return this.#isAdmin();
+    return this.#isAdmin() && !(await this.#user.isUsageUserDeleted());
   }
 
   async getAdminApi(): Promise<RpcStub<AdminApi> | null> {
-    if (!this.#isAdmin()) return null;
+    if (!this.#isAdmin() || await this.#user.isUsageUserDeleted()) return null;
     // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
     // resource catalog so RBAC-gated ones still surface, and to bind Usage Rate audit actors.
     let adminUserId = this.#userId.name!;
@@ -682,6 +695,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       this.users,
       this.overseers,
       this.ctx.exports.UsageProjection,
+      this.env.AVATARS,
     );
   }
 }

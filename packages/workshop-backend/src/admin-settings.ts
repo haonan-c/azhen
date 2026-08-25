@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageBalanceState, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageBalanceState, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -365,6 +365,96 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   /** Return the Registry insertion watermark for a stable Usage Projection rebuild pass. */
   getRegisteredUsageUsersRevision(): bigint {
     return this.usageUsers.revision();
+  }
+
+  /** List active and anonymously retained Usage Principals for one rebuild watermark. */
+  listUsageProjectionPrincipals(
+      afterSequence: bigint | null,
+      maximumSequence: bigint,
+      limit: number) {
+    return this.usageUsers.listProjectionPrincipals(afterSequence, maximumSequence, limit);
+  }
+
+  /** Hide an active identity and persist one resumable deletion coordinator job. */
+  async prepareRegisteredUsageUserDeletion(
+      request: AdminUsageDeleteUserRequest,
+      actorUserId: string,
+      actorUserDoId: string) {
+    this.usageUsers.assertDeletionTargetIsNotActor(request.registeredUserRef, actorUserDoId);
+    // An empty alarm is harmless. Arming before the Registry transaction closes the crash window
+    // where a durable deleting row could otherwise exist without a future coordinator wake-up.
+    await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    return this.usageUsers.prepareDeletion(
+      request.registeredUserRef,
+      request.deletionId,
+      request.reason,
+      actorUserId,
+      actorUserDoId,
+    );
+  }
+
+  /** Commit the permanent anonymous Registry tombstone for one prepared deletion. */
+  completeRegisteredUsageUserDeletion(deletionId: string): AdminUsageDeleteUserResult {
+    return this.usageUsers.completeDeletion(deletionId);
+  }
+
+  /** Advance one persisted deletion job and leave its alarm armed on partial failure. */
+  async continueRegisteredUsageUserDeletion(
+      deletionId: string): Promise<AdminUsageDeleteUserResult> {
+    const job = this.usageUsers.getDeletion(deletionId);
+    if (job === null) throw new Error("Registered User deletion does not exist.");
+    try {
+      const result = await this.#advanceRegisteredUsageUserDeletion(job);
+      await this.#scheduleRegisteredUsageUserDeletionRetry();
+      return result;
+    } catch (error) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      throw error;
+    }
+  }
+
+  /** Continue one bounded page of cross-store deletion acknowledgements after restart. */
+  async alarm(): Promise<void> {
+    const jobs = this.usageUsers.listPendingDeletions(4);
+    let failed = false;
+    for (const job of jobs) {
+      try {
+        await this.#advanceRegisteredUsageUserDeletion(job);
+      } catch (error) {
+        failed = true;
+        logger.warn("Registered User deletion retry failed", {
+          event: "usage.user.deletion.retry.failed",
+          error,
+        });
+      }
+    }
+    if (this.usageUsers.hasPendingDeletions()) {
+      await this.ctx.storage.setAlarm(Date.now() + (failed ? 1_000 : 0));
+    } else {
+      await this.ctx.storage.deleteAlarm();
+    }
+  }
+
+  async #advanceRegisteredUsageUserDeletion(
+      job: import("./usage-user-registry.js").UsageUserDeletionPreparation):
+      Promise<AdminUsageDeleteUserResult> {
+    if (job.state === "deleted") return this.usageUsers.completeDeletion(job.deletionId);
+    let user: DurableObjectStub<UserDurableObject>;
+    try {
+      user = this.users.get(this.users.idFromString(job.userDoId));
+    } catch (error) {
+      throw new Error("Registered User target is invalid.", {cause: error});
+    }
+    await user.advanceUsageUserDeletion(job.deletionId, job.reason, job.actorUserId);
+    return this.usageUsers.completeDeletion(job.deletionId);
+  }
+
+  async #scheduleRegisteredUsageUserDeletionRetry(): Promise<void> {
+    if (this.usageUsers.hasPendingDeletions()) {
+      await this.ctx.storage.setAlarm(Date.now());
+    } else {
+      await this.ctx.storage.deleteAlarm();
+    }
   }
 
   /** Replace one User's content-free Projection outbox health watermarks. */
@@ -941,6 +1031,16 @@ function normalizeAdminUsageReverseRequest(
   };
 }
 
+function normalizeAdminUsageDeleteUserRequest(
+    request: AdminUsageDeleteUserRequest): AdminUsageDeleteUserRequest {
+  assertExactRpcObject(request, ["registeredUserRef", "deletionId", "reason"]);
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    deletionId: normalizeAdminUsageOperationId(request.deletionId),
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
 function normalizeAdminActionReconciliationRequest(
     request: AdminActionReconciliationRequest): AdminActionReconciliationRequest {
   assertExactRpcObject(
@@ -1040,6 +1140,14 @@ function mergeProjectionDeliveryHealth(
   };
 }
 
+async function assertAdminCapabilityActive(
+    users: DurableObjectNamespace<UserDurableObject>,
+    adminUserId: string): Promise<void> {
+  if (await users.getByName(adminUserId).isUsageUserDeleted()) {
+    throw new Error("This administrator capability has been revoked.");
+  }
+}
+
 /** Administrator-only Registry and User Usage Account correction capability. */
 @validateRpc()
 export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
@@ -1048,11 +1156,13 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       private users: DurableObjectNamespace<UserDurableObject>,
       private adminUserId: string,
       private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>,
-      private projection?: DurableObjectNamespace<UsageProjection>) {
+      private projection?: DurableObjectNamespace<UsageProjection>,
+      private avatars?: KVNamespace) {
     super();
   }
 
   async getOverview(): Promise<AdminUsageOverview> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const [registeredUsers, deliveryHealth] = await Promise.all([
       this.admin.countRegisteredUsageUsers(),
       this.admin.getUsageProjectionDeliveryHealth(),
@@ -1078,20 +1188,26 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async getBalance(registeredUserRef: string): Promise<AdminUsageBalanceState> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const user = await this.#resolveUser(normalizeRegisteredUserRef(registeredUserRef));
     return user.getAdminUsageBalanceState();
   }
 
-  requestProjectionRebuild(requestId: string): Promise<ProjectionRebuildStatus> {
+  async requestProjectionRebuild(requestId: string): Promise<ProjectionRebuildStatus> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (!this.projection) throw new Error("Usage Projection is unavailable.");
-    return this.projection.getByName("").requestRebuild(normalizeProjectionRebuildId(requestId));
+    return await this.projection.getByName("").requestRebuild(
+      normalizeProjectionRebuildId(requestId),
+    );
   }
 
-  searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
-    return this.admin.searchRegisteredUsageUsers(normalizeAdminUsageSearchRequest(request));
+  async searchUsers(request: AdminUsageUserSearchRequest): Promise<AdminUsageUserSearchResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.searchRegisteredUsageUsers(normalizeAdminUsageSearchRequest(request));
   }
 
   async listUsageRecords(request: AdminUsageRecordPageRequest): Promise<UserUsageRecordPage> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUsageRecordPageRequest(request);
     const user = await this.#resolveUser(normalized.registeredUserRef);
     return user.listUsageRecords({
@@ -1101,6 +1217,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUsageGrantRequest(request);
     const user = await this.#resolveUser(normalized.registeredUserRef);
     return user.adminGrantUsageCredits(
@@ -1112,6 +1229,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async deduct(request: AdminUsageDeductRequest): Promise<AdminUsageOperationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUsageDeductRequest(request);
     const user = await this.#resolveUser(normalized.registeredUserRef);
     return user.adminDeductUsageCredits(
@@ -1124,6 +1242,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
 
   async reconcileBalance(
       request: AdminUsageReconcileRequest): Promise<AdminUsageOperationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUsageReconcileRequest(request);
     const user = await this.#resolveUser(normalized.registeredUserRef);
     return user.adminReconcileUsageCreditBalance(
@@ -1135,6 +1254,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
   }
 
   async reverse(request: AdminUsageReverseRequest): Promise<AdminUsageOperationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUsageReverseRequest(request);
     const user = await this.#resolveUser(normalized.registeredUserRef);
     return user.adminReverseUsageCreditEntry(
@@ -1145,8 +1265,22 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     );
   }
 
+  async deleteUsageUser(
+      request: AdminUsageDeleteUserRequest): Promise<AdminUsageDeleteUserResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    if (!this.avatars) throw new Error("User avatar deletion is unavailable.");
+    const normalized = normalizeAdminUsageDeleteUserRequest(request);
+    const prepared = await this.admin.prepareRegisteredUsageUserDeletion(
+      normalized,
+      this.adminUserId,
+      this.users.idFromName(this.adminUserId).toString(),
+    );
+    return await this.admin.continueRegisteredUsageUserDeletion(prepared.deletionId);
+  }
+
   async reconcileAction(
       request: AdminActionReconciliationRequest): Promise<AdminActionReconciliationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminActionReconciliationRequest(request);
     if (!this.overseers) throw new Error("Action reconciliation is not configured.");
     let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
@@ -1177,8 +1311,9 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
 }
 
 // Capability for managing deployment-wide admin settings, obtained via
-// AuthenticatedApi.getAdminApi() (which is null for non-admins). The admin access check happens once
-// when the capability is minted in server.ts, so these methods don't re-check. This is a thin
+// AuthenticatedApi.getAdminApi() (which is null for non-admins). The role check happens when the
+// capability is minted in server.ts; every call also checks the permanent User deletion tombstone.
+// This is a thin
 // validation+forwarding facade over the AdminSettings DO — fully user-independent — so a disabled
 // gatekeeper/resource can't be re-enabled via a crafted request, and the client never receives a
 // stub to the DO's internal methods. Covers branding, agent instructions, signups, and gatekeeper
@@ -1188,22 +1323,26 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   /**
    * `adminUserId` is the requesting admin's identity. It is forwarded to RBAC-gated gatekeepers
    * when listing resources and recorded as the actor in Usage Rate audits and User Usage Account
-   * corrections. It is plain data, not a User Durable Object dependency.
+   * corrections. The User namespace revokes an already-minted capability after permanent User
+   * deletion.
    */
   constructor(
       private admin: DurableObjectStub<AdminSettings>,
       private adminUserId: string,
       private users: DurableObjectNamespace<UserDurableObject>,
       private overseers?: DurableObjectNamespace<import("./overseer.js").OverseerDurableObject>,
-      private projection?: DurableObjectNamespace<UsageProjection>) {
+      private projection?: DurableObjectNamespace<UsageProjection>,
+      private avatars?: KVNamespace) {
     super();
   }
 
-  getSettings(): Promise<AdminSettingsView> {
-    return this.admin.getSettings(this.adminUserId);
+  async getSettings(): Promise<AdminSettingsView> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.getSettings(this.adminUserId);
   }
 
   async getUsageApi(): Promise<RpcStub<AdminUsageApi>> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
     return new AdminUsageApiImpl(
       this.admin,
@@ -1211,52 +1350,64 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
       this.adminUserId,
       this.overseers,
       this.projection,
+      this.avatars,
     );
   }
 
-  getUsageRates(): Promise<UsageRateAdminView> {
-    return this.admin.getUsageRates();
+  async getUsageRates(): Promise<UsageRateAdminView> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.getUsageRates();
   }
 
   async updateUsageRates(
       changes: UsageRateChange[], reason: string): Promise<UsageRateAdminView> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalizedReason = validateUsageRateChangeReason(reason);
     return await this.admin.updateUsageRates(changes, normalizedReason, this.adminUserId);
   }
 
-  getDeploymentModelCatalog(): Promise<DeploymentModelCatalog> {
-    return this.admin.getDeploymentModelCatalog();
+  async getDeploymentModelCatalog(): Promise<DeploymentModelCatalog> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.getDeploymentModelCatalog();
   }
 
-  getAiGatewayInfo(): Promise<AiGatewayInfo> {
-    return this.admin.getAiGatewayInfo();
+  async getAiGatewayInfo(): Promise<AiGatewayInfo> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.getAiGatewayInfo();
   }
 
   async addDeploymentModel(name: string, config: AiModelConfig): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     await this.admin.addDeploymentModel(name, config);
   }
 
   async updateDeploymentModel(id: string, name: string, config: AiModelConfig): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     await this.admin.updateDeploymentModel(id, name, config);
   }
 
   async setDeploymentDefaultModel(id: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     await this.admin.setDeploymentDefaultModel(id);
   }
 
   async setDeploymentQuickModel(id: string | null): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     await this.admin.setDeploymentQuickModel(id);
   }
 
   async revokeDeploymentModel(id: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     await this.admin.revokeDeploymentModel(id);
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     await this.admin.updateAdminConfig({ signupsEnabled: enabled });
   }
 
   async setSiteName(name: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (name.length > MAX_SITE_NAME_LENGTH) {
       throw new Error(`Site name too long (max ${MAX_SITE_NAME_LENGTH} characters).`);
     }
@@ -1264,29 +1415,34 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setSiteLogo(data: Uint8Array | null): Promise<AdminSettingsView['siteLogo']> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (data !== null) validateSiteLogo(data);
     return siteLogoImage(await this.admin.setSiteLogo(data));
   }
 
   async setInstanceInstructions(text: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (text.length > MAX_INSTANCE_INSTRUCTIONS_LENGTH) {
       throw new Error(`Instructions too long (max ${MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters).`);
     }
     await this.admin.updateAdminConfig({ instanceInstructions: text });
   }
 
-  setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
-    return this.admin.setResourceEnabled(vendorId, urlPattern, enabled);
+  async setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.setResourceEnabled(vendorId, urlPattern, enabled);
   }
 
-  setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (!isAmbientGatekeeperMode(mode)) {
       throw new Error(`Invalid gatekeeper mode: ${mode}`);
     }
-    return this.admin.setGatekeeperMode(vendorId, mode);
+    return await this.admin.setGatekeeperMode(vendorId, mode);
   }
 
   async setAnnouncement(text: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
       throw new Error(`Announcement too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
     }
@@ -1294,6 +1450,7 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setBanner(text: string, color: BannerColor): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
       throw new Error(`Banner too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
     }
@@ -1304,33 +1461,40 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async setAccentColor(color: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
     if (color !== "" && !isHexColor(color)) {
       throw new Error(`Invalid accent color: ${color}`);
     }
     await this.admin.updateAdminConfig({ accentColor: color });
   }
 
-  isBlueprintFeatured(blueprintId: string): Promise<boolean | null> {
-    return this.admin.isBlueprintFeatured(blueprintId);
+  async isBlueprintFeatured(blueprintId: string): Promise<boolean | null> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.isBlueprintFeatured(blueprintId);
   }
 
-  setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
-    return this.admin.setBlueprintFeatured(blueprintId, featured);
+  async setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.setBlueprintFeatured(blueprintId, featured);
   }
 
-  promoteFormat(blueprintId: string): Promise<void> {
-    return this.admin.promoteFormat(blueprintId);
+  async promoteFormat(blueprintId: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.promoteFormat(blueprintId);
   }
 
-  removeFormat(blueprintId: string): Promise<void> {
-    return this.admin.removeFormat(blueprintId);
+  async removeFormat(blueprintId: string): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.removeFormat(blueprintId);
   }
 
-  updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
-    return this.admin.updateFormat(blueprintId, patch);
+  async updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.updateFormat(blueprintId, patch);
   }
 
-  setFormatOrder(blueprintIds: string[]): Promise<void> {
-    return this.admin.setFormatOrder(blueprintIds);
+  async setFormatOrder(blueprintIds: string[]): Promise<void> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return await this.admin.setFormatOrder(blueprintIds);
   }
 }

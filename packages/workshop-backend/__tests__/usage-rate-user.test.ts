@@ -238,8 +238,12 @@ describe("Usage Rate initial grant connection", () => {
         configurationGap: true,
       },
     });
+    // Settle the real registration/outbox maintenance path before the complete authority snapshot.
+    // The restart assertion must compare two stable snapshots, not race a valid background ACK.
+    await runInDurableObject(user, instance => instance.alarm());
     const beforeRestart = await runInDurableObject(user, (_instance, state) =>
       new UsageAccount(state.storage).getSnapshot());
+    expect(beforeRestart.registrationOutbox.deliveredAt).toBeDefined();
 
     await expect(runInDurableObject(user, (_instance, state) => {
       state.abort("Unpriced Cloudflare model restart test");

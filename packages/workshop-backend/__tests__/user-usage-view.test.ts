@@ -189,6 +189,90 @@ describe("User Usage view", () => {
     });
   });
 
+  it("revokes every live own-User Usage surface and retained subscriber when deletion starts",
+      async () => {
+    const user = await newUser();
+
+    await runInDurableObject(user, async instance => {
+      let updates = 0;
+      let disposals = 0;
+      const callback = {
+        dup() {
+          return this;
+        },
+        update() {
+          updates += 1;
+          return Promise.resolve();
+        },
+        [Symbol.dispose]() {
+          disposals += 1;
+        },
+      } as unknown as RpcStub<UsageCreditBalanceSubscriber>;
+      const subscription = await instance.subscribeUsageCreditBalance(callback);
+      expect(updates).toBe(1);
+
+      instance.beginUsageUserDeletion(
+        "usage-view-live-capability-deletion",
+        "Revoke every live own-User Usage capability",
+        "admin@example.com",
+      );
+      expect(disposals).toBe(1);
+
+      const deletedCalls = [
+        () => instance.getUsageCreditBalance(),
+        () => instance.subscribeUsageCreditBalance(callback),
+        () => instance.acknowledgeUsageActivationNotice("legacy-notice-after-deletion"),
+        () => instance.listUsageRecords({limit: 10}),
+        () => instance.listOwnCreditReservations({limit: 10}),
+        () => instance.listOwnCreditLedger({limit: 10}),
+        () => instance.listOwnDiscoveredGatekeeperMethodPage({limit: 10}),
+      ];
+      for (const call of deletedCalls) {
+        await expect(call()).rejects.toThrow("This User has been deleted.");
+      }
+
+      subscription[Symbol.dispose]();
+      expect(disposals).toBe(1);
+      expect(updates).toBe(1);
+    });
+  });
+
+  it("releases a subscriber when deletion interleaves with its initial balance update", async () => {
+    const user = await newUser();
+
+    await runInDurableObject(user, async instance => {
+      let signalUpdateStarted!: () => void;
+      const updateStarted = new Promise<void>(resolve => { signalUpdateStarted = resolve; });
+      let finishUpdate!: () => void;
+      const updateFinished = new Promise<void>(resolve => { finishUpdate = resolve; });
+      let disposals = 0;
+      const callback = {
+        dup() {
+          return this;
+        },
+        async update() {
+          signalUpdateStarted();
+          await updateFinished;
+        },
+        [Symbol.dispose]() {
+          disposals += 1;
+        },
+      } as unknown as RpcStub<UsageCreditBalanceSubscriber>;
+
+      const pendingSubscription = instance.subscribeUsageCreditBalance(callback);
+      await updateStarted;
+      instance.beginUsageUserDeletion(
+        "usage-view-initial-update-deletion",
+        "Delete while the initial subscriber update is pending",
+        "admin@example.com",
+      );
+      expect(disposals).toBe(1);
+      finishUpdate();
+      await expect(pendingSubscription).rejects.toThrow("This User has been deleted.");
+      expect(disposals).toBe(1);
+    });
+  });
+
   it("acknowledges the legacy activation notice idempotently", async () => {
     const user = await newUser();
     await runInDurableObject(user, (_instance, state) => {
