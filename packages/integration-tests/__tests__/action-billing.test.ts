@@ -158,6 +158,36 @@ async function signInWhenAvailable(username: string): Promise<{
   throw connectionFailure ?? new Error("Workshop did not accept a WebSocket connection.");
 }
 
+function awaitBeforeDeadline<T>(
+    promise: PromiseLike<T>, deadline: number, failedStep: string,
+    disposeLate?: (value: T) => void): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(
+      new Error(`Workshop admin Usage API did not become ready during ${failedStep}.`),
+    );
+  }
+  let timedOut = false;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`Workshop admin Usage API did not become ready during ${failedStep}.`));
+    }, remaining);
+    Promise.resolve(promise).then(value => {
+      if (timedOut) {
+        disposeLate?.(value);
+        return;
+      }
+      clearTimeout(timer);
+      resolve(value);
+    }, error => {
+      if (timedOut) return;
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 async function openUsageAdminWhenAvailable(): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
@@ -174,14 +204,25 @@ async function openUsageAdminWhenAvailable(): Promise<{
     let usage: RpcStub<AdminUsageApi> | undefined;
     try {
       failedStep = "signIn";
-      user = await signIn(publicApi, ADMIN_USERNAME);
+      user = await awaitBeforeDeadline(
+        signIn(publicApi, ADMIN_USERNAME), deadline, failedStep,
+        lateUser => lateUser[Symbol.dispose](),
+      );
       failedStep = "getAdminApi";
-      admin = await user.getAdminApi();
+      admin = await awaitBeforeDeadline(
+        user.getAdminApi(), deadline, failedStep,
+        lateAdmin => lateAdmin?.[Symbol.dispose](),
+      );
       if (!admin) throw new Error("Expected the deployment administrator capability.");
       failedStep = "getUsageApi";
-      usage = await admin.getUsageApi();
+      usage = await awaitBeforeDeadline(
+        admin.getUsageApi(), deadline, failedStep,
+        lateUsage => lateUsage[Symbol.dispose](),
+      );
       failedStep = "searchUsers";
-      await usage.searchUsers({query: ADMIN_USERNAME, limit: 1});
+      await awaitBeforeDeadline(
+        usage.searchUsers({query: ADMIN_USERNAME, limit: 1}), deadline, failedStep,
+      );
       return {publicApi, user, admin, usage};
     } catch (error) {
       usage?.[Symbol.dispose]();
@@ -190,7 +231,6 @@ async function openUsageAdminWhenAvailable(): Promise<{
       publicApi[Symbol.dispose]();
       if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
       connectionFailure = error;
-      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
   throw new Error(`Workshop admin Usage API did not become ready during ${failedStep}.`, {
