@@ -7,81 +7,82 @@ test identities, deterministic Usage facts, local Cloudflare Workers bindings, a
 external mocks. It does not claim a production deployment, production traffic, production User
 data, an upload, a release promotion, or enabled production charging.
 
-The implementation is being developed in the isolated `issue-63` worktree and
-`codex/issue-63` branch. Its original base is `98e1963`, which contains the closed Issue #62
-implementation. Issue #65 must be integrated into `dev` before this candidate is rebased and
-submitted. No pull request is used.
+The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was rebased onto
+`ddfb621eee9d12296b7d646f23eb30d8f30bb323`, which contains the integrated and closed Issues #62,
+#64, and #65. No pull request is used.
 
 ## Frozen report contract
 
 - `AdminUsageApi.openReport(filter)` validates and normalizes the complete allowlisted filter once.
-  Dimensions combine with AND, values inside one dimension combine with OR, empty arrays are
+  Dimensions combine with AND. Values inside one dimension combine with OR. Empty arrays are
   removed, repeated values are deduplicated, and accepted values are sorted. Each dimension has a
   maximum of 32 values and each stable identifier is bounded and content-free.
-- The resulting `AdminUsageReport` capability freezes the canonical filter, strongly consistent
-  Deployment report timezone and its Usage Rate version, UTC half-open date bounds, Projection
-  generation, and applied-ingestion watermark. `getOverview()`, keyset `listRows()`, and
-  `exportCsv()` use this one frozen query.
-- Report dates are strict `YYYY-MM-DD` local dates. Temporal timezone conversion, rather than fixed
-  24-hour arithmetic, produces UTC boundaries. Returned local timestamps include their numeric UTC
-  offset. Focused cases cover UTC, New York spring-forward and fall-back, Kathmandu's 45-minute
-  offset, and Lord Howe's 30-minute DST change.
-- Keyset order is source time descending and immutable fact ID descending. The public cursor is a
-  random, capability-local UUID mapped to a bounded server cursor table. A cursor cannot be decoded,
-  forged, or reused across report capabilities. A generation change fails closed as a stale
-  snapshot.
-- The frozen watermark applies to both detail facts and immutable Summary revisions. The query
-  selects the latest Summary revision visible at that watermark, not the latest current revision,
-  so a later revision cannot rewrite an already-open report.
-- Rows explicitly discriminate `detail` and `aggregate`. A detail row has an event time, a Model or
-  Gatekeeper metered kind, and an opaque authority reference. An aggregate row has only a canonical
-  15-minute UTC bucket, stable Summary identity, monotonic revision, and a Model, Gatekeeper, or
-  formal attempt-only metered kind. It never fabricates an event timestamp.
-- Provider cost, charged credits, tokens, Metered Use count, operation counters, Summary revisions,
-  Projection generation, and watermark cross the public boundary as `bigint`. The Projection
-  remains replaceable and never supplies an authoritative balance or Ledger.
+- The resulting `AdminUsageReport` freezes the canonical filter, strongly consistent Deployment
+  report timezone and its Usage Rate version, UTC half-open date bounds, Projection generation,
+  applied-ingestion watermark, and a server-private detail-retention revision.
+  `getOverview()`, keyset `listRows()`, and `exportCsv()` use this one query. A generation change or
+  physical retention deletion fails the report closed as a stale snapshot instead of silently
+  changing its rows.
+- Report dates are strict `YYYY-MM-DD` local dates. Temporal timezone conversion, not fixed 24-hour
+  arithmetic, produces UTC boundaries. Returned local timestamps include their numeric UTC offset.
+  Tests cover UTC, New York spring-forward and fall-back, Kathmandu's 45-minute offset, and Lord
+  Howe's 30-minute DST change.
+- Keyset order is source time descending and immutable fact ID descending. Public cursors are
+  random capability-local references to a bounded server cursor table. A cursor cannot be decoded,
+  forged, or reused across report capabilities.
+- The frozen watermark applies to detail facts and immutable Summary revisions. The query selects
+  the latest Summary revision visible at that watermark. Duplicate delivery of the same Summary
+  revision uses the canonical earliest applied watermark and does not duplicate a frozen row.
+- Rows discriminate `detail` and `aggregate`. A detail row has event time and an opaque User-local
+  authority reference. An aggregate row has only a canonical 15-minute UTC bucket, stable Summary
+  identity, monotonic revision, and explicit `model | gatekeeper | attempt` metered kind. It never
+  invents event time. Attempt-only Summary rows are filterable and exportable without adding
+  Metered Use, tokens, cost, or active membership.
+- Provider cost, charged credits, tokens, Metered Use count, outcome counters, Summary revisions,
+  Projection generation, and watermarks cross the public boundary as `bigint`. The Projection never
+  supplies an authoritative balance or Ledger.
 
 ## Query, authority, and privacy boundaries
 
-- One parameterized predicate compiler is shared by filtered overview, rows, and CSV. It accepts no
-  client SQL, column name, actor, timezone, Projection generation, watermark, or Durable Object
-  name. Gatekeeper methods are always filtered as `(gatekeeperId, stableMethodKey)` pairs.
+- Filtered overview, rows, and CSV use one parameterized predicate compiler. It accepts no client
+  SQL, column name, actor, timezone, Projection generation, watermark, or Durable Object name.
+  Gatekeeper methods are always filtered as `(gatekeeperId, stableMethodKey)` pairs.
 - SQLite keeps content-free facts and dedicated dimension/time indexes. Query-plan tests require
   indexed keyset access and reject a temporary sort.
 - `getRecordDetail({registeredUserRef, safeRecordRef})` resolves the registered User only through
-  the authoritative Registry. The fresh User DO validates the opaque reference and returns one
-  serializable graph containing its Usage Record, Charge Snapshot, Reservation, Ledger entries, and
-  reconciliation audit. The browser receives no Registry, Projection, or User DO stub.
-- Report and detail requests are bounded. `AdminUsageApi` permits at most four open report
-  capabilities. One report permits at most two concurrent operations and keeps at most 1,024 public
-  cursors. Slots are reserved before an await and released on success, failure, cancel, late return,
-  or capability disposal.
-- The real Cap'n Web tracer seeds a forbidden content sentinel into an Action path and asserts that
-  Projection rows, authoritative detail, and CSV do not disclose it. This tracer remains pending
-  execution at the current static checkpoint.
-- Issue #65 owns retention, Summary backfill, and User deletion. After its integration, Issue #63
-  must rebase and prove the final locator seam: new unknown and reconciliation details keep distinct
-  random references, while a retained legacy detail may use `projectionFactId` only as an alias that
-  is still validated inside the corresponding User DO.
+  the authoritative Registry. The corresponding User DO validates the opaque reference and returns
+  one serializable authority graph. The browser receives no Registry, Projection, or User DO stub.
+- New unknown and reconciliation detail facts have different random stable references. A retained
+  legacy #62 detail may use its `projectionFactId` as an alias, but the User DO still validates that
+  alias. A reconciliation-only authority snapshot remains drillable after retention removes the
+  older raw Usage Record. Reconciliation responses do not expose raw billing or reconciliation
+  operation identifiers; public Ledger references are safe aliases scoped by `safeRecordRef`.
+- An administrator deletion revokes an already-minted report and its active CSV stream. Authority
+  is checked before and after asynchronous work and on every stream pull. The #64 own-User boundary
+  and #65 deleted-User tombstone remain separate and unchanged.
+- `AdminUsageApi` permits at most four open reports. One report permits at most two concurrent
+  operations and at most 1,024 public cursors. Slots are reserved before an await and released on
+  success, failure, cancel, late return, or capability disposal.
+- The real Cap'n Web tracer seeds a forbidden content sentinel into an Action path. It confirms that
+  Projection rows, authoritative detail, and CSV do not disclose the sentinel.
 
 ## CSV and browser streaming contract
 
-- `AdminUsageReport.exportCsv()` returns a real `ReadableStream<Uint8Array>`. The stream performs
-  database work only from `pull()`, reads at most 64 keyset rows at a time, and queues at most one
-  encoded chunk. Every chunk is limited to 256 KiB. `cancel()` stops further reads and releases the
-  report operation slot.
+- `AdminUsageReport.exportCsv()` returns a real `ReadableStream<Uint8Array>`. Database work starts
+  only from `pull()`. Each read uses at most 64 keyset rows, each chunk is at most 256 KiB, and a zero
+  high-water mark prevents implicit prefetch. `cancel()` stops reads and releases the operation
+  slot.
 - The deterministic UTF-8 RFC 4180 stream starts with parseable frozen-snapshot and Projection-health
-  metadata. Its data section distinguishes detail and aggregate rows and includes the safe
-  dimensions, exact Metered Use and outcome counters, tokens, provider cost, and charged credits.
-  Cells beginning with `=`, `+`, `-`, or `@` are neutralized before spreadsheet import.
+  metadata. Its data section distinguishes detail and aggregate rows. It includes safe dimensions,
+  exact counters, tokens, provider cost, and charged credits. Cells beginning with `=`, `+`, `-`, or
+  `@` are neutralized before spreadsheet import.
 - The lazy exporter test consumes 1,000,000 generated rows without materializing the result. It
-  asserts a maximum 64-row page and 256 KiB chunk. This test passed before the latest frozen-watermark
-  regression and public metric additions; it must pass again at the final post-rebase checkpoint.
-- Chromium uses the File System Access API and pipes the RPC stream directly to the chosen file.
-  The fallback buffers at most 16 MiB, cancels the reader when that limit is exceeded, and tells the
-  administrator to narrow the filter. Changing a filter or leaving the page aborts an active export.
-- React stores the callable report stub only inside `{api}` state. It disposes replaced, late,
-  failed, cancelled, and unmounted report capabilities and ignores stale page/detail responses.
+  asserts a maximum 64-row page and 256 KiB chunk, real pull backpressure, and cancel behavior.
+- Chromium uses the File System Access API and pipes the RPC stream directly to the selected file.
+  The fallback buffers at most 16 MiB. It cancels the reader above that limit and asks the
+  administrator to narrow the filter. A filter change or page exit aborts an active export.
+- React stores a callable report stub only inside `{api}` state. It disposes replaced, late, failed,
+  cancelled, and unmounted capabilities and ignores stale page and detail responses.
 
 The CSV columns are:
 
@@ -97,44 +98,60 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 
 ## Administrator UI coverage
 
-- The `/admin` Usage and Credits tab contains a separate frozen-report browser rather than adding
-  report state to the main page component.
+- The `/admin` Usage and Credits tab contains a separate frozen-report browser.
 - English and Chinese surfaces provide local-date, registered User, Gadget, Deployment Model,
   Gatekeeper, Gatekeeper-scoped method, external account, Usage Source, outcome, pricing, and
   `model | gatekeeper | attempt` filters.
-- The UI shows exact active User, Metered Use, billable operation, pre-execution failure, and unknown
-  counters with the frozen timezone, generation, and watermark. Rows keep aggregate identity visible
-  and expose authoritative detail only for detail rows.
-- Next and Previous maintain an opaque keyset cursor stack. A changed filter resets it. Slow old
-  report openings cannot replace a faster new report, and their late capabilities are disposed.
-- CSV export shows progress, supports cancel, and uses the currently open report capability rather
-  than reopening a report from client-built filter state.
+- The UI shows exact active User, Metered Use, operation, pre-execution failure, and unknown
+  counters with the frozen timezone, generation, and watermark. Aggregate identity remains visible.
+  Only detail rows expose authoritative drill-down.
+- Reconciliation-only detail renders without inventing a workspace or conversation and shows its
+  content-free external account dimension.
+- Next and Previous maintain an opaque keyset cursor stack. A changed filter resets it. A late old
+  opening cannot replace a newer report and its capability is disposed.
+- CSV export shows progress, supports cancel, and uses the current report capability.
 
-## Current verification matrix
+## Verification matrix
 
-This table describes the current pre-#65-rebase static checkpoint. A final entry replaces all
-`PENDING` cells only after the integrated contract is available.
-
-| Gate | Current result |
+| Gate | Result |
 | --- | --- |
-| `corepack pnpm --filter @gadgets/workshop-shared build` | PASS |
-| `corepack pnpm --filter @gadgets/workshop-backend build` | PASS |
-| `corepack pnpm --filter @gadgets/workshop-frontend build` | PASS |
-| `corepack pnpm --filter @gadgets/integration-tests build` | PASS |
-| Frontend report/overview/file-transfer focused tests | PASS, 19 tests |
-| Focused Usage report workerd tests | PENDING post-rebase rerun; an earlier 13-test checkpoint passed before the latest watermark regression |
-| Focused User authority/detail workerd tests | PENDING post-rebase rerun |
-| Real Cap'n Web integration tracer | PENDING coordinated Harness window |
-| `capnweb-validate` Worker build | PENDING post-rebase |
-| Backend and Frontend package tests | PENDING final candidate gate |
-| Root build/test/lint and release-manifest golden | PENDING main-agent integration gate |
-| Production-shape release dry-run | PENDING main-agent final gate; no upload, promote, or deploy |
-| `git diff --check` | PENDING final candidate repeat |
+| Shared, Backend, Frontend, and Integration Tests package builds | PASS |
+| Focused Usage report workerd | PASS, 17/17 |
+| Focused Summary/retention workerd group | PASS, 24/24 |
+| Frontend report/overview/file-transfer focused tests | PASS, 20/20 |
+| Full Frontend package tests | PASS, 78 files and 372 tests, plus first-party copy 1/1 |
+| Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1 |
+| Backend Worker `capnweb-validate` build | PASS |
+| Full Backend package tests | PASS, 654 tests with 4 expected skips |
+| Root `corepack pnpm build` | PASS, 52 tasks |
+| Root `corepack pnpm lint` | PASS, configured non-blocking warnings only |
+| Release-manifest golden | PASS, 4/4 |
+| `corepack pnpm types:generate` | PASS; no Issue #63 generated change |
+| Production-shape release dry-run | PASS, 19 Workers, 85 modules, 37 asset blobs, 28 MiB |
+| Root `corepack pnpm test` | PENDING final coordinated fleet |
+| Standards/specification fixed-point review | PENDING independent dual-axis review |
+| `git diff --check` | PASS |
 
-## Final gate restrictions
+The first production-shape dry-run stopped because a gitignored Confluence configurator prerequisite
+had not yet been generated. The root build generated the normal prerequisite. The unchanged release
+command then passed with Wrangler `4.119.0` and release ID `issue-63-local`. Its retained output is
+under
+`/var/folders/yh/fxzrf0n550q5nvlcfm5w318r0000gn/T/azhen-issue63-release.XXXXXX.T1AMW0dky1/release-out`.
+There was no upload, promotion, or deployment.
 
-Issue #63 is not ready to close at this checkpoint. It must first rebase onto `dev` after Issue #65,
-resolve the final Summary and locator contracts, rerun the focused workerd and real Cap'n Web paths,
-complete the standards/specification dual review, and pass the affected package gates. No push,
-merge, pull request, Issue closure, deployment, upload, promotion, production configuration change,
-charging change, or worktree deletion is part of this worktree implementation step.
+`types:generate` also exposed one unrelated UGC Ads workerd metadata drift. It was reviewed and
+precisely restored. The final Issue #63 diff contains no UGC Ads file.
+
+One first Backend-package run observed the existing #65 cleanup assertion exceed its 64-row batch
+bound because an overdue automatic alarm raced the test's manual alarm. Production SQL still uses
+the required hard `LIMIT 64`. The exact isolated case passed, then the full Projection suite passed
+56/56 twice, and the final complete Backend package passed with the same assertion unchanged. No
+production batch bound or assertion was weakened.
+
+## Remaining branch gate
+
+The candidate still requires the independent standards/specification review and one coordinated
+root `corepack pnpm test`. After those gates and any TDD corrections, this document must record the
+final fixed point. No push, merge, pull request, Issue closure, deployment, upload, promotion,
+production configuration change, charging change, or worktree deletion is part of this worktree
+step.

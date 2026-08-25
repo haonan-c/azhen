@@ -754,3 +754,34 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   pending gates are recorded in `ISSUE-63-VERIFICATION.md`.
 - No push, merge, pull request, Issue closure, deployment, upload, promotion, production
   configuration change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #63 post-#65 rebase candidate
+
+- Rebased the isolated candidate onto `ddfb621eee9d12296b7d646f23eb30d8f30bb323`, which includes
+  the closed Issues #62, #64, and #65. The rebase preserved the frozen Summary contract: detail and
+  aggregate remain distinct; attempt-only aggregate rows use explicit `meteredKind`; exact Metered
+  Use and outcome counters remain `bigint`; Summary totals do not double-count detail.
+- RED tests exposed four integrated seams. GREEN changes keep the same Summary revision canonical
+  at its earliest applied watermark, revoke an already-minted report and active CSV stream when its
+  administrator deletion starts, retain reconciliation-only authority after the older raw Usage
+  Record expires, and fail a frozen report closed when retention physically removes its detail.
+- User-authority drill-down now validates new unknown and reconciliation facts through their
+  different random safe references. Legacy #62 facts may use `projectionFactId` only as a User DO
+  validated alias. Public reconciliation and Ledger responses do not disclose raw billing or
+  reconciliation operation identifiers.
+- Focused workerd passed Usage report 17/17 and Summary/retention 24/24. The production Harness
+  Cap'n Web stream/cancel/privacy tracer passed 1/1. Frontend focused tests passed 20/20 and the full
+  Frontend package passed 372 tests plus its copy check. The complete Backend package passed 654
+  tests with four expected skips; shared, Backend, Frontend, and integration-test builds passed.
+- Root build passed 52 tasks. Root lint passed with configured non-blocking warnings. The release
+  manifest golden passed 4/4, `types:generate` exited 0 with no Issue #63 generated diff, and
+  `git diff --check` passed. The unrelated UGC Ads workerd metadata drift from type generation was
+  reviewed and precisely restored.
+- The local production-shape release dry-run passed after the normal root-build prerequisite. It
+  used Wrangler 4.119.0 and release ID `issue-63-local`, and produced 19 Workers, 85 modules, 37
+  unique asset blobs, and 28 MiB. It did not upload, promote, deploy, change production
+  configuration, or enable charging.
+- One earlier Backend run saw an automatic cleanup alarm race the test's manual alarm. The exact
+  isolated case passed, the full Projection suite passed 56/56 twice, and the final Backend package
+  passed without changing the production `LIMIT 64` or weakening the assertion. Independent
+  standards/specification review and the coordinated root test remain the final branch gates.
