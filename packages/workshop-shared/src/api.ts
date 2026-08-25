@@ -1421,6 +1421,9 @@ export interface AdminUsageReport {
 
   /** Stream RFC 4180 CSV bytes for this same frozen snapshot with Cap'n Web flow control. */
   exportCsv(): Promise<ReadableStream<Uint8Array>>;
+
+  /** Cancel every active CSV source owned by this report and release its bounded stream slots. */
+  cancelCsvExports(): Promise<void>;
 }
 
 /** Durable status of an idempotent Usage Projection rebuild request. */
@@ -1560,6 +1563,26 @@ export type AdminActionReconciliationRequest = {
   reason: string;
 };
 
+/** Detail-scoped request to settle or release one unknown Gatekeeper Usage Record. */
+export type AdminUnknownUsageReconciliationRequest = {
+  /** Opaque target returned by the authoritative User Registry. */
+  registeredUserRef: string;
+  /** Random User-local reference returned by the selected report detail row. */
+  safeRecordRef: string;
+  /** Stable client retry identity for this administrator decision. */
+  operationId: string;
+  /** Financial decision allowed for the selected unknown Usage Record. */
+  decision: "settle" | "release";
+  /** Bounded administrator explanation retained for audit. */
+  reason: string;
+};
+
+/** Auditable result that omits the server-private Workspace and Action locator. */
+export type AdminUnknownUsageReconciliationResult = Omit<
+  AdminActionReconciliationResult,
+  "workspaceId" | "actionId"
+>;
+
 /** Auditable result of one idempotent administrator Action coordination decision. */
 export type AdminActionReconciliationResult = {
   /** Stable Workshop identifier containing the coordinated Action. */
@@ -1630,6 +1653,11 @@ export interface AdminUsageApi {
   reconcileAction(
     request: AdminActionReconciliationRequest,
   ): Promise<AdminActionReconciliationResult>;
+
+  /** Settle or release the selected unknown detail without accepting an Action identifier. */
+  reconcileUnknownRecord(
+    request: AdminUnknownUsageReconciliationRequest,
+  ): Promise<AdminUnknownUsageReconciliationResult>;
 }
 
 /** Top-level API exposed to the user after they have authenticated. */

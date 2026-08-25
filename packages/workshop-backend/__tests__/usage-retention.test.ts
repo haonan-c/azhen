@@ -351,6 +351,20 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.beginGatekeeperUsage(billingOperationId, ATTRIBUTION, PRICED);
       account.markGatekeeperUsageStarted(billingOperationId);
       account.completeGatekeeperUsage(billingOperationId, "unknown");
+      const unknown = account.getSnapshot().projectionFacts.find(
+        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown",
+      );
+      if (!unknown || unknown.rowKind !== "detail") {
+        throw new Error("Expected an unknown Usage detail reference.");
+      }
+      expect(() => account.assertAdminUnknownUsageDetailReference(
+        unknown.safeRecordRef,
+        billingOperationId,
+      )).not.toThrow();
+      expect(() => account.assertAdminUnknownUsageDetailReference(
+        unknown.safeRecordRef,
+        "gatekeeper-operation:another-action",
+      )).toThrow("Usage Record does not match the Action");
 
       vi.setSystemTime(new Date("2026-08-23T12:00:00.000Z"));
       account.reconcileUnknownGatekeeperUsage(

@@ -245,6 +245,8 @@ export type GatekeeperUsageAttribution = (
   billingMethodKey: string;
   /** Connected external account the upstream business call consumes quota from. */
   externalAccountId: string;
+  /** Server-private Workspace Action locator, present only for delayed Actions. */
+  actionId?: number;
 };
 
 /**
@@ -1651,6 +1653,50 @@ export class UsageAccount {
         reason: reconciliation.reason,
         createdAt: reconciliation.createdAt,
       } : null,
+    };
+  }
+
+  /** Fail closed unless one random detail reference identifies the specified unknown operation. */
+  assertAdminUnknownUsageDetailReference(
+      safeRecordRef: string,
+      billingOperationId: string): void {
+    if (!isOpaqueUsageReference(safeRecordRef) ||
+        operationIdValidationError(billingOperationId) !== undefined) {
+      throw new Error("Usage Record does not match the Action.");
+    }
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper" || locator.operationId !== billingOperationId) {
+      throw new Error("Usage Record does not match the Action.");
+    }
+    const detail = this.getAdminUsageRecordDetail(safeRecordRef);
+    if (detail.record.kind !== "gatekeeper" || detail.record.outcome !== "usage-unknown") {
+      throw new Error("Usage Record does not match the Action.");
+    }
+  }
+
+  /** Resolve an unknown detail to its server-private Action locator inside this User authority. */
+  getAdminUnknownUsageActionTarget(safeRecordRef: string): {
+    workspaceId: string;
+    actionId: number;
+    billingOperationId: string;
+  } {
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper") {
+      throw new Error("Unknown Usage Record does not exist.");
+    }
+    this.assertAdminUnknownUsageDetailReference(safeRecordRef, locator.operationId);
+    const record = this.storage.kv.get<GatekeeperUsageRecord>(
+      GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
+    );
+    if (!record || typeof record.attribution.workspaceId !== "string" ||
+        !Number.isSafeInteger(record.attribution.actionId) ||
+        (record.attribution.actionId ?? -1) < 0) {
+      throw new Error("Unknown Usage Record has no Action authority.");
+    }
+    return {
+      workspaceId: record.attribution.workspaceId,
+      actionId: record.attribution.actionId!,
+      billingOperationId: locator.operationId,
     };
   }
 
@@ -4757,13 +4803,16 @@ function normalizeGatekeeperUsageAttribution(
       Object.keys(value).some(key => key !== "vendorId" && key !== "billingMethodKey" &&
         key !== "externalAccountId" && key !== "principal" && key !== "source" &&
         key !== "workspaceId" && key !== "chatId" && key !== "gadgetId" &&
-        key !== "automationId" && key !== "automationRunId") ||
+        key !== "automationId" && key !== "automationRunId" && key !== "actionId") ||
       !isStableUsageDimension(value.vendorId) ||
       !isStableUsageDimension(value.billingMethodKey) ||
-      !isStableUsageDimension(value.externalAccountId)) {
+      !isStableUsageDimension(value.externalAccountId) ||
+      (value.actionId !== undefined &&
+        (value.workspaceId === undefined || !Number.isSafeInteger(value.actionId) ||
+          value.actionId < 0))) {
     throw new TypeError("Gatekeeper Usage attribution is invalid.");
   }
-  const {vendorId, billingMethodKey, externalAccountId, ...attribution} = value;
+  const {vendorId, billingMethodKey, externalAccountId, actionId, ...attribution} = value;
   const normalizedAttribution = attribution.workspaceId === undefined
     ? normalizeDirectUserUsageAttribution(attribution)
     : normalizeUsageAttribution(attribution);
@@ -4772,6 +4821,7 @@ function normalizeGatekeeperUsageAttribution(
     vendorId,
     billingMethodKey,
     externalAccountId,
+    ...(actionId === undefined ? {} : {actionId}),
   };
 }
 
@@ -4793,6 +4843,7 @@ function gatekeeperAttemptInputsEqual(
     attempt.attribution.gadgetId === attribution.gadgetId &&
     attempt.attribution.automationId === attribution.automationId &&
     attempt.attribution.automationRunId === attribution.automationRunId &&
+    attempt.attribution.actionId === attribution.actionId &&
     attempt.attribution.vendorId === attribution.vendorId &&
     attempt.attribution.billingMethodKey === attribution.billingMethodKey &&
     attempt.attribution.externalAccountId === attribution.externalAccountId &&

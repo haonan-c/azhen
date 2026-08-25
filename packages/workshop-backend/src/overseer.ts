@@ -3482,6 +3482,7 @@ class OverseerImpl implements AgentHooks {
       let begun = await this.userForPrincipal(action.caller.attribution.principal.userId)
           .beginGatekeeperActionUsage(billingOperationId, {
             ...action.caller.attribution,
+            actionId,
             vendorId: action.chargeSnapshot.vendorId,
             billingMethodKey: billing.methodKey,
             externalAccountId: billing.externalAccountId,
@@ -3631,9 +3632,18 @@ class OverseerImpl implements AgentHooks {
       operationId: string,
       decision: AdminActionReconciliationDecision,
       reason: string,
-      actorUserId: string): Promise<AdminActionReconciliationResult> {
+      actorUserId: string,
+      safeRecordRef?: string): Promise<AdminActionReconciliationResult> {
     let action = this.storage.actions.get(actionId);
     if (!action || action.type !== "action") throw new Error("Action does not exist.");
+    let billingOperationId = action.description.billingOperationId;
+    if (!billingOperationId || !action.description.billing) {
+      throw new Error("Action has no Billable API Operation to reconcile.");
+    }
+    let user = this.userForPrincipal(action.caller.attribution.principal.userId);
+    if (safeRecordRef !== undefined) {
+      await user.assertAdminUnknownUsageDetailReference(safeRecordRef, billingOperationId);
+    }
     let replay = replayActionReconciliation(
       action, operationId, decision, reason, actorUserId,
     );
@@ -3641,16 +3651,11 @@ class OverseerImpl implements AgentHooks {
       await this.handleActionExecutionTerminal(actionId);
       return replay;
     }
-    let billingOperationId = action.description.billingOperationId;
-    if (!billingOperationId || !action.description.billing) {
-      throw new Error("Action has no Billable API Operation to reconcile.");
-    }
 
     let previousState = action.state;
     let newState: ActionState;
     let ledgerEntryId: string | null;
     let createdAt: string;
-    let user = this.userForPrincipal(action.caller.attribution.principal.userId);
     if (decision === "settle" || decision === "release") {
       if (previousState !== "unknown") {
         throw new Error("Only an unknown Action can be settled or released.");
@@ -7943,13 +7948,15 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       operationId: string,
       decision: AdminActionReconciliationDecision,
       reason: string,
-      actorUserId: string): Promise<AdminActionReconciliationResult> {
+      actorUserId: string,
+      safeRecordRef?: string): Promise<AdminActionReconciliationResult> {
     return this.impl.reconcileActionUsage(
       actionId,
       operationId,
       decision,
       reason,
       actorUserId,
+      safeRecordRef,
     );
   }
 

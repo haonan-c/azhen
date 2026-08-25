@@ -844,6 +844,29 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     await replacement.cancel("prove the operation slot was released");
   });
 
+  it("explicitly cancels an active Cap'n Web CSV source and releases its operation slot",
+      async () => {
+    const projection = {
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() {
+        return {rows: [CSV_ROW], nextCursor: "next"};
+      },
+    };
+    using report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1_000n,
+    ));
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    await (report as unknown as {cancelCsvExports(): Promise<void>}).cancelCsvExports();
+
+    await expect(reader.read()).rejects.toThrow("CSV export was cancelled");
+    reader.releaseLock();
+    const replacement = await report.exportCsv();
+    await replacement.cancel("prove explicit cancellation released the slot");
+  });
+
   it("terminates an active CSV reader when its report capability is disposed", async () => {
     const projection = {
       async readHealth() { return HEALTHY_PROJECTION },
@@ -861,6 +884,64 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     report[Symbol.dispose]();
 
     await expect(reader.read()).rejects.toThrow("Usage report is closed.");
+    reader.releaseLock();
+  });
+
+  it("does not return a CSV stream when its report is disposed during health lookup", async () => {
+    let releaseHealth!: () => void;
+    const healthBlocked = new Promise<void>(resolve => { releaseHealth = resolve });
+    const projection = {
+      async readHealth() {
+        await healthBlocked;
+        return HEALTHY_PROJECTION;
+      },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
+    };
+    const report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1n,
+    ));
+    const exporting = report.exportCsv();
+    await Promise.resolve();
+
+    report[Symbol.dispose]();
+    releaseHealth();
+
+    await expect(exporting).rejects.toThrow("Usage report is closed.");
+  });
+
+  it("terminates a final CSV page disposed during its post-query authority check", async () => {
+    let authorityChecks = 0;
+    let finalCheckReached!: () => void;
+    const reachedFinalCheck = new Promise<void>(resolve => { finalCheckReached = resolve });
+    let releaseFinalCheck!: () => void;
+    const finalCheckBlocked = new Promise<void>(resolve => { releaseFinalCheck = resolve });
+    const projection = {
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
+    };
+    const report = new AdminUsageReportImpl(
+      projection,
+      freezeUsageReportQuery({}, "UTC", 1n, 1n, 1n),
+      () => undefined,
+      async () => {
+        authorityChecks += 1;
+        if (authorityChecks === 6) {
+          finalCheckReached();
+          await finalCheckBlocked;
+        }
+      },
+    );
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+    const finalRead = reader.read();
+    await reachedFinalCheck;
+
+    report[Symbol.dispose]();
+    releaseFinalCheck();
+
+    await expect(finalRead).rejects.toThrow("Usage report is closed.");
     reader.releaseLock();
   });
 

@@ -1000,6 +1000,27 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.getAdminUsageRecordDetail(safeRecordRef);
   }
 
+  /** Verify one detail-scoped unknown Usage reference before Action coordination. */
+  async assertAdminUnknownUsageDetailReference(
+      safeRecordRef: string,
+      billingOperationId: string): Promise<void> {
+    await this.activateUsageAccount();
+    this.usageAccount.assertAdminUnknownUsageDetailReference(
+      safeRecordRef,
+      billingOperationId,
+    );
+  }
+
+  /** Resolve one unknown detail to its server-private Workspace Action locator. */
+  async getAdminUnknownUsageActionTarget(safeRecordRef: string): Promise<{
+    workspaceId: string;
+    actionId: number;
+    billingOperationId: string;
+  }> {
+    await this.activateUsageAccount();
+    return this.usageAccount.getAdminUnknownUsageActionTarget(safeRecordRef);
+  }
+
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
   async reserveUsageCredits(
       operationId: string,

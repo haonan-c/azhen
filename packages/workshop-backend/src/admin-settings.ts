@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageBalanceState, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUnknownUsageReconciliationRequest, type AdminUnknownUsageReconciliationResult, type AdminUsageBalanceState, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -37,6 +37,7 @@ import {
   type AdminUsageReportOverview,
   type AdminUsageReportPage,
   type AdminUsageReportPageRequest,
+  type AdminUsageProjectionHealth,
   type AdminUsageReportRow,
 } from "@gadgets/workshop-shared/api";
 import {
@@ -45,6 +46,47 @@ import {
 } from "./usage-report-query.js";
 
 const logger = createWorkshopLogger("workshop.admin.settings");
+
+/** Server-private lifecycle event exposed only to an explicitly installed integration observer. */
+export type UsageReportIntegrationTestEvent = {
+  /** Opaque report instance identity generated only for process-local correlation. */
+  reportId: string;
+  /** Content-free lifecycle boundary observed by a test-only Worker entrypoint. */
+  event:
+    | "target-created"
+    | "target-disposed"
+    | "stream-reserved"
+    | "stream-cancelled"
+    | "stream-control-cancelled"
+    | "stream-owner-terminated"
+    | "stream-released"
+    | "page-query-start"
+    | "page-query-end"
+    | "chunk-enqueued";
+  /** Number of operations currently reserving this report capability. */
+  activeOperations: number;
+  /** Number of Projection page queries in flight for this stream. */
+  queryInFlight?: number;
+  /** Number of rows returned by one bounded Projection query. */
+  rowCount?: number;
+  /** Exact encoded byte length of one application-owned chunk. */
+  chunkBytes?: number;
+  /** Cumulative encoded application bytes produced by this stream. */
+  encodedBytes?: number;
+};
+
+let usageReportIntegrationTestObserver:
+  ((event: UsageReportIntegrationTestEvent) => void) | undefined;
+
+/** Install one server-private observer from a test-only Worker entrypoint, never from production. */
+export function setUsageReportIntegrationTestObserver(
+    observer: (event: UsageReportIntegrationTestEvent) => void): void {
+  usageReportIntegrationTestObserver = observer;
+}
+
+function emitUsageReportIntegrationTestEvent(event: UsageReportIntegrationTestEvent): void {
+  usageReportIntegrationTestObserver?.(event);
+}
 
 /** Server-only Deployment Model data. Model Configuration never enters a public catalog view. */
 export type DeploymentModelRecord = {
@@ -1082,6 +1124,24 @@ function normalizeAdminActionReconciliationRequest(
   };
 }
 
+function normalizeAdminUnknownUsageReconciliationRequest(
+    request: AdminUnknownUsageReconciliationRequest): AdminUnknownUsageReconciliationRequest {
+  assertExactRpcObject(
+    request,
+    ["registeredUserRef", "safeRecordRef", "operationId", "decision", "reason"],
+  );
+  if (request.decision !== "settle" && request.decision !== "release") {
+    throw new TypeError("Unknown Usage reconciliation decision is invalid.");
+  }
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    safeRecordRef: normalizeAdminUsageRecordReference(request.safeRecordRef),
+    operationId: normalizeAdminUsageOperationId(request.operationId),
+    decision: request.decision,
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
 function hasAsciiControlCharacter(value: string): boolean {
   for (const character of value) {
     const codePoint = character.codePointAt(0)!;
@@ -1181,9 +1241,13 @@ type UsageReportProjection = Pick<DurableObjectStub<UsageProjection>,
 /** Frozen administrator Usage report backed by one Projection generation and watermark. */
 @validateRpc()
 export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport {
+  private readonly reportId = crypto.randomUUID();
   private disposed = false;
   private activeOperations = 0;
-  private activeStreams = new Set<(error: Error) => void>();
+  private activeStreams = new Set<(
+    error: Error,
+    event?: "stream-control-cancelled" | "stream-owner-terminated",
+  ) => void>();
   private pageCursors = new Map<string, string>();
 
   constructor(
@@ -1192,6 +1256,11 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
       private onDispose: () => void = () => undefined,
       private assertActive: () => Promise<void> = async () => undefined) {
     super();
+    emitUsageReportIntegrationTestEvent({
+      reportId: this.reportId,
+      event: "target-created",
+      activeOperations: this.activeOperations,
+    });
   }
 
   async getOverview(): Promise<AdminUsageReportOverview> {
@@ -1236,39 +1305,56 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
     if (this.disposed) throw new Error("Usage report is closed.");
     if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
     this.activeOperations += 1;
-    const health = await this.projection.readHealth().catch(error => {
-      this.activeOperations -= 1;
-      throw error;
-    });
-    await this.assertActive().catch(error => {
-      this.activeOperations -= 1;
-      throw error;
-    });
-    const generatedAt = new Date().toISOString();
+    this.#emitIntegrationTestEvent("stream-reserved");
     let cursor: string | undefined;
     let firstPull = true;
     let complete = false;
     let cancelled = false;
     let released = false;
+    let queryInFlight = 0;
+    let encodedBytes = 0;
+    let ownerError: Error | undefined;
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-    let terminateFromOwner: ((error: Error) => void) | undefined;
+    let terminateFromOwner: ((
+      error: Error,
+      event?: "stream-control-cancelled" | "stream-owner-terminated",
+    ) => void) | undefined;
     const release = () => {
       if (released) return;
       released = true;
       this.activeOperations -= 1;
       if (terminateFromOwner !== undefined) this.activeStreams.delete(terminateFromOwner);
+      this.#emitIntegrationTestEvent("stream-released");
     };
     const cancel = () => {
       cancelled = true;
+      this.#emitIntegrationTestEvent("stream-cancelled");
       release();
     };
-    terminateFromOwner = error => {
-      if (cancelled || complete) return;
+    terminateFromOwner = (error, event = "stream-owner-terminated") => {
+      if (cancelled || released) return;
       cancelled = true;
+      ownerError = error;
+      this.#emitIntegrationTestEvent(event);
       controller?.error(error);
       release();
     };
     this.activeStreams.add(terminateFromOwner);
+    let health: AdminUsageProjectionHealth;
+    try {
+      health = await this.projection.readHealth();
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
+      await this.assertActive();
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
+    } catch (error) {
+      terminateFromOwner(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+    const generatedAt = new Date().toISOString();
     const encoder = new TextEncoder();
     return new ReadableStream<Uint8Array>({
       start: streamController => {
@@ -1284,11 +1370,22 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
             firstPull = false;
             chunk = encoder.encode(csvPreamble(this.query, generatedAt, health));
           } else {
-            const page = await this.projection.listReportRows(
-              this.query,
-              cursor,
-              ADMIN_USAGE_CSV_PAGE_SIZE,
-            );
+            queryInFlight += 1;
+            this.#emitIntegrationTestEvent("page-query-start", {queryInFlight});
+            let page: AdminUsageReportPage;
+            try {
+              page = await this.projection.listReportRows(
+                this.query,
+                cursor,
+                ADMIN_USAGE_CSV_PAGE_SIZE,
+              );
+            } finally {
+              queryInFlight -= 1;
+            }
+            this.#emitIntegrationTestEvent("page-query-end", {
+              queryInFlight,
+              rowCount: page.rows.length,
+            });
             if (cancelled) return;
             chunk = encoder.encode(page.rows.map(csvReportRow).join(""));
             cursor = page.nextCursor ?? undefined;
@@ -1299,7 +1396,15 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
           if (chunk.byteLength > ADMIN_USAGE_CSV_MAX_CHUNK_BYTES) {
             throw new Error("Usage report CSV chunk exceeds its bounded buffer.");
           }
-          if (chunk.byteLength > 0) streamController.enqueue(chunk);
+          if (chunk.byteLength > 0) {
+            encodedBytes += chunk.byteLength;
+            this.#emitIntegrationTestEvent("chunk-enqueued", {
+              chunkBytes: chunk.byteLength,
+              encodedBytes,
+              queryInFlight,
+            });
+            streamController.enqueue(chunk);
+          }
           if (complete) {
             streamController.close();
             release();
@@ -1313,14 +1418,33 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
     }, {highWaterMark: 0});
   }
 
+  async cancelCsvExports(): Promise<void> {
+    for (const terminate of this.activeStreams) {
+      terminate(new Error("Usage report CSV export was cancelled."), "stream-control-cancelled");
+    }
+  }
+
   [Symbol.dispose](): void {
     if (this.disposed) return;
     this.disposed = true;
-    for (const terminate of [...this.activeStreams]) {
+    for (const terminate of this.activeStreams) {
       terminate(new Error("Usage report is closed."));
     }
     this.pageCursors.clear();
     this.onDispose();
+    this.#emitIntegrationTestEvent("target-disposed");
+  }
+
+  #emitIntegrationTestEvent(
+      event: UsageReportIntegrationTestEvent["event"],
+      detail: Omit<UsageReportIntegrationTestEvent,
+        "reportId" | "event" | "activeOperations"> = {}): void {
+    emitUsageReportIntegrationTestEvent({
+      reportId: this.reportId,
+      event,
+      activeOperations: this.activeOperations,
+      ...detail,
+    });
   }
 
   async #withOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1363,13 +1487,18 @@ function normalizeAdminUsageRecordDetailRequest(
     throw new TypeError("Usage Record detail request is invalid.");
   }
   const registeredUserRef = normalizeRegisteredUserRef(value.registeredUserRef);
-  if (typeof value.safeRecordRef !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
-        value.safeRecordRef,
-      )) {
+  return {
+    registeredUserRef,
+    safeRecordRef: normalizeAdminUsageRecordReference(value.safeRecordRef),
+  };
+}
+
+function normalizeAdminUsageRecordReference(value: unknown): string {
+  if (typeof value !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
     throw new TypeError("Usage Record reference is invalid.");
   }
-  return {registeredUserRef, safeRecordRef: value.safeRecordRef};
+  return value;
 }
 
 function csvPreamble(
@@ -1630,6 +1759,9 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       request: AdminActionReconciliationRequest): Promise<AdminActionReconciliationResult> {
     await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminActionReconciliationRequest(request);
+    if (normalized.decision !== "reverse") {
+      throw new Error("Unknown Action decisions require a selected Usage detail.");
+    }
     if (!this.overseers) throw new Error("Action reconciliation is not configured.");
     let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
     try {
@@ -1644,6 +1776,40 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       normalized.reason,
       this.adminUserId,
     );
+  }
+
+  async reconcileUnknownRecord(
+      request: AdminUnknownUsageReconciliationRequest,
+  ): Promise<AdminUnknownUsageReconciliationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    const normalized = normalizeAdminUnknownUsageReconciliationRequest(request);
+    if (!this.overseers) throw new Error("Action reconciliation is not configured.");
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    const target = await user.getAdminUnknownUsageActionTarget(normalized.safeRecordRef);
+    let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
+    try {
+      overseer = this.overseers.get(this.overseers.idFromString(target.workspaceId));
+    } catch (error) {
+      throw new Error("Workspace identifier is invalid.", {cause: error});
+    }
+    const result = await overseer.reconcileActionUsage(
+      target.actionId,
+      normalized.operationId,
+      normalized.decision,
+      normalized.reason,
+      this.adminUserId,
+      normalized.safeRecordRef,
+    );
+    return {
+      operationId: result.operationId,
+      decision: result.decision,
+      previousState: result.previousState,
+      newState: result.newState,
+      ledgerEntryId: result.ledgerEntryId,
+      actorUserId: result.actorUserId,
+      reason: result.reason,
+      createdAt: result.createdAt,
+    };
   }
 
   async #resolveUser(
