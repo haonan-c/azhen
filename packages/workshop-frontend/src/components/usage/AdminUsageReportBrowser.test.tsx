@@ -795,7 +795,9 @@ describe("administrator frozen Usage report browser", () => {
     expect(button("Release unknown Action")).toBeUndefined();
   });
 
-  it("refreshes a conflicting unknown decision and removes terminal controls", async () => {
+  it.each(["succeeds", "conflicts"] as const)(
+    "removes stale controls when an operation %s but its authority refresh fails",
+    async operationOutcome => {
     const usageRow: AdminUsageReportRow = {
       ...row("unknown-conflict"),
       meteredKind: "gatekeeper",
@@ -829,11 +831,22 @@ describe("administrator frozen Usage report browser", () => {
         chargeSubunits: 9n,
       },
       reservation: null,
-      ledgerEntries: [],
+      ledgerEntries: [{
+        id: `${usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "x"}:usage-charge`,
+        kind: "usage-charge",
+        deltaSubunits: -9n,
+        createdAt: "2026-08-24T12:00:00.000Z",
+      }],
       reconciliation: null,
     };
     const reconciledDetail = {
       ...detail,
+      ledgerEntries: [...detail.ledgerEntries, {
+        id: `${usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "x"}:credit-reversal`,
+        kind: "credit-reversal" as const,
+        deltaSubunits: 9n,
+        createdAt: "2026-08-24T12:01:00.000Z",
+      }],
       reconciliation: {
         decision: "release" as const,
         actorUserId: "other-admin@example.test",
@@ -843,9 +856,24 @@ describe("administrator frozen Usage report browser", () => {
     };
     const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>()
       .mockResolvedValueOnce(detail)
+      .mockRejectedValueOnce(new Error("Authority refresh is unavailable"))
       .mockResolvedValue(reconciledDetail);
     const reconcileUnknownRecord = vi.fn<AdminUsageApi["reconcileUnknownRecord"]>()
-      .mockRejectedValue(new Error("Decision conflicts with retained authority"));
+      .mockImplementation(async request => {
+        if (operationOutcome === "conflicts") {
+          throw new Error("Decision conflicts with retained authority");
+        }
+        return {
+          operationId: request.operationId,
+          decision: request.decision,
+          previousState: "unknown",
+          newState: "accepted",
+          ledgerEntryId: `${request.safeRecordRef}:usage-charge`,
+          actorUserId: "admin@example.test",
+          reason: request.reason,
+          createdAt: "2026-08-24T12:00:00.000Z",
+        };
+      });
     const current = report([usageRow]);
     await render(usageApi(
       vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
@@ -866,9 +894,21 @@ describe("administrator frozen Usage report browser", () => {
     await act(async () => button("Settle unknown Action")?.click());
 
     await vi.waitFor(() => expect(getRecordDetail).toHaveBeenCalledTimes(2));
-    expect(container?.textContent).toContain("Operation failed");
+    await vi.waitFor(() => expect(container?.textContent)
+      .toContain("This authoritative Usage Record is not available."));
+    expect(container?.textContent).not.toContain("Operation succeeded");
     expect(button("Settle unknown Action")).toBeUndefined();
     expect(button("Release unknown Action")).toBeUndefined();
+    expect(button("Reverse selected charge")).toBeUndefined();
+
+    await act(async () => button("View detail")?.click());
+
+    await vi.waitFor(() => expect(getRecordDetail).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(container?.textContent)
+      .toContain("Another administrator completed this decision"));
+    expect(button("Settle unknown Action")).toBeUndefined();
+    expect(button("Release unknown Action")).toBeUndefined();
+    expect(button("Reverse selected charge")).toBeUndefined();
   });
 
   it("uses a new unknown-operation ID when refreshed authority changes", async () => {

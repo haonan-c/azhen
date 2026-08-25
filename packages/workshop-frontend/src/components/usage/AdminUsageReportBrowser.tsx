@@ -203,7 +203,7 @@ export default function AdminUsageReportBrowser({api}: Props) {
   };
 
   const readDetail = async (row: AdminUsageReportRow, clear = true) => {
-    if (row.rowKind !== "detail") return;
+    if (row.rowKind !== "detail") return false;
     const reportRevision = requestRevision.current;
     const revision = ++detailRevision.current;
     if (clear) setDetail(null);
@@ -216,11 +216,15 @@ export default function AdminUsageReportBrowser({api}: Props) {
       });
       if (reportRevision === requestRevision.current && revision === detailRevision.current) {
         setDetail(next);
+        return true;
       }
+      return false;
     } catch {
       if (reportRevision === requestRevision.current && revision === detailRevision.current) {
+        setDetail(null);
         setDetailError(true);
       }
+      return false;
     }
   };
 
@@ -277,7 +281,7 @@ export default function AdminUsageReportBrowser({api}: Props) {
         api={api}
         registeredUserRef={detailRow?.registeredUserRef ?? null}
         onRefresh={detailRow?.rowKind === "detail"
-          ? () => readDetail(detailRow, false) : async () => undefined}
+          ? () => readDetail(detailRow, false) : async () => false}
         onClose={() => {
           detailRevision.current += 1;
           setDetail(null);
@@ -441,7 +445,7 @@ function DetailPanel({detail, error, api, registeredUserRef, onRefresh, onClose}
   error: boolean;
   api: RpcStub<AdminUsageApi>;
   registeredUserRef: string | null;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<boolean>;
   onClose: () => void;
 }) {
   return <aside role={error ? "alert" : "dialog"} aria-label={messages.admin_usage_detail_title()}
@@ -562,7 +566,7 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
   api: RpcStub<AdminUsageApi>;
   detail: AdminUsageRecordDetail;
   registeredUserRef: string;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<boolean>;
 }) {
   const [amount, setAmount] = useState("");
   const [reason, setReason] = useState("");
@@ -643,7 +647,10 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
       setResult("failed");
     } finally {
       try {
-        if (authorityChangeRequested) await onRefresh();
+        if (authorityChangeRequested) {
+          const refreshed = await onRefresh();
+          if (!refreshed) setResult("failed");
+        }
       } catch {
         setResult("failed");
       } finally {
