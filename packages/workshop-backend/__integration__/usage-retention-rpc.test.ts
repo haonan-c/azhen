@@ -1,10 +1,12 @@
 import {runDurableObjectAlarm} from "cloudflare:test";
 import {exports} from "cloudflare:workers";
-import {newWebSocketRpcSession, type RpcStub} from "capnweb";
+import {newWebSocketRpcSession, RpcStub, RpcTarget} from "capnweb";
 import type {
   AdminUsageApi,
   PricedGatekeeperChargeSnapshot,
   PublicApi,
+  UsageCreditBalance,
+  UsageCreditBalanceSubscriber,
 } from "@gadgets/workshop-shared/api";
 import type {GatekeeperUsageAttribution} from "../src/usage-account.js";
 import {afterEach, describe, expect, it, vi} from "vitest";
@@ -56,6 +58,15 @@ describe("Issue #65 retention and User deletion over real Cap'n Web", () => {
     if (token === null) throw new Error("Expected a fresh ordinary User.");
     using ordinary = await publicApi.authenticate(token);
     expect(await ordinary.getAdminApi()).toBeNull();
+    const balanceSnapshots: UsageCreditBalance[] = [];
+    class Subscriber extends RpcTarget implements UsageCreditBalanceSubscriber {
+      update(balance: UsageCreditBalance): void {
+        balanceSnapshots.push(balance);
+      }
+    }
+    using subscriber = new RpcStub(new Subscriber());
+    using _balanceSubscription = await ordinary.subscribeUsageCreditBalance(subscriber);
+    await vi.waitFor(() => expect(balanceSnapshots).toHaveLength(1));
     using usage = await deploymentAdminUsage(publicApi);
     const registered = (await usage.searchUsers({query: identity})).users[0];
     if (!registered) throw new Error("Expected the activated ordinary User in Registry.");
@@ -94,6 +105,7 @@ describe("Issue #65 retention and User deletion over real Cap'n Web", () => {
     expect((await ordinary.listOwnUsageRecords({limit: 10})).records).toEqual([]);
     expect((await usage.getOverview()).metrics).toEqual(before.metrics);
 
+    const balanceUpdateCountBeforeDeletion = balanceSnapshots.length;
     const deletionId = `delete-rpc-${crypto.randomUUID()}`;
     const deleted = await usage.deleteUsageUser({
       registeredUserRef: registered.registeredUserRef,
@@ -114,6 +126,20 @@ describe("Issue #65 retention and User deletion over real Cap'n Web", () => {
     expect((await usage.searchUsers({query: identity})).users).toEqual([]);
     await expect(ordinary.getUsageCreditBalance())
       .rejects.toThrow("This User has been deleted.");
+    using rejectedSubscriber = new RpcStub(new Subscriber());
+    await expect(ordinary.subscribeUsageCreditBalance(rejectedSubscriber))
+      .rejects.toThrow("This User has been deleted.");
+    const revokedOwnUsageCalls = [
+      () => ordinary.acknowledgeUsageActivationNotice("notice-after-deletion"),
+      () => ordinary.listOwnUsageRecords({limit: 10}),
+      () => ordinary.listOwnCreditReservations({limit: 10}),
+      () => ordinary.listOwnCreditLedger({limit: 10}),
+      () => ordinary.listPublishedApiRates({limit: 10}),
+    ];
+    for (const call of revokedOwnUsageCalls) {
+      await expect(call()).rejects.toThrow("This User has been deleted.");
+    }
+    expect(balanceSnapshots).toHaveLength(balanceUpdateCountBeforeDeletion);
     await expect(publicApi.authenticate(token)).rejects.toThrow("invalid session token");
     expect(await publicApi.login(identity, PASSWORD_HASH)).toBeNull();
     expect((await usage.getOverview()).metrics).toEqual(before.metrics);
