@@ -2,13 +2,20 @@
 // uses. The fixture is a real Gatekeeper Worker; only its provider HTTP endpoint is replaced.
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {dirname, resolve} from "node:path";
+import {fileURLToPath} from "node:url";
 import type { RpcStub } from "capnweb";
 import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
 import type {
   TestPrivateActionContent, TestSession,
 } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import {
-  ADMIN_USERNAME, startTestGatekeeperHarness, TEST_VENDOR_ID, type Harness,
+  ADMIN_USERNAME,
+  startHarness,
+  TEST_GATEKEEPER_BINDING,
+  TEST_GATEKEEPER_DIR,
+  TEST_VENDOR_ID,
+  type Harness,
 } from "../src/harness.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
@@ -19,6 +26,18 @@ import {
 const ACTION_METHOD_KEY = "test.action.apply.v1";
 const ACTION_CHARGE = 25n;
 const ACTION_PROVIDER_ORIGIN = "https://action-provider.gadgets-test.example";
+const HERE = dirname(fileURLToPath(import.meta.url));
+const USAGE_REPORT_INSPECTION_ENTRYPOINT =
+  resolve(HERE, "../fixtures/workshop-usage-report-inspection.mjs");
+const WORKSHOP_WORKER = "workshop-backend";
+const REPORT_TELEMETRY_PATH = "/__integration__/usage-report-telemetry";
+const REPORT_BOOTSTRAP_PATH = "/__integration__/usage-report-bootstrap";
+const REPORT_USER_STATE_PATH = "/__integration__/usage-report-user-state";
+const REPORT_SEED_PATH = "/__integration__/usage-report-seed";
+const CAPNWEB_INITIAL_FLOW_CONTROL_WINDOW_BYTES = 256 * 1024;
+const USAGE_REPORT_MAX_CHUNK_BYTES = 256 * 1024;
+const USAGE_REPORT_SEED_ROWS = 1_024;
+const USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID = `issue63-seed-account-${"a".repeat(179)}`;
 
 let harness: Harness;
 let interceptor: NetworkInterceptor;
@@ -71,7 +90,18 @@ beforeAll(async () => {
     return new Response(null, {status: 204});
   }]);
   interceptor.install();
-  harness = await startTestGatekeeperHarness();
+  harness = await startHarness({
+    gatekeepers: [{binding: TEST_GATEKEEPER_BINDING, dir: TEST_GATEKEEPER_DIR}],
+    patchWorkshop(config) {
+      config.main = USAGE_REPORT_INSPECTION_ENTRYPOINT;
+      Object.assign(config, {
+        durable_objects: {bindings: [
+          {name: "USAGE_TEST_USERS", class_name: "UserDurableObject"},
+          {name: "USAGE_TEST_PROJECTION", class_name: "UsageProjection"},
+        ]},
+      });
+    },
+  });
 
   using publicApi = connect(harness.url);
   using authenticatedAdmin = await signUp(publicApi, ADMIN_USERNAME);
@@ -112,6 +142,85 @@ async function setActionRate(amountSubunits: bigint, reason: string): Promise<vo
     billingMethodKey: ACTION_METHOD_KEY,
     amountSubunits,
   }], reason);
+}
+
+type UsageReportTelemetryEvent = {
+  reportId: string;
+  event: string;
+  activeOperations: number;
+  queryInFlight?: number;
+  rowCount?: number;
+  chunkBytes?: number;
+  encodedBytes?: number;
+};
+
+async function resetUsageReportTelemetry(): Promise<void> {
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_TELEMETRY_PATH}`,
+    {method: "DELETE"},
+  );
+  expect(response.status).toBe(200);
+}
+
+async function readUsageReportTelemetry(): Promise<UsageReportTelemetryEvent[]> {
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_TELEMETRY_PATH}`,
+  );
+  expect(response.status).toBe(200);
+  return (await response.json() as {events: UsageReportTelemetryEvent[]}).events;
+}
+
+async function setUsageReportBootstrapBlocked(blocked: boolean): Promise<void> {
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_BOOTSTRAP_PATH}?blocked=${blocked}`,
+  );
+  expect(response.status).toBe(200);
+}
+
+async function readUsageReportUserState(username: string): Promise<unknown> {
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_USER_STATE_PATH}?username=${encodeURIComponent(username)}`,
+  );
+  expect(response.status).toBe(200);
+  return response.json();
+}
+
+async function waitForNextUnknownUsageReference(
+    username: string,
+    consumed: Set<string>): Promise<string> {
+  const safeRecordRef = await waitFor("a new unknown Usage detail reference", async () => {
+    const state = await readUsageReportUserState(username) as {
+      projectionFacts?: Array<{
+        rowKind?: string;
+        outcome?: string;
+        safeRecordRef?: string;
+      }>;
+    };
+    return state.projectionFacts?.find(fact =>
+      fact.rowKind === "detail" && fact.outcome === "usage-unknown" &&
+      typeof fact.safeRecordRef === "string" && !consumed.has(fact.safeRecordRef))
+      ?.safeRecordRef ?? null;
+  });
+  consumed.add(safeRecordRef);
+  return safeRecordRef;
+}
+
+async function seedUsageReportRows(
+    username: string, workspaceId: string, count: number): Promise<void> {
+  const query = new URLSearchParams({username, workspaceId, count: count.toString()});
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_SEED_PATH}?${query}`,
+  );
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    count,
+    externalAccountId: USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID,
+  });
 }
 
 describe("approved Action billing", () => {
@@ -589,6 +698,10 @@ describe("approved Action billing", () => {
     using admin = await authenticatedAdmin.getAdminApi();
     if (!admin) throw new Error("Expected the deployment administrator capability.");
     using usageAdmin = await admin.getUsageApi();
+    const registered = await waitFor("the Action User to enter the Usage Registry", async () =>
+      (await usageAdmin.searchUsers({query: username, limit: 2})).users
+        .find(candidate => candidate.identity === username) ?? null);
+    const consumedUnknownReferences = new Set<string>();
 
     const settleLabel = `unknown-settle-${crypto.randomUUID()}`;
     await session.requestBillableAction(settleLabel);
@@ -596,15 +709,19 @@ describe("approved Action billing", () => {
       entry.type === "action" && entry.description.title === `Test action ${settleLabel}`);
     if (!settleAction) throw new Error("Expected the settle Action.");
     await workspace.approveAction(settleAction.id);
+    const settleSafeRecordRef = await waitForNextUnknownUsageReference(
+      username,
+      consumedUnknownReferences,
+    );
     const settleRequest = {
-      workspaceId,
-      actionId: settleAction.id,
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: settleSafeRecordRef,
       operationId: `admin-action-settle:${crypto.randomUUID()}`,
       decision: "settle" as const,
       reason: "Provider confirmed that the indeterminate Action executed",
     };
-    const settled = await usageAdmin.reconcileAction(settleRequest);
-    expect(await usageAdmin.reconcileAction(settleRequest)).toEqual(settled);
+    const settled = await usageAdmin.reconcileUnknownRecord(settleRequest);
+    expect(await usageAdmin.reconcileUnknownRecord(settleRequest)).toEqual(settled);
     expect(settled).toMatchObject({
       decision: "settle",
       previousState: "unknown",
@@ -619,7 +736,7 @@ describe("approved Action billing", () => {
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
-    await expect(usageAdmin.reconcileAction({...settleRequest, decision: "release"}))
+    await expect(usageAdmin.reconcileUnknownRecord({...settleRequest, decision: "release"}))
       .rejects.toThrow();
 
     const settledReversal = await usageAdmin.reconcileAction({
@@ -643,9 +760,13 @@ describe("approved Action billing", () => {
       entry.type === "action" && entry.description.title === `Test action ${releaseLabel}`);
     if (!releaseAction) throw new Error("Expected the release Action.");
     await workspace.approveAction(releaseAction.id);
-    const released = await usageAdmin.reconcileAction({
-      workspaceId,
-      actionId: releaseAction.id,
+    const releaseSafeRecordRef = await waitForNextUnknownUsageReference(
+      username,
+      consumedUnknownReferences,
+    );
+    const released = await usageAdmin.reconcileUnknownRecord({
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: releaseSafeRecordRef,
       operationId: `admin-action-release:${crypto.randomUUID()}`,
       decision: "release",
       reason: "Provider confirmed that the indeterminate Action did not execute",
@@ -697,17 +818,21 @@ describe("approved Action billing", () => {
       entry.type === "action" && entry.description.title === `Test action ${concurrentLabel}`);
     if (!concurrentAction) throw new Error("Expected the concurrent reconciliation Action.");
     await workspace.approveAction(concurrentAction.id);
+    const concurrentSafeRecordRef = await waitForNextUnknownUsageReference(
+      username,
+      consumedUnknownReferences,
+    );
     const decisions = await Promise.allSettled([
-      usageAdmin.reconcileAction({
-        workspaceId,
-        actionId: concurrentAction.id,
+      usageAdmin.reconcileUnknownRecord({
+        registeredUserRef: registered.registeredUserRef,
+        safeRecordRef: concurrentSafeRecordRef,
         operationId: `admin-action-concurrent-settle:${crypto.randomUUID()}`,
         decision: "settle",
         reason: "Concurrent administrator confirmed provider acceptance",
       }),
-      usageAdmin.reconcileAction({
-        workspaceId,
-        actionId: concurrentAction.id,
+      usageAdmin.reconcileUnknownRecord({
+        registeredUserRef: registered.registeredUserRef,
+        safeRecordRef: concurrentSafeRecordRef,
         operationId: `admin-action-concurrent-release:${crypto.randomUUID()}`,
         decision: "release",
         reason: "Concurrent administrator confirmed no provider execution",
@@ -716,9 +841,9 @@ describe("approved Action billing", () => {
     expect(decisions.filter(result => result.status === "fulfilled")).toHaveLength(1);
     expect(decisions.filter(result => result.status === "rejected")).toHaveLength(1);
 
-    await expect(usageAdmin.reconcileAction({
-      workspaceId,
-      actionId: releaseAction.id,
+    await expect(usageAdmin.reconcileUnknownRecord({
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: releaseSafeRecordRef,
       operationId: `admin-action-invalid:${crypto.randomUUID()}`,
       decision: "release",
       reason: "   ",
@@ -828,6 +953,7 @@ describe("approved Action billing", () => {
     expect(await user.getAdminApi()).toBeNull();
     const account = await provisionAccount(user);
     using workspace = await user.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
     using gatekeeper = await workspace.newGatekeeper(
       account.id,
       `https://gadgets-test.example/things/report-${crypto.randomUUID()}`,
@@ -845,6 +971,11 @@ describe("approved Action billing", () => {
       error: `ISSUE63_ERROR_${suffix}`,
     };
     const forbiddenSentinels = Object.values(privateContent);
+    expect(USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID).toMatch(/^[A-Za-z0-9._:/@-]{200}$/);
+    expect(USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID).not.toContain(username);
+    for (const sentinel of forbiddenSentinels) {
+      expect(USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID).not.toContain(sentinel);
+    }
     const privacyLabel = `privacy-${suffix}`;
     privacyTracer = {label: privacyLabel, content: privateContent};
     privacyProviderObservation = undefined;
@@ -859,19 +990,40 @@ describe("approved Action billing", () => {
 
     const settledLabels = Array.from({length: 65}, (_value, index) =>
       `reportrow-${index}-${suffix}`);
+    const settledActionIds: number[] = [];
     for (const label of settledLabels) {
       await session.requestBillableAction(label);
       const settled = (await workspace.listActions()).find(entry =>
         entry.type === "action" && entry.description.title === `Test action ${label}`);
       if (!settled) throw new Error("Expected a settled report Action.");
+      settledActionIds.push(settled.id);
       expect(await workspace.approveAction(settled.id)).toBe("accepted");
     }
+    await seedUsageReportRows(username, workspaceId, USAGE_REPORT_SEED_ROWS);
 
     using adminPublicApi = connect(harness.url);
     using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
     using admin = await authenticatedAdmin.getAdminApi();
     if (!admin) throw new Error("Expected the deployment administrator capability.");
     using usage = await admin.getUsageApi();
+    await setUsageReportBootstrapBlocked(true);
+    try {
+      const blockedOpening = usage.openReport({});
+      const [direct, pipelined] = await Promise.allSettled([
+        blockedOpening,
+        blockedOpening.getOverview(),
+      ]);
+      expect(direct).toMatchObject({
+        status: "rejected",
+        reason: {message: "Usage Projection bootstrap is incomplete."},
+      });
+      expect(pipelined).toMatchObject({
+        status: "rejected",
+        reason: {message: "Usage Projection bootstrap is incomplete."},
+      });
+    } finally {
+      await setUsageReportBootstrapBlocked(false);
+    }
     const registered = await waitFor("the report User to enter the authoritative Registry", async () =>
       (await usage.searchUsers({query: username, limit: 2})).users
         .find(candidate => candidate.identity === username) ?? null);
@@ -890,16 +1042,33 @@ describe("approved Action billing", () => {
             error.message.includes("Usage Projection bootstrap is incomplete")) return null;
         throw error;
       }
-      const page = await candidate.listRows({limit: 200});
-      const details = page.rows.filter(item => item.rowKind === "detail" &&
-        item.gatekeeperId === TEST_VENDOR_ID && item.stableMethodKey === ACTION_METHOD_KEY);
-      const row = details.find(item => item.rowKind === "detail" &&
-        item.outcome === "usage-unknown");
-      if (!row || row.rowKind !== "detail" || details.length < 66) {
+      const overview = await candidate.getOverview();
+      if (overview.metrics.meteredUseCount < BigInt(65 + USAGE_REPORT_SEED_ROWS)) {
         candidate[Symbol.dispose]();
         return null;
       }
-      return {candidate, row};
+      const details = [];
+      let cursor: string | undefined;
+      do {
+        const page = await candidate.listRows({limit: 200, cursor});
+        details.push(...page.rows.filter(item => item.rowKind === "detail" &&
+          item.gatekeeperId === TEST_VENDOR_ID && item.stableMethodKey === ACTION_METHOD_KEY));
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor !== undefined);
+      const row = details.find(item => item.rowKind === "detail" &&
+        item.outcome === "usage-unknown");
+      if (!row || row.rowKind !== "detail" ||
+          details.length < 66 + USAGE_REPORT_SEED_ROWS) {
+        candidate[Symbol.dispose]();
+        return null;
+      }
+      const nonUnknownRow = details.find(item => item.rowKind === "detail" &&
+        item.outcome !== "usage-unknown");
+      if (!nonUnknownRow || nonUnknownRow.rowKind !== "detail") {
+        candidate[Symbol.dispose]();
+        return null;
+      }
+      return {candidate, row, nonUnknownRow};
     }, 90_000);
     using report = opened.candidate;
     expect(opened.row.metrics.unknownOperations).toBe(1n);
@@ -926,11 +1095,75 @@ describe("approved Action billing", () => {
       ? value.toString() : value);
     for (const sentinel of forbiddenSentinels) expect(encodedDetail).not.toContain(sentinel);
 
+    await expect(usage.reconcileAction({
+      workspaceId,
+      actionId: settledActionIds[0]!,
+      operationId: `issue63-mismatched-action:${crypto.randomUUID()}`,
+      decision: "settle",
+      reason: "Prove raw Action identifiers cannot settle unknown Usage",
+    })).rejects.toThrow("selected Usage detail");
+    await expect(usage.reconcileUnknownRecord({
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: opened.nonUnknownRow.safeRecordRef,
+      operationId: `issue63-non-unknown-detail:${crypto.randomUUID()}`,
+      decision: "settle",
+      reason: "Prove a terminal detail cannot settle unknown Usage",
+    })).rejects.toThrow();
+    const adminRegistered = await waitFor("the administrator to enter the Usage Registry", async () =>
+      (await usage.searchUsers({query: ADMIN_USERNAME, limit: 2})).users
+        .find(candidate => candidate.identity === ADMIN_USERNAME) ?? null);
+    await expect(usage.reconcileUnknownRecord({
+      registeredUserRef: adminRegistered.registeredUserRef,
+      safeRecordRef: opened.row.safeRecordRef,
+      operationId: `issue63-wrong-user-detail:${crypto.randomUUID()}`,
+      decision: "settle",
+      reason: "Prove a detail cannot cross its registered User boundary",
+    })).rejects.toThrow();
+    const settleRequest = {
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: opened.row.safeRecordRef,
+      operationId: `issue63-private-action-settle:${crypto.randomUUID()}`,
+      decision: "settle" as const,
+      reason: "Confirm the controlled private-content Action executed",
+    };
+    const settled = await usage.reconcileUnknownRecord(settleRequest);
+    expect(await usage.reconcileUnknownRecord(settleRequest)).toEqual(settled);
+    const userState = await waitFor("private Action Ledger and outbox state", async () => {
+      const state = await readUsageReportUserState(username);
+      const encoded = JSON.stringify(state);
+      return encoded.includes("usage-charge") && encoded.includes("reconciled-settled")
+        ? encoded : null;
+    });
+    for (const sentinel of forbiddenSentinels) expect(userState).not.toContain(sentinel);
+
+    await resetUsageReportTelemetry();
     const slowReader = (await report.exportCsv()).getReader();
     const metadataChunk = await slowReader.read();
     if (metadataChunk.done) throw new Error("Expected the report metadata chunk.");
     expect(metadataChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
     await new Promise(resolve => setTimeout(resolve, 100));
+    const reservedTelemetry = await readUsageReportTelemetry();
+    const reportId = reservedTelemetry.find(event => event.event === "stream-reserved")?.reportId;
+    if (!reportId) throw new Error("Expected server-private report telemetry.");
+    const prefetchEvents = reservedTelemetry.filter(event => event.reportId === reportId);
+    const prefetchQueries = prefetchEvents.filter(event => event.event === "page-query-start");
+    expect(prefetchQueries.length).toBeGreaterThan(0);
+    expect(prefetchEvents.filter(event => event.event === "page-query-end").length)
+      .toBe(prefetchQueries.length);
+    expect(prefetchQueries.every(event => event.queryInFlight === 1)).toBe(true);
+    expect(prefetchEvents.filter(event => event.event === "page-query-end")
+      .every(event => event.queryInFlight === 0 && (event.rowCount ?? 65) <= 64)).toBe(true);
+    const prefetchedRows = prefetchEvents.filter(event => event.event === "page-query-end")
+      .reduce((total, event) => total + (event.rowCount ?? 0), 0);
+    expect(prefetchedRows).toBeLessThan(66 + USAGE_REPORT_SEED_ROWS);
+    const prefetchChunks = prefetchEvents.filter(event => event.event === "chunk-enqueued");
+    expect(prefetchChunks.every(event =>
+      (event.chunkBytes ?? USAGE_REPORT_MAX_CHUNK_BYTES + 1) <=
+        USAGE_REPORT_MAX_CHUNK_BYTES)).toBe(true);
+    const prefetchedBytes = Math.max(...prefetchChunks.map(event => event.encodedBytes ?? 0));
+    expect(prefetchedBytes).toBeLessThanOrEqual(
+      CAPNWEB_INITIAL_FLOW_CONTROL_WINDOW_BYTES + USAGE_REPORT_MAX_CHUNK_BYTES,
+    );
     const dataChunk = await slowReader.read();
     if (dataChunk.done) throw new Error("Expected a real SQLite report data page.");
     const dataRows = new TextDecoder().decode(dataChunk.value)
@@ -939,7 +1172,60 @@ describe("approved Action billing", () => {
     expect(dataRows.length).toBeLessThanOrEqual(64);
     expect(dataChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
     await new Promise(resolve => setTimeout(resolve, 100));
+    const pausedTelemetry = await readUsageReportTelemetry();
+    const completedPagesAtPause = pausedTelemetry.filter(event =>
+      event.reportId === reportId && event.event === "page-query-end");
+    const chunksAtPause = pausedTelemetry.filter(event =>
+      event.reportId === reportId && event.event === "chunk-enqueued");
+    const queriesAtPause = pausedTelemetry.filter(event => event.reportId === reportId &&
+      event.event === "page-query-start").length;
+    const bytesAtPause = Math.max(...chunksAtPause.map(event => event.encodedBytes ?? 0));
+    const maxPageRows = Math.max(...completedPagesAtPause.map(event => event.rowCount ?? 0));
+    const maxChunkBytes = Math.max(...chunksAtPause.map(event => event.chunkBytes ?? 0));
+    expect(queriesAtPause).toBeGreaterThanOrEqual(prefetchQueries.length);
+    expect(bytesAtPause).toBeLessThanOrEqual(
+      prefetchedBytes + metadataChunk.value.byteLength + dataChunk.value.byteLength +
+        USAGE_REPORT_MAX_CHUNK_BYTES,
+    );
+    expect(completedPagesAtPause.every(event =>
+      event.queryInFlight === 0 && (event.rowCount ?? 65) <= 64)).toBe(true);
+    const rowsAtPause = completedPagesAtPause
+      .reduce((total, event) => total + (event.rowCount ?? 0), 0);
+    expect(rowsAtPause).toBeLessThan(66 + USAGE_REPORT_SEED_ROWS);
+    expect(chunksAtPause.every(event =>
+      (event.chunkBytes ?? USAGE_REPORT_MAX_CHUNK_BYTES + 1) <=
+        USAGE_REPORT_MAX_CHUNK_BYTES)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const pausedAgain = await readUsageReportTelemetry();
+    expect(pausedAgain.filter(event => event.reportId === reportId &&
+      event.event === "page-query-start")).toHaveLength(queriesAtPause);
+    expect(Math.max(...pausedAgain.filter(event =>
+      event.reportId === reportId && event.event === "chunk-enqueued")
+      .map(event => event.encodedBytes ?? 0))).toBe(bytesAtPause);
+    expect(pausedAgain.some(event => event.reportId === reportId &&
+      event.event === "stream-released")).toBe(false);
     await slowReader.cancel("Issue #63 slow-consumer cancellation");
+    await report.cancelCsvExports();
+    await waitFor("the cancelled report stream to release its server slot", async () => {
+      const events = await readUsageReportTelemetry();
+      return events.some(event => event.reportId === reportId &&
+        event.event === "stream-control-cancelled") && events.some(event =>
+        event.reportId === reportId && event.event === "stream-released") ? events : null;
+    });
+    const queriesAfterCancel = (await readUsageReportTelemetry()).filter(event =>
+      event.reportId === reportId && event.event === "page-query-start").length;
+    const bytesAfterCancel = Math.max(...(await readUsageReportTelemetry()).filter(event =>
+      event.reportId === reportId && event.event === "chunk-enqueued")
+      .map(event => event.encodedBytes ?? 0));
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const afterCancel = await readUsageReportTelemetry();
+    expect(afterCancel.filter(event =>
+      event.reportId === reportId && event.event === "page-query-start")).toHaveLength(
+        queriesAfterCancel,
+      );
+    expect(Math.max(...afterCancel.filter(event =>
+      event.reportId === reportId && event.event === "chunk-enqueued")
+      .map(event => event.encodedBytes ?? 0))).toBe(bytesAfterCancel);
     expect((await report.listRows({limit: 1})).rows).toHaveLength(1);
 
     const replacementOne = (await report.exportCsv()).getReader();
@@ -950,9 +1236,43 @@ describe("approved Action billing", () => {
     await replacementTwo.cancel("prove the second replacement slot is releasable");
 
     const csv = await new Response(await report.exportCsv()).text();
+    const totalCsvBytes = new TextEncoder().encode(csv).byteLength;
+    expect(prefetchedBytes * 2).toBeLessThan(totalCsvBytes);
+    console.info("Issue #63 Cap'n Web flow-control measurement", {
+      authoritativeDetailRows: 66 + USAGE_REPORT_SEED_ROWS,
+      metadataPauseQueries: prefetchQueries.length,
+      dataPauseQueries: queriesAtPause,
+      metadataPauseRows: prefetchedRows,
+      dataPauseRows: rowsAtPause,
+      metadataPauseBytes: prefetchedBytes,
+      dataPauseBytes: bytesAtPause,
+      cancelQueries: queriesAfterCancel,
+      cancelBytes: bytesAfterCancel,
+      cancelQueryDelta: queriesAfterCancel - queriesAtPause,
+      cancelByteDelta: bytesAfterCancel - bytesAtPause,
+      maxPageRows,
+      maxChunkBytes,
+      totalCsvBytes,
+    });
     expect(csv).toContain("schema_version,admin-usage-v1\r\n");
     expect(csv).toContain(opened.row.safeRecordRef);
     expect(csv).toContain(ACTION_CHARGE.toString());
     for (const sentinel of forbiddenSentinels) expect(csv).not.toContain(sentinel);
-  }, 180_000);
+
+    const siblings = await Promise.all(Array.from({length: 3}, () =>
+      usage.openReport(reportFilter)));
+    try {
+      await expect(usage.openReport(reportFilter)).rejects.toThrow(
+        "Too many Usage reports are open.",
+      );
+      report[Symbol.dispose]();
+      await waitFor("the report target disposer telemetry", async () =>
+        (await readUsageReportTelemetry()).some(event =>
+          event.reportId === reportId && event.event === "target-disposed") || null);
+      using replacementTarget = await usage.openReport(reportFilter);
+      expect((await replacementTarget.listRows({limit: 1})).rows).toHaveLength(1);
+    } finally {
+      for (const sibling of siblings) sibling[Symbol.dispose]();
+    }
+  }, 300_000);
 });
