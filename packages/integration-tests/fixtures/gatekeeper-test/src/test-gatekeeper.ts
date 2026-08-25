@@ -236,9 +236,20 @@ export class TestVerifier
 export interface TestSession {
   requestAction(label: string): Promise<void>;
   requestBillableAction(label: string, providerIdempotency?: "supported"): Promise<void>;
+  requestPrivateBillableAction(label: string, content: TestPrivateActionContent): Promise<void>;
   requestAutoApprovableAction(label: string): Promise<void>;
   requestUnpricedAction(label: string): Promise<void>;
 }
+
+export type TestPrivateActionContent = {
+  prompt: string;
+  output: string;
+  args: string;
+  header: string;
+  token: string;
+  body: string;
+  error: string;
+};
 
 type TestActionExecutionRecord = {
   billingOperationId: string;
@@ -264,6 +275,15 @@ class TestSessionImpl extends RpcTarget implements TestSession {
     await this.#requestAction(label, ACTION_METHOD_KEY, providerIdempotency);
   }
 
+  async requestPrivateBillableAction(
+      label: string, content: TestPrivateActionContent): Promise<void> {
+    if (Object.values(content).some(value =>
+      typeof value !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(value))) {
+      throw new TypeError("Invalid private Action tracer content.");
+    }
+    await this.#requestAction(label, ACTION_METHOD_KEY, undefined, false, content);
+  }
+
   async requestAutoApprovableAction(label: string): Promise<void> {
     await this.#requestAction(label, ACTION_METHOD_KEY, undefined, true);
   }
@@ -277,6 +297,7 @@ class TestSessionImpl extends RpcTarget implements TestSession {
       methodKey: string,
       providerIdempotency?: "supported",
       autoApprovable = false,
+      privateContent?: TestPrivateActionContent,
   ): Promise<void> {
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(label)) throw new TypeError("Invalid test action label.");
     let action = this.state.storage.kv.get<number>(`action-label:${label}`);
@@ -285,9 +306,12 @@ class TestSessionImpl extends RpcTarget implements TestSession {
       this.state.storage.kv.put("next-action", action + 1);
       this.state.storage.kv.put(`action-label:${label}`, action);
       this.state.storage.kv.put(`action:${action}`, label);
+      if (privateContent !== undefined) {
+        this.state.storage.kv.put(`private-action:${action}`, privateContent);
+      }
     }
     await this.approvalQueue.submitAction(action, {
-      title: `Test action ${label}`,
+      title: `Test action ${label}${privateContent ? ` ${privateContent.args}` : ""}`,
       billing: {
         methodKey,
         externalAccountId: this.accountLabel,
@@ -296,7 +320,9 @@ class TestSessionImpl extends RpcTarget implements TestSession {
       ...(autoApprovable
         ? {actionKind: {tag: "test-write", label: "Test writes"}, autoApprovable: true}
         : {}),
-      description: "A delayed action used only by the Usage Principal integration tracer.",
+      description: privateContent
+        ? `${privateContent.prompt} ${privateContent.output}`
+        : "A delayed action used only by the Usage Principal integration tracer.",
       implementsRevert: true,
       awaitDecision: true,
     });
@@ -365,6 +391,9 @@ export class TestGatekeeper
       action: number, execution: ActionExecution): Promise<ActionExecutionResult> {
     const label = this.ctx.storage.kv.get<string>(`action:${action}`);
     if (!label) throw new Error("No such test action.");
+    const privateContent = this.ctx.storage.kv.get<TestPrivateActionContent>(
+      `private-action:${action}`,
+    );
     if (!execution) {
       throw new Error("Test Actions require a billing execution context.");
     }
@@ -419,9 +448,22 @@ export class TestGatekeeper
     try {
       const response = await fetch(`${ACTION_PROVIDER_ORIGIN}/effects/${label}`, {
         method: "POST",
-        ...(record.providerIdempotencyKey
-          ? {headers: {"idempotency-key": record.providerIdempotencyKey}}
-          : {}),
+        ...(record.providerIdempotencyKey || privateContent
+          ? {headers: {
+            ...(record.providerIdempotencyKey
+              ? {"idempotency-key": record.providerIdempotencyKey} : {}),
+            ...(privateContent ? {
+              "x-test-private-header": privateContent.header,
+              authorization: `Bearer ${privateContent.token}`,
+              "content-type": "application/json",
+            } : {}),
+          }} : {}),
+        ...(privateContent ? {body: JSON.stringify({
+          prompt: privateContent.prompt,
+          output: privateContent.output,
+          args: privateContent.args,
+          body: privateContent.body,
+        })} : {}),
       });
       if (!response.ok) throw new Error("The test Action provider returned an indeterminate error.");
     } catch (error) {

@@ -1,10 +1,12 @@
 // Crash-safe billing for delayed Gatekeeper Actions through the same Workshop RPC seam the browser
 // uses. The fixture is a real Gatekeeper Worker; only its provider HTTP endpoint is replaced.
 
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { RpcStub } from "capnweb";
 import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
-import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
+import type {
+  TestPrivateActionContent, TestSession,
+} from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import {
   ADMIN_USERNAME, startTestGatekeeperHarness, TEST_VENDOR_ID, type Harness,
 } from "../src/harness.js";
@@ -27,9 +29,16 @@ let rateBarrier: {
   reached: () => void;
   release: Promise<void>;
 } | undefined;
+let privacyTracer: {label: string; content: TestPrivateActionContent} | undefined;
+let privacyProviderObservation: string | undefined;
+
+afterEach(() => {
+  privacyTracer = undefined;
+  privacyProviderObservation = undefined;
+});
 
 beforeAll(async () => {
-  interceptor = new NetworkInterceptor([async (url, _method, headers) => {
+  interceptor = new NetworkInterceptor([async (url, _method, headers, request) => {
     if (url.origin !== ACTION_PROVIDER_ORIGIN) return null;
     providerCalls.push({
       url: url.toString(),
@@ -38,6 +47,15 @@ beforeAll(async () => {
     if (rateBarrier && url.pathname === `/effects/${rateBarrier.label}`) {
       rateBarrier.reached();
       await rateBarrier.release;
+    }
+    if (privacyTracer && url.pathname === `/effects/${privacyTracer.label}`) {
+      privacyProviderObservation = JSON.stringify({
+        header: headers.get("x-test-private-header"),
+        token: headers.get("authorization"),
+        body: await request.text(),
+        errorBody: privacyTracer.content.error,
+      });
+      return new Response(privacyTracer.content.error, {status: 502});
     }
     if (url.pathname.startsWith("/effects/unknown-")) {
       throw new Error("The provider response was lost after dispatch.");
@@ -816,12 +834,38 @@ describe("approved Action billing", () => {
     );
     if (!gatekeeper) throw new Error("Expected the test Gatekeeper.");
     using session = await gatekeeper.openSession() as RpcStub<TestSession>;
-    const forbiddenSentinel = `ISSUE63_PRIVATE_CONTENT_${crypto.randomUUID()}`;
-    await session.requestBillableAction(forbiddenSentinel);
+    const suffix = crypto.randomUUID().replaceAll("-", "");
+    const privateContent: TestPrivateActionContent = {
+      prompt: `ISSUE63_PROMPT_${suffix}`,
+      output: `ISSUE63_OUTPUT_${suffix}`,
+      args: `ISSUE63_ARGS_${suffix}`,
+      header: `ISSUE63_HEADER_${suffix}`,
+      token: `ISSUE63_TOKEN_${suffix}`,
+      body: `ISSUE63_BODY_${suffix}`,
+      error: `ISSUE63_ERROR_${suffix}`,
+    };
+    const forbiddenSentinels = Object.values(privateContent);
+    const privacyLabel = `privacy-${suffix}`;
+    privacyTracer = {label: privacyLabel, content: privateContent};
+    privacyProviderObservation = undefined;
+    await session.requestPrivateBillableAction(privacyLabel, privateContent);
     const action = (await workspace.listActions()).find(entry =>
-      entry.type === "action" && entry.description.title === `Test action ${forbiddenSentinel}`);
+      entry.type === "action" && entry.description.title.includes(privacyLabel));
     if (!action) throw new Error("Expected the report Action.");
-    await workspace.approveAction(action.id);
+    expect(await workspace.approveAction(action.id)).toBe("unknown");
+    for (const sentinel of forbiddenSentinels) {
+      expect(privacyProviderObservation).toContain(sentinel);
+    }
+
+    const settledLabels = Array.from({length: 65}, (_value, index) =>
+      `reportrow-${index}-${suffix}`);
+    for (const label of settledLabels) {
+      await session.requestBillableAction(label);
+      const settled = (await workspace.listActions()).find(entry =>
+        entry.type === "action" && entry.description.title === `Test action ${label}`);
+      if (!settled) throw new Error("Expected a settled report Action.");
+      expect(await workspace.approveAction(settled.id)).toBe("accepted");
+    }
 
     using adminPublicApi = connect(harness.url);
     using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
@@ -831,27 +875,37 @@ describe("approved Action billing", () => {
     const registered = await waitFor("the report User to enter the authoritative Registry", async () =>
       (await usage.searchUsers({query: username, limit: 2})).users
         .find(candidate => candidate.identity === username) ?? null);
-    const opened = await waitFor("the Usage detail fact to reach Projection", async () => {
-      const candidate = await usage.openReport({
-        registeredUserRefs: [registered.registeredUserRef],
-        gatekeeperIds: [TEST_VENDOR_ID],
-        methods: [{gatekeeperId: TEST_VENDOR_ID, stableMethodKey: ACTION_METHOD_KEY}],
-        meteredKinds: ["gatekeeper"],
-      });
-      const page = await candidate.listRows({limit: 50});
-      const row = page.rows.find(item => item.rowKind === "detail" &&
+    const reportFilter = {
+      registeredUserRefs: [registered.registeredUserRef],
+      gatekeeperIds: [TEST_VENDOR_ID],
+      methods: [{gatekeeperId: TEST_VENDOR_ID, stableMethodKey: ACTION_METHOD_KEY}],
+      meteredKinds: ["gatekeeper" as const],
+    };
+    const opened = await waitFor("all Usage detail facts to reach Projection", async () => {
+      let candidate;
+      try {
+        candidate = await usage.openReport(reportFilter);
+      } catch (error) {
+        if (error instanceof Error &&
+            error.message.includes("Usage Projection bootstrap is incomplete")) return null;
+        throw error;
+      }
+      const page = await candidate.listRows({limit: 200});
+      const details = page.rows.filter(item => item.rowKind === "detail" &&
         item.gatekeeperId === TEST_VENDOR_ID && item.stableMethodKey === ACTION_METHOD_KEY);
-      if (!row || row.rowKind !== "detail") {
+      const row = details.find(item => item.rowKind === "detail" &&
+        item.outcome === "usage-unknown");
+      if (!row || row.rowKind !== "detail" || details.length < 66) {
         candidate[Symbol.dispose]();
         return null;
       }
       return {candidate, row};
-    });
+    }, 90_000);
     using report = opened.candidate;
-    expect(opened.row.metrics.billableApiOperations).toBe(1n);
-    expect(opened.row.metrics.chargedUsageCreditSubunits).toBe(ACTION_CHARGE);
-    expect(JSON.stringify(opened.row, (_key, value) => typeof value === "bigint"
-      ? value.toString() : value)).not.toContain(forbiddenSentinel);
+    expect(opened.row.metrics.unknownOperations).toBe(1n);
+    const encodedRow = JSON.stringify(opened.row, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value);
+    for (const sentinel of forbiddenSentinels) expect(encodedRow).not.toContain(sentinel);
 
     const detail = await usage.getRecordDetail({
       registeredUserRef: registered.registeredUserRef,
@@ -863,26 +917,42 @@ describe("approved Action billing", () => {
         kind: "gatekeeper",
         vendorId: TEST_VENDOR_ID,
         billingMethodKey: ACTION_METHOD_KEY,
-        outcome: "settled",
-        chargeSubunits: ACTION_CHARGE,
+        outcome: "usage-unknown",
+        chargeSubunits: null,
       },
-      reservation: {state: "settled"},
+      reservation: {state: "reserved"},
     });
-    expect(JSON.stringify(detail, (_key, value) => typeof value === "bigint"
-      ? value.toString() : value)).not.toContain(forbiddenSentinel);
+    const encodedDetail = JSON.stringify(detail, (_key, value) => typeof value === "bigint"
+      ? value.toString() : value);
+    for (const sentinel of forbiddenSentinels) expect(encodedDetail).not.toContain(sentinel);
 
     const slowReader = (await report.exportCsv()).getReader();
-    const firstChunk = await slowReader.read();
-    if (firstChunk.done) throw new Error("Expected the report metadata chunk.");
-    expect(firstChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
+    const metadataChunk = await slowReader.read();
+    if (metadataChunk.done) throw new Error("Expected the report metadata chunk.");
+    expect(metadataChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const dataChunk = await slowReader.read();
+    if (dataChunk.done) throw new Error("Expected a real SQLite report data page.");
+    const dataRows = new TextDecoder().decode(dataChunk.value)
+      .split("\r\n").filter(Boolean);
+    expect(dataRows.length).toBeGreaterThan(0);
+    expect(dataRows.length).toBeLessThanOrEqual(64);
+    expect(dataChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
     await new Promise(resolve => setTimeout(resolve, 100));
     await slowReader.cancel("Issue #63 slow-consumer cancellation");
     expect((await report.listRows({limit: 1})).rows).toHaveLength(1);
+
+    const replacementOne = (await report.exportCsv()).getReader();
+    const replacementTwo = (await report.exportCsv()).getReader();
+    expect((await replacementOne.read()).done).toBe(false);
+    expect((await replacementTwo.read()).done).toBe(false);
+    await replacementOne.cancel("prove the first replacement slot is releasable");
+    await replacementTwo.cancel("prove the second replacement slot is releasable");
 
     const csv = await new Response(await report.exportCsv()).text();
     expect(csv).toContain("schema_version,admin-usage-v1\r\n");
     expect(csv).toContain(opened.row.safeRecordRef);
     expect(csv).toContain(ACTION_CHARGE.toString());
-    expect(csv).not.toContain(forbiddenSentinel);
-  });
+    for (const sentinel of forbiddenSentinels) expect(csv).not.toContain(sentinel);
+  }, 180_000);
 });
