@@ -833,15 +833,23 @@ describe("DeepSeek Agent billing", () => {
     using admin = await authenticatedAdmin.getAdminApi();
     if (!admin) throw new Error("Expected the deployment administrator capability.");
     using usageAdmin = await admin.getUsageApi();
+    const registered = await waitFor("the delayed Action User Registry entry", async () =>
+      (await usageAdmin.searchUsers({query: submitterName, limit: 2})).users
+        .find(candidate => candidate.identity === submitterName) ?? null);
+    using detailPublicApi = connect(harness.url);
+    using detailUser = await signIn(detailPublicApi, submitterName);
+    const unknown = await waitFor("the delayed unknown Usage detail", async () =>
+      (await detailUser.listOwnUsageRecords({limit: 20})).records.find(record =>
+        record.kind === "gatekeeper" && record.outcome === "usage-unknown") ?? null);
     const reconciliationRequest = {
-      workspaceId,
-      actionId: pending.id,
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: unknown.id,
       operationId: `admin-action-settle:${crypto.randomUUID()}`,
       decision: "settle" as const,
       reason: "Provider confirmed that the delayed Action executed",
     };
-    const reconciliation = await usageAdmin.reconcileAction(reconciliationRequest);
-    expect(await usageAdmin.reconcileAction(reconciliationRequest)).toEqual(reconciliation);
+    const reconciliation = await usageAdmin.reconcileUnknownRecord(reconciliationRequest);
+    expect(await usageAdmin.reconcileUnknownRecord(reconciliationRequest)).toEqual(reconciliation);
     await Promise.race([
       assistanceCall,
       new Promise<never>((_resolve, reject) =>

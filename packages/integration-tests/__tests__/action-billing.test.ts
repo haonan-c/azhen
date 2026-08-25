@@ -34,6 +34,7 @@ const REPORT_TELEMETRY_PATH = "/__integration__/usage-report-telemetry";
 const REPORT_BOOTSTRAP_PATH = "/__integration__/usage-report-bootstrap";
 const REPORT_USER_STATE_PATH = "/__integration__/usage-report-user-state";
 const REPORT_SEED_PATH = "/__integration__/usage-report-seed";
+const REPORT_LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
 const CAPNWEB_INITIAL_FLOW_CONTROL_WINDOW_BYTES = 256 * 1024;
 const USAGE_REPORT_MAX_CHUNK_BYTES = 256 * 1024;
 const USAGE_REPORT_SEED_ROWS = 1_024;
@@ -98,6 +99,7 @@ beforeAll(async () => {
         durable_objects: {bindings: [
           {name: "USAGE_TEST_USERS", class_name: "UserDurableObject"},
           {name: "USAGE_TEST_PROJECTION", class_name: "UsageProjection"},
+          {name: "USAGE_TEST_OVERSEERS", class_name: "OverseerDurableObject"},
         ]},
       });
     },
@@ -221,6 +223,16 @@ async function seedUsageReportRows(
     count,
     externalAccountId: USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID,
   });
+}
+
+async function makeUnknownActionLegacy(
+    username: string, workspaceId: string, safeRecordRef: string): Promise<void> {
+  const query = new URLSearchParams({username, workspaceId, safeRecordRef});
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_LEGACY_ACTION_PATH}?${query}`,
+  );
+  expect(response.status).toBe(200);
 }
 
 describe("approved Action billing", () => {
@@ -729,7 +741,7 @@ describe("approved Action billing", () => {
       actorUserId: ADMIN_USERNAME,
       reason: settleRequest.reason,
     });
-    expect(settled.ledgerEntryId).toMatch(/^usage-credit-charge:/);
+    expect(settled.ledgerEntryId).toBe(`${settleSafeRecordRef}:usage-charge`);
     expect((await workspace.listActions()).find(entry => entry.id === settleAction.id)?.state)
       .toBe("accepted");
     expect(await user.getUsageCreditBalance()).toMatchObject({
@@ -848,6 +860,72 @@ describe("approved Action billing", () => {
       decision: "release",
       reason: "   ",
     })).rejects.toThrow();
+  });
+
+  it("migrates a second-page legacy Action and coordinates retained authority after deletion",
+      async () => {
+    using publicApi = connect(harness.url);
+    const [username] = nextUsernames("actionlegacydeleted");
+    using user = await signUp(publicApi, username);
+    const account = await provisionAccount(user);
+    using workspace = await user.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
+    using gatekeeper = await workspace.newGatekeeper(
+      account.id,
+      `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
+    );
+    if (!gatekeeper) throw new Error("Expected the test Gatekeeper.");
+    using session = await gatekeeper.openSession() as RpcStub<TestSession>;
+
+    for (let index = 0; index < 64; index += 1) {
+      await session.requestBillableAction(`legacy-index-filler-${index}-${crypto.randomUUID()}`);
+    }
+    const targetLabel = `unknown-legacy-second-page-${crypto.randomUUID()}`;
+    await session.requestBillableAction(targetLabel);
+    const target = (await workspace.listActions()).find(entry =>
+      entry.type === "action" && entry.description.title === `Test action ${targetLabel}`);
+    if (!target) throw new Error("Expected the second-page legacy Action.");
+    expect(target.id).toBeGreaterThanOrEqual(64);
+    await workspace.approveAction(target.id);
+    const safeRecordRef = await waitForNextUnknownUsageReference(username, new Set());
+
+    using adminPublicApi = connect(harness.url);
+    using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
+    using admin = await authenticatedAdmin.getAdminApi();
+    if (!admin) throw new Error("Expected the deployment administrator capability.");
+    using usage = await admin.getUsageApi();
+    const registered = await waitFor("the legacy User Registry entry", async () =>
+      (await usage.searchUsers({query: username, limit: 2})).users
+        .find(candidate => candidate.identity === username) ?? null);
+    await makeUnknownActionLegacy(username, workspaceId, safeRecordRef);
+    await usage.deleteUsageUser({
+      registeredUserRef: registered.registeredUserRef,
+      deletionId: `delete-legacy-action-user-${crypto.randomUUID()}`,
+      reason: "Prove deleted identity cannot erase retained unknown financial authority",
+    });
+    expect((await usage.searchUsers({query: username, limit: 2})).users).toEqual([]);
+    await expect(user.getUsageCreditBalance()).rejects.toThrow("deleted");
+
+    const request = {
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef,
+      operationId: `legacy-second-page-settle:${crypto.randomUUID()}`,
+      decision: "settle" as const,
+      reason: "Provider confirmed the retained pre-upgrade Action executed",
+    };
+    await expect(usage.reconcileUnknownRecord(request))
+      .rejects.toThrow("Legacy Action authority is being prepared");
+    const settled = await usage.reconcileUnknownRecord(request);
+    expect(await usage.reconcileUnknownRecord(request)).toEqual(settled);
+    expect(settled).toMatchObject({
+      operationId: request.operationId,
+      decision: "settle",
+      previousState: "unknown",
+      newState: "accepted",
+      ledgerEntryId: `${safeRecordRef}:usage-charge`,
+      actorUserId: ADMIN_USERNAME,
+    });
+    expect((await usage.searchUsers({query: username, limit: 2})).users).toEqual([]);
   });
 
   it("reverts an accepted Action without charging or reversing its original charge", async () => {
@@ -1101,7 +1179,7 @@ describe("approved Action billing", () => {
       operationId: `issue63-mismatched-action:${crypto.randomUUID()}`,
       decision: "settle",
       reason: "Prove raw Action identifiers cannot settle unknown Usage",
-    })).rejects.toThrow("selected Usage detail");
+    } as never)).rejects.toThrow("decision is invalid");
     await expect(usage.reconcileUnknownRecord({
       registeredUserRef: registered.registeredUserRef,
       safeRecordRef: opened.nonUnknownRow.safeRecordRef,

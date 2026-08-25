@@ -3,6 +3,7 @@
 // the local integration harness. The shipping Worker entrypoint never imports this module.
 
 import workshop, {
+  OverseerDurableObject as ProductionOverseerDurableObject,
   UsageProjection as ProductionUsageProjection,
   UserDurableObject as ProductionUserDurableObject,
 } from "../../workshop-backend/.wrangler/validate/src/server.js";
@@ -17,6 +18,7 @@ const TELEMETRY_PATH = "/__integration__/usage-report-telemetry";
 const BOOTSTRAP_PATH = "/__integration__/usage-report-bootstrap";
 const USER_STATE_PATH = "/__integration__/usage-report-user-state";
 const SEED_PATH = "/__integration__/usage-report-seed";
+const LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
 const MAX_TELEMETRY_EVENTS = 4_096;
 const SEED_EXTERNAL_ACCOUNT_ID = `issue63-seed-account-${"a".repeat(179)}`;
 const telemetryEvents = [];
@@ -85,6 +87,31 @@ export class UserDurableObject extends ProductionUserDurableObject {
       projectionFacts: snapshot.projectionFacts,
     };
   }
+
+  /** Remove only the new Action locator to reproduce one retained pre-upgrade unknown record. */
+  makeUnknownUsageLegacyForTest(safeRecordRef) {
+    const account = new UsageAccount(this.ctx.storage);
+    const locator = account.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper") throw new Error("Unknown Usage detail is invalid.");
+    const key = `usageAccount:gatekeeperUsageRecord:${locator.operationId}`;
+    const record = this.ctx.storage.kv.get(key);
+    if (!record || record.outcome !== "usage-unknown") {
+      throw new Error("Unknown Usage authority is unavailable.");
+    }
+    const {actionId: _actionId, ...attribution} = record.attribution;
+    this.ctx.storage.kv.put(key, {...record, attribution});
+  }
+}
+
+/** Production Overseer with a test-only seam that reproduces an unbuilt legacy Action index. */
+export class OverseerDurableObject extends ProductionOverseerDurableObject {
+  /** Clear only the new compatibility index so bounded migration must rebuild it from Actions. */
+  resetBillingActionAuthorityIndexForTest() {
+    for (const record of Array.from(this.impl.storage.billingActionAuthorities.list())) {
+      this.impl.storage.billingActionAuthorities.delete(record.billingOperationId);
+    }
+    this.impl.storage.billingActionAuthorityMigrationCursor.put(-1);
+  }
 }
 
 /** Production Projection with one explicit test-only bootstrap pause seam. */
@@ -134,6 +161,21 @@ export default {
       return new Response(serialize(await user.seedUsageReportingForTest(count, workspaceId)), {
         headers: {"content-type": "application/json"},
       });
+    }
+    if (url.pathname === LEGACY_ACTION_PATH) {
+      const username = url.searchParams.get("username");
+      const workspaceId = url.searchParams.get("workspaceId");
+      const safeRecordRef = url.searchParams.get("safeRecordRef");
+      if (!username || !workspaceId || !safeRecordRef) {
+        return new Response("Missing legacy Action input.", {status: 400});
+      }
+      const user = env.USAGE_TEST_USERS.get(env.USAGE_TEST_USERS.idFromName(username));
+      await user.makeUnknownUsageLegacyForTest(safeRecordRef);
+      const overseer = env.USAGE_TEST_OVERSEERS.get(
+        env.USAGE_TEST_OVERSEERS.idFromString(workspaceId),
+      );
+      await overseer.resetBillingActionAuthorityIndexForTest();
+      return new Response("ok");
     }
     return workshop.fetch(request, env, ctx);
   },
