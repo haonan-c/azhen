@@ -13,6 +13,7 @@ import {
   formatUsageCreditSubunits,
   formatUsdRateSubunits,
 } from "../billing/formatUsageCredits.js";
+import AdminUsageReportBrowser from "./AdminUsageReportBrowser.js";
 
 /** Administrator Usage Projection refresh interval. */
 export const ADMIN_USAGE_REFRESH_INTERVAL_MS = 30_000;
@@ -185,6 +186,9 @@ export default function AdminUsageOverview({adminApi}: Props) {
         <MetricCard label={messages.admin_usage_unpriced()}
           value={`${formatInteger(metrics.unpricedModelUses)} / ${formatInteger(metrics.unpricedApiOperations)}`} />
       </div>
+      {usage && typeof usage.api.openReport === "function" && (
+        <AdminUsageReportBrowser api={usage.api} />
+      )}
       <div role={health.state === "failed" ? "alert" : "status"}
         className="flex flex-wrap items-center justify-between gap-2 text-xs text-kumo-subtle">
         <span>{messages.admin_usage_projection()}: {HEALTH_LABELS[health.state]()}</span>

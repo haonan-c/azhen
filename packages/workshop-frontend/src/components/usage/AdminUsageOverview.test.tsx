@@ -22,6 +22,7 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       reasoningTokens: 1n,
       meteredUseCount: 5n,
       billableApiOperations: 5n,
+      meteredUseCount: 9n,
       activeUsers: 6n,
       unpricedModelUses: 7n,
       unpricedApiOperations: 8n,
