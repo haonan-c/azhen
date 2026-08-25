@@ -47,7 +47,18 @@ export async function saveStreamToFile(
   if (picker) {
     const handle = await picker({suggestedName: filename})
     const writable = await handle.createWritable()
-    await (await createStream()).pipeTo(writable, {signal})
+    let stream: ReadableStream<Uint8Array>
+    try {
+      stream = await createStream()
+    } catch (error) {
+      try {
+        await writable.abort(error)
+      } catch {
+        // Preserve the source capability failure; it is the actionable export error.
+      }
+      throw error
+    }
+    await stream.pipeTo(writable, {signal})
     return
   }
 

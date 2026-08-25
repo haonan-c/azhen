@@ -573,12 +573,14 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
   const [result, setResult] = useState<"idle" | "succeeded" | "failed">("idle");
   const retryIdentity = useRef<{signature: string; operationId: string} | null>(null);
   const unknownAction = detail.record.kind === "gatekeeper" &&
-    detail.record.outcome === "usage-unknown";
+    detail.record.outcome === "usage-unknown" && detail.reconciliation === null;
+  const chargeReversed = detail.ledgerEntries.some(entry => entry.kind === "credit-reversal");
 
   const run = async (operation: AdminOperation) => {
     if (running) return;
     setRunning(true);
     setResult("idle");
+    let authorityChangeRequested = false;
     try {
       const normalizedReason = reason.trim();
       if (normalizedReason.length < 1 || normalizedReason.length > 1_000) {
@@ -606,12 +608,15 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
           throw new TypeError("A positive amount is required.");
         }
         if (operation === "grant") {
+          authorityChangeRequested = true;
           await api.grant({registeredUserRef, operationId, amountSubunits: exact,
             reason: normalizedReason});
         } else if (operation === "deduct") {
+          authorityChangeRequested = true;
           await api.deduct({registeredUserRef, operationId, amountSubunits: exact,
             reason: normalizedReason});
         } else {
+          authorityChangeRequested = true;
           await api.reconcileBalance({registeredUserRef, operationId,
             targetBalanceSubunits: exact, reason: normalizedReason});
         }
@@ -619,10 +624,12 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
         if (ledgerRef.length < 1 || ledgerRef.length > 500) {
           throw new TypeError("A bounded Ledger reference is required.");
         }
+        authorityChangeRequested = true;
         await api.reverse({registeredUserRef, operationId,
           originalLedgerEntryId: ledgerRef, reason: normalizedReason});
       } else {
         if (!unknownAction) throw new TypeError("A valid unknown Usage detail is required.");
+        authorityChangeRequested = true;
         await api.reconcileUnknownRecord({
           registeredUserRef,
           safeRecordRef: detail.record.id,
@@ -632,11 +639,16 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
         });
       }
       setResult("succeeded");
-      await onRefresh();
     } catch {
       setResult("failed");
     } finally {
-      setRunning(false);
+      try {
+        if (authorityChangeRequested) await onRefresh();
+      } catch {
+        setResult("failed");
+      } finally {
+        setRunning(false);
+      }
     }
   };
 
@@ -663,7 +675,7 @@ function AdminOperationPanel({api, detail, registeredUserRef, onRefresh}: {
       <Button size="sm" disabled={running} onClick={() => void run("reconcile")}>{
         messages.admin_usage_operations_reconcile()}</Button>
     </div>
-    {detail.ledgerEntries.some(entry => entry.kind === "usage-charge") && <>
+    {!chargeReversed && detail.ledgerEntries.some(entry => entry.kind === "usage-charge") && <>
       <label className="block text-xs text-kumo-subtle">{
         messages.admin_usage_operations_ledger_ref()}
         <input aria-label={messages.admin_usage_operations_ledger_ref()} value={ledgerRef}

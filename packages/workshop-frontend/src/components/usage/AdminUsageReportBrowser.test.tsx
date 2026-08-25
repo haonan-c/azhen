@@ -699,22 +699,49 @@ describe("administrator frozen Usage report browser", () => {
         kind: "usage-charge", deltaSubunits: -9n, createdAt: "2026-08-24T12:00:00.000Z"}],
       reconciliation: null,
     };
-    const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>().mockResolvedValue(detail);
+    const reversedDetail = {
+      ...detail,
+      ledgerEntries: [...detail.ledgerEntries, {
+        id: `${usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "x"}:credit-reversal`,
+        kind: "credit-reversal" as const,
+        deltaSubunits: 9n,
+        createdAt: "2026-08-24T12:01:00.000Z",
+      }],
+    };
+    const reconciledDetail = {
+      ...reversedDetail,
+      reconciliation: {
+        decision: "settle" as const,
+        actorUserId: "admin@example.test",
+        reason: "Bounded audit reason",
+        createdAt: "2026-08-24T12:02:00.000Z",
+      },
+    };
+    let reversed = false;
+    let settled = false;
+    const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>()
+      .mockImplementation(async () => settled ? reconciledDetail : reversed ? reversedDetail : detail);
     const grant = vi.fn<AdminUsageApi["grant"]>().mockImplementation(async request =>
       operationResult("grant", request.operationId));
     const deduct = vi.fn<AdminUsageApi["deduct"]>()
       .mockRejectedValue(new Error("bounded failure"));
     const reconcileBalance = vi.fn<AdminUsageApi["reconcileBalance"]>()
       .mockImplementation(async request => operationResult("reconcile-balance", request.operationId));
-    const reverse = vi.fn<AdminUsageApi["reverse"]>().mockImplementation(async request =>
-      operationResult("reverse", request.operationId));
-    const reconcileUnknownRecord = vi.fn<AdminUsageApi["reconcileUnknownRecord"]>()
-      .mockResolvedValue({
-      operationId: "operation", decision: "settle",
-      previousState: "unknown", newState: "accepted", ledgerEntryId: "ledger",
-      actorUserId: "admin@example.test", reason: "Bounded audit reason",
-      createdAt: "2026-08-24T12:00:00.000Z",
+    const reverse = vi.fn<AdminUsageApi["reverse"]>().mockImplementation(async request => {
+      reversed = true;
+      return operationResult("reverse", request.operationId);
     });
+    const reconcileUnknownRecord = vi.fn<AdminUsageApi["reconcileUnknownRecord"]>()
+      .mockImplementation(async () => {
+        settled = true;
+        return {
+          operationId: "operation", decision: "settle" as const,
+          previousState: "unknown" as const, newState: "accepted" as const,
+          ledgerEntryId: "ledger",
+          actorUserId: "admin@example.test", reason: "Bounded audit reason",
+          createdAt: "2026-08-24T12:00:00.000Z",
+        };
+      });
     const current = report([usageRow]);
     await render(usageApi(
       vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
@@ -744,13 +771,17 @@ describe("administrator frozen Usage report browser", () => {
     await vi.waitFor(() => expect(grant).toHaveBeenCalledTimes(2));
     expect(grant.mock.calls[1]![0].operationId).toBe(firstOperationId);
 
+    const detailReadsBeforeFailure = getRecordDetail.mock.calls.length;
     await act(async () => button("Deduct")?.click());
     await vi.waitFor(() => expect(container?.textContent).toContain("Operation failed"));
+    await vi.waitFor(() => expect(getRecordDetail)
+      .toHaveBeenCalledTimes(detailReadsBeforeFailure + 1));
     await act(async () => button("Reconcile balance")?.click());
     await vi.waitFor(() => expect(reconcileBalance).toHaveBeenCalledOnce());
     await act(async () => button("Reverse selected charge")?.click());
     await vi.waitFor(() => expect(reverse).toHaveBeenCalledOnce());
     expect(reverse.mock.calls[0]![0].originalLedgerEntryId).toContain(":usage-charge");
+    await vi.waitFor(() => expect(button("Reverse selected charge")).toBeUndefined());
 
     expect(input("Action ID")).toBeNull();
     await act(async () => button("Settle unknown Action")?.click());
@@ -760,7 +791,84 @@ describe("administrator frozen Usage report browser", () => {
       safeRecordRef: usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "unreachable",
       reason: "Bounded audit reason",
     }));
-    expect(button("Release unknown Action")).toBeDefined();
+    await vi.waitFor(() => expect(button("Settle unknown Action")).toBeUndefined());
+    expect(button("Release unknown Action")).toBeUndefined();
+  });
+
+  it("refreshes a conflicting unknown decision and removes terminal controls", async () => {
+    const usageRow: AdminUsageReportRow = {
+      ...row("unknown-conflict"),
+      meteredKind: "gatekeeper",
+      outcome: "usage-unknown",
+      deploymentModelId: null,
+      gatekeeperId: "vendor",
+      stableMethodKey: "method",
+      externalAccountId: "account",
+    };
+    const detail: import("@gadgets/workshop-shared/api").AdminUsageRecordDetail = {
+      record: {
+        kind: "gatekeeper",
+        id: usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "unreachable",
+        source: "agent",
+        workspaceId: "a".repeat(64),
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        externalAccountId: "account",
+        pricing: "priced",
+        outcome: "usage-unknown",
+        chargeSubunits: null,
+        createdAt: "2026-08-24T12:00:00.000Z",
+      },
+      chargeSnapshot: {
+        kind: "gatekeeper",
+        pricing: "priced",
+        usageRateVersion: 2n,
+        issuedAt: "2026-08-24T11:59:00.000Z",
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        chargeSubunits: 9n,
+      },
+      reservation: null,
+      ledgerEntries: [],
+      reconciliation: null,
+    };
+    const reconciledDetail = {
+      ...detail,
+      reconciliation: {
+        decision: "release" as const,
+        actorUserId: "other-admin@example.test",
+        reason: "Another administrator completed this decision",
+        createdAt: "2026-08-24T12:01:00.000Z",
+      },
+    };
+    const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>()
+      .mockResolvedValueOnce(detail)
+      .mockResolvedValue(reconciledDetail);
+    const reconcileUnknownRecord = vi.fn<AdminUsageApi["reconcileUnknownRecord"]>()
+      .mockRejectedValue(new Error("Decision conflicts with retained authority"));
+    const current = report([usageRow]);
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+      getRecordDetail,
+      {reconcileUnknownRecord},
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("vendor / method"));
+    const button = (name: string) => Array.from(container!.querySelectorAll("button"))
+      .find(candidate => candidate.textContent === name);
+    await act(async () => button("View detail")?.click());
+    const reason = await vi.waitFor(() => {
+      const input = container!.querySelector<HTMLTextAreaElement>('textarea[aria-label="Reason"]');
+      if (!input) throw new Error("Expected the operation reason.");
+      return input;
+    });
+    await act(async () => changeInput(reason, "Bounded conflict reason"));
+
+    await act(async () => button("Settle unknown Action")?.click());
+
+    await vi.waitFor(() => expect(getRecordDetail).toHaveBeenCalledTimes(2));
+    expect(container?.textContent).toContain("Operation failed");
+    expect(button("Settle unknown Action")).toBeUndefined();
+    expect(button("Release unknown Action")).toBeUndefined();
   });
 
   it("uses a new unknown-operation ID when refreshed authority changes", async () => {

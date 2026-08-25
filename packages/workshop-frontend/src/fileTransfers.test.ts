@@ -75,6 +75,25 @@ describe('export file transfers', () => {
     expect(source).not.toHaveBeenCalled()
   })
 
+  it('aborts a selected writable once when creating the CSV stream fails', async () => {
+    const failure = new Error('CSV capability failed')
+    const abort = vi.fn<(reason?: unknown) => Promise<void>>(async () => undefined)
+    const writable = {abort} as unknown as WritableStream<Uint8Array>
+    const createWritable = vi.fn<() => Promise<WritableStream<Uint8Array>>>(async () => writable)
+    const picker = vi.fn<() => Promise<{createWritable: typeof createWritable}>>(async () => ({
+      createWritable,
+    }))
+    Object.assign(window, {showSaveFilePicker: picker})
+    const source = vi.fn<() => Promise<ReadableStream<Uint8Array>>>()
+      .mockRejectedValue(failure)
+
+    await expect(saveStreamToFile(source, 'usage.csv')).rejects.toBe(failure)
+
+    expect(abort).toHaveBeenCalledOnce()
+    expect(abort).toHaveBeenCalledWith(failure)
+    expect(createWritable).toHaveBeenCalledOnce()
+  })
+
   it('pipes CSV bytes directly to a Chromium file handle', async () => {
     const written: Uint8Array[] = []
     const writable = new WritableStream<Uint8Array>({
