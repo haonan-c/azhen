@@ -994,14 +994,19 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       updateActiveMeta: boolean,
       failRebuildOnRejection = false): IngestOneResult {
     return this.ctx.storage.transactionSync(() => {
-      const complete = (result: IngestOneResult): IngestOneResult => {
+      const meta = this.#meta();
+      const complete = (
+          result: IngestOneResult,
+          countActiveReplay = false): IngestOneResult => {
+        if (countActiveReplay && updateActiveMeta && result.rejection !== null) {
+          this.#recordFailureInTransaction(meta, result.rejection);
+        }
         if (failRebuildOnRejection && result.rejection !== null &&
             !result.sequenceRejectionAccepted) {
           this.#failRebuild("projection-write-failed");
         }
         return result;
       };
-      const meta = this.#meta();
       const existingById = this.ctx.storage.sql.exec<{
         fact_hash: string;
         applied: number;
@@ -1014,13 +1019,14 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       `, generation, fact.projectionFactId).toArray()[0];
       if (existingById) {
         if (existingById.fact_hash === hash) {
-          return complete(existingById.applied === -1
+          const rejected = existingById.applied === -1;
+          return complete(rejected
             ? {rejection: "invalid-fact", applied: false, sequenceRejectionAccepted: false}
             : {
                 rejection: null,
                 applied: existingById.applied === 1,
                 sequenceRejectionAccepted: false,
-              });
+              }, rejected);
         }
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
         const samePrincipalNewSequence =
@@ -1046,7 +1052,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
             rejection: existingRejectionById.code,
             applied: false,
             sequenceRejectionAccepted: false,
-          });
+          }, true);
         }
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
         const samePrincipal = existingRejectionById.principal_ref === fact.usagePrincipalRef;

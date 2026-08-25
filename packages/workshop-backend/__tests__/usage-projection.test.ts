@@ -605,6 +605,58 @@ describe("deployment Usage Projection", () => {
     });
   });
 
+  it("counts each replay of an applied Summary rejection once", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const usagePrincipalRef = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const initial = aggregateFact({
+      usagePrincipalRef,
+      sourceSequence: 1n,
+      summaryFactId,
+      cacheHitInputTokens: 10n,
+      outputTokens: 10n,
+      reasoningTokens: 10n,
+      providerCostUsdSubunits: 10n,
+      chargedUsageCreditSubunits: 10n,
+    });
+    const conflict = aggregateFact({
+      usagePrincipalRef,
+      sourceSequence: 2n,
+      summaryFactId,
+      summaryRevision: 1n,
+      cacheHitInputTokens: 11n,
+      outputTokens: 11n,
+      reasoningTokens: 11n,
+      providerCostUsdSubunits: 11n,
+      chargedUsageCreditSubunits: 11n,
+    });
+    await projection.ingest([initial]);
+    expect(await projection.ingest([conflict])).toMatchObject({
+      rejected: [{projectionFactId: conflict.projectionFactId, code: "invalid-fact"}],
+    });
+    expect((await projection.readHealth()).failedIngestionCount).toBe(1n);
+
+    expect(await projection.ingest([conflict])).toMatchObject({
+      rejected: [{projectionFactId: conflict.projectionFactId, code: "invalid-fact"}],
+    });
+    expect((await projection.readHealth()).failedIngestionCount).toBe(2n);
+  });
+
+  it("counts each replay against a stored rejection marker once", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const poison = fact({unpricedModelUses: 1n});
+    expect(await projection.ingest([poison])).toMatchObject({
+      rejected: [{projectionFactId: poison.projectionFactId, code: "invalid-fact"}],
+    });
+    expect((await projection.readHealth()).failedIngestionCount).toBe(1n);
+
+    const corrected = {...poison, unpricedModelUses: 0n};
+    expect(await projection.ingest([corrected])).toMatchObject({
+      rejected: [{projectionFactId: poison.projectionFactId, code: "invalid-fact"}],
+    });
+    expect((await projection.readHealth()).failedIngestionCount).toBe(2n);
+  });
+
   it("accepts absolute aggregate use counts above one without weakening detail facts", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const aggregate = aggregateFact({
