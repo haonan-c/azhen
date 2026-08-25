@@ -543,6 +543,11 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   local Initial Grant, legacy notice, and registration outbox. Activation now pre-arms and reuses the
   User's single maintenance alarm. Local User authority remains available, failed Registry delivery
   retries after ten seconds, and restart delivers and acknowledges the same idempotent fact.
+- A later Standards RED constructed the exact upgrade state where Issue #62 had already committed
+  and acknowledged the Registry outbox but no Issue #64 activation notice existed. Initialized
+  activation now idempotently creates an eligible returning legacy notice before inspecting the
+  acknowledgement. The acknowledged fact and delivery time stay unchanged, the Initial Grant stays
+  singular, native new Users remain ineligible, and only pending Registry work schedules the alarm.
 - Removed manual Retry failures from the bounded 100-record legacy public-method migration. The
   first request returns current static/configured/discovered data with a truthful truncation signal,
   while the User alarm advances remaining batches. A 301-record repeated-method history completes
@@ -552,11 +557,11 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   the rounded threshold of 2, zero, and negative balances.
 - Expanded real Cap'n Web evidence to own-User Reservation and Ledger pagination, a negative exact
   delta larger than `Number.MAX_SAFE_INTEGER`, and two-User isolation. Focused results are Provider
-  6/6, Usage Admin 16/16, Gatekeeper Usage Account 25/25, User Usage Account 38/38, and Cap'n Web 5/5.
+  6/6, Usage Admin 17/17, Gatekeeper Usage Account 25/25, User Usage Account 38/38, and Cap'n Web 5/5.
   The real RPC rate case includes the 301-record repeated legacy history, static inventory, and
   configured priced-zero rate in one pass. The Frontend package passed 362/362 plus copy 1/1, and
   Shared, Backend, and Frontend production builds passed.
 - Oxlint passed with repository warnings only, `git diff --check` passed, and the diff contains no
   quote-only `admin-settings.ts` change. The final single uninterrupted 115/115 Harness remains
-  pending. No push, merge, Issue closure, release build,
-  upload, promotion, deployment, production change, charging change, or worktree deletion occurred.
+  pending. No push, merge, Issue closure, release build, upload, promotion, deployment, production
+  change, charging change, or worktree deletion occurred.

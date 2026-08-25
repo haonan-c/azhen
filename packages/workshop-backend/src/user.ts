@@ -716,16 +716,21 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       throw new Error("A User account must exist before its Usage Account can be activated.");
     }
     const initialized = this.usageAccount.isInitialized();
-    if (initialized &&
-        this.usageAccount.getRegistrationOutbox().deliveredAt !== undefined) return;
-    const initialGrantSnapshot = initialized
-      ? undefined
-      : await this.adminSettings.getByName("").issueInitialGrantSnapshot();
+    const activationNoticeEligible = !this.storage.usageCreditNativeAccount.get();
+    if (initialized) {
+      const outbox = this.usageAccount.activate(undefined, activationNoticeEligible);
+      if (outbox.deliveredAt !== undefined) return;
+      const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
+      this.#scheduleProjectionDelivery(preparationRevision);
+      return;
+    }
+    const initialGrantSnapshot =
+      await this.adminSettings.getByName("").issueInitialGrantSnapshot();
     const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       this.usageAccount.activate(
         initialGrantSnapshot,
-        !this.storage.usageCreditNativeAccount.get(),
+        activationNoticeEligible,
       );
     } finally {
       this.#scheduleProjectionDelivery(preparationRevision);

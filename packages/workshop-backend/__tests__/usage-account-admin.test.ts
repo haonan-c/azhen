@@ -219,6 +219,7 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
     expect((await adminUsage().searchUsers({query: deliveryFailed.identity})).users).toEqual([]);
 
     await deliveryFailed.stub.activateUsageAccount();
+    await runDurableObjectAlarm(deliveryFailed.stub);
     const delivered = await accountSnapshot(deliveryFailed.stub);
     expect(delivered.registrationOutbox.fact).toEqual(firstOutbox.fact);
     expect(delivered.registrationOutbox.deliveredAt).toBeDefined();
@@ -240,12 +241,47 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
 
     const restarted = users.get(lostAck.id);
     await restarted.activateUsageAccount();
+    await runDurableObjectAlarm(restarted);
     expect((await adminUsage().searchUsers({query: lostAck.identity})).users).toHaveLength(1);
     const replayed = await accountSnapshot(restarted);
     expect(replayed.registrationOutbox.fact).toEqual(secondOutbox.fact);
     expect(replayed.registrationOutbox.deliveredAt).toBeDefined();
     expect(replayed.ledgerEntries.filter(entry => entry.kind === "initial-grant"))
       .toHaveLength(1);
+  });
+
+  it("backfills a returning legacy notice after its registration was already acknowledged",
+      async () => {
+    const user = await createDormantUser("pre64legacy", "Pre-64 Legacy");
+    const initialGrantSnapshot = await settings.issueInitialGrantSnapshot();
+    const pending = await runInDurableObject(user.stub, (_instance, state) => {
+      state.storage.kv.delete("usageCreditNativeAccount");
+      return new UsageAccount(state.storage, () => ({
+        userDoId: state.id.toString(),
+        identity: user.identity,
+        displayName: user.displayName,
+      })).activate(initialGrantSnapshot, false);
+    });
+    await settings.registerUsageUser(pending.fact);
+    const before = await runInDurableObject(user.stub, (_instance, state) => {
+      const account = new UsageAccount(state.storage);
+      account.acknowledgeRegistration(pending.fact.registrationEventId);
+      return account.getSnapshot();
+    });
+    expect(before.registrationOutbox.deliveredAt).toBeDefined();
+    expect(before.activationNotice).toBeNull();
+
+    await user.stub.activateUsageAccount();
+
+    const balance = await user.stub.getUsageCreditBalance();
+    expect(balance.activationNotice).toMatchObject({
+      grantedSubunits: initialGrantSnapshot.amountSubunits,
+    });
+    const after = await accountSnapshot(user.stub);
+    expect(after.ledgerEntries.filter(entry => entry.kind === "initial-grant"))
+      .toHaveLength(1);
+    expect(after.registrationOutbox.fact).toEqual(pending.fact);
+    expect(after.registrationOutbox.deliveredAt).toBe(before.registrationOutbox.deliveredAt);
   });
 
   it("keeps the local Usage Account available while Registry delivery retries by alarm",

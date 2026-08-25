@@ -158,6 +158,12 @@ the same `implement` stage gates and focused TDD loop:
   existing User maintenance alarm, commits local authority, returns local balance/list results, and
   delivers the stable registration outbox asynchronously. Failure keeps one ten-second alarm;
   restart replays the same fact and acknowledges the idempotent Registry result.
+- A Standards follow-up reproduced an upgrade state in which Issue #62 had already created the
+  Initial Grant and the Registry had acknowledged its registration fact before Issue #64 could
+  create a returning legacy notice. Activation now always runs the initialized Usage Account's
+  idempotent `activate(undefined, legacyEligible)` step before checking `deliveredAt`. It creates the
+  missing notice without changing the Initial Grant or acknowledged fact. Native new Users remain
+  ineligible, and only a pending registration schedules Registry delivery.
 - Legacy public-method discovery first failed every bounded 100-record step with a manual Retry
   error. The first bounded step now returns the current inventory and a truthful truncation signal.
   The same User alarm advances later 100-record batches. A 301-record repeated-method history
@@ -177,7 +183,7 @@ the same `implement` stage gates and focused TDD loop:
 | Third-review check | Result |
 | --- | --- |
 | Strict Mode subscription lifecycle | Passed: 6/6 Provider tests |
-| Registry durable retry | Passed: Usage Admin 16/16 |
+| Registry durable retry and pre-#64 legacy notice migration | Passed: Usage Admin 17/17 |
 | Legacy method discovery and sensitive DTO | Passed: Gatekeeper Usage Account 25/25 |
 | Low-balance rounding, zero, and negative states | Passed: User Usage Account 38/38 |
 | Real Cap'n Web financial pagination, legacy rates, and isolation | Passed: 5/5 with the combined 301-record legacy-rate canary |
