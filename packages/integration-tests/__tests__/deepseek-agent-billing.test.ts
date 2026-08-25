@@ -836,14 +836,29 @@ describe("DeepSeek Agent billing", () => {
     const registered = await waitFor("the delayed Action User Registry entry", async () =>
       (await usageAdmin.searchUsers({query: submitterName, limit: 2})).users
         .find(candidate => candidate.identity === submitterName) ?? null);
-    using detailPublicApi = connect(harness.url);
-    using detailUser = await signIn(detailPublicApi, submitterName);
-    const unknown = await waitFor("the delayed unknown Usage detail", async () =>
-      (await detailUser.listOwnUsageRecords({limit: 20})).records.find(record =>
-        record.kind === "gatekeeper" && record.outcome === "usage-unknown") ?? null);
+    const opened = await waitFor("the delayed unknown Usage report detail", async () => {
+      let candidate;
+      try {
+        candidate = await usageAdmin.openReport({
+          registeredUserRefs: [registered.registeredUserRef],
+        });
+        const page = await candidate.listRows({limit: 20});
+        const row = page.rows.find(item => item.rowKind === "detail" &&
+          item.meteredKind === "gatekeeper" && item.outcome === "usage-unknown");
+        if (row?.rowKind === "detail") return {candidate, row};
+        candidate[Symbol.dispose]();
+        return null;
+      } catch (error) {
+        candidate?.[Symbol.dispose]();
+        if (error instanceof Error &&
+            error.message.includes("Usage Projection bootstrap is incomplete")) return null;
+        throw error;
+      }
+    });
+    using _report = opened.candidate;
     const reconciliationRequest = {
       registeredUserRef: registered.registeredUserRef,
-      safeRecordRef: unknown.id,
+      safeRecordRef: opened.row.safeRecordRef,
       operationId: `admin-action-settle:${crypto.randomUUID()}`,
       decision: "settle" as const,
       reason: "Provider confirmed that the delayed Action executed",

@@ -9,7 +9,7 @@ import {
   type UsageCreditBalance,
   type UsageCreditBalanceSubscriber,
 } from "@gadgets/workshop-shared/api";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {UsageAccount} from "../src/usage-account.js";
 
 const PASSWORD_HASH = new Uint8Array([4, 3, 2, 1]);
@@ -23,6 +23,7 @@ const TEST_CHARGE_SNAPSHOT: PricedGatekeeperChargeSnapshot = {
   billingMethodKey: "test.operation.v1",
   chargeSubunits: 1n,
 };
+const createdAccountUsernames: string[] = [];
 
 async function connect(): Promise<RpcStub<PublicApi>> {
   const response = await exports.default.fetch(new Request("https://workshop.invalid/api", {
@@ -39,8 +40,23 @@ async function createAccount(publicApi: RpcStub<PublicApi>, prefix: string) {
   const username = prefix + crypto.randomUUID().replaceAll("-", "");
   const token = await publicApi.createAccount(username, username, PASSWORD_HASH);
   if (token === null) throw new Error(`Failed to create ${username}.`);
+  createdAccountUsernames.push(username);
   return { username, token };
 }
+
+afterEach(async () => {
+  for (const username of createdAccountUsernames.splice(0)) {
+    const user = exports.UserDurableObject.get(exports.UserDurableObject.idFromName(username));
+    for (let batch = 0; batch < 64; batch += 1) {
+      const pending = await runInDurableObject(user, (_instance, state) =>
+        new UsageAccount(state.storage).listPendingProjectionOutbox(1).length > 0);
+      if (!pending) break;
+      await runInDurableObject(user, instance => instance.alarm());
+    }
+    expect(await runInDurableObject(user, (_instance, state) =>
+      new UsageAccount(state.storage).listPendingProjectionOutbox(1).length)).toBe(0);
+  }
+});
 
 describe("Usage Account across Cap'n Web", () => {
   it("transports exact own-User balances and isolates two authenticated Users", async () => {
@@ -173,9 +189,9 @@ describe("Usage Account across Cap'n Web", () => {
     await vi.waitFor(() => expect(snapshots.map(snapshot => snapshot.revision)).toEqual([1n, 2n]));
 
     subscription[Symbol.dispose]();
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await authenticated.getUsageCreditBalance();
     await user.releaseUsageCredits("rpc-balance-push");
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await authenticated.getUsageCreditBalance();
     expect(snapshots.map(snapshot => snapshot.revision)).toEqual([1n, 2n]);
     subscriber[Symbol.dispose]();
   });

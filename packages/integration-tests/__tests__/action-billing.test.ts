@@ -134,6 +134,28 @@ async function provisionAccount(api: RpcStub<AuthenticatedApi>): Promise<Connect
   });
 }
 
+async function signInWhenAvailable(username: string): Promise<{
+  publicApi: ReturnType<typeof connect>;
+  user: RpcStub<AuthenticatedApi>;
+}> {
+  const deadline = Date.now() + 15_000;
+  let connectionFailure: Error | undefined;
+  while (Date.now() < deadline) {
+    const publicApi = connect(harness.url);
+    try {
+      const user = await signIn(publicApi, username);
+      await user.getUsageCreditBalance();
+      return {publicApi, user};
+    } catch (error) {
+      publicApi[Symbol.dispose]();
+      if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
+      connectionFailure = error;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  throw connectionFailure ?? new Error("Workshop did not accept a WebSocket connection.");
+}
+
 async function setActionRate(amountSubunits: bigint, reason: string): Promise<void> {
   using publicApi = connect(harness.url);
   using authenticatedAdmin = await signIn(publicApi, ADMIN_USERNAME);
@@ -912,13 +934,19 @@ describe("approved Action billing", () => {
       (await usage.searchUsers({query: username, limit: 2})).users
         .find(candidate => candidate.identity === username) ?? null);
     await makeUnknownActionLegacy(username, workspaceId, safeRecordRef);
+    session[Symbol.dispose]();
+    gatekeeper[Symbol.dispose]();
+    workspace[Symbol.dispose]();
+    user[Symbol.dispose]();
+    publicApi[Symbol.dispose]();
     await usage.deleteUsageUser({
       registeredUserRef: registered.registeredUserRef,
       deletionId: `delete-legacy-action-user-${crypto.randomUUID()}`,
       reason: "Prove deleted identity cannot erase retained unknown financial authority",
     });
     expect((await usage.searchUsers({query: username, limit: 2})).users).toEqual([]);
-    await expect(user.getUsageCreditBalance()).rejects.toThrow("deleted");
+    await expect(signInWhenAvailable(username))
+      .rejects.toThrow(`Login failed for "${username}".`);
 
     const request = {
       registeredUserRef: registered.registeredUserRef,
@@ -930,7 +958,13 @@ describe("approved Action billing", () => {
     await expect(usage.reconcileUnknownRecord(request))
       .rejects.toThrow("Legacy Action authority is being prepared");
     const settled = await usage.reconcileUnknownRecord(request);
-    expect(await usage.reconcileUnknownRecord(request)).toEqual(settled);
+    const replaySession = await signInWhenAvailable(ADMIN_USERNAME);
+    using _replayPublicApi = replaySession.publicApi;
+    using replayAuthenticatedAdmin = replaySession.user;
+    using replayAdmin = await replayAuthenticatedAdmin.getAdminApi();
+    if (!replayAdmin) throw new Error("Expected the deployment administrator capability.");
+    using replayUsage = await replayAdmin.getUsageApi();
+    expect(await replayUsage.reconcileUnknownRecord(request)).toEqual(settled);
     expect(settled).toMatchObject({
       operationId: request.operationId,
       decision: "settle",
@@ -939,10 +973,13 @@ describe("approved Action billing", () => {
       ledgerEntryId: `${safeRecordRef}:usage-charge`,
       actorUserId: ADMIN_USERNAME,
     });
-    expect((await usage.searchUsers({query: username, limit: 2})).users).toEqual([]);
+    expect((await replayUsage.searchUsers({query: username, limit: 2})).users).toEqual([]);
   });
 
   it("replays a committed unknown decision after its raw detail is retained away", async () => {
+    const readySession = await signInWhenAvailable(ADMIN_USERNAME);
+    readySession.user[Symbol.dispose]();
+    readySession.publicApi[Symbol.dispose]();
     using publicApi = connect(harness.url);
     const [username] = nextUsernames("actionretainedreplay");
     using user = await signUp(publicApi, username);
@@ -996,8 +1033,14 @@ describe("approved Action billing", () => {
       safeRecordRef,
     })).rejects.toThrow();
 
-    const replayed = await usage.reconcileUnknownRecord(request);
-    expect(await usage.reconcileUnknownRecord(request)).toEqual(replayed);
+    const replaySession = await signInWhenAvailable(ADMIN_USERNAME);
+    using _replayPublicApi = replaySession.publicApi;
+    using replayAuthenticatedAdmin = replaySession.user;
+    using replayAdmin = await replayAuthenticatedAdmin.getAdminApi();
+    if (!replayAdmin) throw new Error("Expected the deployment administrator capability.");
+    using replayUsage = await replayAdmin.getUsageApi();
+    const replayed = await replayUsage.reconcileUnknownRecord(request);
+    expect(await replayUsage.reconcileUnknownRecord(request)).toEqual(replayed);
     expect(replayed).toMatchObject({
       operationId: request.operationId,
       decision: "settle",
@@ -1008,7 +1051,7 @@ describe("approved Action billing", () => {
       reason: request.reason,
     });
     expect(await user.getUsageCreditBalance()).toEqual(afterCommit);
-    await expect(usage.getRecordDetail({
+    await expect(replayUsage.getRecordDetail({
       registeredUserRef: registered.registeredUserRef,
       safeRecordRef,
     })).rejects.toThrow();
@@ -1259,13 +1302,19 @@ describe("approved Action billing", () => {
       ? value.toString() : value);
     for (const sentinel of forbiddenSentinels) expect(encodedDetail).not.toContain(sentinel);
 
+    const rejectedBypassActionState = (await workspace.listActions()).find(candidate =>
+      candidate.id === settledActionIds[0])?.state;
+    const rejectedBypassBalance = await user.getUsageCreditBalance();
     await expect(usage.reconcileAction({
       workspaceId,
       actionId: settledActionIds[0]!,
       operationId: `issue63-mismatched-action:${crypto.randomUUID()}`,
       decision: "settle",
       reason: "Prove raw Action identifiers cannot settle unknown Usage",
-    } as never)).rejects.toThrow("decision is invalid");
+    } as never)).rejects.toThrow('expected "reverse"');
+    expect((await workspace.listActions()).find(candidate =>
+      candidate.id === settledActionIds[0])?.state).toBe(rejectedBypassActionState);
+    expect(await user.getUsageCreditBalance()).toEqual(rejectedBypassBalance);
     await expect(usage.reconcileUnknownRecord({
       registeredUserRef: registered.registeredUserRef,
       safeRecordRef: opened.nonUnknownRow.safeRecordRef,
@@ -1398,6 +1447,24 @@ describe("approved Action billing", () => {
     expect((await replacementTwo.read()).done).toBe(false);
     await replacementOne.cancel("prove the first replacement slot is releasable");
     await replacementTwo.cancel("prove the second replacement slot is releasable");
+    await report.cancelCsvExports();
+    const replacementReleased = await waitFor("both replacement report slots to release", async () => {
+      const events = (await readUsageReportTelemetry()).filter(event =>
+        event.reportId === reportId);
+      const releaseCount = events.filter(event => event.event === "stream-released").length;
+      return releaseCount >= 3 && events.at(-1)?.activeOperations === 0 ? events : null;
+    });
+    const replacementQueries = replacementReleased.filter(event =>
+      event.event === "page-query-start").length;
+    const replacementBytes = Math.max(...replacementReleased.filter(event =>
+      event.event === "chunk-enqueued").map(event => event.encodedBytes ?? 0));
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const replacementStable = (await readUsageReportTelemetry()).filter(event =>
+      event.reportId === reportId);
+    expect(replacementStable.filter(event => event.event === "page-query-start"))
+      .toHaveLength(replacementQueries);
+    expect(Math.max(...replacementStable.filter(event => event.event === "chunk-enqueued")
+      .map(event => event.encodedBytes ?? 0))).toBe(replacementBytes);
 
     const csv = await new Response(await report.exportCsv()).text();
     const totalCsvBytes = new TextEncoder().encode(csv).byteLength;
