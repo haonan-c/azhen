@@ -1007,17 +1007,6 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.usageAccount.getAdminUsageRecordDetail(safeRecordRef);
   }
 
-  /** Verify one detail-scoped unknown Usage reference before Action coordination. */
-  async assertAdminUnknownUsageDetailReference(
-      safeRecordRef: string,
-      billingOperationId: string): Promise<void> {
-    this.#assertUsageAuthorityReady();
-    this.usageAccount.assertAdminUnknownUsageDetailReference(
-      safeRecordRef,
-      billingOperationId,
-    );
-  }
-
   /** Resolve one unknown detail to its server-private Workspace Action locator. */
   async getAdminUnknownUsageActionTarget(safeRecordRef: string): Promise<{
     workspaceId: string;
@@ -1038,6 +1027,29 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.#assertUsageAuthorityReady();
     return this.usageAccount.prepareAdminUnknownUsageReconciliation(
       safeRecordRef,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
+  }
+
+  /** Verify one Action call against its retained detail-scoped administrator preparation. */
+  async assertPreparedAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      workspaceId: string,
+      actionId: number,
+      billingOperationId: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): Promise<void> {
+    this.#assertUsageAuthorityReady();
+    this.usageAccount.assertPreparedAdminUnknownUsageReconciliation(
+      safeRecordRef,
+      workspaceId,
+      actionId,
+      billingOperationId,
       operationId,
       decision,
       reason,

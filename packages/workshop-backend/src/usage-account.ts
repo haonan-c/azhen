@@ -1787,6 +1787,39 @@ export class UsageAccount {
     });
   }
 
+  /** Verify one cross-DO Action call against its retained administrator preparation. */
+  assertPreparedAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      workspaceId: string,
+      actionId: number,
+      billingOperationId: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): void {
+    assertAdminUnknownUsageReconciliationInput(
+      safeRecordRef,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
+    const prepared = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(
+      ADMIN_UNKNOWN_RECONCILIATION_PREFIX + safeRecordRef,
+    );
+    if (prepared === undefined) {
+      throw new Error("Administrator unknown Usage decision was not prepared.");
+    }
+    assertAdminUnknownUsageReconciliationPreparation(prepared, safeRecordRef);
+    if (prepared.operationId !== operationId || prepared.decision !== decision ||
+        prepared.reason !== reason || prepared.actorUserId !== actorUserId ||
+        prepared.target.workspaceId !== workspaceId ||
+        prepared.target.billingOperationId !== billingOperationId ||
+        (prepared.target.actionId !== null && prepared.target.actionId !== actionId)) {
+      throw new Error("Administrator unknown Usage Action does not match its preparation.");
+    }
+  }
+
   /** Commit one safe administrator result so a lost response can replay after detail retention. */
   completeAdminUnknownUsageReconciliation(
       safeRecordRef: string,

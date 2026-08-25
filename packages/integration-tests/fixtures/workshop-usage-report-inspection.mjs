@@ -19,6 +19,7 @@ const BOOTSTRAP_PATH = "/__integration__/usage-report-bootstrap";
 const USER_STATE_PATH = "/__integration__/usage-report-user-state";
 const SEED_PATH = "/__integration__/usage-report-seed";
 const LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
+const REPLAY_CRASH_PATH = "/__integration__/usage-report-replay-crash";
 const MAX_TELEMETRY_EVENTS = 4_096;
 const SEED_EXTERNAL_ACCOUNT_ID = `issue63-seed-account-${"a".repeat(179)}`;
 const telemetryEvents = [];
@@ -35,6 +36,58 @@ const serialize = value => JSON.stringify(
 
 /** Production User DO with a test-only content-free Ledger/outbox inspection oracle. */
 export class UserDurableObject extends ProductionUserDurableObject {
+  /** Fail one post-Action safe-result commit to reproduce a lost cross-DO response. */
+  armUnknownUsageSafeResultFailureForTest(safeRecordRef) {
+    this.ctx.storage.kv.put(`issue63:test:fail-admin-complete:${safeRecordRef}`, true);
+  }
+
+  /** Preserve the real financial result while failing its first administrator-safe commit. */
+  async completeAdminUnknownUsageReconciliation(safeRecordRef, result) {
+    const key = `issue63:test:fail-admin-complete:${safeRecordRef}`;
+    if (this.ctx.storage.kv.get(key) === true) {
+      this.ctx.storage.kv.delete(key);
+      throw new Error("Simulated lost administrator safe-result response.");
+    }
+    return super.completeAdminUnknownUsageReconciliation(safeRecordRef, result);
+  }
+
+  /** Age one reconciled raw detail and remove it only through production retention. */
+  async expireReconciledUsageDetailForTest(safeRecordRef) {
+    const account = new UsageAccount(this.ctx.storage);
+    const locator = account.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper") throw new Error("Unknown Usage detail is invalid.");
+    let deliveryBatches = 0;
+    while (account.listPendingProjectionOutbox(1).length > 0) {
+      if (deliveryBatches >= 512) throw new Error("Usage retention delivery did not converge.");
+      await this.alarm();
+      deliveryBatches += 1;
+    }
+    const recordKey = `usageAccount:gatekeeperUsageRecord:${locator.operationId}`;
+    const record = this.ctx.storage.kv.get(recordKey);
+    if (!record || record.outcome !== "usage-unknown") {
+      throw new Error("Unknown Usage authority is unavailable.");
+    }
+    const expiredAt = "2024-01-01T00:00:00.000Z";
+    this.ctx.storage.kv.delete(
+      `usageAccount:gatekeeperUsageTimeIndex:${record.createdAt}:${locator.operationId}`,
+    );
+    this.ctx.storage.kv.put(recordKey, {...record, createdAt: expiredAt});
+    this.ctx.storage.kv.put(
+      `usageAccount:gatekeeperUsageTimeIndex:${expiredAt}:${locator.operationId}`,
+      locator.operationId,
+    );
+    this.ctx.storage.kv.delete("usageAccount:retentionNextRunAt:v1");
+    let result;
+    for (let batch = 0; batch < 512; batch += 1) {
+      result = account.runRetentionMaintenanceBatch(64);
+      if (result.complete) break;
+    }
+    if (!result?.complete || account.resolveUsageDetailReference(safeRecordRef) !== null) {
+      throw new Error("Usage detail retention did not converge.");
+    }
+    return {deliveryBatches, deletedDetailCount: result.deletedDetailCount};
+  }
+
   /** Generate real authority-owned Usage rows without writing test data directly to storage. */
   async seedUsageReportingForTest(count, workspaceId) {
     if (!Number.isSafeInteger(count) || count < 1 || count > 4_096) {
@@ -176,6 +229,21 @@ export default {
       );
       await overseer.resetBillingActionAuthorityIndexForTest();
       return new Response("ok");
+    }
+    if (url.pathname === REPLAY_CRASH_PATH) {
+      const username = url.searchParams.get("username");
+      const safeRecordRef = url.searchParams.get("safeRecordRef");
+      const operation = url.searchParams.get("operation");
+      if (!username || !safeRecordRef || (operation !== "arm" && operation !== "expire")) {
+        return new Response("Missing replay crash input.", {status: 400});
+      }
+      const user = env.USAGE_TEST_USERS.get(env.USAGE_TEST_USERS.idFromName(username));
+      const result = operation === "arm"
+        ? await user.armUnknownUsageSafeResultFailureForTest(safeRecordRef)
+        : await user.expireReconciledUsageDetailForTest(safeRecordRef);
+      return new Response(serialize(result ?? {ok: true}), {
+        headers: {"content-type": "application/json"},
+      });
     }
     return workshop.fetch(request, env, ctx);
   },

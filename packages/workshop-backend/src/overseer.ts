@@ -3710,7 +3710,19 @@ class OverseerImpl implements AgentHooks {
     }
     let user = this.userForPrincipal(action.caller.attribution.principal.userId);
     if (safeRecordRef !== undefined) {
-      await user.assertAdminUnknownUsageDetailReference(safeRecordRef, billingOperationId);
+      if (decision === "reverse") {
+        throw new Error("A detail-scoped unknown decision cannot reverse an Action charge.");
+      }
+      await user.assertPreparedAdminUnknownUsageReconciliation(
+        safeRecordRef,
+        this.ctx.id.toString(),
+        actionId,
+        billingOperationId,
+        operationId,
+        decision,
+        reason,
+        actorUserId,
+      );
     }
     let replay = replayActionReconciliation(
       action, operationId, decision, reason, actorUserId,

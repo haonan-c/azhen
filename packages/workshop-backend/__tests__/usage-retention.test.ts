@@ -424,6 +424,26 @@ describe("24 UTC calendar month Usage detail retention", () => {
       vi.setSystemTime(new Date("2026-08-24T12:00:00.001Z"));
       expect(runRetentionToCompletion(account).deletedDetailCount).toBe(1n);
       expect(account.resolveUsageDetailReference(original.safeRecordRef)).toBeNull();
+      expect(() => account.assertPreparedAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        ATTRIBUTION.workspaceId,
+        17,
+        billingOperationId,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      )).not.toThrow();
+      expect(() => account.assertPreparedAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        "c".repeat(64),
+        17,
+        billingOperationId,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      )).toThrow("does not match its preparation");
       expect(account.prepareAdminUnknownUsageReconciliation(
         unknown.safeRecordRef,
         reconciliationOperationId,
