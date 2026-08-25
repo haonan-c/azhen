@@ -444,3 +444,13 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   `b1fbba23673d8374f077c62d8e097f45a1f3533a`. Root/release/Wrangler gates were not run in this cycle.
   No push, merge, Issue closure, upload, promotion, deployment, production change, or worktree
   deletion occurred.
+- A final targeted RED phase proved that active replays of an already applied rejection and a stored
+  rejection marker returned the rejection without counting the new ingestion attempt. Both replay
+  paths now increment `failedIngestionCount` exactly once per active attempt. The same input is not
+  counted twice internally, and rebuild replay does not update the active delivery counter.
+- Final targeted Projection verification passed 50/50. Backend direct TypeScript and
+  `git diff --check` passed. The complete Backend package passed 581 tests with 4 expected skips and
+  0 failures. The code checkpoint is `d06ae593eba975abc6540fcebd68e78c97b59d6d`.
+  Frontend/shared code did not change in this targeted correction, so their package gates were not
+  repeated. Root/release/Wrangler gates were not run in this cycle. No push, merge, Issue closure,
+  upload, promotion, deployment, production change, or worktree deletion occurred.

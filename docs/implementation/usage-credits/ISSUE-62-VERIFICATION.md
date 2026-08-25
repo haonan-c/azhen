@@ -37,7 +37,10 @@ It does not modify `main` and does not create a pull request.
   machine code. It is not retried forever and it remains available for diagnosis and rebuild.
 - A Projection ACK now means that the fact was applied, not only queued. An out-of-order Summary
   remains pending in the User outbox. If closing the gap later proves that queued snapshot invalid,
-  replay returns the persisted rejection and the User records the bounded poison code.
+  replay returns the persisted rejection and the User records the bounded poison code. Each active
+  rejected ingestion attempt increments the deployment failure count once, including an ACK-loss
+  replay of an applied rejection or a replay against its stored rejection marker. Rebuild replay
+  does not change this active delivery counter.
 - Pending outbox work has an ordered source-sequence index and exact counter. Page reads use
   `startAfter` and a limit, and ACK/rejection updates read their exact source-sequence keys. Delivered
   lifetime history is not materialized for delivery, paging, ACK, or rejection.
@@ -126,6 +129,7 @@ All commands below ran from the isolated worktree.
 | `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the third fixed-point review: 31 tests, including atomic drain rollback, exact empty/non-empty pre-arm ownership, unavailable bootstrap metrics, single rebuild-step scheduling, rebuild-drain completion, principal fairness, delayed Summary ACK/rejection, and old-meta migration. |
 | `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-account-gatekeeper.test.ts` | GREEN after the third fixed-point review: 22 tests, including retained queued Summary poison writeback. |
 | `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the fourth fixed-point review and its dual-axis correction: 48 tests, including 10,000-User alarm-only bootstrap timing, rebuild pre-arm/CAS recovery, poison markers, runnable-drain health, split pending watermarks, ingress pre-arm consumption, same/cross-principal fact-ID conflicts, exact rejection counts, atomic rebuild rollback, and rebuild-side Summary rejection. |
+| `corepack pnpm --filter @gadgets/workshop-backend exec vitest run __tests__/usage-projection.test.ts` | GREEN after the final targeted replay correction: 50 tests. The two new tests prove that an active replay of an applied rejection and a replay against a stored rejection marker each increment `failedIngestionCount` once per attempt, without double counting one input or counting rebuild replay. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.usage-admin.config.ts` | GREEN: 15 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.metered-model.config.ts` | GREEN: 35 tests. |
 | `corepack pnpm --dir packages/workshop-backend exec vitest run --config vitest.integration.config.ts __integration__/usage-projection-rpc.test.ts` | GREEN: one real WebSocket/Cap’n Web test with promise pipelining and stub disposal. |
@@ -133,6 +137,7 @@ All commands below ran from the isolated worktree.
 | `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the second review fixes: Browser Fonts 1; default workerd 472; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; 0 fail. |
 | `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the final third-review alarm correction: Browser Fonts 1; default workerd 481; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; total 562 pass, 4 expected skips, 0 fail. |
 | `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN at the final fourth-review checkpoint: Browser Fonts 1; default workerd 498; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; total 579 pass, 4 expected skips, 0 fail. |
+| `corepack pnpm --filter @gadgets/workshop-backend test` | GREEN after the final targeted replay correction: Browser Fonts 1; default workerd 500; Usage Admin 15; metered-model 35; Open Gadget 1; RPC/recovery 23 with 4 expected skips; Registry RPC 2; DOCX 4; total 581 pass, 4 expected skips, 0 fail. |
 | `corepack pnpm --filter @gadgets/workshop-backend exec tsc -p tsconfig.json --noEmit` | GREEN at the fourth-review checkpoint. |
 | `corepack pnpm --filter @gadgets/workshop-frontend exec tsc -p tsconfig.json --noEmit` | GREEN at the fourth-review checkpoint. |
 | `corepack pnpm --filter @gadgets/workshop-frontend test` | GREEN: 351 pass across the main and first-party-copy runs. |
@@ -201,9 +206,12 @@ ordinary invalid-marker Summary rejection, and concurrent rebuild requests. The 
 includes cache-write input in the displayed token total and makes the shared pending-field docs match
 their exact semantics. A final correction preserves the original authority fact ID when a live
 invalid conflict is mirrored into an unscanned rebuild generation, and records exactly one failure
-for each rejected input. Projection 48, direct Backend/Frontend TypeScript, whitespace, the Frontend
-package, and the complete Backend package are GREEN. Root, release-manifest, Wrangler, and
-release-builder gates were intentionally not run in this review cycle.
+for each rejected input. The final targeted RED phase then proved that repeated active rejection
+attempts were returned without updating the attempt counter. Applied-rejection and stored-marker
+replays now each add exactly one failure, while rebuild replay adds none. Projection 50, direct
+Backend/Frontend TypeScript, whitespace, the Frontend package, and the complete Backend package are
+GREEN. Root, release-manifest, Wrangler, and release-builder gates were intentionally not run in
+this review cycle.
 
 ## Generated types, migration, and release shape
 
@@ -227,9 +235,9 @@ release-builder gates were intentionally not run in this review cycle.
   complete Backend package matrix passed with 562 tests, 4 expected skips, and 0 failures. Root,
   release-manifest, Wrangler, and release dry-run gates have not yet been repeated for this
   checkpoint.
-- The final fourth-review code checkpoint is `b1fbba23673d8374f077c62d8e097f45a1f3533a`, based on
-  `be1f501`. Projection passed 48/48, direct Backend and Frontend TypeScript passed, Frontend passed
-  353/353, and the complete Backend package passed 579 tests with 4 expected skips and 0 failures.
+- The final targeted code checkpoint is `d06ae593eba975abc6540fcebd68e78c97b59d6d`, based on
+  `be1f501`. Projection passed 50/50, direct Backend and Frontend TypeScript passed, Frontend passed
+  353/353, and the complete Backend package passed 581 tests with 4 expected skips and 0 failures.
   Root, release-manifest, Wrangler, and release dry-run gates have not been repeated for this
   checkpoint.
 - Root build/test/lint, release manifest, and release dry-run evidence below belongs to the earlier
