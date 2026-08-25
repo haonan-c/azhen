@@ -2,6 +2,7 @@
 // The provider endpoint is a strict local mock; this is not a live DeepSeek or deployed-production test.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import {
@@ -59,7 +60,10 @@ function recordsForDeploymentModel(records: UserUsageRecord[]): UserModelUsageRe
     record.kind === "model" && record.deploymentModelId === deploymentModelId);
 }
 
-async function signInWhenAvailable(username: string): Promise<{
+async function signInWhenAvailable(
+  username: string,
+  ready?: (user: Awaited<ReturnType<typeof signIn>>) => Promise<void>,
+): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: Awaited<ReturnType<typeof signIn>>;
 }> {
@@ -67,9 +71,13 @@ async function signInWhenAvailable(username: string): Promise<{
   let connectionFailure: Error | undefined;
   while (Date.now() < deadline) {
     const publicApi = connect(harness.url);
+    let user: Awaited<ReturnType<typeof signIn>> | undefined;
     try {
-      return {publicApi, user: await signIn(publicApi, username)};
+      user = await signIn(publicApi, username);
+      await ready?.(user);
+      return {publicApi, user};
     } catch (error) {
+      user?.[Symbol.dispose]();
       publicApi[Symbol.dispose]();
       if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") throw error;
       connectionFailure = error;
@@ -1278,24 +1286,56 @@ describe("DeepSeek Agent billing", () => {
     ]);
     expect(await appliedActionCount(actionLabel)).toBe(1);
 
+    // executeCode reloads Worker Loader after the Action completes, which closes the browser's
+    // Cap'n Web session. Reconnect before using the same durable workflow again.
+    secondAfterRestartWorkspace[Symbol.dispose]();
+    secondAfterRestart[Symbol.dispose]();
+    secondAfterRestartPublicApi[Symbol.dispose]();
     // Load the restarted Gadget before the Agent restores its callback. Otherwise the first
     // restore can reload Worker Loader mid-WebSocket and lose the one-shot registration call.
-    const schedulerWarmupGadget = await secondAfterRestartWorkspace.getGadget(gadgetId);
-    const schedulerWarmupApp: any = await schedulerWarmupGadget.connectToGadget();
-    await schedulerWarmupApp.getLastFiring();
-    schedulerWarmupApp[Symbol.dispose]();
-    schedulerWarmupGadget[Symbol.dispose]();
+    const afterActionSession = await signInWhenAvailable(secondName, async user => {
+      using workspace = await user.openGadget(workspaceId);
+      using gadget = await workspace.getGadget(gadgetId);
+      using app: any = await gadget.connectToGadget();
+      await app.getLastFiring();
+    });
+    secondAfterRestartPublicApi = afterActionSession.publicApi;
+    secondAfterRestart = afterActionSession.user;
+    secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
 
     let schedulerProviderCalls = 0;
+    let lastSchedulerChatState = "not-polled";
+    let lastSchedulerHookCount = -1;
+    const schedulerProviderAttempts: ({kind: "registration-initial" | "scheduled"} | {
+      kind: "registration-tool-result";
+      requestHash: string;
+      toolCallIdentity: string;
+    } | {kind: "unclassified"})[] = [];
     let signalScheduled!: () => void;
     const scheduled = new Promise<void>(resolve => { signalScheduled = resolve; });
     providerHandler = async (url, _method, _headers, request) => {
       if (url.origin === TITLE_PROVIDER_ORIGIN) return deepSeekSse();
       if (url.origin !== PROVIDER_ORIGIN) return null;
-      const payload = JSON.parse(await request.text()) as {tools?: unknown};
+      const requestBody = await request.text();
+      const payload = JSON.parse(requestBody) as {
+        messages?: {
+          role?: unknown;
+          tool_call_id?: unknown;
+          tool_calls?: {id?: unknown}[];
+        }[];
+        tools?: unknown;
+      };
       if (!Array.isArray(payload.tools) || payload.tools.length === 0) return deepSeekSse();
       schedulerProviderCalls += 1;
-      if (schedulerProviderCalls === 1) {
+      const messages = payload.messages ?? [];
+      const lastMessage = messages.at(-1);
+      const toolCallMessageCount = messages.filter(message =>
+        Array.isArray(message.tool_calls)).length;
+      const toolResultCount = messages.filter(message =>
+        message.role === "tool" || typeof message.tool_call_id === "string").length;
+      if (payload.tools.length === 12 && messages.length === 2 && lastMessage?.role === "user" &&
+          toolCallMessageCount === 0 && toolResultCount === 0) {
+        schedulerProviderAttempts.push({kind: "registration-initial"});
         return deepSeekNamedToolCallSse("executeCode", {
           code: `
             import { restore } from "cloudflare:workers";
@@ -1309,15 +1349,29 @@ describe("DeepSeek Agent billing", () => {
           `,
         });
       }
-      if (schedulerProviderCalls === 3) signalScheduled();
+      if (payload.tools.length === 12 && messages.length === 4 && lastMessage?.role === "tool" &&
+          toolCallMessageCount === 1 && toolResultCount === 1 &&
+          typeof lastMessage.tool_call_id === "string") {
+        schedulerProviderAttempts.push({
+          kind: "registration-tool-result",
+          requestHash: createHash("sha256").update(requestBody).digest("hex"),
+          toolCallIdentity: lastMessage.tool_call_id,
+        });
+        return deepSeekSse();
+      }
+      if (payload.tools.length === 2 && messages.length === 2 && lastMessage?.role === "user" &&
+          toolCallMessageCount === 0 && toolResultCount === 0) {
+        schedulerProviderAttempts.push({kind: "scheduled"});
+        signalScheduled();
+        return deepSeekSse();
+      }
+      schedulerProviderAttempts.push({kind: "unclassified"});
       return deepSeekSse();
     };
     const schedulerChatId = await secondAfterRestartWorkspace.newChat(
       "Register the complete tracer schedule.",
       deploymentModelId,
     );
-    let lastSchedulerChatState = "not-polled";
-    let lastSchedulerHookCount = -1;
     let schedulerReconnectCount = 0;
     try {
       await waitFor("the complete tracer Scheduler Hook", async () => {
@@ -1357,8 +1411,9 @@ describe("DeepSeek Agent billing", () => {
       );
     }
 
-    const ownerManagementPublicApi = connect(harness.url);
-    const ownerManagement = await signIn(ownerManagementPublicApi, ownerName);
+    const ownerManagementSession = await signInWhenAvailable(ownerName);
+    const ownerManagementPublicApi = ownerManagementSession.publicApi;
+    const ownerManagement = ownerManagementSession.user;
     const schedulerApp = await ownerManagement.getGatekeeperApp("scheduler");
     if (!schedulerApp) throw new Error("Expected the complete tracer Scheduler app.");
     const schedulerManagement: any = schedulerApp.ui;
@@ -1380,10 +1435,15 @@ describe("DeepSeek Agent billing", () => {
           40_000)),
     ]);
 
-    using finalPublicApi = connect(harness.url);
-    using finalOwner = await signIn(finalPublicApi, ownerName);
-    using finalFirst = await signIn(finalPublicApi, firstName);
-    using finalSecond = await signIn(finalPublicApi, secondName);
+    const finalOwnerSession = await signInWhenAvailable(ownerName);
+    using finalOwnerPublicApi = finalOwnerSession.publicApi;
+    using finalOwner = finalOwnerSession.user;
+    const finalFirstSession = await signInWhenAvailable(firstName);
+    using finalFirstPublicApi = finalFirstSession.publicApi;
+    using finalFirst = finalFirstSession.user;
+    const finalSecondSession = await signInWhenAvailable(secondName);
+    using finalSecondPublicApi = finalSecondSession.publicApi;
+    using finalSecond = finalSecondSession.user;
     const [ownerRecords, firstRecords, secondRecords] = await waitFor(
       "all complete Principal tracer Records",
       async () => {
@@ -1407,10 +1467,29 @@ describe("DeepSeek Agent billing", () => {
     const ownerAfter = await finalOwner.getUsageCreditBalance();
     const firstAfter = await finalFirst.getUsageCreditBalance();
     const secondAfter = await finalSecond.getUsageCreditBalance();
+    const providerCallsBeforeQuiescence = schedulerProviderCalls;
+    await new Promise(done => setTimeout(done, 500));
+    const registrationInitialAttempts = schedulerProviderAttempts.filter(
+      attempt => attempt.kind === "registration-initial",
+    );
+    const registrationToolResultAttempts = schedulerProviderAttempts.filter(
+      attempt => attempt.kind === "registration-tool-result",
+    );
+    const scheduledAttempts = schedulerProviderAttempts.filter(
+      attempt => attempt.kind === "scheduled",
+    );
 
     expect(appProviderCalls).toBe(2);
     expect(actionProviderCalls).toBe(2);
-    expect(schedulerProviderCalls).toBe(3);
+    expect(schedulerProviderCalls).toBe(providerCallsBeforeQuiescence);
+    expect(schedulerProviderAttempts.filter(attempt => attempt.kind === "unclassified")).toEqual([]);
+    expect(registrationInitialAttempts).toHaveLength(1);
+    expect(registrationToolResultAttempts.length).toBeGreaterThanOrEqual(1);
+    expect(registrationToolResultAttempts.length).toBeLessThanOrEqual(2);
+    if (registrationToolResultAttempts.length === 2) {
+      expect(registrationToolResultAttempts[1]).toEqual(registrationToolResultAttempts[0]);
+    }
+    expect(scheduledAttempts).toHaveLength(1);
     expect(firing.scheduleId).toBe(scheduleId);
     expect(ownerAfter.availableSubunits).toBeLessThan(ownerBefore.availableSubunits);
     expect(firstAfter.availableSubunits).toBeLessThan(firstBefore.availableSubunits);
