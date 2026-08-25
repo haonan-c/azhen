@@ -189,6 +189,15 @@ function awaitBeforeDeadline<T>(
   });
 }
 
+async function retainedReplayStage<T>(
+    stage: string, start: () => PromiseLike<T>): Promise<T> {
+  try {
+    return await start();
+  } catch (error) {
+    throw new Error(`Retained replay failed during ${stage}.`, {cause: error});
+  }
+}
+
 async function openUsageAdminWhenAvailable(): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
@@ -1206,34 +1215,57 @@ describe("approved Action billing", () => {
 
   it("replays a committed unknown decision after its raw detail is retained away", async () => {
     const [username] = nextUsernames("actionretainedreplay");
-    const userSession = await openNewUserWhenAvailable(username);
+    const userSession = await retainedReplayStage(
+      "open-new-user", () => openNewUserWhenAvailable(username),
+    );
     using _publicApi = userSession.publicApi;
     using user = userSession.user;
-    const account = await provisionAccount(user);
-    using workspace = await user.newGadget();
-    using gatekeeper = await workspace.newGatekeeper(
-      account.id,
-      `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
+    const account = await retainedReplayStage("provision-account", () => provisionAccount(user));
+    using workspace = await retainedReplayStage("new-gadget", () => user.newGadget());
+    using gatekeeper = await retainedReplayStage(
+      "new-gatekeeper",
+      () => workspace.newGatekeeper(
+        account.id,
+        `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
+      ),
     );
     if (!gatekeeper) throw new Error("Expected the test Gatekeeper.");
-    using session = await gatekeeper.openSession() as RpcStub<TestSession>;
-    const before = await user.getUsageCreditBalance();
+    using session = await retainedReplayStage(
+      "open-gatekeeper-session", () => gatekeeper.openSession(),
+    ) as RpcStub<TestSession>;
+    const before = await retainedReplayStage(
+      "read-balance-before-action", () => user.getUsageCreditBalance(),
+    );
     const label = `unknown-retained-replay-${crypto.randomUUID()}`;
-    await session.requestBillableAction(label);
-    const action = (await workspace.listActions()).find(entry =>
+    await retainedReplayStage(
+      "request-billable-action", () => session.requestBillableAction(label),
+    );
+    const actions = await retainedReplayStage("list-pending-actions", () => workspace.listActions());
+    const action = actions.find(entry =>
       entry.type === "action" && entry.description.title === `Test action ${label}`);
     if (!action) throw new Error("Expected the retained replay Action.");
-    expect(await workspace.approveAction(action.id)).toBe("unknown");
-    const safeRecordRef = await waitForNextUnknownUsageReference(username, new Set());
+    const approval = await retainedReplayStage(
+      "approve-action", () => workspace.approveAction(action.id),
+    );
+    expect(approval).toBe("unknown");
+    const safeRecordRef = await retainedReplayStage(
+      "read-unknown-safe-record-ref",
+      () => waitForNextUnknownUsageReference(username, new Set()),
+    );
 
-    const adminSession = await openUsageAdminWhenAvailable();
+    const adminSession = await retainedReplayStage(
+      "open-initial-admin", () => openUsageAdminWhenAvailable(),
+    );
     using _adminPublicApi = adminSession.publicApi;
     using _authenticatedAdmin = adminSession.user;
     using _admin = adminSession.admin;
     using usage = adminSession.usage;
-    const registered = await waitFor("the retained replay User Registry entry", async () =>
-      (await usage.searchUsers({query: username, limit: 2})).users
-        .find(candidate => candidate.identity === username) ?? null);
+    const registered = await retainedReplayStage(
+      "search-user-registry",
+      () => waitFor("the retained replay User Registry entry", async () =>
+        (await usage.searchUsers({query: username, limit: 2})).users
+          .find(candidate => candidate.identity === username) ?? null),
+    );
     const request = {
       registeredUserRef: registered.registeredUserRef,
       safeRecordRef,
@@ -1241,31 +1273,53 @@ describe("approved Action billing", () => {
       decision: "settle" as const,
       reason: "Replay the committed Action after raw detail retention",
     };
-    await controlUnknownUsageReplayCrash(username, safeRecordRef, "arm");
+    await retainedReplayStage(
+      "arm-lost-safe-result", () => controlUnknownUsageReplayCrash(username, safeRecordRef, "arm"),
+    );
 
-    await expect(usage.reconcileUnknownRecord(request))
-      .rejects.toThrow("Simulated lost administrator safe-result response");
-    expect((await workspace.listActions()).find(entry => entry.id === action.id)?.state)
+    await retainedReplayStage(
+      "commit-unknown-decision-with-lost-response",
+      () => expect(usage.reconcileUnknownRecord(request))
+        .rejects.toThrow("Simulated lost administrator safe-result response"),
+    );
+    const committedActions = await retainedReplayStage(
+      "read-action-after-commit", () => workspace.listActions(),
+    );
+    expect(committedActions.find(entry => entry.id === action.id)?.state)
       .toBe("accepted");
-    const afterCommit = await user.getUsageCreditBalance();
+    const afterCommit = await retainedReplayStage(
+      "read-balance-after-commit", () => user.getUsageCreditBalance(),
+    );
     expect(afterCommit).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
 
-    await controlUnknownUsageReplayCrash(username, safeRecordRef, "expire");
-    await expect(usage.getRecordDetail({
-      registeredUserRef: registered.registeredUserRef,
-      safeRecordRef,
-    })).rejects.toThrow();
+    await retainedReplayStage(
+      "expire-raw-detail", () => controlUnknownUsageReplayCrash(username, safeRecordRef, "expire"),
+    );
+    await retainedReplayStage(
+      "verify-raw-detail-expired",
+      () => expect(usage.getRecordDetail({
+        registeredUserRef: registered.registeredUserRef,
+        safeRecordRef,
+      })).rejects.toThrow(),
+    );
 
-    const replaySession = await openUsageAdminWhenAvailable();
+    const replaySession = await retainedReplayStage(
+      "open-replay-admin", () => openUsageAdminWhenAvailable(),
+    );
     using _replayPublicApi = replaySession.publicApi;
     using _replayAuthenticatedAdmin = replaySession.user;
     using _replayAdmin = replaySession.admin;
     using replayUsage = replaySession.usage;
-    const replayed = await replayUsage.reconcileUnknownRecord(request);
-    expect(await replayUsage.reconcileUnknownRecord(request)).toEqual(replayed);
+    const replayed = await retainedReplayStage(
+      "replay-committed-decision", () => replayUsage.reconcileUnknownRecord(request),
+    );
+    const replayedAgain = await retainedReplayStage(
+      "repeat-replayed-decision", () => replayUsage.reconcileUnknownRecord(request),
+    );
+    expect(replayedAgain).toEqual(replayed);
     expect(replayed).toMatchObject({
       operationId: request.operationId,
       decision: "settle",
@@ -1275,11 +1329,17 @@ describe("approved Action billing", () => {
       actorUserId: ADMIN_USERNAME,
       reason: request.reason,
     });
-    expect(await user.getUsageCreditBalance()).toEqual(afterCommit);
-    await expect(replayUsage.getRecordDetail({
-      registeredUserRef: registered.registeredUserRef,
-      safeRecordRef,
-    })).rejects.toThrow();
+    const finalBalance = await retainedReplayStage(
+      "read-final-balance", () => user.getUsageCreditBalance(),
+    );
+    expect(finalBalance).toEqual(afterCommit);
+    await retainedReplayStage(
+      "verify-final-detail-expired",
+      () => expect(replayUsage.getRecordDetail({
+        registeredUserRef: registered.registeredUserRef,
+        safeRecordRef,
+      })).rejects.toThrow(),
+    );
   });
 
   it("reverts an accepted Action without charging or reversing its original charge", async () => {
