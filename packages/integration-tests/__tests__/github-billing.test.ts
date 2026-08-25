@@ -1016,8 +1016,9 @@ describe.sequential("GitHub billing production Worker contract", () => {
     ]));
     expect(secondRecords.map(record => record.billingMethodKey))
       .toContain("github.issue.details.read.v1");
-    expect(new Set([...firstRecords, ...secondRecords].map(record => record.externalAccountId)).size)
-      .toBe(1);
+    expect([...firstRecords, ...secondRecords].every(
+      record => !Object.hasOwn(record, "externalAccountId"),
+    )).toBe(true);
   });
 
   it("keeps one settled cursor charge after early disposal, reconnect, and Worker restart", async () => {

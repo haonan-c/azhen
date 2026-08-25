@@ -457,8 +457,9 @@ describe.sequential("Spotify billing", () => {
       "spotify.account.save-tracks",
     ]));
     expect(secondRecords[0]?.billingMethodKey).toBe("spotify.account.search");
-    expect(new Set([...firstRecords, ...secondRecords].map(record => record.externalAccountId)).size)
-      .toBe(1);
+    expect([...firstRecords, ...secondRecords].every(
+      record => !Object.hasOwn(record, "externalAccountId"),
+    )).toBe(true);
   });
 
   it("reserves only after approval and rejection performs no provider write", async () => {

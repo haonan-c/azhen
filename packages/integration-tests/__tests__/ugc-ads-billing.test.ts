@@ -924,11 +924,15 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
       const records = await usageRecordsFor(context.user, XHS_BILLING_METHODS.search.methodKey);
       expect(records).toEqual([expect.objectContaining({
         source: "direct-user",
-        externalAccountId: "ugc-ads-deployment",
+        vendorId: VENDOR_ID,
+        billingMethodKey: XHS_BILLING_METHODS.search.methodKey,
         pricing: "priced",
         outcome: "settled",
         chargeSubunits: XHS_CHARGE_SUBUNITS,
       })]);
+      expect(JSON.stringify(records, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value))
+        .not.toContain("ugc-ads-deployment");
       const inspection = await inspectGatekeeperMetering(context.username, true);
       expect(inspection.attempts).toHaveLength(1);
       expect(inspection.usageRecords).toHaveLength(1);
@@ -1338,11 +1342,13 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         source: "direct-user",
         vendorId: VENDOR_ID,
         billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
-        externalAccountId: "ugc-ads-deployment",
         pricing: "priced",
         outcome: "settled",
         chargeSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       })]);
+      expect(JSON.stringify(usageRecords, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value))
+        .not.toContain("ugc-ads-deployment");
       const meteringInspection = await inspectGatekeeperMetering(context.username, true);
       const expectedSettledAttempt = expect.objectContaining({
         operationId: expect.any(String),
