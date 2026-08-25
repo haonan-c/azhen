@@ -162,7 +162,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
     });
   });
 
-  it("commits one immutable projection fact and outbox with the terminal Usage Record", async () => {
+  it("commits immutable detail and aggregate outbox facts with the terminal Usage Record", async () => {
     await withAccount(account => {
       const operationId = "gatekeeper-operation:projection-outbox";
       account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
@@ -171,7 +171,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(account.completeGatekeeperUsage(operationId, "executed")).toEqual(record);
 
       const snapshot = account.getSnapshot();
-      expect(snapshot.projectionOutbox).toHaveLength(1);
+      expect(snapshot.projectionOutbox).toHaveLength(2);
       expect(snapshot.projectionOutbox[0]).toMatchObject({
         fact: {
           schemaVersion: 1,
@@ -186,6 +186,28 @@ describe("Gatekeeper two-stage billing state machine", () => {
           billingMethodKey: "context.read.v1",
           externalAccountId: "context-account-1",
           chargedUsageCreditSubunits: 0n,
+          meteredUseCount: 1n,
+          billableApiOperations: 1n,
+          activeUserContribution: 1n,
+          unpricedApiOperations: 1n,
+        },
+      });
+      expect(snapshot.projectionOutbox[1]).toMatchObject({
+        fact: {
+          schemaVersion: 1,
+          sourceSequence: 2n,
+          usagePrincipalRef: snapshot.registrationOutbox.fact.registeredUserRef,
+          rowKind: "aggregate",
+          meteredKind: "gatekeeper",
+          source: "agent",
+          kind: "gatekeeper",
+          outcome: "settled",
+          pricing: "unpriced",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "context-account-1",
+          chargedUsageCreditSubunits: 0n,
+          meteredUseCount: 1n,
           billableApiOperations: 1n,
           activeUserContribution: 1n,
           unpricedApiOperations: 1n,
@@ -201,19 +223,20 @@ describe("Gatekeeper two-stage billing state machine", () => {
       account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
       account.markGatekeeperUsageStarted(operationId);
       account.completeGatekeeperUsage(operationId, "executed");
-      const pending = account.listPendingProjectionOutbox(1)[0]!;
-      const fact = pending.fact;
+      const pending = account.listPendingProjectionOutbox(2);
+      const detail = pending.find(entry => entry.fact.rowKind === "detail")!;
+      const aggregate = pending.find(entry => entry.fact.rowKind === "aggregate")!;
 
-      account.recordProjectionDeliveryResult([pending], {
-        acknowledgedFactIds: [],
-        rejected: [{projectionFactId: fact.projectionFactId, code: "invalid-fact"}],
+      account.recordProjectionDeliveryResult(pending, {
+        acknowledgedFactIds: [aggregate.fact.projectionFactId],
+        rejected: [{projectionFactId: detail.fact.projectionFactId, code: "invalid-fact"}],
       });
 
       expect(account.listPendingProjectionOutbox(1)).toEqual([]);
-      expect(account.getSnapshot().projectionOutbox).toEqual([{
-        fact,
-        failureCode: "invalid-fact",
-      }]);
+      expect(account.getSnapshot().projectionOutbox).toEqual([
+        {fact: detail.fact, failureCode: "invalid-fact"},
+        {fact: aggregate.fact, deliveredAt: expect.any(String)},
+      ]);
     });
   });
 
@@ -224,16 +247,29 @@ describe("Gatekeeper two-stage billing state machine", () => {
       account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
       account.markGatekeeperUsageStarted(operationId);
       account.completeGatekeeperUsage(operationId, "executed");
-      const pending = account.listPendingProjectionOutbox(1)[0]!;
+      const pending = account.listPendingProjectionOutbox(2);
+      const detail = pending.find(entry => entry.fact.rowKind === "detail")!;
+      const aggregate = pending.find(entry => entry.fact.rowKind === "aggregate")!;
       const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      await runInDurableObject(projection, (_instance, state) => {
+        state.storage.sql.exec(`
+          UPDATE usage_projection_totals SET totals_source = 'summary'
+          WHERE generation = '1'
+        `);
+      });
 
-      expect(await projection.ingest([pending.fact])).toEqual({
-        acknowledgedFactIds: [pending.fact.projectionFactId],
+      const firstDelivery = await projection.ingest(pending.map(entry => entry.fact));
+      expect(firstDelivery).toEqual({
+        acknowledgedFactIds: pending.map(entry => entry.fact.projectionFactId),
         rejected: [],
       });
-      // The response is deliberately not recorded locally. A retry receives the same ACK.
-      const replay = await projection.ingest([pending.fact]);
-      account.recordProjectionDeliveryResult([pending], replay);
+      // The response is deliberately not recorded locally. Each retry receives the same ACK.
+      account.recordProjectionDeliveryResult(
+        [aggregate], await projection.ingest([aggregate.fact]),
+      );
+      account.recordProjectionDeliveryResult(
+        [detail], await projection.ingest([detail.fact]),
+      );
 
       expect(account.listPendingProjectionOutbox(1)).toEqual([]);
       expect((await projection.readOverview()).metrics).toMatchObject({
@@ -256,6 +292,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
         sourceSequence,
         usagePrincipalRef,
         rowKind: "aggregate",
+        meteredKind: "model",
         bucketStart: "2026-08-24T12:00:00.000Z",
         summaryFactId,
         summaryRevision: 1n,
@@ -275,7 +312,10 @@ describe("Gatekeeper two-stage billing state machine", () => {
         reasoningTokens: 0n,
         providerCostUsdSubunits: cacheHitInputTokens,
         chargedUsageCreditSubunits: cacheHitInputTokens,
+        meteredUseCount: 1n,
         billableApiOperations: 0n,
+        preExecutionFailures: 0n,
+        unknownOperations: 0n,
         activeUserContribution: 1n,
         unpricedModelUses: 0n,
         unpricedApiOperations: 0n,
@@ -322,9 +362,9 @@ describe("Gatekeeper two-stage billing state machine", () => {
         account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
         account.markGatekeeperUsageStarted(operationId);
         account.completeGatekeeperUsage(operationId, "executed");
-        const pending = account.listPendingProjectionOutbox(1)[0]!;
-        account.recordProjectionDeliveryResult([pending], {
-          acknowledgedFactIds: [pending.fact.projectionFactId],
+        const pending = account.listPendingProjectionOutbox(2);
+        account.recordProjectionDeliveryResult(pending, {
+          acknowledgedFactIds: pending.map(entry => entry.fact.projectionFactId),
           rejected: [],
         });
       }
@@ -332,13 +372,19 @@ describe("Gatekeeper two-stage billing state machine", () => {
       account.beginGatekeeperUsage(finalOperation, ATTRIBUTION, UNPRICED);
       account.markGatekeeperUsageStarted(finalOperation);
       account.completeGatekeeperUsage(finalOperation, "executed");
-      const finalPending = account.listPendingProjectionOutbox(1)[0]!;
+      const finalPending = account.listPendingProjectionOutbox(2);
+      expect(finalPending.map(entry => entry.fact.sourceSequence)).toEqual([401n, 402n]);
 
       const firstKey = `usageAccount:projectionOutbox:${"1".padStart(40, "0")}`;
       storage.kv.put(firstKey, {corruptDeliveredHistory: true});
-      expect(account.listPendingProjectionOutbox(1)).toEqual([finalPending]);
-      expect(account.listUsageProjectionFacts(200n, 1)).toEqual({
-        facts: [finalPending.fact],
+      expect(account.listPendingProjectionOutbox(2)).toEqual(finalPending);
+      expect(account.listUsageProjectionFacts(400n, 1)).toEqual({
+        facts: [finalPending[0]!.fact],
+        nextSourceSequence: 401n,
+        backfillComplete: true,
+      });
+      expect(account.listUsageProjectionFacts(401n, 1)).toEqual({
+        facts: [finalPending[1]!.fact],
         nextSourceSequence: null,
         backfillComplete: true,
       });
@@ -359,6 +405,13 @@ describe("Gatekeeper two-stage billing state machine", () => {
         unknownId, "gatekeeper-operation:legacy-reconcile", "settle",
         "Recover legacy authority", "legacy-admin",
       );
+      const reconciliationKey =
+        "usageAccount:gatekeeperReconciliation:gatekeeper-operation:legacy-reconcile";
+      const storedReconciliation = storage.kv.get<Record<string, unknown>>(reconciliationKey);
+      if (!storedReconciliation) throw new Error("Expected a stored reconciliation decision.");
+      const legacyReconciliation = structuredClone(storedReconciliation);
+      delete legacyReconciliation.authoritySnapshot;
+      storage.kv.put(reconciliationKey, legacyReconciliation);
 
       for (const [key] of Array.from(storage.kv.list({prefix: "usageAccount:projection"}))) {
         storage.kv.delete(key);
@@ -376,6 +429,17 @@ describe("Gatekeeper two-stage billing state machine", () => {
         "reconciled-settled", "settled", "usage-unknown",
       ]);
       expect(restarted.listUsageProjectionFacts(null, 10).facts).toEqual(facts);
+      const reconciliationFact = facts.find(fact => fact.outcome === "reconciled-settled");
+      if (!reconciliationFact || reconciliationFact.rowKind !== "detail") {
+        throw new Error("Expected the backfilled reconciliation detail.");
+      }
+      expect(restarted.getGatekeeperReconciliationAuthority(
+        reconciliationFact.safeRecordRef,
+      )).toMatchObject({
+        billingOperationId: unknownId,
+        reconciliationOperationId: "gatekeeper-operation:legacy-reconcile",
+        outcome: "reconciled-settled",
+      });
 
       const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
       await projection.ingest(facts);
@@ -385,6 +449,44 @@ describe("Gatekeeper two-stage billing state machine", () => {
         billableApiOperations: 2n,
         unpricedApiOperations: 2n,
       });
+    });
+  });
+
+  it("fails closed when legacy reconciliation authority cannot be recovered", async () => {
+    await withAccount((account, storage) => {
+      const unknownId = "gatekeeper-operation:legacy-missing-authority";
+      const reconciliationId = "gatekeeper-operation:legacy-missing-reconcile";
+      account.beginGatekeeperUsage(unknownId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(unknownId);
+      account.completeGatekeeperUsage(unknownId, "unknown");
+      account.reconcileUnknownGatekeeperUsage(
+        unknownId, reconciliationId, "settle", "Legacy decision", "legacy-admin",
+      );
+
+      const reconciliationKey = `usageAccount:gatekeeperReconciliation:${reconciliationId}`;
+      const storedReconciliation = storage.kv.get<Record<string, unknown>>(reconciliationKey);
+      if (!storedReconciliation) throw new Error("Expected a stored reconciliation decision.");
+      const legacyReconciliation = structuredClone(storedReconciliation);
+      delete legacyReconciliation.authoritySnapshot;
+      storage.kv.put(reconciliationKey, legacyReconciliation);
+      storage.kv.delete(`usageAccount:gatekeeperUsageRecord:${unknownId}`);
+      storage.kv.delete(`usageAccount:gatekeeperAttempt:${unknownId}`);
+      storage.kv.delete(`usageAccount:unpricedDecision:${unknownId}`);
+      for (const [key] of Array.from(storage.kv.list({
+        prefix: "usageAccount:gatekeeperUsageTimeIndex:",
+      }))) {
+        storage.kv.delete(key);
+      }
+      for (const [key] of Array.from(storage.kv.list({prefix: "usageAccount:projection"}))) {
+        storage.kv.delete(key);
+      }
+
+      const restarted = new UsageAccount(storage);
+      expect(() => {
+        for (let batch = 0; batch < 8; batch += 1) {
+          restarted.backfillProjectionFactsBatch(1);
+        }
+      }).toThrow("Gatekeeper Usage reconciliation authority cannot be backfilled.");
     });
   });
 

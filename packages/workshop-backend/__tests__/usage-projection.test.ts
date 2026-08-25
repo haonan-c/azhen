@@ -1,6 +1,7 @@
 import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import {describe, expect, it, vi} from "vitest";
 import {AdminUsageApiImpl, type AdminSettings} from "../src/admin-settings.js";
+import {UsageAccount} from "../src/usage-account.js";
 import type {
   UsageProjection,
   UsageProjectionAggregateFact,
@@ -16,6 +17,11 @@ const testEnv = env as unknown as {
 };
 const PROJECTION_MAINTENANCE_REVISION_KEY =
   "usageAccount:projectionMaintenanceRevision:v1";
+const PROJECTION_BACKFILL_STAGE_KEY = "usageAccount:projectionBackfillStage:v1";
+const PROJECTION_BACKFILL_CURSOR_KEY = "usageAccount:projectionBackfillCursor:v1";
+const SUMMARY_BACKFILL_STAGE_KEY = "usageAccount:summaryBackfillStage:v1";
+const SUMMARY_BACKFILL_CURSOR_KEY = "usageAccount:summaryBackfillCursor:v1";
+const PROJECTION_PENDING_COUNT_KEY = "usageAccount:projectionPendingCount:v1";
 
 function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjectionDetailFact {
   return {
@@ -24,6 +30,7 @@ function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjecti
     sourceSequence: 1n,
     usagePrincipalRef: crypto.randomUUID(),
     rowKind: "detail",
+    safeRecordRef: crypto.randomUUID(),
     occurredAt: "2026-08-24T12:00:00.000Z",
     source: "agent",
     kind: "model",
@@ -41,7 +48,10 @@ function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjecti
     reasoningTokens: 1n,
     providerCostUsdSubunits: 9_007_199_254_740_995n,
     chargedUsageCreditSubunits: 7n,
+    meteredUseCount: 1n,
     billableApiOperations: 0n,
+    preExecutionFailures: 0n,
+    unknownOperations: 0n,
     activeUserContribution: 1n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -51,10 +61,12 @@ function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjecti
 
 function aggregateFact(
     overrides: Partial<UsageProjectionAggregateFact> = {}): UsageProjectionAggregateFact {
-  const {occurredAt: _occurredAt, ...base} = fact();
+  const {occurredAt: _occurredAt, safeRecordRef: _safeRecordRef, ...base} = fact();
+  const kind = overrides.kind ?? base.kind;
   return {
     ...base,
     rowKind: "aggregate",
+    meteredKind: overrides.meteredKind ?? kind,
     bucketStart: "2026-08-24T12:00:00.000Z",
     summaryFactId: crypto.randomUUID(),
     summaryRevision: 1n,
@@ -63,6 +75,51 @@ function aggregateFact(
 }
 
 describe("deployment Usage Projection", () => {
+  it("forces a clean Summary-backed bootstrap when migrating legacy detail totals", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        ALTER TABLE usage_projection_totals DROP COLUMN totals_source
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete',
+          rebuild_request_id = 'legacy-completed', rebuild_state = 'completed',
+          rebuild_generation = active_generation,
+          rebuild_started_at = '2026-08-24T00:00:00.000Z',
+          rebuild_completed_at = '2026-08-24T00:01:00.000Z'
+        WHERE singleton = 1
+      `);
+    });
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart legacy totals migration");
+    })).rejects.toThrow("restart legacy totals migration");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    expect(await runInDurableObject(restarted, (_instance, state) => ({
+      bootstrap: state.storage.sql.exec<{bootstrap_state: string}>(`
+        SELECT bootstrap_state FROM usage_projection_meta WHERE singleton = 1
+      `).one().bootstrap_state,
+      rebuild: state.storage.sql.exec<{rebuild_state: string | null}>(`
+        SELECT rebuild_state FROM usage_projection_meta WHERE singleton = 1
+      `).one().rebuild_state,
+      totalsSource: state.storage.sql.exec<{totals_source: string}>(`
+        SELECT totals_source FROM usage_projection_totals WHERE generation = '1'
+      `).one().totals_source,
+    }))).toEqual({bootstrap: "pending", rebuild: null, totalsSource: "legacy"});
+    expect(await restarted.ensureBootstrap()).toBe(false);
+    for (let step = 0; step < 10 && !await restarted.ensureBootstrap(); step += 1) {
+      await runDurableObjectAlarm(restarted);
+    }
+    expect(await restarted.ensureBootstrap()).toBe(true);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.sql.exec<{totals_source: string}>(`
+        SELECT totals_source FROM usage_projection_totals WHERE generation = (
+          SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
+        )
+      `).one().totals_source)).toBe("summary");
+  });
+
   it("migrates projection metadata created before rebuild authority completion", async () => {
     const projectionName = crypto.randomUUID();
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
@@ -114,6 +171,93 @@ describe("deployment Usage Projection", () => {
       .toBe(9_007_199_254_740_993n);
   });
 
+  it("replays an Issue #62 fact with its original hash after ACK loss", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const current = fact();
+    const {
+      safeRecordRef: _safeRecordRef,
+      meteredUseCount: _meteredUseCount,
+      preExecutionFailures: _preExecutionFailures,
+      unknownOperations: _unknownOperations,
+      ...legacy
+    } = current;
+    const canonical = JSON.stringify([
+      legacy.schemaVersion, legacy.projectionFactId, legacy.sourceSequence.toString(),
+      legacy.usagePrincipalRef, legacy.rowKind, legacy.occurredAt, null, null,
+      legacy.source, legacy.kind,
+      legacy.outcome, legacy.pricing, legacy.deploymentModelId, legacy.vendorId,
+      legacy.billingMethodKey, legacy.externalAccountId, legacy.gadgetId,
+      legacy.cacheHitInputTokens.toString(), legacy.cacheMissInputTokens.toString(),
+      legacy.cacheWriteInputTokens.toString(), legacy.outputTokens.toString(),
+      legacy.reasoningTokens.toString(), legacy.providerCostUsdSubunits.toString(),
+      legacy.chargedUsageCreditSubunits.toString(), legacy.billableApiOperations.toString(),
+      legacy.activeUserContribution.toString(), legacy.unpricedModelUses.toString(),
+      legacy.unpricedApiOperations.toString(),
+    ]);
+    const expectedHash = new Uint8Array(await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(canonical),
+    )).toHex();
+
+    expect(await projection.ingest([legacy as UsageProjectionDetailFact])).toEqual({
+      acknowledgedFactIds: [legacy.projectionFactId],
+      rejected: [],
+    });
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{fact_hash: string}>(`
+        SELECT fact_hash FROM usage_projection_facts WHERE fact_id = ?
+      `, legacy.projectionFactId).one().fact_hash)).toBe(expectedHash);
+    expect(await projection.ingest([legacy as UsageProjectionDetailFact])).toEqual({
+      acknowledgedFactIds: [legacy.projectionFactId],
+      rejected: [],
+    });
+  });
+
+  it("replays an Issue #62 aggregate with its original hash after ACK loss", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const current = aggregateFact();
+    const {
+      meteredKind: _meteredKind,
+      meteredUseCount: _meteredUseCount,
+      preExecutionFailures: _preExecutionFailures,
+      unknownOperations: _unknownOperations,
+      ...legacy
+    } = current;
+    const canonical = JSON.stringify([
+      legacy.schemaVersion, legacy.projectionFactId, legacy.sourceSequence.toString(),
+      legacy.usagePrincipalRef, legacy.rowKind, legacy.bucketStart,
+      legacy.summaryFactId, legacy.summaryRevision.toString(), legacy.source, legacy.kind,
+      legacy.outcome, legacy.pricing, legacy.deploymentModelId, legacy.vendorId,
+      legacy.billingMethodKey, legacy.externalAccountId, legacy.gadgetId,
+      legacy.cacheHitInputTokens.toString(), legacy.cacheMissInputTokens.toString(),
+      legacy.cacheWriteInputTokens.toString(), legacy.outputTokens.toString(),
+      legacy.reasoningTokens.toString(), legacy.providerCostUsdSubunits.toString(),
+      legacy.chargedUsageCreditSubunits.toString(), legacy.billableApiOperations.toString(),
+      legacy.activeUserContribution.toString(), legacy.unpricedModelUses.toString(),
+      legacy.unpricedApiOperations.toString(),
+    ]);
+    const expectedHash = new Uint8Array(await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(canonical),
+    )).toHex();
+
+    expect(await projection.ingest([legacy as UsageProjectionAggregateFact])).toEqual({
+      acknowledgedFactIds: [legacy.projectionFactId],
+      rejected: [],
+    });
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{fact_hash: string; metered_kind: string}>(`
+        SELECT fact_hash, metered_kind FROM usage_projection_facts WHERE fact_id = ?
+      `, legacy.projectionFactId).one())).toEqual({
+      fact_hash: expectedHash,
+      metered_kind: legacy.kind,
+    });
+    expect(await projection.ingest([legacy as UsageProjectionAggregateFact])).toEqual({
+      acknowledgedFactIds: [legacy.projectionFactId],
+      rejected: [],
+    });
+  });
+
   it("acks active ingestion while failing a conflicting rebuild generation", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const input = fact();
@@ -125,10 +269,12 @@ describe("deployment Usage Projection", () => {
     await runInDurableObject(projection, (_instance, state) => {
       state.storage.sql.exec(`
         INSERT INTO usage_projection_totals (
-          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-          unpriced_model_uses, unpriced_api_operations
-        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+          generation, totals_source, provider_cost, charged_credits,
+          cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+          reasoning_tokens, metered_use_count, billable_api_operations,
+          pre_execution_failures, unknown_operations, unpriced_model_uses,
+          unpriced_api_operations
+        ) VALUES ('2', 'legacy', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
       `);
       state.storage.sql.exec(`
         UPDATE usage_projection_meta SET active_generation = '2' WHERE singleton = 1
@@ -235,10 +381,12 @@ describe("deployment Usage Projection", () => {
     await runInDurableObject(restarted, (_instance, state) => {
       state.storage.sql.exec(`
         INSERT INTO usage_projection_totals (
-          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-          unpriced_model_uses, unpriced_api_operations
-        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+          generation, totals_source, provider_cost, charged_credits,
+          cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+          reasoning_tokens, metered_use_count, billable_api_operations,
+          pre_execution_failures, unknown_operations, unpriced_model_uses,
+          unpriced_api_operations
+        ) VALUES ('2', 'legacy', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
       `);
       state.storage.sql.exec(`
         UPDATE usage_projection_meta SET cleanup_generation = '2', cleanup_stage = 'totals'
@@ -263,7 +411,7 @@ describe("deployment Usage Projection", () => {
   it("keeps a drain wakeup when ingress pre-arm is consumed before hashing", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const usagePrincipalRef = crypto.randomUUID();
-    const pending = Array.from({length: 65}, (_, index) => fact({
+    const pending = Array.from({length: 65}, (_, index) => aggregateFact({
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: BigInt(index + 2),
@@ -317,7 +465,7 @@ describe("deployment Usage Projection", () => {
     const projectionName = crypto.randomUUID();
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
     const usagePrincipalRef = crypto.randomUUID();
-    const pending = Array.from({length: 65}, (_, index) => fact({
+    const pending = Array.from({length: 65}, (_, index) => aggregateFact({
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: BigInt(index + 2),
@@ -326,7 +474,7 @@ describe("deployment Usage Projection", () => {
     }));
     await projection.ingest(pending.slice(0, 64));
     await projection.ingest(pending.slice(64));
-    await projection.ingest([fact({
+    await projection.ingest([aggregateFact({
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: 1n,
@@ -414,14 +562,14 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({users: [], nextCursor: null}),
+          listUsageProjectionPrincipals: async () => ({principals: [], nextSequence: null}),
         }),
       };
       expect((await instance.requestRebuild(requestId)).state).toBe("rebuilding");
       await state.storage.deleteAlarm();
     });
     const usagePrincipalRef = crypto.randomUUID();
-    const pending = Array.from({length: 65}, (_, index) => fact({
+    const pending = Array.from({length: 65}, (_, index) => aggregateFact({
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: BigInt(index + 2),
@@ -430,7 +578,7 @@ describe("deployment Usage Projection", () => {
     }));
     await projection.ingest(pending.slice(0, 64));
     await projection.ingest(pending.slice(64));
-    await projection.ingest([fact({
+    await projection.ingest([aggregateFact({
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: 1n,
@@ -498,6 +646,59 @@ describe("deployment Usage Projection", () => {
       occurred_at: null,
       bucket_start: "2026-08-24T12:00:00.000Z",
     }]);
+  });
+
+  it("does not retain exact event time in Summary-backed overview metadata", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const usagePrincipalRef = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const detail = fact({
+      usagePrincipalRef,
+      occurredAt: "2026-08-24T12:07:08.009Z",
+    });
+    const aggregate = aggregateFact({
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 2n,
+      usagePrincipalRef,
+      bucketStart: "2026-08-24T12:00:00.000Z",
+      summaryFactId,
+    });
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_totals SET totals_source = 'summary'
+        WHERE generation = '1'
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete'
+        WHERE singleton = 1
+      `);
+    });
+
+    expect(await projection.ingest([detail, aggregate])).toEqual({
+      acknowledgedFactIds: [detail.projectionFactId, aggregate.projectionFactId],
+      rejected: [],
+    });
+    expect(await projection.expireDetailBefore(
+      usagePrincipalRef,
+      "2026-08-24T12:15:00.000Z",
+    )).toBe(true);
+
+    const retainedTimes = await runInDurableObject(projection, (_instance, state) => ({
+      startedAt: state.storage.sql.exec<{started_at: string | null}>(`
+        SELECT started_at FROM usage_projection_totals WHERE generation = '1'
+      `).one().started_at,
+      latestAppliedSourceAt: state.storage.sql.exec<{latest_applied_source_at: string | null}>(`
+        SELECT latest_applied_source_at FROM usage_projection_meta WHERE singleton = 1
+      `).one().latest_applied_source_at,
+      detailTimes: state.storage.sql.exec<{occurred_at: string}>(`
+        SELECT occurred_at FROM usage_projection_facts WHERE occurred_at IS NOT NULL
+      `).toArray(),
+    }));
+    expect(retainedTimes).toEqual({
+      startedAt: "2026-08-24T12:00:00.000Z",
+      latestAppliedSourceAt: "2026-08-24T12:00:00.000Z",
+      detailTimes: [],
+    });
   });
 
   it("replaces one aggregate snapshot by revision while detail remains additive", async () => {
@@ -659,6 +860,7 @@ describe("deployment Usage Projection", () => {
 
   it("accepts absolute aggregate use counts above one without weakening detail facts", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const exactCount = 9_007_199_254_740_993n;
     const aggregate = aggregateFact({
       kind: "gatekeeper",
       pricing: "unpriced",
@@ -672,18 +874,140 @@ describe("deployment Usage Projection", () => {
       reasoningTokens: 0n,
       providerCostUsdSubunits: 0n,
       chargedUsageCreditSubunits: 0n,
-      billableApiOperations: 20n,
+      meteredUseCount: exactCount,
+      billableApiOperations: exactCount,
+      activeUserContribution: exactCount,
       unpricedModelUses: 0n,
-      unpricedApiOperations: 20n,
+      unpricedApiOperations: exactCount,
     });
     expect(await projection.ingest([aggregate])).toEqual({
       acknowledgedFactIds: [aggregate.projectionFactId],
       rejected: [],
     });
     expect((await projection.readOverview()).metrics).toMatchObject({
-      billableApiOperations: 20n,
-      unpricedApiOperations: 20n,
+      meteredUseCount: exactCount,
+      billableApiOperations: exactCount,
+      unpricedApiOperations: exactCount,
       activeUsers: 1n,
+    });
+
+    const reconciliations = aggregateFact({
+      outcome: "reconciliation-required",
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 2n,
+      unknownOperations: 2n,
+      activeUserContribution: 2n,
+    });
+    expect(await projection.ingest([reconciliations])).toEqual({
+      acknowledgedFactIds: [reconciliations.projectionFactId],
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics).toMatchObject({
+      meteredUseCount: exactCount + 2n,
+      activeUsers: 2n,
+    });
+
+    const attempts = aggregateFact({
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "failed-before-execution",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "context",
+      billingMethodKey: "context.read.v1",
+      externalAccountId: "attempt-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      preExecutionFailures: 2n,
+      activeUserContribution: 0n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: 0n,
+    });
+    expect(await projection.ingest([attempts])).toEqual({
+      acknowledgedFactIds: [attempts.projectionFactId],
+      rejected: [],
+    });
+    expect((await projection.readOverview()).metrics).toMatchObject({
+      meteredUseCount: exactCount + 2n,
+      activeUsers: 2n,
+    });
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{
+        count: string;
+        pre_execution_failures: string;
+        metered_use_count: string;
+      }>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS count,
+               pre_execution_failures, metered_use_count
+        FROM usage_projection_facts
+        WHERE metered_kind = 'attempt'
+      `).one())).toEqual({
+      count: "1",
+      pre_execution_failures: "2",
+      metered_use_count: "0",
+    });
+
+    const mismatchedActiveContribution = aggregateFact({
+      meteredUseCount: 2n,
+      activeUserContribution: 1n,
+    });
+    expect(await projection.ingest([mismatchedActiveContribution])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{
+        projectionFactId: mismatchedActiveContribution.projectionFactId,
+        code: "invalid-fact",
+      }],
+    });
+
+    const mismatchedApiCount = aggregateFact({
+      kind: "gatekeeper",
+      pricing: "priced",
+      deploymentModelId: null,
+      vendorId: "context",
+      billingMethodKey: "context.read.v1",
+      externalAccountId: "mismatched-api-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      meteredUseCount: 2n,
+      billableApiOperations: 1n,
+      activeUserContribution: 2n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: 0n,
+    });
+    expect(await projection.ingest([mismatchedApiCount])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{
+        projectionFactId: mismatchedApiCount.projectionFactId,
+        code: "invalid-fact",
+      }],
+    });
+
+    const emptySettledSnapshot = aggregateFact({
+      meteredKind: "attempt",
+      meteredUseCount: 0n,
+      activeUserContribution: 0n,
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+    });
+    expect(await projection.ingest([emptySettledSnapshot])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{
+        projectionFactId: emptySettledSnapshot.projectionFactId,
+        code: "invalid-fact",
+      }],
     });
 
     const invalidDetail = fact({
@@ -759,24 +1083,21 @@ describe("deployment Usage Projection", () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const usagePrincipalRef = crypto.randomUUID();
     const poison = fact({usagePrincipalRef, sourceSequence: 1n, unpricedModelUses: 1n});
-    const next = fact({usagePrincipalRef, sourceSequence: 2n, cacheHitInputTokens: 23n});
+    const next = aggregateFact({
+      usagePrincipalRef,
+      sourceSequence: 2n,
+      cacheHitInputTokens: 23n,
+    });
     await projection.ingest([poison, next]);
     const registeredUserRef = crypto.randomUUID();
     await runInDurableObject(projection, instance => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({
-            users: [{
-              registeredUserRef,
-              identity: "poison-rebuild@example.test",
-              displayName: "Poison Rebuild",
-              registeredAt: "2026-08-24T12:00:00.000Z",
-              activatedAt: "2026-08-24T12:00:00.000Z",
-            }],
-            nextCursor: null,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{sequence: 1n, registeredUserRef, userDoId: registeredUserRef}],
+            nextSequence: null,
           }),
-          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
         }),
       };
       (instance as unknown as {users: unknown}).users = {
@@ -803,15 +1124,16 @@ describe("deployment Usage Projection", () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const registeredUserRef = crypto.randomUUID();
     const usagePrincipalRef = crypto.randomUUID();
-    const first = fact({
+    const first = aggregateFact({
       usagePrincipalRef, sourceSequence: 1n,
       cacheHitInputTokens: 3n, providerCostUsdSubunits: 3n,
     });
-    const conflicting = fact({
-      ...first, sourceSequence: 2n,
+    const conflicting: UsageProjectionAggregateFact = {
+      ...first,
+      sourceSequence: 2n,
       cacheHitInputTokens: 5n, providerCostUsdSubunits: 5n,
-    });
-    const third = fact({
+    };
+    const third = aggregateFact({
       usagePrincipalRef, sourceSequence: 3n,
       cacheHitInputTokens: 7n, providerCostUsdSubunits: 7n,
     });
@@ -819,17 +1141,10 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({
-            users: [{
-              registeredUserRef,
-              identity: "conflict-rebuild@example.test",
-              displayName: "Conflict Rebuild",
-              registeredAt: "2026-08-24T12:00:00.000Z",
-              activatedAt: "2026-08-24T12:00:00.000Z",
-            }],
-            nextCursor: null,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{sequence: 1n, registeredUserRef, userDoId: registeredUserRef}],
+            nextSequence: null,
           }),
-          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
         }),
       };
       (instance as unknown as {users: unknown}).users = {
@@ -860,17 +1175,10 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({
-            users: [{
-              registeredUserRef,
-              identity: "live-poison@example.test",
-              displayName: "Live Poison",
-              registeredAt: "2026-08-24T12:00:00.000Z",
-              activatedAt: "2026-08-24T12:00:00.000Z",
-            }],
-            nextCursor: null,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{sequence: 1n, registeredUserRef, userDoId: registeredUserRef}],
+            nextSequence: null,
           }),
-          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
         }),
       };
       (instance as unknown as {users: unknown}).users = {
@@ -1005,16 +1313,16 @@ describe("deployment Usage Projection", () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const registeredUserRef = crypto.randomUUID();
     const usagePrincipalRef = crypto.randomUUID();
-    const first = fact({
+    const first = aggregateFact({
       usagePrincipalRef, sourceSequence: 1n,
       cacheHitInputTokens: 3n, providerCostUsdSubunits: 3n,
     });
-    const poison = fact({
+    const poison: UsageProjectionAggregateFact = {
       ...first,
       sourceSequence: 2n,
       reasoningTokens: first.outputTokens + 1n,
-    });
-    const third = fact({
+    };
+    const third = aggregateFact({
       usagePrincipalRef, sourceSequence: 3n,
       cacheHitInputTokens: 7n, providerCostUsdSubunits: 7n,
     });
@@ -1023,17 +1331,10 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({
-            users: [{
-              registeredUserRef,
-              identity: "live-invalid-conflict@example.test",
-              displayName: "Live Invalid Conflict",
-              registeredAt: "2026-08-24T12:00:00.000Z",
-              activatedAt: "2026-08-24T12:00:00.000Z",
-            }],
-            nextCursor: null,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{sequence: 1n, registeredUserRef, userDoId: registeredUserRef}],
+            nextSequence: null,
           }),
-          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
         }),
       };
       (instance as unknown as {users: unknown}).users = {
@@ -1092,10 +1393,12 @@ describe("deployment Usage Projection", () => {
     await runInDurableObject(projection, (_instance, state) => {
       state.storage.sql.exec(`
         INSERT INTO usage_projection_totals (
-          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-          unpriced_model_uses, unpriced_api_operations
-        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+          generation, totals_source, provider_cost, charged_credits,
+          cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+          reasoning_tokens, metered_use_count, billable_api_operations,
+          pre_execution_failures, unknown_operations, unpriced_model_uses,
+          unpriced_api_operations
+        ) VALUES ('2', 'legacy', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
       `);
       state.storage.sql.exec(`
         UPDATE usage_projection_meta SET rebuild_request_id = ?, rebuild_state = 'rebuilding',
@@ -1148,10 +1451,12 @@ describe("deployment Usage Projection", () => {
     await runInDurableObject(projection, (_instance, state) => {
       state.storage.sql.exec(`
         INSERT INTO usage_projection_totals (
-          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-          unpriced_model_uses, unpriced_api_operations
-        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+          generation, totals_source, provider_cost, charged_credits,
+          cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+          reasoning_tokens, metered_use_count, billable_api_operations,
+          pre_execution_failures, unknown_operations, unpriced_model_uses,
+          unpriced_api_operations
+        ) VALUES ('2', 'legacy', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
       `);
       state.storage.sql.exec(`
         UPDATE usage_projection_meta SET rebuild_request_id = ?, rebuild_state = 'rebuilding',
@@ -1220,10 +1525,12 @@ describe("deployment Usage Projection", () => {
     await runInDurableObject(projection, (_instance, state) => {
       state.storage.sql.exec(`
         INSERT INTO usage_projection_totals (
-          generation, provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-          unpriced_model_uses, unpriced_api_operations
-        ) VALUES ('2', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+          generation, totals_source, provider_cost, charged_credits,
+          cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+          reasoning_tokens, metered_use_count, billable_api_operations,
+          pre_execution_failures, unknown_operations, unpriced_model_uses,
+          unpriced_api_operations
+        ) VALUES ('2', 'legacy', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
       `);
       state.storage.sql.exec(`
         UPDATE usage_projection_meta SET rebuild_request_id = ?, rebuild_state = 'rebuilding',
@@ -1329,9 +1636,13 @@ describe("deployment Usage Projection", () => {
       configurationGap: true,
     });
     await user.markGatekeeperUsageStarted(operationId);
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    for (let step = 0; step < 20 && !await projection.ensureBootstrap(); step += 1) {
+      await runDurableObjectAlarm(projection);
+    }
+    expect(await projection.ensureBootstrap()).toBe(true);
     expect((await user.completeGatekeeperUsage(operationId, "executed")).outcome).toBe("settled");
 
-    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
     await expect.poll(async () =>
       (await projection.readOverview()).metrics?.billableApiOperations,
     ).toBe(1n);
@@ -1372,7 +1683,10 @@ describe("deployment Usage Projection", () => {
 
     await runInDurableObject(user, async (instance, state) => {
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: () => new Promise(() => {})}),
+        getByName: () => ({
+          ingest: () => new Promise(() => {}),
+          expireDetailBefore: async () => true,
+        }),
       };
       await instance.completeGatekeeperUsage(operationId, "executed");
       expect(await state.storage.getAlarm()).not.toBeNull();
@@ -1386,7 +1700,7 @@ describe("deployment Usage Projection", () => {
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
     await expect.poll(async () =>
       (await projection.readOverview()).ingestionWatermark,
-    ).toBe(beforeWatermark + 1n);
+    ).toBe(beforeWatermark + 2n);
   });
 
   it("keeps a concurrent terminal alarm after an empty maintenance health wait", async () => {
@@ -1450,7 +1764,7 @@ describe("deployment Usage Projection", () => {
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
     await expect.poll(async () =>
       (await projection.readOverview()).ingestionWatermark,
-    ).toBe(beforeWatermark + 1n);
+    ).toBe(beforeWatermark + 2n);
   });
 
   it("keeps an alarm when empty maintenance starts after pre-arm but before commit", async () => {
@@ -1483,7 +1797,10 @@ describe("deployment Usage Projection", () => {
 
     const persistedAlarm = await runInDurableObject(user, async (instance, state) => {
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: () => new Promise(() => {})}),
+        getByName: () => ({
+          ingest: () => new Promise(() => {}),
+          expireDetailBefore: async () => true,
+        }),
       };
       (instance as unknown as {adminSettings: unknown}).adminSettings = {
         getByName: () => ({recordUsageProjectionDeliveryHealth: async () => {}}),
@@ -1563,7 +1880,10 @@ describe("deployment Usage Projection", () => {
       }}).usageAccount;
       account.completeGatekeeperUsage(oldOperationId, "executed");
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: () => new Promise(() => {})}),
+        getByName: () => ({
+          ingest: () => new Promise(() => {}),
+          expireDetailBefore: async () => true,
+        }),
       };
       (instance as unknown as {adminSettings: unknown}).adminSettings = {
         getByName: () => ({recordUsageProjectionDeliveryHealth: async () => {}}),
@@ -1600,7 +1920,7 @@ describe("deployment Usage Projection", () => {
     expect(await runInDurableObject(restarted, (_instance, state) =>
       state.storage.getAlarm())).not.toBeNull();
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    expect((await projection.readOverview()).ingestionWatermark).toBe(beforeWatermark + 2n);
+    expect((await projection.readOverview()).ingestionWatermark).toBe(beforeWatermark + 4n);
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
 
@@ -1631,9 +1951,12 @@ describe("deployment Usage Projection", () => {
     await user.markGatekeeperUsageStarted(operationId);
     await runInDurableObject(user, async instance => {
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: async () => {
-          throw new Error("controlled Projection outage");
-        }}),
+        getByName: () => ({
+          ingest: async () => {
+            throw new Error("controlled Projection outage");
+          },
+          expireDetailBefore: async () => true,
+        }),
       };
       await instance.completeGatekeeperUsage(operationId, "executed");
       await instance.alarm();
@@ -1767,7 +2090,7 @@ describe("deployment Usage Projection", () => {
     await user.completeGatekeeperUsage(operationId, "executed");
     await expect.poll(async () =>
       (await projection.readOverview()).ingestionWatermark,
-    ).toBe(before.ingestionWatermark + 1n);
+    ).toBe(before.ingestionWatermark + 2n);
     const authoritativeBalanceBefore = await user.getAdminUsageBalanceState();
     const projectedBefore = await projection.readOverview();
     const requestId = `rebuild-${crypto.randomUUID()}`;
@@ -1818,7 +2141,7 @@ describe("deployment Usage Projection", () => {
     await newUser.markGatekeeperUsageStarted(newOperationId);
     await newUser.completeGatekeeperUsage(newOperationId, "executed");
     await expect.poll(async () => (await projection.readOverview()).ingestionWatermark)
-      .toBe(projectedBefore.ingestionWatermark + 2n);
+      .toBe(projectedBefore.ingestionWatermark + 4n);
     const expectedMetrics = (await projection.readOverview()).metrics;
     await expect(runInDurableObject(projection, (_instance, state) => {
       state.abort("interrupt rebuild alarm");
@@ -1847,25 +2170,22 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => {
+          listUsageProjectionPrincipals: async () => {
             registryReads += 1;
             if (registryReads === 1) {
               registryReadStarted.resolve();
               await releaseRegistryRead.promise;
               return {
-                users: [{
+                principals: [{
+                  sequence: 1n,
                   registeredUserRef,
-                  identity: "rebuild-step@example.test",
-                  displayName: "Rebuild Step",
-                  registeredAt: "2026-08-24T12:00:00.000Z",
-                  activatedAt: "2026-08-24T12:00:00.000Z",
+                  userDoId: registeredUserRef,
                 }],
-                nextCursor: null,
+                nextSequence: null,
               };
             }
-            return {users: [], nextCursor: null};
+            return {principals: [], nextSequence: null};
           },
-          resolveRegisteredUsageUser: async () => ({userDoId: registeredUserRef}),
         }),
       };
       (instance as unknown as {users: unknown}).users = {
@@ -2005,7 +2325,6 @@ describe("deployment Usage Projection", () => {
   });
 
   it("backfills pre-Projection Usage Records during rebuild without double counting", async () => {
-    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
     const identity = `projection-legacy-${crypto.randomUUID()}`;
     const userId = testEnv.TEST_USER.idFromName(identity);
     const user = testEnv.TEST_USER.get(userId);
@@ -2043,51 +2362,111 @@ describe("deployment Usage Projection", () => {
     );
     const liveFacts = (await user.listUsageProjectionFacts(null, 10)).facts;
     const principalRef = liveFacts[0]!.usagePrincipalRef;
-    await expect.poll(() => runInDurableObject(projection, (_instance, state) =>
-      state.storage.sql.exec<{count: string}>(`
-        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_projection_facts
-        WHERE generation = (
-          SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-        ) AND principal_ref = ? AND applied = 1
-      `, principalRef).one().count)).toBe("3");
-    const totalsBefore = (await projection.readOverview()).metrics;
-
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    await runInDurableObject(projection, instance => {
+      (instance as unknown as {admin: unknown}).admin = {
+        getByName: () => ({
+          getRegisteredUsageUsersRevision: async () => 1n,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{
+              sequence: 1n,
+              registeredUserRef: principalRef,
+              userDoId: userId.toString(),
+            }],
+            nextSequence: null,
+          }),
+        }),
+      };
+    });
     await runInDurableObject(user, (_instance, state) => {
-      for (const [key] of Array.from(state.storage.kv.list({
-        prefix: "usageAccount:projection",
-      }))) {
-        state.storage.kv.delete(key);
+      for (const prefix of [
+        "usageAccount:projection",
+        "usageAccount:summary",
+        "usageAccount:detail",
+      ]) {
+        for (const [key] of Array.from(state.storage.kv.list({prefix}))) {
+          state.storage.kv.delete(key);
+        }
       }
     });
     const requestId = `legacy-rebuild-${crypto.randomUUID()}`;
-    await expect.poll(async () => {
-      try {
-        return (await projection.requestRebuild(requestId)).requestId;
-      } catch {
-        return null;
-      }
-    }).toBe(requestId);
+    expect((await projection.requestRebuild(requestId)).requestId).toBe(requestId);
     await expect.poll(async () => (await projection.requestRebuild(requestId)).state)
       .toBe("completed");
-    expect((await projection.readOverview()).metrics).toEqual(totalsBefore);
     const retained = await user.listUsageProjectionFacts(null, 10);
     expect(retained.backfillComplete).toBe(true);
-    expect(retained.facts).toHaveLength(3);
+    expect(retained.facts).toHaveLength(6);
+    const latestAuthoritySummaries = new Map<string, UsageProjectionAggregateFact>();
+    for (const fact of retained.facts) {
+      if (fact.rowKind !== "aggregate") continue;
+      const previous = latestAuthoritySummaries.get(fact.summaryFactId);
+      if (previous === undefined || previous.summaryRevision < fact.summaryRevision) {
+        latestAuthoritySummaries.set(fact.summaryFactId, fact);
+      }
+    }
+    const expectedPrincipalTotals = Array.from(latestAuthoritySummaries.values()).reduce(
+      (totals, fact) => ({
+        meteredUseCount: totals.meteredUseCount + fact.meteredUseCount,
+        billableApiOperations: totals.billableApiOperations + fact.billableApiOperations,
+        unpricedApiOperations: totals.unpricedApiOperations + fact.unpricedApiOperations,
+      }),
+      {meteredUseCount: 0n, billableApiOperations: 0n, unpricedApiOperations: 0n},
+    );
+    const projectedPrincipalTotals = await runInDurableObject(
+      projection,
+      (_instance, state) => state.storage.sql.exec<{
+        summary_count: string;
+        metered_use_count: string;
+        billable_api_operations: string;
+        unpriced_api_operations: string;
+      }>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS summary_count,
+          CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
+            AS metered_use_count,
+          CAST(COALESCE(SUM(CAST(billable_api_operations AS INTEGER)), 0) AS TEXT)
+            AS billable_api_operations,
+          CAST(COALESCE(SUM(CAST(unpriced_api_operations AS INTEGER)), 0) AS TEXT)
+            AS unpriced_api_operations
+        FROM usage_projection_summaries
+        WHERE generation = (
+          SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
+        ) AND summary_fact_id IN (
+          SELECT summary_fact_id FROM usage_projection_facts
+          WHERE generation = (
+            SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
+          ) AND principal_ref = ? AND row_kind = 'aggregate' AND applied = 1
+        )
+      `, principalRef).one(),
+    );
+    expect(projectedPrincipalTotals).toEqual({
+      summary_count: latestAuthoritySummaries.size.toString(),
+      metered_use_count: expectedPrincipalTotals.meteredUseCount.toString(),
+      billable_api_operations: expectedPrincipalTotals.billableApiOperations.toString(),
+      unpriced_api_operations: expectedPrincipalTotals.unpricedApiOperations.toString(),
+    });
   });
 
   it("keeps User legacy backfill alive when the requesting rebuild stops", async () => {
+    const activeProjection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    for (let step = 0; step < 20 && !await activeProjection.ensureBootstrap(); step += 1) {
+      await runDurableObjectAlarm(activeProjection);
+    }
+    expect(await activeProjection.ensureBootstrap()).toBe(true);
     const identity = `projection-rebuild-backfill-${crypto.randomUUID()}`;
     const userId = testEnv.TEST_USER.idFromName(identity);
-    const user = testEnv.TEST_USER.get(userId);
+    let user = testEnv.TEST_USER.get(userId);
     expect(await user.createAccount(identity, identity, new Uint8Array([31, 32, 33])))
       .not.toBeNull();
     await user.activateUsageAccount();
     await runInDurableObject(user, async instance => {
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: async (facts: UsageProjectionFact[]) => ({
-          acknowledgedFactIds: facts.map(item => item.projectionFactId),
-          rejected: [],
-        })}),
+        getByName: () => ({
+          ingest: async (facts: UsageProjectionFact[]) => ({
+            acknowledgedFactIds: facts.map(item => item.projectionFactId),
+            rejected: [],
+          }),
+          expireDetailBefore: async () => true,
+        }),
       };
       for (let index = 0; index < 33; index += 1) {
         const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
@@ -2115,18 +2494,44 @@ describe("deployment Usage Projection", () => {
     const registered = (await settings.searchRegisteredUsageUsers({query: identity, limit: 1}))
       .users[0]!;
     await runInDurableObject(user, async (_instance, state) => {
-      for (const [key] of Array.from(state.storage.kv.list({
-        prefix: "usageAccount:projection",
-      }))) {
-        state.storage.kv.delete(key);
+      for (const prefix of [
+        "usageAccount:projection",
+        "usageAccount:summary",
+        "usageAccount:detail",
+      ]) {
+        for (const [key] of Array.from(state.storage.kv.list({prefix}))) {
+          state.storage.kv.delete(key);
+        }
       }
       await state.storage.deleteAlarm();
     });
+    const partialBackfill = await runInDurableObject(user, (_instance, state) => {
+      expect(new UsageAccount(state.storage).backfillProjectionFactsBatch(32)).toBe(false);
+      return {
+        stage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+        cursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+        pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+      };
+    });
+    expect(partialBackfill).toMatchObject({stage: "gatekeeper", pendingCount: 64n});
+    expect(partialBackfill.cursor).toBeDefined();
+    await expect(runInDurableObject(user, (_instance, state) => {
+      state.abort("restart during bounded legacy backfill");
+    })).rejects.toThrow("restart during bounded legacy backfill");
+    user = testEnv.TEST_USER.get(userId);
+    expect(await runInDurableObject(user, (_instance, state) => ({
+      stage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+      cursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+      pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+    }))).toEqual(partialBackfill);
     await runInDurableObject(user, instance => {
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: async () => {
-          throw new Error("controlled Projection outage");
-        }}),
+        getByName: () => ({
+          ingest: async () => {
+            throw new Error("controlled Projection outage");
+          },
+          expireDetailBefore: async () => true,
+        }),
       };
     });
 
@@ -2135,11 +2540,14 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({
-            users: [registered],
-            nextCursor: null,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{
+              sequence: 1n,
+              registeredUserRef: registered.registeredUserRef,
+              userDoId: userId.toString(),
+            }],
+            nextSequence: null,
           }),
-          resolveRegisteredUsageUser: async () => ({userDoId: userId.toString()}),
         }),
       };
       await instance.requestRebuild(`legacy-backfill-stop-${crypto.randomUUID()}`);
@@ -2147,22 +2555,59 @@ describe("deployment Usage Projection", () => {
       await instance.alarm();
       state.abort("stop requesting rebuild after one legacy page");
     })).rejects.toThrow("stop requesting rebuild after one legacy page");
-    expect(await runInDurableObject(user, (_userInstance, userState) =>
-      userState.storage.getAlarm())).not.toBeNull();
-    const activeProjection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const stateBeforeRestart = await runInDurableObject(user, async (_instance, state) => ({
+      projectionStage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+      projectionCursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+      summaryStage: state.storage.kv.get<string>(SUMMARY_BACKFILL_STAGE_KEY),
+      summaryCursor: state.storage.kv.get<string>(SUMMARY_BACKFILL_CURSOR_KEY),
+      pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+      alarm: await state.storage.getAlarm(),
+    }));
+    expect(stateBeforeRestart).toMatchObject({
+      projectionStage: "complete",
+      projectionCursor: undefined,
+      summaryStage: "complete",
+      summaryCursor: undefined,
+      pendingCount: 66n,
+    });
+    expect(stateBeforeRestart.alarm).not.toBeNull();
     const unpricedBefore = (await activeProjection.readOverview()).metrics.unpricedApiOperations;
     await expect(runInDurableObject(user, (_instance, state) => {
       state.abort("restart after rebuild backfill outage");
     })).rejects.toThrow("restart after rebuild backfill outage");
     const restarted = testEnv.TEST_USER.get(userId);
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    const continuationAlarm = await runInDurableObject(
-      restarted, (_instance, state) => state.storage.getAlarm());
-    expect(continuationAlarm).not.toBeNull();
-    expect(continuationAlarm!).toBeLessThanOrEqual(Date.now() + 1_500);
+    const stateAfterRestart = await runInDurableObject(restarted, async (_instance, state) => ({
+      projectionStage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+      projectionCursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+      summaryStage: state.storage.kv.get<string>(SUMMARY_BACKFILL_STAGE_KEY),
+      summaryCursor: state.storage.kv.get<string>(SUMMARY_BACKFILL_CURSOR_KEY),
+      pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+      alarm: await state.storage.getAlarm(),
+    }));
+    expect(stateAfterRestart).toMatchObject({
+      projectionStage: "complete",
+      projectionCursor: undefined,
+      summaryStage: "complete",
+      summaryCursor: undefined,
+      pendingCount: 34n,
+    });
+    expect(stateAfterRestart.alarm).not.toBeNull();
+    expect(stateAfterRestart.alarm!).toBeLessThanOrEqual(Date.now() + 1_500);
+    // Backfill writes immutable detail then aggregate facts per record. The first 32-fact delivery
+    // after restart therefore applies 16 Summary snapshots and leaves 34 facts pending.
+    expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
+      .toBe(unpricedBefore + 16n);
+    expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY))).toBe(2n);
+    // The second 32-fact delivery applies the next 16 aggregate snapshots.
     expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
       .toBe(unpricedBefore + 32n);
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY))).toBe(0n);
+    // The last detail/aggregate pair contributes the 33rd Summary and ends the bounded replay.
     expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
       .toBe(unpricedBefore + 33n);
   });
@@ -2176,10 +2621,13 @@ describe("deployment Usage Projection", () => {
     await user.activateUsageAccount();
     await runInDurableObject(user, async instance => {
       (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({ingest: async (facts: UsageProjectionFact[]) => ({
-          acknowledgedFactIds: facts.map(item => item.projectionFactId),
-          rejected: [],
-        })}),
+        getByName: () => ({
+          ingest: async (facts: UsageProjectionFact[]) => ({
+            acknowledgedFactIds: facts.map(item => item.projectionFactId),
+            rejected: [],
+          }),
+          expireDetailBefore: async () => true,
+        }),
       };
       const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
       await instance.beginGatekeeperUsage(operationId, {
@@ -2204,32 +2652,38 @@ describe("deployment Usage Projection", () => {
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
     const registered = (await settings.searchRegisteredUsageUsers({query: identity, limit: 1}))
       .users[0]!;
-    await runInDurableObject(user, (_instance, state) => {
-      for (const [key] of Array.from(state.storage.kv.list({
-        prefix: "usageAccount:projection",
-      }))) {
-        state.storage.kv.delete(key);
-      }
-    });
-
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     await runInDurableObject(projection, instance => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => ({
-            users: [registered],
-            nextCursor: null,
+          listUsageProjectionPrincipals: async () => ({
+            principals: [{
+              sequence: 1n,
+              registeredUserRef: registered.registeredUserRef,
+              userDoId: userId.toString(),
+            }],
+            nextSequence: null,
           }),
-          resolveRegisteredUsageUser: async () => ({userDoId: userId.toString()}),
         }),
       };
     });
     const projectionNamespace = {
       getByName: () => projection,
     } as unknown as DurableObjectNamespace<UsageProjection>;
+    // The test keeps the real Registry registration and User authority scan. It isolates only the
+    // deployment-wide delivery-health merge, which concurrent outage tests intentionally mutate.
+    const cleanAdminHealth = {
+      countRegisteredUsageUsers: async () => 1n,
+      getUsageProjectionDeliveryHealth: async () => ({
+        pendingEventCount: 0n,
+        oldestPendingAt: null,
+        failedDeliveryCount: 0n,
+        failureCode: null,
+      }),
+    } as unknown as DurableObjectStub<AdminSettings>;
     const admin = new AdminUsageApiImpl(
-      settings, testEnv.TEST_USER, "projection-bootstrap-admin", undefined,
+      cleanAdminHealth, testEnv.TEST_USER, "projection-bootstrap-admin", undefined,
       projectionNamespace,
     );
 
@@ -2247,7 +2701,7 @@ describe("deployment Usage Projection", () => {
       async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const registeredUserRefs = Array.from({length: 10_000}, () => crypto.randomUUID());
-    const target = fact({
+    const target = aggregateFact({
       usagePrincipalRef: registeredUserRefs.at(-1)!,
       cacheHitInputTokens: 17n,
     });
@@ -2258,27 +2712,24 @@ describe("deployment Usage Projection", () => {
         (instance as unknown as {admin: unknown}).admin = {
           getByName: () => ({
             getRegisteredUsageUsersRevision: async () => 10_000n,
-            searchRegisteredUsageUsers: async ({cursor, limit}: {
-              cursor?: string;
-              limit: number;
-            }) => {
+            listUsageProjectionPrincipals: async (
+                afterSequence: bigint | null,
+                maximumSequence: bigint,
+                limit: number) => {
               expect(limit).toBe(100);
-              const start = cursor === undefined ? 0 : Number(cursor);
+              expect(maximumSequence).toBe(10_000n);
+              const start = Number(afterSequence ?? 0n);
               const end = Math.min(start + limit, registeredUserRefs.length);
               return {
-                users: registeredUserRefs.slice(start, end).map(registeredUserRef => ({
-                  registeredUserRef,
-                  identity: "bounded-bootstrap@example.test",
-                  displayName: "Bounded Bootstrap",
-                  registeredAt: "2026-08-24T12:00:00.000Z",
-                  activatedAt: "2026-08-24T12:00:00.000Z",
+                principals: registeredUserRefs.slice(start, end).map(
+                  (registeredUserRef, index) => ({
+                    sequence: BigInt(start + index + 1),
+                    registeredUserRef,
+                    userDoId: registeredUserRef,
                 })),
-                nextCursor: end === registeredUserRefs.length ? null : end.toString(),
+                nextSequence: end === registeredUserRefs.length ? null : BigInt(end),
               };
             },
-            resolveRegisteredUsageUser: async (registeredUserRef: string) => ({
-              userDoId: registeredUserRef,
-            }),
           }),
         };
         (instance as unknown as {users: unknown}).users = {
@@ -2329,7 +2780,7 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 1n,
-          searchRegisteredUsageUsers: async () => {
+          listUsageProjectionPrincipals: async () => {
             throw new Error("controlled bootstrap Registry failure");
           },
         }),
@@ -2358,7 +2809,7 @@ describe("deployment Usage Projection", () => {
       (instance as unknown as {admin: unknown}).admin = {
         getByName: () => ({
           getRegisteredUsageUsersRevision: async () => 0n,
-          searchRegisteredUsageUsers: async () => {
+          listUsageProjectionPrincipals: async () => {
             throw new Error("controlled Registry failure");
           },
         }),
@@ -2377,6 +2828,17 @@ describe("deployment Usage Projection", () => {
 
   it("resumes bounded inactive-generation cleanup without deleting the active generation",
       async () => {
+    const generationTables = [
+      "usage_projection_facts",
+      "usage_projection_expired_sequences",
+      "usage_projection_rejections",
+      "usage_projection_drains",
+      "usage_projection_principals",
+      "usage_projection_active_users",
+      "usage_projection_summaries",
+      "usage_projection_rebuild_users",
+      "usage_projection_totals",
+    ] as const;
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
     const requestId = `cleanup-${crypto.randomUUID()}`;
     await projection.requestRebuild(requestId);
@@ -2386,9 +2848,44 @@ describe("deployment Usage Projection", () => {
       state.abort("interrupt generation cleanup");
     })).rejects.toThrow("interrupt generation cleanup");
     const restarted = testEnv.TEST_USAGE_PROJECTION.get(projection.id);
-    for (let index = 0; index < 8; index += 1) {
-      await runDurableObjectAlarm(restarted);
-    }
+    const readCleanupState = () => runInDurableObject(restarted, (_instance, state) => {
+      const meta = state.storage.sql.exec<{
+        active_generation: string;
+        cleanup_generation: string | null;
+        cleanup_stage: string | null;
+      }>(`
+        SELECT active_generation, cleanup_generation, cleanup_stage
+        FROM usage_projection_meta WHERE singleton = 1
+      `).one();
+      const cleanupRows = meta.cleanup_generation === null ? 0n : generationTables.reduce(
+        (total, table) => total + BigInt(state.storage.sql.exec<{count: string}>(`
+          SELECT CAST(COUNT(*) AS TEXT) AS count FROM ${table} WHERE generation = ?
+        `, meta.cleanup_generation).one().count),
+        0n,
+      );
+      const activeTotals = state.storage.sql.exec<{count: string}>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_projection_totals
+        WHERE generation = ?
+      `, meta.active_generation).one().count;
+      return {...meta, cleanupRows, activeTotals};
+    });
+    const finishCleanup = async (): Promise<void> => {
+      for (let step = 0; step < 128; step += 1) {
+        const before = await readCleanupState();
+        expect(before.activeTotals).toBe("1");
+        if (before.cleanup_generation === null) return;
+        expect(before.cleanup_generation).not.toBe(before.active_generation);
+        await runDurableObjectAlarm(restarted);
+        const after = await readCleanupState();
+        expect(after.active_generation).toBe(before.active_generation);
+        expect(after.activeTotals).toBe("1");
+        const deleted = before.cleanupRows - after.cleanupRows;
+        expect(deleted).toBeGreaterThanOrEqual(0n);
+        expect(deleted).toBeLessThanOrEqual(64n);
+      }
+      throw new Error("Inactive Usage Projection generation cleanup did not finish.");
+    };
+    await finishCleanup();
     const afterFirstCleanup = await runInDurableObject(restarted, (_instance, state) => ({
       active: state.storage.sql.exec<{active_generation: string}>(`
         SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
@@ -2407,9 +2904,7 @@ describe("deployment Usage Projection", () => {
     expect((await restarted.requestRebuild(secondRequestId)).state).toBe("rebuilding");
     await expect.poll(async () => (await restarted.requestRebuild(secondRequestId)).state)
       .toBe("completed");
-    for (let index = 0; index < 8; index += 1) {
-      await runDurableObjectAlarm(restarted);
-    }
+    await finishCleanup();
     const generations = await runInDurableObject(restarted, (_instance, state) => ({
       active: state.storage.sql.exec<{active_generation: string}>(`
         SELECT active_generation FROM usage_projection_meta WHERE singleton = 1

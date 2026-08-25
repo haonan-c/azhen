@@ -111,8 +111,10 @@ describe("Issue #45 User Registry and administrator Usage Account operations", (
       ingestionWatermark: 0n,
       health: {state: "unavailable"},
     });
-    expect(() => adminUsage().requestProjectionRebuild("projection-down-rebuild"))
-      .toThrow("Usage Projection is unavailable.");
+    await expectRejectedWith(
+      () => adminUsage().requestProjectionRebuild("projection-down-rebuild"),
+      "Usage Projection is unavailable.",
+    );
   });
 
   it("refuses to activate a User Durable Object that has no real account", async () => {

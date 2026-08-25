@@ -52,6 +52,11 @@ export default defineConfig({
     onUnhandledError(error) {
       const code = "code" in error ? error.code : undefined;
       if (typeof code === "string" && EXPECTED_OPEN_ERROR_CODES.has(code)) return false;
+      // User deletion revokes both a live authenticated Usage surface and its original session.
+      // The #65 retention RPC test asserts the matching awaited rejections.
+      if (code === "INVALID_SESSION_TOKEN" || error.message === "This User has been deleted.") {
+        return false;
+      }
       // Cap'n Web also reports the rejected future capability independently from the awaited
       // revoked-model call asserted by the Deployment Model RPC test.
       if (code === "DEPLOYMENT_MODEL_UNAVAILABLE") return false;

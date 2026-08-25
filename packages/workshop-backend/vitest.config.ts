@@ -22,6 +22,7 @@ export default defineConfig({
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },
           TEST_USAGE_PROJECTION: { className: 'UsageProjection', useSQLite: true },
         },
+        kvNamespaces: ['AVATARS'],
       },
     }),
   ],
@@ -29,7 +30,14 @@ export default defineConfig({
     include: ['__tests__/*.test.ts'],
     // Expected rejected Durable Object RPCs need a file-scoped unhandled-error policy. The package
     // test script runs this file separately with vitest.usage-admin.config.ts.
-    exclude: ['__tests__/usage-account-admin.test.ts', '__tests__/metered-model.test.ts'],
+    exclude: [
+      '__tests__/usage-account-admin.test.ts',
+      '__tests__/metered-model.test.ts',
+      '__tests__/usage-summary-facts.test.ts',
+      '__tests__/usage-retention.test.ts',
+      '__tests__/usage-anonymization.test.ts',
+      '__tests__/usage-projection.test.ts',
+    ],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ['../../test-setup/assert-workerd.ts'],
   },
