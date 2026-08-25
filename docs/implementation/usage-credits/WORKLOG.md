@@ -884,3 +884,24 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   tests skipped. Root test remains prohibited until the next independent dual-axis fixed point.
 - No push, merge, pull request, Issue closure, deployment, upload, promotion, production
   configuration change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #63 fourth review correction candidate
+
+- The fourth review found one cross-Durable-Object replay P1 and two browser P2 gaps. RED coverage
+  reproduced all three before production changes.
+- The exact production Harness sequence now freezes the User preparation, commits User financial
+  authority and the Overseer Action, fails the first administrator-safe result commit, expires the
+  original raw detail through production retention, and retries the same registered User, safe
+  reference, and operation ID. The old path rejected the retry because the locator was gone. The
+  corrected Overseer verifies the retained preparation and frozen target, replays the original
+  result, leaves the balance unchanged, and does not resurrect detail. The exact case passed 1/1 in
+  16.72 seconds with 18 unrelated cases skipped.
+- Chromium export now aborts an opened file writable exactly once when creating the remote CSV
+  stream fails, and it preserves the original failure. Administrator grant, deduction, balance,
+  reversal, and unknown-decision requests now refresh authority on success and failure. Refreshed
+  reconciliation and Credit Reversal terminal state removes the corresponding stale controls.
+- Focused evidence is GREEN: Frontend 29/29, Usage administrator 18/18, report 23/23, retention
+  25/25, and the retained-detail Harness 1/1. Affected Backend, Frontend, and Integration Tests
+  builds passed. Root test remains prohibited pending the next independent fixed-point review.
+- No push, merge, pull request, Issue closure, deployment, upload, promotion, production
+  configuration change, charging change, or worktree deletion occurred.

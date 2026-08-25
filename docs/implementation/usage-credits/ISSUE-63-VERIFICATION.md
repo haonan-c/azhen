@@ -178,10 +178,11 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | Focused Usage report workerd | PASS, 23/23 |
 | Focused Summary/retention workerd group | PASS, 25/25 |
 | Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
-| Frontend report/file-transfer follow-up tests | PASS, 27/27 |
+| Frontend report/file-transfer follow-up tests | PASS, 29/29 |
 | Full Frontend package tests | PASS, 78 files and 381 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Real production-Harness second-page legacy/deleted-User coordination | PASS, 1/1; 17 unrelated tests skipped; 15.80 seconds |
+| Real production-Harness retained-detail cross-DO replay | PASS, 1/1; 18 unrelated tests skipped; 16.72 seconds |
 | Backend Worker `capnweb-validate` build | PASS |
 | Full Backend package tests | PRE-REVIEW PASS, 654 tests with 4 expected skips; final rerun pending follow-up review |
 | Root `corepack pnpm build` | PRE-REVIEW PASS, 52 tasks; final rerun pending follow-up review |
@@ -268,3 +269,28 @@ those gates and any TDD corrections, this document must record the final fixed p
 merge, pull request, Issue closure, deployment, upload, promotion,
 production configuration change, charging change, or worktree deletion is part of this worktree
 step.
+
+## Fourth review correction fixed point
+
+The fourth review reported one P1 and two P2 gaps. Each was reproduced before the correction:
+
+- The real production Harness committed the User financial result and Overseer Action transition,
+  failed the first administrator-safe result commit, removed the old raw detail and locator through
+  production retention, and retried the same registered User, safe reference, and operation ID. The
+  old path failed with `Usage Record does not match the Action.` The corrected path verifies the
+  call against the retained User preparation and its frozen Workspace, Action, billing operation,
+  decision, reason, and actor. It returns the original safe result, does not charge again, and does
+  not recreate detail. The exact Harness case passed 1/1 in 16.72 seconds with 18 unrelated cases
+  skipped.
+- Chromium file streaming now awaits `writable.abort(error)` when file creation succeeded but the
+  CSV stream capability failed. The test observes one abort, no pipe, and the original capability
+  error even if cleanup could fail.
+- Administrator operations refresh authoritative detail after both RPC success and RPC conflict or
+  failure. A refreshed reconciliation removes unknown settle/release controls. A refreshed Credit
+  Reversal removes the reverse control. The conflict test simulates another administrator finishing
+  first and confirms that the stale controls disappear after the failed local request.
+
+The correction gates passed: Frontend focused 29/29, Usage administrator 18/18, Usage report 23/23,
+Summary/retention 25/25, the exact retained-detail Harness 1/1, and affected Backend, Frontend, and
+Integration Tests builds. Root test remains prohibited until the next independent fixed-point
+review.
