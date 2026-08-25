@@ -816,3 +816,42 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   intentionally deferred until that review. No push, merge, pull request, Issue closure, deployment,
   upload, promotion, production configuration change, charging change, or worktree deletion
   occurred.
+
+### 2026-08-25 — Issue #63 follow-up review correction candidate
+
+- The follow-up Standards/Spec review found seven remaining P1/P2 seams. RED→GREEN corrections now
+  fail report opening closed until the real Projection bootstrap completes, terminate readers in
+  both asynchronous disposal races, bind unknown settle/release to the selected detail's validated
+  safe reference, cancel a late browser stream, show complete row metrics, and drive the privacy
+  matrix through the controlled provider path.
+- Cap'n Web 0.11 uses a 256 KiB initial flow-control window in addition to the application's zero
+  high-water mark. A remote reader cancellation alone can remain behind that window, so the public
+  report capability now provides explicit bounded export cancellation. Browser abort sends that
+  control call; the server terminates every active export on the report and releases its slots.
+- The real production Harness seeds 1,024 rows through production User Usage authority methods and
+  bounded outbox alarms, in addition to 66 real Action billing details. It never writes directly to
+  Usage storage. Its content-free 200-character external-account dimension contains no User identity
+  or privacy sentinel.
+- Three consecutive Harness runs passed. The evidence run completed in 199.76 seconds with 1,090
+  authority details. Metadata pause measured 7 queries, 448 rows, and 210,424 bytes. After one data
+  read returned flow-control credit, the stable no-read sample measured 15 queries, 960 rows, and
+  449,528 bytes. Explicit cancellation left those counters unchanged; total CSV size was 500,683
+  bytes. Every page remained at most 64 rows and every application chunk at most 256 KiB. Two
+  replacement streams and one replacement report target remained usable.
+- A final pre-commit self-review found that the first safe-reference patch still accepted optional
+  raw Action IDs. A new RED Harness run proved the initial detail-scoped normalizer also reused a
+  two-field exact-object validator against a five-field request and therefore rejected every valid
+  call. The GREEN path now accepts only registered User plus selected safe detail reference for
+  settle/release, resolves the Workspace/Action locator only inside User authority, omits that raw
+  locator from the response, and restricts the older Action RPC to reversals. The browser no longer
+  renders an Action-ID input.
+- The updated production Harness passed in 197.71 seconds. Wrong User, non-unknown detail, and old
+  Action-ID settle paths failed closed; the valid detail-scoped settle replayed idempotently. Its
+  exact flow-control sample remained 7/448/210,424 bytes at metadata pause and 15/960/449,528 bytes
+  at stable data pause, with zero query/byte growth after cancel. The exact maximum page was 64 rows,
+  the exact maximum application chunk was 29,888 bytes, and the full CSV was 500,683 bytes.
+- Current focused evidence is GREEN: Usage report workerd 22/22; Frontend report/file-transfer
+  23/23; and the real Harness 1/1 with 16 unrelated cases skipped. Root tests remain prohibited until
+  the third dual-axis fixed-point review. No push, merge, pull request, Issue closure, deployment,
+  upload, promotion, production configuration change, charging change, or worktree deletion
+  occurred.

@@ -60,6 +60,12 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
   alias. A reconciliation-only authority snapshot remains drillable after retention removes the
   older raw Usage Record. Reconciliation responses do not expose raw billing or reconciliation
   operation identifiers; public Ledger references are safe aliases scoped by `safeRecordRef`.
+- Unknown settle/release uses `reconcileUnknownRecord({registeredUserRef, safeRecordRef, ...})`.
+  The User authority resolves the selected random detail reference to a server-private Workspace,
+  Action, and billing-operation locator. The public request and response contain none of those raw
+  locator fields. The older Action-ID RPC rejects settle/release and remains available only for an
+  exact reversal. Tests reject a wrong registered User, a non-unknown detail, and the old Action-ID
+  bypass; a valid selected detail is idempotent under its stable operation ID.
 - The existing administrator reversal RPC accepts those validated detail-scoped aliases without
   exposing the raw Usage operation or Ledger identifier. Existing public Initial Grant and
   administrator-correction Ledger references keep their prior behavior. Actor binding, bounded
@@ -79,8 +85,11 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
 
 - `AdminUsageReport.exportCsv()` returns a real `ReadableStream<Uint8Array>`. Database work starts
   only from `pull()`. Each read uses at most 64 keyset rows, each chunk is at most 256 KiB, and a zero
-  high-water mark prevents implicit prefetch. `cancel()` stops reads and releases the operation
-  slot.
+  high-water mark prevents application-side buffering. Cap'n Web 0.11 applies its own bounded
+  256 KiB initial flow-control window. The browser therefore sends an explicit
+  `cancelCsvExports()` control call when it aborts a remote export; the report terminates the source
+  and releases its operation slot even when a remote `ReadableStream.cancel()` remains buffered
+  behind that window.
 - Disposing a report terminates an already-returned active CSV stream with a bounded error. A reader
   that consumed the preamble cannot wait forever after owner disposal, and the operation slot is
   released for a later export.
@@ -95,7 +104,9 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
   administrator to narrow the filter. A filter change or page exit aborts an active export.
 - The browser creates the writable file before it creates the RPC stream. A file-picker writable
   failure therefore cannot leak a server stream. The Blob fallback checks cancellation again after
-  every pending read; an abort throws `AbortError` and never downloads an empty or partial file.
+  every pending read; an abort throws `AbortError` and never downloads an empty or partial file. If
+  abort wins while the RPC stream is still being minted, the returned stream is cancelled before
+  the function exits.
 - React stores a callable report stub only inside `{api}` state. It disposes replaced, late, failed,
   cancelled, and unmounted capabilities and ignores stale page and detail responses. A failed
   initial overview or first page disposes the opened report and clears all partial state. A Usage
@@ -130,7 +141,9 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
   Model token status; Reservation lifecycle; Ledger entries; and reconciliation audit. The same
   panel enters grant, deduction, balance reconciliation, safe reversal, and unknown settle/release
   through the existing administrator RPCs. Reasons are bounded and retries keep one operation ID;
-  successful operations refresh authoritative detail. All added labels are English/Chinese.
+  successful operations refresh authoritative detail. Unknown settle/release sends only the
+  selected User and detail references; the browser has no Action-ID input. All added labels are
+  English/Chinese.
 - Next and Previous maintain an opaque keyset cursor stack. A changed filter resets it. A late old
   opening cannot replace a newer report and its capability is disposed.
 - CSV export shows progress, supports cancel, and uses the current report capability.
@@ -141,10 +154,10 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | --- | --- |
 | Shared, Backend, Frontend, and Integration Tests package builds | PASS |
 | Focused Usage administrator workerd | PASS, 18/18; recorded RED 16/18 before safe-reference compatibility fix |
-| Focused Usage report workerd | PASS, 19/19 |
+| Focused Usage report workerd | PASS, 22/22 |
 | Focused Summary/retention workerd group | PASS, 25/25 |
 | Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
-| Frontend report/overview/file-transfer focused tests | PASS, 29/29 |
+| Frontend report/file-transfer follow-up tests | PASS, 23/23 |
 | Full Frontend package tests | PASS, 78 files and 381 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Backend Worker `capnweb-validate` build | PASS |
@@ -176,19 +189,47 @@ production batch bound or assertion was weakened.
 
 ## Review-correction fixed point
 
-The first independent Standards/Spec review reported no P0 and eleven P1/P2 gaps. The correction
-batch closed all reported items through RED→GREEN tests. The production Harness created one unknown
-and 65 settled Usage details only through real Action approval and billing paths. Its first CSV data
-page contained 64 rows, both the metadata and data chunks stayed within 256 KiB, and two concurrent
-replacement streams read successfully after the paused reader was cancelled. This is bounded local
-evidence; it is not a production traffic measurement.
+The first independent Standards/Spec review reported no P0 and eleven P1/P2 gaps. The first
+correction batch closed those items through RED→GREEN tests. The follow-up review then found seven
+remaining P1/P2 seams. The second correction batch added production-path Projection bootstrap
+coverage, disposal-race termination, explicit remote-export cancellation, a detail-scoped unknown
+Action reference, late browser-stream cancellation, complete row metrics, and provider-path privacy
+evidence.
 
-The branch now needs a follow-up dual-axis review of these correction commits. Root and complete
+The real production Harness created 1,090 authoritative detail rows only through the inherited
+production `beginGatekeeperUsage()`, `markGatekeeperUsageStarted()`, and
+`completeGatekeeperUsage()` methods, followed by the real bounded outbox alarm. Each seeded row used
+a production-valid 200-character content-free external-account dimension; the test proves that it
+contains neither the controlled User identity nor any privacy sentinel. No test writes directly to
+the Usage tables.
+
+The Cap'n Web 0.11 slow-consumer measurement was repeated three times and passed each time. The
+evidence run completed in 199.76 seconds and reported:
+
+```text
+authoritativeDetailRows=1090
+metadataPauseQueries=7, metadataPauseRows=448, metadataPauseBytes=210424
+dataPauseQueries=15, dataPauseRows=960, dataPauseBytes=449528
+cancelQueries=15, cancelBytes=449528, cancelQueryDelta=0, cancelByteDelta=0
+totalCsvBytes=500683
+maxPageRows=64, maxChunkBytes=29888
+```
+
+The metadata pause occurred before the full result was prefetched. Reading one data chunk returned
+flow-control credit, so Cap'n Web refilled its bounded window; a second no-read sample then remained
+stable. Explicit cancellation produced both server-private `stream-control-cancelled` and
+`stream-released` events within 30 seconds. Query and encoded-byte counters did not grow after
+cancellation. Two concurrent replacement streams and a replacement report target then read
+successfully. The exact observed maximum was 64 rows per query and 29,888 bytes per application
+chunk, below the hard 256 KiB chunk limit. This is bounded local evidence over production code paths
+with controlled external mocks, not a production traffic measurement.
+
+The branch now needs a third dual-axis review of this second correction batch. Root and complete
 Backend gates remain deliberately pending until that review fixed point.
 
 ## Remaining branch gate
 
-The candidate still requires the follow-up standards/specification review, final affected/root
+The candidate still requires the third standards/specification review, final affected/root
 build and lint gates, complete Backend tests, and one coordinated root `corepack pnpm test`. After
 those gates and any TDD corrections, this document must record the final fixed point. No push,
 merge, pull request, Issue closure, deployment, upload, promotion,
