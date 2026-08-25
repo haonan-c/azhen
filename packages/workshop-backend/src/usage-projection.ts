@@ -210,6 +210,7 @@ type StoredFactRow = {
 };
 
 type StoredSummaryRow = {
+  summary_fact_id: string;
   summary_revision: string;
   dimension_key: string;
   snapshot_value: string;
@@ -1553,13 +1554,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       throw new Error("Usage Projection Summary identity is missing.");
     }
     const existing = this.ctx.storage.sql.exec<StoredSummaryRow>(`
-      SELECT summary_revision, dimension_key, snapshot_value, metered_kind, cache_hit_input,
+      SELECT summary_fact_id, summary_revision, dimension_key, snapshot_value, metered_kind,
+             cache_hit_input,
              cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
              provider_cost, charged_credits, metered_use_count, billable_api_operations,
              pre_execution_failures, unknown_operations, active_user_contribution, unpriced_model_uses,
              unpriced_api_operations
       FROM usage_projection_summaries WHERE generation = ? AND summary_fact_id = ?
     `, generation, fact.summary_fact_id).toArray()[0];
+    const existingDimension = this.ctx.storage.sql.exec<{summary_fact_id: string}>(`
+      SELECT summary_fact_id FROM usage_projection_summaries
+      WHERE generation = ? AND dimension_key = ?
+    `, generation, fact.summary_dimension_key).toArray()[0];
+    if (existingDimension !== undefined &&
+        existingDimension.summary_fact_id !== fact.summary_fact_id) return null;
     if (!existing) {
       this.#writeAggregateSnapshot(generation, fact, incoming);
       return incoming;
@@ -1574,20 +1582,41 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ? emptyMetricSnapshot() : null;
     }
     const previous = storedSummaryMetricSnapshot(existing);
+    const delta = subtractMetricSnapshots(incoming, previous);
+    if (Object.values(delta).some(value => value < 0n)) return null;
     this.#writeAggregateSnapshot(generation, fact, incoming);
-    return subtractMetricSnapshots(incoming, previous);
+    return delta;
   }
 
   #writeAggregateSnapshot(
       generation: string, fact: StoredFactRow, metrics: ProjectionMetricSnapshot): void {
     this.ctx.storage.sql.exec(`
-      INSERT OR REPLACE INTO usage_projection_summaries (
+      INSERT INTO usage_projection_summaries (
         generation, summary_fact_id, summary_revision, dimension_key, snapshot_value, metered_kind,
         cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
         reasoning_tokens, provider_cost, charged_credits, metered_use_count,
         billable_api_operations, pre_execution_failures, unknown_operations, active_user_contribution,
         unpriced_model_uses, unpriced_api_operations
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (generation, summary_fact_id) DO UPDATE SET
+        summary_revision = excluded.summary_revision,
+        dimension_key = excluded.dimension_key,
+        snapshot_value = excluded.snapshot_value,
+        metered_kind = excluded.metered_kind,
+        cache_hit_input = excluded.cache_hit_input,
+        cache_miss_input = excluded.cache_miss_input,
+        cache_write_input = excluded.cache_write_input,
+        output_tokens = excluded.output_tokens,
+        reasoning_tokens = excluded.reasoning_tokens,
+        provider_cost = excluded.provider_cost,
+        charged_credits = excluded.charged_credits,
+        metered_use_count = excluded.metered_use_count,
+        billable_api_operations = excluded.billable_api_operations,
+        pre_execution_failures = excluded.pre_execution_failures,
+        unknown_operations = excluded.unknown_operations,
+        active_user_contribution = excluded.active_user_contribution,
+        unpriced_model_uses = excluded.unpriced_model_uses,
+        unpriced_api_operations = excluded.unpriced_api_operations
     `, generation, fact.summary_fact_id, fact.summary_revision, fact.summary_dimension_key,
     fact.summary_snapshot_value, fact.metered_kind, metrics.cacheHitInput.toString(),
     metrics.cacheMissInput.toString(), metrics.cacheWriteInput.toString(),
@@ -1967,6 +1996,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
       `);
     }
+    this.ctx.storage.sql.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension
+      ON usage_projection_summaries(generation, dimension_key)
+    `);
   }
 }
 

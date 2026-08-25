@@ -415,6 +415,7 @@ describe("deployment Usage Projection", () => {
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: BigInt(index + 2),
+      deploymentModelId: `model-${index + 2}`,
       cacheHitInputTokens: 1n,
       providerCostUsdSubunits: 1n,
     }));
@@ -446,6 +447,7 @@ describe("deployment Usage Projection", () => {
         projectionFactId: crypto.randomUUID(),
         usagePrincipalRef,
         sourceSequence: 1n,
+        deploymentModelId: "model-1",
         cacheHitInputTokens: 1n,
         providerCostUsdSubunits: 1n,
       })]);
@@ -469,6 +471,7 @@ describe("deployment Usage Projection", () => {
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: BigInt(index + 2),
+      deploymentModelId: `model-${index + 2}`,
       cacheHitInputTokens: 1n,
       providerCostUsdSubunits: 1n,
     }));
@@ -478,6 +481,7 @@ describe("deployment Usage Projection", () => {
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: 1n,
+      deploymentModelId: "model-1",
       cacheHitInputTokens: 1n,
       providerCostUsdSubunits: 1n,
     })]);
@@ -573,6 +577,7 @@ describe("deployment Usage Projection", () => {
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: BigInt(index + 2),
+      deploymentModelId: `model-${index + 2}`,
       cacheHitInputTokens: 1n,
       providerCostUsdSubunits: 1n,
     }));
@@ -582,6 +587,7 @@ describe("deployment Usage Projection", () => {
       projectionFactId: crypto.randomUUID(),
       usagePrincipalRef,
       sourceSequence: 1n,
+      deploymentModelId: "model-1",
       cacheHitInputTokens: 1n,
       providerCostUsdSubunits: 1n,
     })]);
@@ -804,6 +810,216 @@ describe("deployment Usage Projection", () => {
       chargedUsageCreditSubunits: 32n,
       activeUsers: 2n,
     });
+  });
+
+  it("rejects a second Summary identity for one generation dimension without changing authority",
+      async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+    const initial = aggregateFact({
+      sourceSequence: 1n,
+      cacheHitInputTokens: 10n,
+      cacheMissInputTokens: 10n,
+      cacheWriteInputTokens: 10n,
+      outputTokens: 10n,
+      reasoningTokens: 5n,
+      providerCostUsdSubunits: 10n,
+      chargedUsageCreditSubunits: 10n,
+      meteredUseCount: 10n,
+      activeUserContribution: 10n,
+    });
+    expect(await projection.ingest([initial])).toEqual({
+      acknowledgedFactIds: [initial.projectionFactId],
+      rejected: [],
+    });
+    const before = {
+      metrics: (await projection.readOverview()).metrics,
+      storage: await runInDurableObject(projection, (_instance, state) => ({
+        active: state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_active_users ORDER BY principal_ref
+        `).toArray(),
+        summaries: state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_summaries ORDER BY summary_fact_id
+        `).toArray(),
+      })),
+    };
+    const conflictingIdentity = {
+      ...initial,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 2n,
+      summaryFactId: crypto.randomUUID(),
+      summaryRevision: 2n,
+      cacheHitInputTokens: 11n,
+    };
+
+    expect(await projection.ingest([conflictingIdentity])).toEqual({
+      acknowledgedFactIds: [],
+      rejected: [{
+        projectionFactId: conflictingIdentity.projectionFactId,
+        code: "invalid-fact",
+      }],
+    });
+    expect((await projection.readOverview()).metrics).toEqual(before.metrics);
+    expect(await runInDurableObject(projection, (_instance, state) => ({
+      active: state.storage.sql.exec<Record<string, string>>(`
+        SELECT * FROM usage_projection_active_users ORDER BY principal_ref
+      `).toArray(),
+      summaries: state.storage.sql.exec<Record<string, string>>(`
+        SELECT * FROM usage_projection_summaries ORDER BY summary_fact_id
+      `).toArray(),
+    }))).toEqual(before.storage);
+  });
+
+  it("rejects every legal higher-revision cumulative rollback without changing authority",
+      async () => {
+    const rollbackCases = [
+      ["cache hit input", {cacheHitInputTokens: 9n}],
+      ["cache miss input", {cacheMissInputTokens: 9n}],
+      ["cache write input", {cacheWriteInputTokens: 9n}],
+      ["output", {outputTokens: 9n}],
+      ["reasoning", {reasoningTokens: 4n}],
+      ["provider cost", {providerCostUsdSubunits: 9n}],
+      ["charged Credit", {chargedUsageCreditSubunits: 9n}],
+      ["metered use", {meteredUseCount: 9n}],
+      ["active contribution", {activeUserContribution: 9n}],
+    ] as const;
+    for (const [label, rollback] of rollbackCases) {
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      const initial = aggregateFact({
+        sourceSequence: 1n,
+        cacheHitInputTokens: 10n,
+        cacheMissInputTokens: 10n,
+        cacheWriteInputTokens: 10n,
+        outputTokens: 10n,
+        reasoningTokens: 5n,
+        providerCostUsdSubunits: 10n,
+        chargedUsageCreditSubunits: 10n,
+        meteredUseCount: 10n,
+        activeUserContribution: 10n,
+      });
+      expect(await projection.ingest([initial]), label).toEqual({
+        acknowledgedFactIds: [initial.projectionFactId],
+        rejected: [],
+      });
+      const beforeMetrics = (await projection.readOverview()).metrics;
+      const beforeRows = await runInDurableObject(projection, (_instance, state) => ({
+        active: state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_active_users ORDER BY principal_ref
+        `).toArray(),
+        summaries: state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_summaries ORDER BY summary_fact_id
+        `).toArray(),
+      }));
+      const next = {
+        ...initial,
+        ...rollback,
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence: 2n,
+        summaryRevision: 2n,
+      };
+      expect(await projection.ingest([next]), label).toEqual({
+        acknowledgedFactIds: [],
+        rejected: [{projectionFactId: next.projectionFactId, code: "invalid-fact"}],
+      });
+      expect((await projection.readOverview()).metrics, label).toEqual(beforeMetrics);
+      expect(await runInDurableObject(projection, (_instance, state) => ({
+        active: state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_active_users ORDER BY principal_ref
+        `).toArray(),
+        summaries: state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_summaries ORDER BY summary_fact_id
+        `).toArray(),
+      })), label).toEqual(beforeRows);
+    }
+
+    const constrainedCases = [
+      {
+        label: "billable API count",
+        initial: aggregateFact({
+          kind: "gatekeeper", deploymentModelId: null, vendorId: "context",
+          billingMethodKey: "context.read.v1", externalAccountId: "summary-priced-api",
+          cacheHitInputTokens: 0n, cacheMissInputTokens: 0n, cacheWriteInputTokens: 0n,
+          outputTokens: 0n, reasoningTokens: 0n, providerCostUsdSubunits: 0n,
+          chargedUsageCreditSubunits: 10n, meteredUseCount: 10n,
+          billableApiOperations: 10n, activeUserContribution: 10n,
+        }),
+        rollback: {meteredUseCount: 9n, billableApiOperations: 9n},
+      },
+      {
+        label: "pre-execution failure count",
+        initial: aggregateFact({
+          outcome: "failed-before-execution", meteredKind: "attempt", pricing: "unpriced",
+          cacheHitInputTokens: 0n, cacheMissInputTokens: 0n, cacheWriteInputTokens: 0n,
+          outputTokens: 0n, reasoningTokens: 0n, providerCostUsdSubunits: 0n,
+          chargedUsageCreditSubunits: 0n, meteredUseCount: 0n, activeUserContribution: 0n,
+          preExecutionFailures: 10n,
+        }),
+        rollback: {preExecutionFailures: 9n},
+      },
+      {
+        label: "unknown count",
+        initial: aggregateFact({
+          kind: "gatekeeper", outcome: "usage-unknown", meteredKind: "attempt",
+          pricing: "unpriced", deploymentModelId: null, vendorId: "context",
+          billingMethodKey: "context.read.v1", externalAccountId: "summary-unknown-api",
+          cacheHitInputTokens: 0n, cacheMissInputTokens: 0n, cacheWriteInputTokens: 0n,
+          outputTokens: 0n, reasoningTokens: 0n, providerCostUsdSubunits: 0n,
+          chargedUsageCreditSubunits: 0n, meteredUseCount: 0n,
+          billableApiOperations: 0n, activeUserContribution: 0n, unknownOperations: 10n,
+        }),
+        rollback: {unknownOperations: 9n},
+      },
+      {
+        label: "unpriced Model count",
+        initial: aggregateFact({
+          pricing: "unpriced", providerCostUsdSubunits: 0n,
+          chargedUsageCreditSubunits: 0n, meteredUseCount: 10n,
+          activeUserContribution: 10n, unpricedModelUses: 10n,
+        }),
+        rollback: {meteredUseCount: 9n, unpricedModelUses: 9n},
+      },
+      {
+        label: "unpriced API count",
+        initial: aggregateFact({
+          kind: "gatekeeper", pricing: "unpriced", deploymentModelId: null,
+          vendorId: "context", billingMethodKey: "context.read.v1",
+          externalAccountId: "summary-unpriced-api", cacheHitInputTokens: 0n,
+          cacheMissInputTokens: 0n, cacheWriteInputTokens: 0n, outputTokens: 0n,
+          reasoningTokens: 0n, providerCostUsdSubunits: 0n, chargedUsageCreditSubunits: 0n,
+          meteredUseCount: 10n, billableApiOperations: 10n, activeUserContribution: 10n,
+          unpricedApiOperations: 10n,
+        }),
+        rollback: {
+          meteredUseCount: 9n, billableApiOperations: 9n, unpricedApiOperations: 9n,
+        },
+      },
+    ] as const;
+    for (const {label, initial, rollback} of constrainedCases) {
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      expect(await projection.ingest([initial]), label).toEqual({
+        acknowledgedFactIds: [initial.projectionFactId], rejected: [],
+      });
+      const beforeMetrics = (await projection.readOverview()).metrics;
+      const beforeSummary = await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_summaries ORDER BY summary_fact_id
+        `).toArray());
+      const next = {
+        ...initial,
+        ...rollback,
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence: 2n,
+        summaryRevision: 2n,
+      };
+      expect(await projection.ingest([next]), label).toEqual({
+        acknowledgedFactIds: [],
+        rejected: [{projectionFactId: next.projectionFactId, code: "invalid-fact"}],
+      });
+      expect((await projection.readOverview()).metrics, label).toEqual(beforeMetrics);
+      expect(await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<Record<string, string>>(`
+          SELECT * FROM usage_projection_summaries ORDER BY summary_fact_id
+        `).toArray()), label).toEqual(beforeSummary);
+    }
   });
 
   it("counts each replay of an applied Summary rejection once", async () => {
@@ -1135,6 +1351,7 @@ describe("deployment Usage Projection", () => {
     };
     const third = aggregateFact({
       usagePrincipalRef, sourceSequence: 3n,
+      deploymentModelId: "model-3",
       cacheHitInputTokens: 7n, providerCostUsdSubunits: 7n,
     });
     await runInDurableObject(projection, instance => {
@@ -1324,6 +1541,7 @@ describe("deployment Usage Projection", () => {
     };
     const third = aggregateFact({
       usagePrincipalRef, sourceSequence: 3n,
+      deploymentModelId: "model-3",
       cacheHitInputTokens: 7n, providerCostUsdSubunits: 7n,
     });
     await projection.ingest([first]);
@@ -2092,6 +2310,18 @@ describe("deployment Usage Projection", () => {
       (await projection.readOverview()).ingestionWatermark,
     ).toBe(before.ingestionWatermark + 2n);
     const authoritativeBalanceBefore = await user.getAdminUsageBalanceState();
+    for (let step = 0; step < 20; step += 1) {
+      const cleanupGeneration = await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{cleanup_generation: string | null}>(`
+          SELECT cleanup_generation FROM usage_projection_meta WHERE singleton = 1
+        `).one().cleanup_generation);
+      if (cleanupGeneration === null) break;
+      expect(await runDurableObjectAlarm(projection)).toBe(true);
+    }
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{cleanup_generation: string | null}>(`
+        SELECT cleanup_generation FROM usage_projection_meta WHERE singleton = 1
+      `).one().cleanup_generation)).toBeNull();
     const projectedBefore = await projection.readOverview();
     const requestId = `rebuild-${crypto.randomUUID()}`;
 
@@ -2577,14 +2807,18 @@ describe("deployment Usage Projection", () => {
     })).rejects.toThrow("restart after rebuild backfill outage");
     const restarted = testEnv.TEST_USER.get(userId);
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    const stateAfterRestart = await runInDurableObject(restarted, async (_instance, state) => ({
-      projectionStage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
-      projectionCursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
-      summaryStage: state.storage.kv.get<string>(SUMMARY_BACKFILL_STAGE_KEY),
-      summaryCursor: state.storage.kv.get<string>(SUMMARY_BACKFILL_CURSOR_KEY),
-      pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
-      alarm: await state.storage.getAlarm(),
-    }));
+    const stateAfterRestart = await runInDurableObject(restarted, async (_instance, state) => {
+      const alarm = await state.storage.getAlarm();
+      if (alarm !== null) await state.storage.setAlarm(Date.now() + 60_000);
+      return {
+        projectionStage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+        projectionCursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+        summaryStage: state.storage.kv.get<string>(SUMMARY_BACKFILL_STAGE_KEY),
+        summaryCursor: state.storage.kv.get<string>(SUMMARY_BACKFILL_CURSOR_KEY),
+        pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+        alarm,
+      };
+    });
     expect(stateAfterRestart).toMatchObject({
       projectionStage: "complete",
       projectionCursor: undefined,
@@ -2599,8 +2833,14 @@ describe("deployment Usage Projection", () => {
     expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
       .toBe(unpricedBefore + 16n);
     expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    expect(await runInDurableObject(restarted, (_instance, state) =>
-      state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY))).toBe(2n);
+    const secondDelivery = await runInDurableObject(restarted, async (_instance, state) => {
+      const pendingCount = state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY);
+      const alarm = await state.storage.getAlarm();
+      if (alarm !== null) await state.storage.setAlarm(Date.now() + 60_000);
+      return {pendingCount, alarm};
+    });
+    expect(secondDelivery.pendingCount).toBe(2n);
+    expect(secondDelivery.alarm).not.toBeNull();
     // The second 32-fact delivery applies the next 16 aggregate snapshots.
     expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
       .toBe(unpricedBefore + 32n);
