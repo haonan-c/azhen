@@ -867,6 +867,40 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     await replacement.cancel("prove explicit cancellation released the slot");
   });
 
+  it("registers CSV cancellation before its first asynchronous authority check", async () => {
+    let authorityChecks = 0;
+    let firstCheckReached!: () => void;
+    const reachedFirstCheck = new Promise<void>(resolve => { firstCheckReached = resolve });
+    let releaseFirstCheck!: () => void;
+    const firstCheckBlocked = new Promise<void>(resolve => { releaseFirstCheck = resolve });
+    const projection = {
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
+    };
+    using report = new AdminUsageReportImpl(
+      projection,
+      freezeUsageReportQuery({}, "UTC", 1n, 1n, 1n),
+      () => undefined,
+      async () => {
+        authorityChecks += 1;
+        if (authorityChecks === 1) {
+          firstCheckReached();
+          await firstCheckBlocked;
+        }
+      },
+    );
+    const exporting = report.exportCsv();
+    await reachedFirstCheck;
+
+    await report.cancelCsvExports();
+    releaseFirstCheck();
+
+    await expect(exporting).rejects.toThrow("CSV export was cancelled");
+    const replacement = await report.exportCsv();
+    await replacement.cancel("prove early cancellation released the slot");
+  });
+
   it("terminates an active CSV reader when its report capability is disposed", async () => {
     const projection = {
       async readHealth() { return HEALTHY_PROJECTION },

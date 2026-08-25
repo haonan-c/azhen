@@ -25,6 +25,7 @@ import {
   type UnpricedUsageDecision,
 } from "./usage-account.js";
 import type {
+  AdminUnknownUsageReconciliationResult,
   AdminUsageBalanceState,
   AdminUsageRecordDetail,
   AdminUsageOperationResult,
@@ -935,6 +936,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.#assertOwnUsageSurfaceActive();
   }
 
+  #assertUsageAuthorityReady(): void {
+    if (!this.storage.created.get() || !this.usageAccount.isInitialized()) {
+      throw new Error("User Usage authority does not exist.");
+    }
+  }
+
   #assertOwnUsageSurfaceActive(): void {
     if (this.usageAccount.getUserDeletionState() !== null) {
       throw new Error("This User has been deleted.");
@@ -1004,7 +1011,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async assertAdminUnknownUsageDetailReference(
       safeRecordRef: string,
       billingOperationId: string): Promise<void> {
-    await this.activateUsageAccount();
+    this.#assertUsageAuthorityReady();
     this.usageAccount.assertAdminUnknownUsageDetailReference(
       safeRecordRef,
       billingOperationId,
@@ -1014,11 +1021,40 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   /** Resolve one unknown detail to its server-private Workspace Action locator. */
   async getAdminUnknownUsageActionTarget(safeRecordRef: string): Promise<{
     workspaceId: string;
-    actionId: number;
+    actionId: number | null;
     billingOperationId: string;
   }> {
     await this.activateUsageAccount();
     return this.usageAccount.getAdminUnknownUsageActionTarget(safeRecordRef);
+  }
+
+  /** Freeze or replay one detail-scoped unknown decision from retained User authority. */
+  async prepareAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string) {
+    this.#assertUsageAuthorityReady();
+    return this.usageAccount.prepareAdminUnknownUsageReconciliation(
+      safeRecordRef,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
+  }
+
+  /** Commit one safe response alias for idempotent unknown-decision replay. */
+  async completeAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      result: AdminUnknownUsageReconciliationResult):
+      Promise<AdminUnknownUsageReconciliationResult> {
+    this.#assertUsageAuthorityReady();
+    return this.usageAccount.completeAdminUnknownUsageReconciliation(
+      safeRecordRef,
+      result,
+    );
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
@@ -1185,7 +1221,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       decision: "settle" | "release",
       reason: string,
       actorUserId: string) {
-    await this.activateUsageAccount();
+    this.#assertUsageAuthorityReady();
     const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.reconcileUnknownGatekeeperUsage(

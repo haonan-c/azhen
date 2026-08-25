@@ -1549,7 +1549,7 @@ export type AdminUsageDeleteUserResult = {
 /** Administrator decision for an Action whose financial state needs explicit coordination. */
 export type AdminActionReconciliationDecision = "settle" | "release" | "reverse";
 
-/** Administrator request to coordinate one durable Action and its linked Usage Account state. */
+/** Administrator request to reverse one durable Action's already-settled Usage Charge. */
 export type AdminActionReconciliationRequest = {
   /** Stable Workshop identifier returned by `Overseer.getMetadata()`. */
   workspaceId: string;
@@ -1557,8 +1557,8 @@ export type AdminActionReconciliationRequest = {
   actionId: number;
   /** Stable client retry identity for this coordination decision. */
   operationId: string;
-  /** Financial decision allowed for the Action's current execution state. */
-  decision: AdminActionReconciliationDecision;
+  /** The only raw Action-scoped decision; unknown coordination requires a selected detail. */
+  decision: "reverse";
   /** Required bounded human explanation retained in the Action audit. */
   reason: string;
 };
@@ -1577,11 +1577,14 @@ export type AdminUnknownUsageReconciliationRequest = {
   reason: string;
 };
 
-/** Auditable result that omits the server-private Workspace and Action locator. */
+/** Auditable unknown-detail result that omits every server-private authority locator. */
 export type AdminUnknownUsageReconciliationResult = Omit<
   AdminActionReconciliationResult,
-  "workspaceId" | "actionId"
->;
+  "workspaceId" | "actionId" | "decision"
+> & {
+  /** Unknown-held decision accepted by the selected authoritative detail. */
+  decision: "settle" | "release";
+};
 
 /** Auditable result of one idempotent administrator Action coordination decision. */
 export type AdminActionReconciliationResult = {
@@ -1649,7 +1652,7 @@ export interface AdminUsageApi {
   /** Permanently remove one registered User's direct identity and retain pseudonymous history. */
   deleteUsageUser(request: AdminUsageDeleteUserRequest): Promise<AdminUsageDeleteUserResult>;
 
-  /** Coordinate one unknown Action, or reverse its already-settled Usage Charge exactly. */
+  /** Reverse one already-settled Action Usage Charge exactly. */
   reconcileAction(
     request: AdminActionReconciliationRequest,
   ): Promise<AdminActionReconciliationResult>;

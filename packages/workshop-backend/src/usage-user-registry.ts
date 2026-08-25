@@ -540,6 +540,23 @@ export class UsageUserRegistry {
     return row ? {userDoId: row.user_do_id} : null;
   }
 
+  /** Resolve active or anonymously retained User financial authority without restoring identity. */
+  resolveAuthority(registeredUserRef: string): ResolvedUsageUser | null {
+    if (!isOpaqueReference(registeredUserRef)) {
+      throw new TypeError("Registered User reference is invalid.");
+    }
+    const rows = this.storage.sql.exec<{user_do_id: string}>(`
+      SELECT user_do_id FROM usage_user_registry
+      WHERE registered_user_ref = ? AND lifecycle_state = 'active'
+      UNION ALL
+      SELECT user_do_id FROM usage_user_anonymous_principals
+      WHERE registered_user_ref = ?
+      LIMIT 2
+    `, registeredUserRef, registeredUserRef).toArray();
+    if (rows.length > 1) throw new Error("Registered User authority does not reconcile.");
+    return rows[0] ? {userDoId: rows[0].user_do_id} : null;
+  }
+
   private selectByEventId(registrationEventId: string): RegistryRow | undefined {
     return this.storage.sql.exec<RegistryRow>(`
       SELECT CAST(sequence AS TEXT) AS sequence, registered_user_ref, user_do_id,

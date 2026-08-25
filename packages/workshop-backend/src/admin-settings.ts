@@ -530,6 +530,11 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     return this.usageUsers.resolve(registeredUserRef);
   }
 
+  /** Resolve retained financial authority without restoring a deleted User's identity surface. */
+  resolveRegisteredUsageAuthorityUser(registeredUserRef: string): ResolvedUsageUser | null {
+    return this.usageUsers.resolveAuthority(registeredUserRef);
+  }
+
   getDeploymentModelCatalog(): DeploymentModelCatalog {
     let defaultModelId = this.storage.deploymentDefaultModelId.get();
     let quickModelId = this.storage.deploymentQuickModelId.get();
@@ -1111,8 +1116,7 @@ function normalizeAdminActionReconciliationRequest(
   if (!Number.isSafeInteger(request.actionId) || request.actionId < 0) {
     throw new TypeError("Action identifier is invalid.");
   }
-  if (request.decision !== "settle" && request.decision !== "release" &&
-      request.decision !== "reverse") {
+  if (request.decision !== "reverse") {
     throw new TypeError("Action reconciliation decision is invalid.");
   }
   return {
@@ -1301,8 +1305,6 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
 
   async exportCsv(): Promise<ReadableStream<Uint8Array>> {
     if (this.disposed) throw new Error("Usage report is closed.");
-    await this.assertActive();
-    if (this.disposed) throw new Error("Usage report is closed.");
     if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
     this.activeOperations += 1;
     this.#emitIntegrationTestEvent("stream-reserved");
@@ -1342,6 +1344,10 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
     this.activeStreams.add(terminateFromOwner);
     let health: AdminUsageProjectionHealth;
     try {
+      await this.assertActive();
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
       health = await this.projection.readHealth();
       if (cancelled || this.disposed) {
         throw ownerError ?? new Error("Usage report is closed.");
@@ -1759,9 +1765,6 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       request: AdminActionReconciliationRequest): Promise<AdminActionReconciliationResult> {
     await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminActionReconciliationRequest(request);
-    if (normalized.decision !== "reverse") {
-      throw new Error("Unknown Action decisions require a selected Usage detail.");
-    }
     if (!this.overseers) throw new Error("Action reconciliation is not configured.");
     let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
     try {
@@ -1784,38 +1787,71 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     await assertAdminCapabilityActive(this.users, this.adminUserId);
     const normalized = normalizeAdminUnknownUsageReconciliationRequest(request);
     if (!this.overseers) throw new Error("Action reconciliation is not configured.");
-    const user = await this.#resolveUser(normalized.registeredUserRef);
-    const target = await user.getAdminUnknownUsageActionTarget(normalized.safeRecordRef);
+    const user = await this.#resolveAuthorityUser(normalized.registeredUserRef);
+    const prepared = await user.prepareAdminUnknownUsageReconciliation(
+      normalized.safeRecordRef,
+      normalized.operationId,
+      normalized.decision,
+      normalized.reason,
+      this.adminUserId,
+    );
+    if (prepared.result !== null) return prepared.result;
+    const target = prepared.target;
     let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
     try {
       overseer = this.overseers.get(this.overseers.idFromString(target.workspaceId));
     } catch (error) {
       throw new Error("Workspace identifier is invalid.", {cause: error});
     }
-    const result = await overseer.reconcileActionUsage(
-      target.actionId,
-      normalized.operationId,
-      normalized.decision,
-      normalized.reason,
-      this.adminUserId,
-      normalized.safeRecordRef,
-    );
-    return {
+    const result = target.actionId === null
+      ? await overseer.reconcileLegacyUnknownActionUsage(
+        target.billingOperationId,
+        normalized.operationId,
+        normalized.decision,
+        normalized.reason,
+        this.adminUserId,
+        normalized.safeRecordRef,
+      )
+      : await overseer.reconcileActionUsage(
+        target.actionId,
+        normalized.operationId,
+        normalized.decision,
+        normalized.reason,
+        this.adminUserId,
+        normalized.safeRecordRef,
+      );
+    const safeResult: AdminUnknownUsageReconciliationResult = {
       operationId: result.operationId,
-      decision: result.decision,
+      decision: normalized.decision,
       previousState: result.previousState,
       newState: result.newState,
-      ledgerEntryId: result.ledgerEntryId,
+      ledgerEntryId: result.ledgerEntryId === null
+        ? null : `${normalized.safeRecordRef}:usage-charge`,
       actorUserId: result.actorUserId,
       reason: result.reason,
       createdAt: result.createdAt,
     };
+    return user.completeAdminUnknownUsageReconciliation(
+      normalized.safeRecordRef,
+      safeResult,
+    );
   }
 
   async #resolveUser(
       registeredUserRef: string): Promise<DurableObjectStub<UserDurableObject>> {
     const resolved = await this.admin.resolveRegisteredUsageUser(registeredUserRef);
     if (!resolved) throw new Error("Registered User does not exist.");
+    try {
+      return this.users.get(this.users.idFromString(resolved.userDoId));
+    } catch (error) {
+      throw new Error("Registered User target is invalid.", {cause: error});
+    }
+  }
+
+  async #resolveAuthorityUser(
+      registeredUserRef: string): Promise<DurableObjectStub<UserDurableObject>> {
+    const resolved = await this.admin.resolveRegisteredUsageAuthorityUser(registeredUserRef);
+    if (!resolved) throw new Error("Registered User authority does not exist.");
     try {
       return this.users.get(this.users.idFromString(resolved.userDoId));
     } catch (error) {

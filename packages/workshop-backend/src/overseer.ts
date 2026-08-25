@@ -708,6 +708,11 @@ export type ActionRecord = {
   enabled: boolean;
 });
 
+type BillingActionAuthorityRecord = {
+  billingOperationId: string;
+  actionId: number;
+};
+
 type ActionSubmissionRecord = {
   id: string;
   actionId: number;
@@ -1017,6 +1022,7 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
       nextGatekeeperId: 0,
 
       nextActionId: 0,
+      billingActionAuthorityMigrationCursor: -1,
       nextChatId: 0,
       nextHookId: 0,
 
@@ -1080,6 +1086,10 @@ function makeOverseerStorage(storage: DurableObjectStorage) {
 
       actions: collection<ActionRecord>()({
         primaryKey: "id"
+      }),
+
+      billingActionAuthorities: collection<BillingActionAuthorityRecord>()({
+        primaryKey: "billingOperationId",
       }),
 
       actionSubmissions: collection<ActionSubmissionRecord>()({
@@ -3626,6 +3636,64 @@ class OverseerImpl implements AgentHooks {
     await this.resumePendingSystemAssistance(prepared.task.id);
   }
 
+  /** Resolve one pre-Action-locator Usage record through a bounded durable compatibility index. */
+  async reconcileLegacyUnknownActionUsage(
+      billingOperationId: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string,
+      safeRecordRef: string): Promise<AdminActionReconciliationResult> {
+    const authority = this.storage.billingActionAuthorities.get(billingOperationId) ??
+      this.#migrateBillingActionAuthorityBatch(billingOperationId);
+    if (authority === null) {
+      throw new Error("Legacy Action authority is being prepared. Retry the request.");
+    }
+    if (authority === undefined) throw new Error("Action does not exist.");
+    return this.reconcileActionUsage(
+      authority.actionId,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+      safeRecordRef,
+    );
+  }
+
+  #migrateBillingActionAuthorityBatch(
+      expectedBillingOperationId: string): BillingActionAuthorityRecord | null | undefined {
+    if (typeof expectedBillingOperationId !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(expectedBillingOperationId)) {
+      throw new TypeError("Billing operation ID is invalid.");
+    }
+    const cursor = this.storage.billingActionAuthorityMigrationCursor.get();
+    if (cursor === Number.MAX_SAFE_INTEGER) return undefined;
+    const actions = Array.from(this.storage.actions.list({
+      ...(cursor < 0 ? {start: 0} : {startAfter: cursor}),
+      limit: 64,
+    }));
+    for (const action of actions) {
+      if (action.type !== "action" || action.description.billingOperationId === undefined) continue;
+      const indexed = this.storage.billingActionAuthorities.get(
+        action.description.billingOperationId,
+      );
+      if (indexed !== undefined && indexed.actionId !== action.id) {
+        throw new Error("Action billing authority index does not reconcile.");
+      }
+      this.storage.billingActionAuthorities.put({
+        billingOperationId: action.description.billingOperationId,
+        actionId: action.id,
+      });
+    }
+    const last = actions.at(-1);
+    this.storage.billingActionAuthorityMigrationCursor.put(
+      actions.length < 64 ? Number.MAX_SAFE_INTEGER : last!.id,
+    );
+    const resolved = this.storage.billingActionAuthorities.get(expectedBillingOperationId);
+    if (resolved !== undefined) return resolved;
+    return actions.length < 64 ? undefined : null;
+  }
+
   /** Coordinate one unknown Action or reverse its settled charge under administrator authority. */
   async reconcileActionUsage(
       actionId: number,
@@ -4238,11 +4306,17 @@ class OverseerImpl implements AgentHooks {
           !sameGatekeeperCaller(existing.caller, caller)) {
         throw new Error("Gatekeeper Action identity conflicts with its stored submission.");
       }
+      const billingOperationId = existing.description.billingOperationId;
+      if (billingOperationId !== undefined &&
+          this.storage.billingActionAuthorities.get(billingOperationId) === undefined) {
+        this.storage.billingActionAuthorities.put({billingOperationId, actionId: existing.id});
+      }
       return;
     }
 
     let actionId = this.storage.nextActionId.get();
     this.storage.nextActionId.put(actionId + 1);
+    const billingOperationId = `gatekeeper-action:${crypto.randomUUID()}`;
 
     let gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
 
@@ -4271,11 +4345,15 @@ class OverseerImpl implements AgentHooks {
         : {}),
       description: {
         ...description,
-        billingOperationId: `gatekeeper-action:${crypto.randomUUID()}`,
+        billingOperationId,
       },
     };
 
     this.storage.actions.put(record);
+    this.storage.billingActionAuthorities.put({
+      billingOperationId,
+      actionId,
+    });
     this.storage.actionSubmissions.put({id: submissionId, actionId});
     this.#associateAction(caller, actionId);
 
@@ -7952,6 +8030,24 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       safeRecordRef?: string): Promise<AdminActionReconciliationResult> {
     return this.impl.reconcileActionUsage(
       actionId,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+      safeRecordRef,
+    );
+  }
+
+  /** Resolve and coordinate one legacy unknown Action through server-only Usage authority. */
+  reconcileLegacyUnknownActionUsage(
+      billingOperationId: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string,
+      safeRecordRef: string): Promise<AdminActionReconciliationResult> {
+    return this.impl.reconcileLegacyUnknownActionUsage(
+      billingOperationId,
       operationId,
       decision,
       reason,

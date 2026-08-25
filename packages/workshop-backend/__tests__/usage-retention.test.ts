@@ -366,13 +366,47 @@ describe("24 UTC calendar month Usage detail retention", () => {
         "gatekeeper-operation:another-action",
       )).toThrow("Usage Record does not match the Action");
 
+      const adminReason = "Confirm the old provider operation";
+      const adminActor = "reconciliation-admin@example.test";
+      const prepared = account.prepareAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      );
+      expect(prepared).toMatchObject({
+        safeRecordRef: unknown.safeRecordRef,
+        operationId: reconciliationOperationId,
+        decision: "settle",
+        result: null,
+        target: {
+          workspaceId: ATTRIBUTION.workspaceId,
+          actionId: null,
+          billingOperationId,
+        },
+      });
+
       vi.setSystemTime(new Date("2026-08-23T12:00:00.000Z"));
-      account.reconcileUnknownGatekeeperUsage(
+      const financial = account.reconcileUnknownGatekeeperUsage(
         billingOperationId,
         reconciliationOperationId,
         "settle",
-        "Confirm the old provider operation",
-        "reconciliation-admin@example.test",
+        adminReason,
+        adminActor,
+      );
+      const safeAdminResult = account.completeAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        {
+          operationId: reconciliationOperationId,
+          decision: "settle",
+          previousState: "unknown",
+          newState: "accepted",
+          ledgerEntryId: `${unknown.safeRecordRef}:usage-charge`,
+          actorUserId: adminActor,
+          reason: adminReason,
+          createdAt: financial.createdAt,
+        },
       );
       const details = account.getSnapshot().projectionFacts.filter(
         fact => fact.rowKind === "detail",
@@ -390,6 +424,13 @@ describe("24 UTC calendar month Usage detail retention", () => {
       vi.setSystemTime(new Date("2026-08-24T12:00:00.001Z"));
       expect(runRetentionToCompletion(account).deletedDetailCount).toBe(1n);
       expect(account.resolveUsageDetailReference(original.safeRecordRef)).toBeNull();
+      expect(account.prepareAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      ).result).toEqual(safeAdminResult);
       const authority = account.getGatekeeperReconciliationAuthority(
         reconciliation.safeRecordRef,
       );
@@ -490,6 +531,12 @@ describe("24 UTC calendar month Usage detail retention", () => {
       expect(storage.kv.get(
         `usageAccount:gatekeeperReconciliationReplayTombstone:${billingOperationId}`,
       )).toBe(true);
+      expect(storage.kv.get(
+        `usageAccount:adminUnknownReconciliation:v1:${unknown.safeRecordRef}`,
+      )).toBeUndefined();
+      expect(storage.kv.get(
+        `usageAccount:adminUnknownReconciliationByOperation:v1:${reconciliationOperationId}`,
+      )).toBeUndefined();
       const retainedKeys = Array.from(storage.kv.list(), ([key]) => key);
       expect(retainedKeys.some(key => key.includes(reconciliationOperationId))).toBe(false);
 

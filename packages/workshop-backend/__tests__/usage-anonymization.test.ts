@@ -423,11 +423,17 @@ describe("registered User deletion and pseudonymous financial retention", () => 
       account.beginGatekeeperUsage(unknownId, ATTRIBUTION, PRICED);
       account.markGatekeeperUsageStarted(unknownId);
       account.completeGatekeeperUsage(unknownId, "unknown");
+      const unknown = account.getSnapshot().projectionFacts.find(
+        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown",
+      );
+      if (!unknown || unknown.rowKind !== "detail") {
+        throw new Error("Expected the deleted User's unknown Usage detail.");
+      }
 
       const startedId = "gatekeeper-operation:deletion-started";
       account.beginGatekeeperUsage(startedId, ATTRIBUTION, UNPRICED);
       account.markGatekeeperUsageStarted(startedId);
-      return account.getSnapshot();
+      return {...account.getSnapshot(), unknownSafeRecordRef: unknown.safeRecordRef};
     });
 
     const deletionRequest = {
@@ -450,6 +456,19 @@ describe("registered User deletion and pseudonymous financial retention", () => 
     expect((await adminUsage().searchUsers({query: displayName})).users).toEqual([]);
     await expect(adminUsage().getBalance(registered.registeredUserRef))
       .rejects.toThrow("Registered User does not exist.");
+    await expect(adminUsage().grant({
+      registeredUserRef: registered.registeredUserRef,
+      operationId: "deleted-user-grant-must-stay-blocked",
+      amountSubunits: 1n,
+      reason: "A retained financial authority is not an active grant target",
+    })).rejects.toThrow("Registered User does not exist.");
+    expect(await runInDurableObject(adminSettings(), instance => ({
+      active: instance.resolveRegisteredUsageUser(registered.registeredUserRef),
+      authority: instance.resolveRegisteredUsageAuthorityUser(registered.registeredUserRef),
+    }))).toEqual({
+      active: null,
+      authority: {userDoId: users.idFromName(identity).toString()},
+    });
     expect(await adminSettings().countRegisteredUsageUsers())
       .toBe(registeredUsersBeforeDeletion - 1n);
     expect(await testEnv.AVATARS.get(identity)).toBeNull();
@@ -482,14 +501,46 @@ describe("registered User deletion and pseudonymous financial retention", () => 
         "gatekeeper-operation:deletion-started-new-provider-call",
       )).toThrow("does not exist");
       account.completeGatekeeperUsage("gatekeeper-operation:deletion-started", "executed");
-      account.reconcileUnknownGatekeeperUsage(
-        "gatekeeper-operation:deletion-unknown",
-        "deletion-unknown-release",
+      const operationId = "deletion-unknown-release";
+      const reason = "User deletion does not decide unknown Usage";
+      const actorUserId = "deletion-admin@example.test";
+      const prepared = account.prepareAdminUnknownUsageReconciliation(
+        before.unknownSafeRecordRef,
+        operationId,
         "release",
-        "User deletion does not decide unknown Usage",
-        "deletion-admin@example.test",
+        reason,
+        actorUserId,
       );
-      return account.getSnapshot();
+      expect(prepared).toMatchObject({
+        safeRecordRef: before.unknownSafeRecordRef,
+        target: {
+          workspaceId: ATTRIBUTION.workspaceId,
+          actionId: null,
+          billingOperationId: "gatekeeper-operation:deletion-unknown",
+        },
+        result: null,
+      });
+      const financial = account.reconcileUnknownGatekeeperUsage(
+        "gatekeeper-operation:deletion-unknown",
+        operationId,
+        "release",
+        reason,
+        actorUserId,
+      );
+      const safeResult = account.completeAdminUnknownUsageReconciliation(
+        before.unknownSafeRecordRef,
+        {
+          operationId,
+          decision: "release",
+          previousState: "unknown",
+          newState: "failed-before-execution",
+          ledgerEntryId: null,
+          actorUserId,
+          reason,
+          createdAt: financial.createdAt,
+        },
+      );
+      return {...account.getSnapshot(), safeResult};
     });
     expect(after.ledgerEntries).toEqual(before.ledgerEntries);
     expect(after.adminOperations).toEqual(before.adminOperations);
@@ -497,6 +548,11 @@ describe("registered User deletion and pseudonymous financial retention", () => 
     expect(after.reservations.find(
       reservation => reservation.operationId === "gatekeeper-operation:deletion-unknown",
     )?.state).toBe("released");
+    expect(after.safeResult).toMatchObject({
+      operationId: "deletion-unknown-release",
+      decision: "release",
+      ledgerEntryId: null,
+    });
     for (const summary of before.usageSummaryFacts) {
       expect(after.usageSummaryFacts).toContainEqual(summary);
     }

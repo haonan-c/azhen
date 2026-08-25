@@ -1,4 +1,5 @@
 import {
+  type AdminUnknownUsageReconciliationResult,
   type AdminUsageRecordDetail,
   type AdminUsageBalanceState,
   type AdminUsageOperationKind,
@@ -104,6 +105,10 @@ const GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX =
   "usageAccount:gatekeeperReconciliationTimeIndex:";
 const USAGE_OPERATION_TOMBSTONE_PREFIX = "usageAccount:operationTombstone:";
 const USAGE_USER_DELETION_KEY = "usageAccount:userDeletion:v1";
+const ADMIN_UNKNOWN_RECONCILIATION_PREFIX =
+  "usageAccount:adminUnknownReconciliation:v1:";
+const ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX =
+  "usageAccount:adminUnknownReconciliationByOperation:v1:";
 const RETENTION_RUN_KEY = "usageAccount:retentionRun:v1";
 const RETENTION_NEXT_RUN_AT_KEY = "usageAccount:retentionNextRunAt:v1";
 const RETENTION_FAILURE_RETRY_AT_KEY = "usageAccount:retentionFailureRetryAt:v1";
@@ -139,6 +144,24 @@ export type UsageUserDeletionState = {
   requestedAt: string;
   completedAt: string | null;
   state: "deleting" | "deleted";
+};
+
+/** Server-private authority target frozen before an administrator coordinates unknown Usage. */
+export type AdminUnknownUsageActionTarget = {
+  workspaceId: string;
+  actionId: number | null;
+  billingOperationId: string;
+};
+
+/** Bounded User-authoritative retry state for one detail-scoped unknown Usage decision. */
+export type AdminUnknownUsageReconciliationPreparation = {
+  safeRecordRef: string;
+  operationId: string;
+  decision: "settle" | "release";
+  reason: string;
+  actorUserId: string;
+  target: AdminUnknownUsageActionTarget;
+  result: AdminUnknownUsageReconciliationResult | null;
 };
 
 type UsageRetentionStage = "model" | "gatekeeper" | "reconciliation";
@@ -1263,6 +1286,25 @@ export class UsageAccount {
         reconciliation.billingOperationId,
       true,
     );
+    const adminSafeRecordRef = this.storage.kv.get<string>(
+      ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+    );
+    if (adminSafeRecordRef !== undefined) {
+      const preparation = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(
+        ADMIN_UNKNOWN_RECONCILIATION_PREFIX + adminSafeRecordRef,
+      );
+      if (preparation === undefined) {
+        throw new Error("Administrator unknown Usage replay index does not reconcile.");
+      }
+      assertAdminUnknownUsageReconciliationPreparation(preparation, adminSafeRecordRef);
+      if (preparation.operationId !== operationId) {
+        throw new Error("Administrator unknown Usage replay index does not reconcile.");
+      }
+      this.storage.kv.delete(ADMIN_UNKNOWN_RECONCILIATION_PREFIX + adminSafeRecordRef);
+      this.storage.kv.delete(
+        ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+      );
+    }
     this.storage.kv.delete(
       GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + reconciliation.billingOperationId,
     );
@@ -1675,11 +1717,7 @@ export class UsageAccount {
   }
 
   /** Resolve an unknown detail to its server-private Action locator inside this User authority. */
-  getAdminUnknownUsageActionTarget(safeRecordRef: string): {
-    workspaceId: string;
-    actionId: number;
-    billingOperationId: string;
-  } {
+  getAdminUnknownUsageActionTarget(safeRecordRef: string): AdminUnknownUsageActionTarget {
     const locator = this.resolveUsageDetailReference(safeRecordRef);
     if (locator?.kind !== "gatekeeper") {
       throw new Error("Unknown Usage Record does not exist.");
@@ -1689,15 +1727,90 @@ export class UsageAccount {
       GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
     );
     if (!record || typeof record.attribution.workspaceId !== "string" ||
-        !Number.isSafeInteger(record.attribution.actionId) ||
-        (record.attribution.actionId ?? -1) < 0) {
+        (record.attribution.actionId !== undefined &&
+         (!Number.isSafeInteger(record.attribution.actionId) || record.attribution.actionId < 0))) {
       throw new Error("Unknown Usage Record has no Action authority.");
     }
     return {
       workspaceId: record.attribution.workspaceId,
-      actionId: record.attribution.actionId!,
+      actionId: record.attribution.actionId ?? null,
       billingOperationId: locator.operationId,
     };
+  }
+
+  /** Freeze one detail-scoped unknown decision before any cross-Durable-Object mutation. */
+  prepareAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): AdminUnknownUsageReconciliationPreparation {
+    return this.storage.transactionSync(() => {
+      assertAdminUnknownUsageReconciliationInput(
+        safeRecordRef, operationId, decision, reason, actorUserId,
+      );
+      const operationRef = this.storage.kv.get<string>(
+        ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+      );
+      if (operationRef !== undefined && operationRef !== safeRecordRef) {
+        throw new Error(
+          "Administrator unknown Usage operation conflicts with its selected detail.",
+        );
+      }
+      const key = ADMIN_UNKNOWN_RECONCILIATION_PREFIX + safeRecordRef;
+      const existing = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(key);
+      if (existing !== undefined) {
+        assertAdminUnknownUsageReconciliationPreparation(existing, safeRecordRef);
+        if (existing.operationId !== operationId || existing.decision !== decision ||
+            existing.reason !== reason || existing.actorUserId !== actorUserId) {
+          throw new Error(
+            "Administrator unknown Usage detail conflicts with its stored decision.",
+          );
+        }
+        return structuredClone(existing);
+      }
+      const prepared: AdminUnknownUsageReconciliationPreparation = {
+        safeRecordRef,
+        operationId,
+        decision,
+        reason,
+        actorUserId,
+        target: this.getAdminUnknownUsageActionTarget(safeRecordRef),
+        result: null,
+      };
+      this.storage.kv.put(key, prepared);
+      this.storage.kv.put(
+        ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+        safeRecordRef,
+      );
+      return structuredClone(prepared);
+    });
+  }
+
+  /** Commit one safe administrator result so a lost response can replay after detail retention. */
+  completeAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      result: AdminUnknownUsageReconciliationResult):
+      AdminUnknownUsageReconciliationResult {
+    return this.storage.transactionSync(() => {
+      const key = ADMIN_UNKNOWN_RECONCILIATION_PREFIX + safeRecordRef;
+      const prepared = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(key);
+      if (prepared === undefined) {
+        throw new Error("Administrator unknown Usage decision was not prepared.");
+      }
+      assertAdminUnknownUsageReconciliationPreparation(prepared, safeRecordRef);
+      assertAdminUnknownUsageReconciliationResult(result, prepared);
+      if (prepared.result !== null) {
+        assertAdminUnknownUsageReconciliationResult(prepared.result, prepared);
+        if (!adminUnknownUsageResultsEqual(prepared.result, result)) {
+          throw new Error("Administrator unknown Usage result conflicts with its stored result.");
+        }
+        return structuredClone(prepared.result);
+      }
+      const completed = {...prepared, result: structuredClone(result)};
+      this.storage.kv.put(key, completed);
+      return structuredClone(result);
+    });
   }
 
   private migrateGatekeeperUsageTimeIndexBatch(): boolean {
@@ -4040,6 +4153,77 @@ function assertGatekeeperUsageReconciliationAudit(
       ) !== reconciliation.createdAt) {
     throw new Error("Gatekeeper Usage reconciliation does not reconcile.");
   }
+}
+
+function assertAdminUnknownUsageReconciliationInput(
+    safeRecordRef: string,
+    operationId: string,
+    decision: "settle" | "release",
+    reason: string,
+    actorUserId: string): void {
+  if (!isOpaqueUsageReference(safeRecordRef) || operationIdValidationError(operationId) ||
+      (decision !== "settle" && decision !== "release") ||
+      typeof reason !== "string" || reason.length === 0 || reason.length > 1_000 ||
+      reason.trim() !== reason || reason.includes("\u0000") ||
+      typeof actorUserId !== "string" || actorUserId.length === 0 ||
+      actorUserId.length > 500 || hasAsciiControlCharacter(actorUserId)) {
+    throw new TypeError("Administrator unknown Usage decision is invalid.");
+  }
+}
+
+function assertAdminUnknownUsageReconciliationPreparation(
+    preparation: AdminUnknownUsageReconciliationPreparation,
+    safeRecordRef: string): void {
+  assertAdminUnknownUsageReconciliationInput(
+    safeRecordRef,
+    preparation.operationId,
+    preparation.decision,
+    preparation.reason,
+    preparation.actorUserId,
+  );
+  const target = preparation.target;
+  if (preparation.safeRecordRef !== safeRecordRef ||
+      typeof target.workspaceId !== "string" || !/^[0-9a-f]{64}$/.test(target.workspaceId) ||
+      (target.actionId !== null &&
+       (!Number.isSafeInteger(target.actionId) || target.actionId < 0)) ||
+      operationIdValidationError(target.billingOperationId)) {
+    throw new Error("Administrator unknown Usage decision does not reconcile.");
+  }
+  if (preparation.result !== null) {
+    assertAdminUnknownUsageReconciliationResult(preparation.result, preparation);
+  }
+}
+
+function assertAdminUnknownUsageReconciliationResult(
+    result: AdminUnknownUsageReconciliationResult,
+    preparation: AdminUnknownUsageReconciliationPreparation): void {
+  if (result.operationId !== preparation.operationId ||
+      result.decision !== preparation.decision ||
+      result.actorUserId !== preparation.actorUserId || result.reason !== preparation.reason ||
+      !isAdminUnknownUsageActionState(result.previousState) ||
+      !isAdminUnknownUsageActionState(result.newState) ||
+      (result.ledgerEntryId !== null &&
+       result.ledgerEntryId !== `${preparation.safeRecordRef}:usage-charge`) ||
+      normalizeCanonicalUtcTimestamp(
+        result.createdAt, "Administrator unknown Usage result time",
+      ) !== result.createdAt) {
+    throw new Error("Administrator unknown Usage result does not reconcile.");
+  }
+}
+
+function isAdminUnknownUsageActionState(state: string): boolean {
+  return state === "pending" || state === "applying" || state === "accepted" ||
+    state === "failed-before-execution" || state === "unknown" || state === "rejected" ||
+    state === "reverted";
+}
+
+function adminUnknownUsageResultsEqual(
+    left: AdminUnknownUsageReconciliationResult,
+    right: AdminUnknownUsageReconciliationResult): boolean {
+  return left.operationId === right.operationId && left.decision === right.decision &&
+    left.previousState === right.previousState && left.newState === right.newState &&
+    left.ledgerEntryId === right.ledgerEntryId && left.actorUserId === right.actorUserId &&
+    left.reason === right.reason && left.createdAt === right.createdAt;
 }
 
 function assertGatekeeperUsageReconciliation(
