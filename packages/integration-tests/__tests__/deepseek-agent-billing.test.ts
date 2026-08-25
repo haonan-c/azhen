@@ -427,7 +427,7 @@ describe("DeepSeek Agent billing", () => {
 
     expect(providerRequests).toHaveLength(1);
     expect(providerRequests[0]?.isAgentInference).toBe(true);
-    expect(after).toEqual({
+    expect(after).toMatchObject({
       availableSubunits: before.availableSubunits - expected,
       reservedSubunits: 0n,
     });
@@ -551,7 +551,7 @@ describe("DeepSeek Agent billing", () => {
     );
     expect(agentProviderCalls).toBe(2);
     expect(requestTimes).toHaveLength(2);
-    expect(after).toEqual({
+    expect(after).toMatchObject({
       availableSubunits: before.availableSubunits - expectedTotal,
       reservedSubunits: 0n,
     });
@@ -1278,6 +1278,14 @@ describe("DeepSeek Agent billing", () => {
     ]);
     expect(await appliedActionCount(actionLabel)).toBe(1);
 
+    // Load the restarted Gadget before the Agent restores its callback. Otherwise the first
+    // restore can reload Worker Loader mid-WebSocket and lose the one-shot registration call.
+    const schedulerWarmupGadget = await secondAfterRestartWorkspace.getGadget(gadgetId);
+    const schedulerWarmupApp: any = await schedulerWarmupGadget.connectToGadget();
+    await schedulerWarmupApp.getLastFiring();
+    schedulerWarmupApp[Symbol.dispose]();
+    schedulerWarmupGadget[Symbol.dispose]();
+
     let schedulerProviderCalls = 0;
     let signalScheduled!: () => void;
     const scheduled = new Promise<void>(resolve => { signalScheduled = resolve; });
@@ -1308,30 +1316,46 @@ describe("DeepSeek Agent billing", () => {
       "Register the complete tracer schedule.",
       deploymentModelId,
     );
-    await waitFor("the complete tracer Scheduler Hook", async () => {
-      try {
-        const chat = (await secondAfterRestartWorkspace.listChats())
-            .find(candidate => candidate.id === schedulerChatId);
-        const hooks = await secondAfterRestartWorkspace.listHooks();
-        if (chat?.activeAgent !== undefined || hooks.length !== 1) return null;
-        await secondAfterRestartWorkspace.enableHook(hooks[0]!.id);
-        return hooks[0]!;
-      } catch (error) {
-        if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") {
-          throw error;
+    let lastSchedulerChatState = "not-polled";
+    let lastSchedulerHookCount = -1;
+    let schedulerReconnectCount = 0;
+    try {
+      await waitFor("the complete tracer Scheduler Hook", async () => {
+        try {
+          const chat = (await secondAfterRestartWorkspace.listChats())
+              .find(candidate => candidate.id === schedulerChatId);
+          const hooks = await secondAfterRestartWorkspace.listHooks();
+          lastSchedulerChatState = chat === undefined ? "missing"
+            : chat.activeAgent === undefined ? "inactive" : "active";
+          lastSchedulerHookCount = hooks.length;
+          if (chat?.activeAgent !== undefined || hooks.length !== 1) return null;
+          await secondAfterRestartWorkspace.enableHook(hooks[0]!.id);
+          return hooks[0]!;
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "WebSocket connection failed.") {
+            throw error;
+          }
+          // Worker Loader can reload the runtime while executeCode registers the Hook. Mirror the
+          // browser's reconnect path before polling the same durable workflow again.
+          schedulerReconnectCount += 1;
+          secondAfterRestartWorkspace[Symbol.dispose]();
+          secondAfterRestart[Symbol.dispose]();
+          secondAfterRestartPublicApi[Symbol.dispose]();
+          const session = await signInWhenAvailable(secondName);
+          secondAfterRestartPublicApi = session.publicApi;
+          secondAfterRestart = session.user;
+          secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
+          return null;
         }
-        // Worker Loader can reload the runtime while executeCode registers the Hook. Mirror the
-        // browser's reconnect path before polling the same durable workflow again.
-        secondAfterRestartWorkspace[Symbol.dispose]();
-        secondAfterRestart[Symbol.dispose]();
-        secondAfterRestartPublicApi[Symbol.dispose]();
-        const session = await signInWhenAvailable(secondName);
-        secondAfterRestartPublicApi = session.publicApi;
-        secondAfterRestart = session.user;
-        secondAfterRestartWorkspace = await secondAfterRestart.openGadget(workspaceId);
-        return null;
-      }
-    });
+      });
+    } catch (error) {
+      throw new Error(
+        `Complete tracer Scheduler Hook stalled: providerCalls=${schedulerProviderCalls}, ` +
+        `chat=${lastSchedulerChatState}, hooks=${lastSchedulerHookCount}, ` +
+        `reconnects=${schedulerReconnectCount}.`,
+        {cause: error},
+      );
+    }
 
     const ownerManagementPublicApi = connect(harness.url);
     const ownerManagement = await signIn(ownerManagementPublicApi, ownerName);

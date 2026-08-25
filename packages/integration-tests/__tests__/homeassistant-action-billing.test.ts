@@ -297,7 +297,7 @@ describe("Home Assistant Action billing", () => {
       expect(calls.filter(call => call.operation === "call_service")).toHaveLength(1);
       expect(calls.length).toBeGreaterThan(1);
       const charge = writeCharge("Entity.turnOn");
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - charge,
       });
@@ -329,7 +329,12 @@ describe("Home Assistant Action billing", () => {
       expect(await context.workspace.approveAction(action.id)).toBe("failed-before-execution");
 
       expect(await upstream.calls()).toEqual([]);
-      expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      const afterRelease = await context.user.getUsageCreditBalance();
+      expect(afterRelease).toMatchObject({
+        availableSubunits: before.availableSubunits,
+        reservedSubunits: before.reservedSubunits,
+      });
+      expect(afterRelease.revision).toBeGreaterThan(before.revision);
       expect(await latestGatekeeperUsage(context.user)).toMatchObject({
         billingMethodKey:
           HOME_ASSISTANT_WRITE_BILLING_METHODS["HomeAssistantSession.fireEvent"].methodKey,
@@ -362,7 +367,7 @@ describe("Home Assistant Action billing", () => {
         {transport: "websocket", operation: "fire_event"},
       ]);
       const charge = writeCharge("HomeAssistantSession.fireEvent");
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: charge,
         availableSubunits: before.availableSubunits - charge,
       });
@@ -414,7 +419,7 @@ describe("Home Assistant Action billing", () => {
       expect((await upstream.calls()).filter(call => call.operation === "call_service"))
         .toHaveLength(1);
       const charge = writeCharge("Entity.turnOn");
-      expect(await user.getUsageCreditBalance()).toEqual({
+      expect(await user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - charge,
       });

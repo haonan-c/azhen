@@ -249,7 +249,7 @@ describe("Deployment Model invocation metering", () => {
       usage: REPORTED_USAGE,
     });
     const after = await user.getUsageCreditBalance();
-    expect(after).toEqual({
+    expect(after).toMatchObject({
       availableSubunits: before.availableSubunits - records[0]!.chargeSubunits!,
       reservedSubunits: 0n,
     });

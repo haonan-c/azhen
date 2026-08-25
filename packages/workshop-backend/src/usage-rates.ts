@@ -19,6 +19,13 @@ import {
   RELEASED_MODEL_USAGE_RATE_CATALOG_VERSION,
   releasedModelUsageRateCatalog,
 } from "./usage-rate-catalog.js";
+import {
+  isPublicPublishedApiMethod,
+  normalizePublishedApiRateSourceRequest,
+  publishedApiRateKey,
+  type ConfiguredPublishedApiRatePage,
+  type PublishedApiRateSourceRequest,
+} from "./public-api-rates.js";
 
 /** Confirmed provider token categories used to calculate one model Usage Charge. */
 export type ModelTokenUsage = {
@@ -318,6 +325,29 @@ export class UsageRateRegistry {
     return this.storage.transaction(() => {
       const current = this.ensureCurrentVersion();
       return this.readAdminView(current);
+    });
+  }
+
+  /** Return one bounded keyset page of current public Gatekeeper rates. */
+  getPublishedGatekeeperRatePage(
+      request: PublishedApiRateSourceRequest): ConfiguredPublishedApiRatePage {
+    const {cursorKey, limit} = normalizePublishedApiRateSourceRequest(request);
+    return this.storage.transaction(() => {
+      const ordered = this.ensureCurrentVersion().gatekeeperOperationRates
+        .filter(isPublicPublishedApiMethod)
+        .filter(rate => cursorKey === undefined || publishedApiRateKey(rate) > cursorKey)
+        .toSorted((left, right) => {
+          const leftKey = publishedApiRateKey(left);
+          const rightKey = publishedApiRateKey(right);
+          return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+        });
+      const visible = structuredClone(ordered.slice(0, limit));
+      return {
+        rates: visible,
+        nextCursorKey: ordered.length > limit
+          ? publishedApiRateKey(visible.at(-1)!)
+          : null,
+      };
     });
   }
 

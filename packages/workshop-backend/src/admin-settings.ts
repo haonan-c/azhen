@@ -23,6 +23,10 @@ import {
 } from './usage-user-registry.js';
 import type {UsageUserRegistrationFact} from './usage-account.js';
 import type {UsageProjection} from './usage-projection.js';
+import type {
+  ConfiguredPublishedApiRatePage,
+  PublishedApiRateSourceRequest,
+} from './public-api-rates.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -312,6 +316,12 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   /** Return the current deployment Usage Rates and their immutable history. */
   getUsageRates(): UsageRateAdminView {
     return this.usageRates.getAdminView();
+  }
+
+  /** Return one strong-consistency bounded page of public Gatekeeper operation rates. */
+  getPublishedGatekeeperRatePage(
+      request: PublishedApiRateSourceRequest): ConfiguredPublishedApiRatePage {
+    return this.usageRates.getPublishedGatekeeperRatePage(request);
   }
 
   /** Atomically apply effective Usage Rate changes and bind any new audit to the administrator. */

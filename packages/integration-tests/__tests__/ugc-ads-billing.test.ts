@@ -807,7 +807,7 @@ describe.sequential("UGC Ads Browser production Worker billing", () => {
         operations: BROWSER_PHYSICAL_SEQUENCE,
         protocolComplete: true,
       });
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - RENDER_CHARGE_SUBUNITS,
       });
@@ -859,7 +859,7 @@ describe.sequential("UGC Ads Browser production Worker billing", () => {
         operations: ["browser.acquire"],
         protocolComplete: true,
       });
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: RENDER_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - RENDER_CHARGE_SUBUNITS,
       });
@@ -899,7 +899,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
           throw new Error("Xiaohongshu search completed before its first provider request.");
         }),
       ]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: XHS_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - XHS_CHARGE_SUBUNITS,
       });
@@ -917,18 +917,22 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         {path: XHS_SEARCH_PATH, method: "GET", page: 1},
         {path: XHS_SEARCH_PATH, method: "GET", page: 2},
       ]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - XHS_CHARGE_SUBUNITS,
       });
       const records = await usageRecordsFor(context.user, XHS_BILLING_METHODS.search.methodKey);
       expect(records).toEqual([expect.objectContaining({
         source: "direct-user",
-        externalAccountId: "ugc-ads-deployment",
+        vendorId: VENDOR_ID,
+        billingMethodKey: XHS_BILLING_METHODS.search.methodKey,
         pricing: "priced",
         outcome: "settled",
         chargeSubunits: XHS_CHARGE_SUBUNITS,
       })]);
+      expect(JSON.stringify(records, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value))
+        .not.toContain("ugc-ads-deployment");
       const inspection = await inspectGatekeeperMetering(context.username, true);
       expect(inspection.attempts).toHaveLength(1);
       expect(inspection.usageRecords).toHaveLength(1);
@@ -1005,7 +1009,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         .toEqual([expect.objectContaining({outcome: "settled", chargeSubunits: XHS_CHARGE_SUBUNITS})]);
       expect(await usageRecordsFor(context.user, XHS_BILLING_METHODS.creator.methodKey))
         .toEqual([expect.objectContaining({outcome: "settled", chargeSubunits: XHS_CHARGE_SUBUNITS})]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - 2n * XHS_CHARGE_SUBUNITS,
       });
@@ -1091,7 +1095,12 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         .rejects.toThrow();
 
       expect(physicalCalls).toEqual([]);
-      expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      const afterDispatchFailure = await context.user.getUsageCreditBalance();
+      expect(afterDispatchFailure).toMatchObject({
+        availableSubunits: before.availableSubunits,
+        reservedSubunits: before.reservedSubunits,
+      });
+      expect(afterDispatchFailure.revision).toBeGreaterThan(before.revision);
       const records = await usageRecordsFor(context.user, XHS_BILLING_METHODS.detail.methodKey);
       expect(records)
         .toEqual([expect.objectContaining({
@@ -1135,7 +1144,7 @@ describe.sequential("UGC Ads Xiaohongshu production Worker billing", () => {
         {path: XHS_SEARCH_PATH, method: "GET", page: 1},
         {path: XHS_SEARCH_PATH, method: "GET", page: 1},
       ]);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: XHS_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - XHS_CHARGE_SUBUNITS,
       });
@@ -1281,7 +1290,7 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
       const before = await context.user.getUsageCreditBalance();
       const resultPromise = context.session.searchOfficialAccountArticles(QUERY_TERMS);
       await firstRequestStarted;
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
@@ -1321,7 +1330,7 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
       expect(physicalCalls.filter(call => call.path === SEARCH_PATH)).toHaveLength(10);
       expect(physicalCalls.filter(call => call.path === STATS_PATH)).toHaveLength(16);
       expect(physicalCalls.every(call => call.method === "POST")).toBe(true);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
@@ -1333,11 +1342,13 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         source: "direct-user",
         vendorId: VENDOR_ID,
         billingMethodKey: OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
-        externalAccountId: "ugc-ads-deployment",
         pricing: "priced",
         outcome: "settled",
         chargeSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       })]);
+      expect(JSON.stringify(usageRecords, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value))
+        .not.toContain("ugc-ads-deployment");
       const meteringInspection = await inspectGatekeeperMetering(context.username, true);
       const expectedSettledAttempt = expect.objectContaining({
         operationId: expect.any(String),
@@ -1379,7 +1390,7 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         context.user,
         OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
       )).toEqual(usageRecords);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });
@@ -1414,7 +1425,12 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
       ])).rejects.toThrow();
 
       expect(physicalCalls).toEqual([]);
-      expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      const afterDispatchFailure = await context.user.getUsageCreditBalance();
+      expect(afterDispatchFailure).toMatchObject({
+        availableSubunits: before.availableSubunits,
+        reservedSubunits: before.reservedSubunits,
+      });
+      expect(afterDispatchFailure.revision).toBeGreaterThan(before.revision);
       const usageRecords = await usageRecordsFor(
         context.user,
         OFFICIAL_ACCOUNT_BILLING_METHOD.methodKey,
@@ -1453,7 +1469,7 @@ describe.sequential("UGC Ads Official Account production Worker billing", () => 
         .rejects.toThrow();
 
       expect(physicalCalls).toHaveLength(expectedCalls);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
         availableSubunits: before.availableSubunits - OFFICIAL_ACCOUNT_CHARGE_SUBUNITS,
       });

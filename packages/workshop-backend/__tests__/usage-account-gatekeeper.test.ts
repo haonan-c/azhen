@@ -66,12 +66,16 @@ const ATTRIBUTION: GatekeeperUsageAttribution = {
  * Durable Object's I/O objects from another.
  */
 async function withAccount<T>(
-    body: (account: UsageAccount, storage: DurableObjectStorage) => T): Promise<T> {
+    body: (
+      account: UsageAccount,
+      storage: DurableObjectStorage,
+      user: UserDurableObject,
+    ) => T): Promise<T> {
   const username = `gk-usage-${crypto.randomUUID()}`;
   const stub = users.get(users.idFromName(username));
   const token = await stub.createAccount(username, username, new Uint8Array([2, 4, 6, 8]));
   if (token === null) throw new Error("Failed to create Gatekeeper billing test User.");
-  return runInDurableObject(stub, (_instance, state) => {
+  return runInDurableObject(stub, (instance, state) => {
     const account = new UsageAccount(state.storage, () => ({
       userDoId: "a".repeat(64),
       identity: "gatekeeper-billing@example.test",
@@ -79,7 +83,7 @@ async function withAccount<T>(
     }));
     // Materialize the initial grant so later calls need no snapshot argument.
     account.getBalance(GRANT);
-    return body(account, state.storage);
+    return body(account, state.storage, instance);
   });
 }
 
@@ -90,7 +94,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(attempt.state).toBe("ready");
       expect(attempt.reservationId).toBe("op-settle");
       expect(attempt.reservationAmountSubunits).toBe(CHARGE);
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: CHARGE,
       });
@@ -105,7 +109,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.chargeSubunits).toBe(CHARGE);
       expect(record.ledgerEntryId).not.toBeNull();
       // The exact fixed charge leaves the balance; nothing stays reserved.
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: 0n,
       });
@@ -120,7 +124,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       const attempt = account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
       expect(attempt.reservationId).toBeNull();
       expect(attempt.reservationAmountSubunits).toBe(0n);
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE,
         reservedSubunits: 0n,
       });
@@ -130,7 +134,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.outcome).toBe("settled");
       expect(record.chargeSubunits).toBe(0n);
       expect(record.ledgerEntryId).toBeNull();
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE,
         reservedSubunits: 0n,
       });
@@ -147,12 +151,14 @@ describe("Gatekeeper two-stage billing state machine", () => {
         chatId: ATTRIBUTION.chatId,
         vendorId: ATTRIBUTION.vendorId,
         billingMethodKey: ATTRIBUTION.billingMethodKey,
-        externalAccountId: ATTRIBUTION.externalAccountId,
         pricing: "unpriced",
         outcome: "settled",
         chargeSubunits: 0n,
         createdAt: record.createdAt,
       }]);
+      expect(JSON.stringify(account.listUserUsageRecords({limit: 10}),
+        (_key, value) => typeof value === "bigint" ? value.toString() : value))
+        .not.toContain(ATTRIBUTION.externalAccountId);
     });
   });
 
@@ -402,7 +408,6 @@ describe("Gatekeeper two-stage billing state machine", () => {
         source: "direct-user",
         vendorId: "context",
         billingMethodKey: "context.read.v1",
-        externalAccountId: "context-account-1",
         pricing: "unpriced",
         outcome: "settled",
         chargeSubunits: 0n,
@@ -454,6 +459,103 @@ describe("Gatekeeper two-stage billing state machine", () => {
     });
   });
 
+  it("publishes only hashed dynamic MCP method keys", async () => {
+    await withAccount(account => {
+      const safeKey = `mcp.tool.v1.${"a".repeat(64)}`;
+      for (const [operationId, billingMethodKey] of [
+        ["gatekeeper-operation:mcp-safe", safeKey],
+        ["gatekeeper-operation:mcp-unsafe", "raw-provider-tool-name"],
+      ] as const) {
+        const attribution = {...ATTRIBUTION, vendorId: "mcp", billingMethodKey};
+        const snapshot = {...UNPRICED, vendorId: "mcp", billingMethodKey};
+        account.beginGatekeeperUsage(operationId, attribution, snapshot);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+
+      expect(account.listDiscoveredGatekeeperMethodPage({limit: 10})).toEqual({
+        methods: [{vendorId: "mcp", billingMethodKey: safeKey}],
+        nextCursorKey: null,
+        truncated: false,
+      });
+    });
+  });
+
+  it("caps discovered methods without making the first rate page permanently fail", async () => {
+    await withAccount(account => {
+      for (let index = 0; index < 501; ++index) {
+        const billingMethodKey = `operation.${index.toString().padStart(3, "0")}`;
+        const operationId = `gatekeeper-operation:inventory-${index}`;
+        const attribution = {...ATTRIBUTION, vendorId: "test", billingMethodKey};
+        const snapshot = {...UNPRICED, vendorId: "test", billingMethodKey};
+        account.beginGatekeeperUsage(operationId, attribution, snapshot);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+
+      let cursorKey: string | undefined;
+      const visible = [];
+      do {
+        const page = account.listDiscoveredGatekeeperMethodPage({cursorKey, limit: 100});
+        expect(page.truncated).toBe(true);
+        visible.push(...page.methods);
+        cursorKey = page.nextCursorKey ?? undefined;
+      } while (cursorKey !== undefined);
+
+      expect(visible).toHaveLength(500);
+      expect(new Set(visible.map(method => method.billingMethodKey)).size).toBe(500);
+      expect(visible.some(method => method.billingMethodKey === "operation.500")).toBe(false);
+    });
+  });
+
+  it("advances a large repeated legacy method inventory without requiring request retries",
+      async () => {
+    await withAccount(async (account, storage, user) => {
+      for (let index = 0; index < 301; ++index) {
+        const operationId = `gatekeeper-operation:legacy-repeat-${index}`;
+        account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
+      }
+      for (const [key] of storage.kv.list({
+        prefix: "usageAccount:discoveredGatekeeperMethod:v2:",
+      })) {
+        storage.kv.delete(key);
+      }
+      for (const key of [
+        "usageAccount:discoveredGatekeeperMethodVersion:v2",
+        "usageAccount:discoveredGatekeeperMethodMigrationCursor:v2",
+        "usageAccount:discoveredGatekeeperMethodCount:v2",
+        "usageAccount:discoveredGatekeeperMethodTruncated:v2",
+      ]) {
+        storage.kv.delete(key);
+      }
+
+      expect(await user.listOwnDiscoveredGatekeeperMethodPage({limit: 10})).toEqual({
+        methods: [{
+          vendorId: ATTRIBUTION.vendorId,
+          billingMethodKey: ATTRIBUTION.billingMethodKey,
+        }],
+        nextCursorKey: null,
+        truncated: true,
+      });
+      for (let pass = 0; pass < 4 &&
+          storage.kv.get("usageAccount:discoveredGatekeeperMethodVersion:v2") !== true;
+          ++pass) {
+        await user.alarm();
+      }
+      expect(storage.kv.get("usageAccount:discoveredGatekeeperMethodVersion:v2")).toBe(true);
+      expect(account.listDiscoveredGatekeeperMethodPage({limit: 10})).toEqual({
+        methods: [{
+          vendorId: ATTRIBUTION.vendorId,
+          billingMethodKey: ATTRIBUTION.billingMethodKey,
+        }],
+        nextCursorKey: null,
+        truncated: false,
+      });
+    });
+  });
+
   it("lazily indexes old Usage Records in bounded resumable batches", async () => {
     await withAccount((account, storage) => {
       for (let index = 0; index < 101; ++index) {
@@ -496,7 +598,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.outcome).toBe("failed-before-execution");
       expect(record.chargeSubunits).toBeNull();
       expect(record.ledgerEntryId).toBeNull();
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE,
         reservedSubunits: 0n,
       });
@@ -512,7 +614,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(record.outcome).toBe("usage-unknown");
       expect(record.chargeSubunits).toBeNull();
       // Held, not released and not charged: the Credit stays reserved for reconciliation.
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: CHARGE,
       });
@@ -536,7 +638,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       const record = account.completeGatekeeperUsage("op-retry", "executed");
       expect(account.completeGatekeeperUsage("op-retry", "executed")).toEqual(record);
       // Exactly one charge reached the immutable Ledger.
-      expect(account.getBalance()).toEqual({
+      expect(account.getBalance()).toMatchObject({
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: 0n,
       });

@@ -8,6 +8,8 @@ import Sidebar from './Sidebar'
 import CommandPalette from './CommandPalette'
 import { OPEN_COMMAND_PALETTE_EVENT } from './commandPaletteBus'
 import { m as messages } from '../../paraglide/messages.js'
+import { UsageCreditProvider } from '../../UsageCreditContext'
+import LowBalanceWarning from '../billing/LowBalanceWarning'
 
 const STORAGE_KEY_COLLAPSED = 'gadgets:sidebar-collapsed'
 
@@ -80,6 +82,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, [])
 
   return (
+    <UsageCreditProvider>
     <div className="flex h-screen min-h-screen w-screen overflow-hidden bg-kumo-base">
       {/* Desktop sidebar — hidden on mobile in favor of the drawer. */}
       <div className="hidden md:flex">
@@ -119,6 +122,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               hidden, leaving this the only in-flow child, which `justify-between` would park on the
               left. */}
           <div className="ml-auto flex items-center gap-2">
+            <LowBalanceWarning />
             {connectionLost && <ReconnectingChip />}
             <span aria-hidden="true" className="h-7 w-7 md:hidden" />
           </div>
@@ -130,5 +134,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
+    </UsageCreditProvider>
   )
 }

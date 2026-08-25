@@ -485,3 +485,103 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   workspace packages.
 - No deployment, upload, promotion, production configuration, charging change, or worktree deletion
   occurred.
+
+### 2026-08-24 — Issue #64 fixed-point review corrections
+
+- Reviewed candidate `06dd15d736cf4dedcab21ba5f0983552adabc214` on both specification and
+  code-quality axes. Reproduced the reported API-switch data leak, missing subscription recovery,
+  unsafe dynamic MCP publication, late acknowledgement overwrite, callback-throw coupling,
+  incomplete operation counts, cross-page reversal gap, unbounded rate-source read, and link-role
+  regression with focused canaries before applying the corrections.
+- Bound all frontend page state and asynchronous activation results to the current authenticated
+  API. Added a bounded full-subscription retry and complete capability disposal on failure,
+  replacement, late resolution, cancellation, and unmount.
+- Isolated subscriber callback failures from committed financial results. Added safe linked Ledger
+  summaries and bounded configured/discovered rate-owner keyset pages. Dynamic MCP publication now
+  accepts only `mcp.tool.v1.<64 lowercase hex>` and reports durable discovered-inventory truncation.
+- Added settled, failed-before-execution, and usage-unknown API operation counts; preserved native
+  link semantics inside the low-balance live region; and reduced four repeated list loaders to one
+  API-keyed hook.
+- Focused verification passed under the pinned workspace toolchain: frontend review canaries 19/19,
+  frontend package 353/353 plus first-party copy 1/1, backend workerd group 79/79, and real Cap'n Web
+  integration 4/4. Direct backend/frontend `tsc`, `corepack pnpm lint:check`, and
+  `git diff --check` exited 0.
+- The correction is not rebased over #62 and no final root test, Wrangler command, release build,
+  upload, promotion, deployment, push, Issue closure, or worktree deletion was performed. Final
+  root and release gates remain pending until the coordinated post-#62 rebase.
+
+### 2026-08-24 — Issue #64 post-#62 rebase and package gates
+
+- Rebasing `codex/issue-64` onto `98e1963265840f57463727b1b724b562690c00ee` retained both contracts:
+  Issue #62 continues to own deployment Projection delivery and administrator reads, while Issue
+  #64 reads only the current User Durable Object and exposes no target User identifier.
+- The conflict RED phase found a random-UUID ordering assumption in the Ledger pagination test.
+  The corrected test traverses real one-row keyset pages and proves the reversal summary remains
+  safe across pages without assuming that the reversal has a following page. The focused backend
+  group passed 85/85 and real Cap'n Web passed 4/4.
+- Shared and Backend builds passed. The Backend package passed 596 tests with 4 intentional skips.
+  The Frontend production build passed, followed by 361/361 package tests and first-party copy 1/1.
+  Focused Frontend subscription, profile, shell, and privacy tests passed 23/23.
+- Oxlint first rejected one stale `GatekeeperOperationRate` import left by conflict resolution. The
+  import was removed and `corepack pnpm lint:check` passed with repository warnings only.
+- The first complete production-Harness run passed 114/115. The sole timeout was the existing
+  complete DeepSeek Principal tracer. Focused diagnostics proved two provider calls completed, the
+  chat was inactive, no Hook was stored, and two WebSocket reconnects occurred. The test now loads
+  the restarted Gadget through real RPC before `env.APP[restore]`, preventing Worker Loader reload
+  from interrupting the one-shot registration. The original-timeout file passed 9/9.
+- A final complete 115/115 production-Harness run remains mandatory after review. Root build, test,
+  lint, manifest golden, and whitespace gates remain for the coordinated `dev` integration. No
+  push, merge, Issue closure, release build, upload, promotion, deployment, production change,
+  charging change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #64 third fixed-point review corrections
+
+- Re-entered the `implement` and TDD gates for the post-rebase findings. A Strict Mode lifecycle RED
+  proved that effect cleanup left the second setup without a balance subscription. Each setup now
+  re-arms the active API; the callback and both pending/resolved subscription paths are disposed.
+- A controlled Registry failure RED proved that synchronous delivery blocked an already-committed
+  local Initial Grant, legacy notice, and registration outbox. Activation now pre-arms and reuses the
+  User's single maintenance alarm. Local User authority remains available, failed Registry delivery
+  retries after ten seconds, and restart delivers and acknowledges the same idempotent fact.
+- A later Standards RED constructed the exact upgrade state where Issue #62 had already committed
+  and acknowledged the Registry outbox but no Issue #64 activation notice existed. Initialized
+  activation now idempotently creates an eligible returning legacy notice before inspecting the
+  acknowledgement. The acknowledged fact and delivery time stay unchanged, the Initial Grant stays
+  singular, native new Users remain ineligible, and only pending Registry work schedules the alarm.
+- Removed manual Retry failures from the bounded 100-record legacy public-method migration. The
+  first request returns current static/configured/discovered data with a truthful truncation signal,
+  while the User alarm advances remaining batches. A 301-record repeated-method history completes
+  without a second list request and deduplicates to one method.
+- Removed raw `externalAccountId` from the User-safe Gatekeeper Usage Record DTO and added sensitive
+  serialization canaries. Added low-balance coverage for a non-divisible 11-subunit Initial Grant,
+  the rounded threshold of 2, zero, and negative balances.
+- Expanded real Cap'n Web evidence to own-User Reservation and Ledger pagination, a negative exact
+  delta larger than `Number.MAX_SAFE_INTEGER`, and two-User isolation. Focused results are Provider
+  6/6, Usage Admin 17/17, Gatekeeper Usage Account 25/25, User Usage Account 38/38, and Cap'n Web 5/5.
+  The real RPC rate case includes the 301-record repeated legacy history, static inventory, and
+  configured priced-zero rate in one pass. The Frontend package passed 362/362 plus copy 1/1, and
+  Shared, Backend, and Frontend production builds passed.
+- Oxlint passed with repository warnings only, `git diff --check` passed, and the diff contains no
+  quote-only `admin-settings.ts` change. The final single uninterrupted 115/115 Harness remains
+  pending. No push, merge, Issue closure, release build, upload, promotion, deployment, production
+  change, charging change, or worktree deletion occurred.
+
+### 2026-08-24 — Issue #64 final production-Harness gate
+
+- The first uninterrupted final-candidate package run passed 12/13 files and 113/115 tests in
+  645.35 seconds. Its two failures were stale UGC Ads expectations for the removed raw
+  `externalAccountId` on the User-safe Usage Record DTO. The remaining priced lifecycle and
+  internal authoritative metering fields matched, so no production code changed.
+- Updated only three production-Harness test files. The two UGC Ads checks now retain source,
+  vendor, method, pricing, outcome, and exact charge assertions while rejecting the sensitive
+  account canary. GitHub and Spotify now prove the User-safe field is absent while retaining their
+  method and User-isolation checks. Both integration TypeScript programs passed,
+  `git diff --check` passed, and focused UGC Ads passed 23/23.
+- After specification review found no P0-P2 findings, committed the test-only correction as
+  `b2c3068483f562fc8983229915222c75bd5f2256` and ran one complete, uninterrupted package command.
+  It passed 13/13 files and 115/115 tests in 659.84 seconds without prewarming, splitting, a
+  parallel workerd fleet, or a retry.
+- This closes the Issue #64 branch production-Harness gate. Merged-tree root build, test, lint,
+  manifest golden, and whitespace gates remain for main-agent integration. No push, merge, Issue
+  closure, release build, upload, promotion, deployment, production change, charging change, or
+  worktree deletion occurred.

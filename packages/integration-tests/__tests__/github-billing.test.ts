@@ -462,7 +462,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
 
       expect((await session.getMetadata()).fullName)
         .toBe("fixture-owner/private-repo-marker");
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - READ_CHARGE,
       });
@@ -518,7 +518,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect((await session.getMetadata()).fullName).toBe("fixture-owner/private-repo-marker");
 
       expect(repoConditionalRequests).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - 2n * READ_CHARGE,
       });
@@ -559,7 +559,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
 
       expect(count).toBe(201);
       expect(issuePages).toBe(3);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - READ_CHARGE,
       });
@@ -593,7 +593,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect((await issueSession.getDetails()).title).toBe("Old title");
       expect((await pullSession.getDetails()).title).toBe("Fixture pull request 1");
 
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - 2n * READ_CHARGE,
       });
@@ -624,7 +624,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
 
       expect(await cursor.next()).toBeNull();
       expect(issuePages).toBe(2);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - READ_CHARGE,
       });
@@ -660,7 +660,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect(await context.workspace.approveAction(approved.id)).toBe("accepted");
       expect(await context.workspace.approveAction(approved.id)).toBe("accepted");
       expect(issueCreates).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -695,7 +695,12 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect(await context.workspace.approveAction(action.id)).toBe("failed-before-execution");
       expect(issueReads).toBe(readsBeforeAction + 1);
       expect(issueUpdates).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      const afterRelease = await context.user.getUsageCreditBalance();
+      expect(afterRelease).toMatchObject({
+        availableSubunits: before.availableSubunits,
+        reservedSubunits: before.reservedSubunits,
+      });
+      expect(afterRelease.revision).toBeGreaterThan(before.revision);
       expect(await latestUsage(context.user)).toMatchObject({
         billingMethodKey: "github.issue.title.set.v1",
         outcome: "failed-before-execution",
@@ -724,7 +729,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect(await context.workspace.approveAction(action.id)).toBe("unknown");
       expect(await context.workspace.approveAction(action.id)).toBe("unknown");
       expect(issueCreates).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: WRITE_CHARGE,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -773,7 +778,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect(await context.workspace.approveAction(unknown.id)).toBe("unknown");
 
       expect(mergeCalls).toBe(4);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: WRITE_CHARGE,
         availableSubunits: before.availableSubunits - 2n * WRITE_CHARGE,
       });
@@ -835,7 +840,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       expect(reviewCalls).toBe(1);
       expect(replyPreflightReads).toBe(1);
       expect(replyCalls).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 3n * WRITE_CHARGE,
         availableSubunits: before.availableSubunits - 3n * WRITE_CHARGE,
       });
@@ -873,7 +878,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
 
       expect(commentCalls).toBe(1);
       expect(commentDeletes).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -916,7 +921,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
         reviewEnrichmentReads === 2 ? true : null);
       expect(reviewCalls).toBe(1);
       expect(reviewEnrichmentReads).toBe(2);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -997,11 +1002,11 @@ describe.sequential("GitHub billing production Worker contract", () => {
       .filter((record): record is UserGatekeeperUsageRecord => record.kind === "gatekeeper");
 
     expect(await ownerUser.getUsageCreditBalance()).toEqual(ownerBefore);
-    expect(await reopenedFirst.getUsageCreditBalance()).toEqual({
+    expect(await reopenedFirst.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: firstAvailableBefore - READ_CHARGE - WRITE_CHARGE,
     });
-    expect(await secondUser.getUsageCreditBalance()).toEqual({
+    expect(await secondUser.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: secondBefore.availableSubunits - READ_CHARGE,
     });
@@ -1011,8 +1016,9 @@ describe.sequential("GitHub billing production Worker contract", () => {
     ]));
     expect(secondRecords.map(record => record.billingMethodKey))
       .toContain("github.issue.details.read.v1");
-    expect(new Set([...firstRecords, ...secondRecords].map(record => record.externalAccountId)).size)
-      .toBe(1);
+    expect([...firstRecords, ...secondRecords].every(
+      record => !Object.hasOwn(record, "externalAccountId"),
+    )).toBe(true);
   });
 
   it("keeps one settled cursor charge after early disposal, reconnect, and Worker restart", async () => {
@@ -1045,7 +1051,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       using _firstReopenedSession = await reopenedGatekeeper.openSession() as RpcStub<GitHubRepo>;
       using _secondReopenedSession = await reopenedGatekeeper.openSession() as RpcStub<GitHubRepo>;
 
-      expect(await reopenedUser.getUsageCreditBalance()).toEqual({
+      expect(await reopenedUser.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - READ_CHARGE,
       });

@@ -297,7 +297,7 @@ describe.sequential("Spotify billing", () => {
 
       expect(result.tracks).toEqual([]);
       expect(searchRequests).toBe(2);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - READ_CHARGE,
       });
@@ -351,7 +351,7 @@ describe.sequential("Spotify billing", () => {
       expect(tracks).toHaveLength(10);
       expect(playlistReads).toBe(3);
       expect(playlistMutations).toBe(0);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - READ_CHARGE,
       });
@@ -442,11 +442,11 @@ describe.sequential("Spotify billing", () => {
       .filter((record): record is UserGatekeeperUsageRecord => record.kind === "gatekeeper");
 
     expect(await owner.getUsageCreditBalance()).toEqual(ownerBefore);
-    expect(await reopenedFirst.getUsageCreditBalance()).toEqual({
+    expect(await reopenedFirst.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: firstAvailableBefore - READ_CHARGE - WRITE_CHARGE,
     });
-    expect(await second.getUsageCreditBalance()).toEqual({
+    expect(await second.getUsageCreditBalance()).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: secondBefore.availableSubunits - READ_CHARGE,
     });
@@ -457,8 +457,9 @@ describe.sequential("Spotify billing", () => {
       "spotify.account.save-tracks",
     ]));
     expect(secondRecords[0]?.billingMethodKey).toBe("spotify.account.search");
-    expect(new Set([...firstRecords, ...secondRecords].map(record => record.externalAccountId)).size)
-      .toBe(1);
+    expect([...firstRecords, ...secondRecords].every(
+      record => !Object.hasOwn(record, "externalAccountId"),
+    )).toBe(true);
   });
 
   it("reserves only after approval and rejection performs no provider write", async () => {
@@ -488,7 +489,7 @@ describe.sequential("Spotify billing", () => {
       expect(await context.workspace.approveAction(action.id)).toBe("accepted");
       expect(await context.workspace.approveAction(action.id)).toBe("accepted");
       expect(libraryWrites).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -516,7 +517,12 @@ describe.sequential("Spotify billing", () => {
       expect(await context.workspace.approveAction(action.id)).toBe("failed-before-execution");
       expect(playlistReads).toBe(1);
       expect(playlistMutations).toBe(0);
-      expect(await context.user.getUsageCreditBalance()).toEqual(before);
+      const afterRelease = await context.user.getUsageCreditBalance();
+      expect(afterRelease).toMatchObject({
+        availableSubunits: before.availableSubunits,
+        reservedSubunits: before.reservedSubunits,
+      });
+      expect(afterRelease.revision).toBeGreaterThan(before.revision);
       expect(await latestGatekeeperUsage(context.user)).toMatchObject({
         billingMethodKey: "spotify.playlist.add-tracks",
         outcome: "failed-before-execution",
@@ -541,7 +547,7 @@ describe.sequential("Spotify billing", () => {
       expect(await context.workspace.approveAction(action.id)).toBe("accepted");
       expect(playlistReads).toBe(3);
       expect(playlistMutations).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -565,7 +571,7 @@ describe.sequential("Spotify billing", () => {
 
       expect(await context.workspace.approveAction(action.id)).toBe("accepted");
       expect(nextEffects).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: 0n,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });
@@ -594,7 +600,7 @@ describe.sequential("Spotify billing", () => {
       context.session = await reopenedGatekeeper.openSession() as RpcStub<SpotifyAccountSession>;
       expect(await context.workspace.approveAction(action.id)).toBe("unknown");
       expect(nextEffects).toBe(1);
-      expect(await context.user.getUsageCreditBalance()).toEqual({
+      expect(await context.user.getUsageCreditBalance()).toMatchObject({
         reservedSubunits: WRITE_CHARGE,
         availableSubunits: before.availableSubunits - WRITE_CHARGE,
       });

@@ -152,6 +152,28 @@ const FIRST_CALL_FAILURES = [
 ] as const satisfies readonly (readonly [FirstCallFailure, string, string])[];
 
 describe("User Usage Account", () => {
+  it("rounds the low-balance threshold up and classifies zero and negative balances", async () => {
+    const {stub} = await newUser();
+
+    await runInDurableObject(stub, (_instance, state) => {
+      const account = usageAccount(state.storage);
+      expect(account.getBalance({
+        ...TEST_INITIAL_GRANT_SNAPSHOT,
+        amountSubunits: 11n,
+      })).toMatchObject({
+        availableSubunits: 11n,
+        lowBalanceThresholdSubunits: 2n,
+        lowBalance: false,
+      });
+      account.adminDeduct("reach-rounded-threshold", 9n, "Boundary", "admin");
+      expect(account.getBalance()).toMatchObject({availableSubunits: 2n, lowBalance: true});
+      account.adminDeduct("reach-zero", 2n, "Zero", "admin");
+      expect(account.getBalance()).toMatchObject({availableSubunits: 0n, lowBalance: true});
+      account.adminDeduct("reach-negative", 1n, "Negative", "admin");
+      expect(account.getBalance()).toMatchObject({availableSubunits: -1n, lowBalance: true});
+    });
+  });
+
   it("does not invent an initial grant without a versioned snapshot", async () => {
     const {stub} = await newUser();
 
@@ -261,7 +283,7 @@ describe("User Usage Account", () => {
       return {firstBalance, secondBalance, snapshot: account.getSnapshot()};
     });
 
-    expect(result.firstBalance).toEqual({
+    expect(result.firstBalance).toMatchObject({
       availableSubunits: INITIAL_BALANCE,
       reservedSubunits: 0n,
     });
@@ -326,7 +348,7 @@ describe("User Usage Account", () => {
     const expected = INITIAL_BALANCE;
 
     expect(balances).toEqual(
-      Array.from({ length: 20 }, () => ({
+      Array.from({ length: 20 }, () => expect.objectContaining({
         availableSubunits: expected,
         reservedSubunits: 0n,
       })),
@@ -348,7 +370,7 @@ describe("User Usage Account", () => {
 
   it("keeps the initial grant singular after the User Durable Object restarts", async () => {
     const { id, stub } = await newUser();
-    expect(await stub.getUsageCreditBalance()).toEqual({
+    expect(await stub.getUsageCreditBalance()).toMatchObject({
       availableSubunits: INITIAL_BALANCE,
       reservedSubunits: 0n,
     });
@@ -360,7 +382,7 @@ describe("User Usage Account", () => {
     ).rejects.toThrow("usage-account restart test");
 
     const restarted = users.get(id);
-    expect(await restarted.getUsageCreditBalance()).toEqual({
+    expect(await restarted.getUsageCreditBalance()).toMatchObject({
       availableSubunits: INITIAL_BALANCE,
       reservedSubunits: 0n,
     });
@@ -460,7 +482,7 @@ describe("User Usage Account", () => {
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
-    expect(await stub.getUsageCreditBalance()).toEqual({
+    expect(await stub.getUsageCreditBalance()).toMatchObject({
       availableSubunits: 400n * USAGE_CREDIT_SUBUNITS_PER_CREDIT,
       reservedSubunits: amount,
     });
@@ -592,7 +614,7 @@ describe("User Usage Account", () => {
       instance.settleUsageCredits("over-settlement", held + 1n)))
       .rejects.toThrow("A settled amount cannot exceed its Credit Reservation.");
 
-    expect(await stub.getUsageCreditBalance()).toEqual({
+    expect(await stub.getUsageCreditBalance()).toMatchObject({
       availableSubunits: INITIAL_BALANCE - held,
       reservedSubunits: held,
     });
@@ -614,7 +636,7 @@ describe("User Usage Account", () => {
       state: "released",
     });
     expect(await stub.releaseUsageCredits("released-use")).toEqual(released);
-    expect(await stub.getUsageCreditBalance()).toEqual({
+    expect(await stub.getUsageCreditBalance()).toMatchObject({
       availableSubunits: INITIAL_BALANCE,
       reservedSubunits: 0n,
     });

@@ -51,7 +51,7 @@ describe("Usage Rate initial grant connection", () => {
     );
     const user = await newUser();
 
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       availableSubunits: amountSubunits,
       reservedSubunits: 0n,
     });
@@ -96,7 +96,7 @@ describe("Usage Rate initial grant connection", () => {
       state: "reserved",
       chargeSnapshot: TEST_CHARGE_SNAPSHOT,
     });
-    expect(await user.getUsageCreditBalance()).toEqual({
+    expect(await user.getUsageCreditBalance()).toMatchObject({
       availableSubunits: grantSubunits - held,
       reservedSubunits: held,
     });

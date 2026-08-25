@@ -443,13 +443,37 @@ export const getAuthErrorCode = authErrors.getCode;
  */
 export const USAGE_CREDIT_SUBUNITS_PER_CREDIT = 1_000_000_000_000_000_000n;
 
-/** The authenticated User's authoritative Usage Credit balance. */
+/** One durable activation notice shown only to a returning legacy User. */
+export type UsageCreditActivationNotice = {
+  /** Stable identifier used for an idempotent acknowledgement. */
+  id: string;
+  /** Exact Initial Grant that activated this User's Usage Account. */
+  grantedSubunits: bigint;
+  /** Canonical UTC time when the User's Usage Account was activated. */
+  activatedAt: string;
+};
+
+/** The authenticated User's authoritative Usage Credit balance and notice state. */
 export type UsageCreditBalance = {
   /** Credit that can be reserved for new Metered Use, in exact integer subunits. */
   availableSubunits: bigint;
   /** Credit currently held by active Credit Reservations, in exact integer subunits. */
   reservedSubunits: bigint;
+  /** Durable monotonic revision for ordering initial and pushed snapshots. */
+  revision: bigint;
+  /** Server-side low-balance decision derived from this User's actual Initial Grant. */
+  lowBalance: boolean;
+  /** Exact threshold used by the server-side low-balance decision. */
+  lowBalanceThresholdSubunits: bigint;
+  /** Pending one-time legacy activation notice, or null after acknowledgement or for new Users. */
+  activationNotice: UsageCreditActivationNotice | null;
 };
+
+/** Callback that receives ordered authoritative Usage Credit balance snapshots. */
+export interface UsageCreditBalanceSubscriber {
+  /** Receive an initial or later balance snapshot with a durable monotonic revision. */
+  update(balance: UsageCreditBalance): void;
+}
 
 /** Bounded request for the authenticated User's own Usage Records. */
 export type UserUsageRecordPageRequest = {
@@ -537,8 +561,6 @@ export type UserGatekeeperUsageRecord = {
   vendorId: string;
   /** Stable caller-visible business-method key. */
   billingMethodKey: string;
-  /** Opaque connected external-account dimension supplied by the Gatekeeper. */
-  externalAccountId: string;
   /** Whether the immutable Charge Snapshot had a configured rate. */
   pricing: "priced" | "unpriced";
   /** Durable terminal outcome of the Metering Attempt. */
@@ -558,6 +580,104 @@ export type UserUsageRecordPage = {
   records: UserUsageRecord[];
   /** Opaque cursor for the next page, or null when this page is complete. */
   nextCursor: string | null;
+};
+
+/** Bounded request for one authenticated User-owned financial list. */
+export type UserCreditPageRequest = {
+  /** Opaque cursor returned by the previous page; omit for the first page. */
+  cursor?: string;
+  /** Optional page size from 1 through 100; defaults to 50. */
+  limit?: number;
+};
+
+/** User-safe projection of one Credit Reservation. */
+export type UserCreditReservation = {
+  /** Stable Reservation identifier for UI list keys. */
+  id: string;
+  /** User-visible lifecycle, including held states that require reconciliation. */
+  state: "active" | "started" | "unknown-held" | "reconciliation-required" |
+    "settled" | "released";
+  /** Metered-use category attached to the immutable reservation snapshot. */
+  meteredKind: "model" | "gatekeeper";
+  /** Exact amount originally held. */
+  amountSubunits: bigint;
+  /** Exact settled amount, or null while held or after release. */
+  settledAmountSubunits: bigint | null;
+  /** Stable Gatekeeper vendor identifier for an API reservation. */
+  vendorId?: string;
+  /** Stable public business-method key for an API reservation. */
+  billingMethodKey?: string;
+  /** Canonical UTC creation time. */
+  createdAt: string;
+  /** Canonical UTC terminal time, or null while held. */
+  completedAt: string | null;
+};
+
+/** One bounded page of the authenticated User's own Credit Reservations. */
+export type UserCreditReservationPage = {
+  /** User-safe Reservations in stable keyset order. */
+  reservations: UserCreditReservation[];
+  /** Opaque cursor for the next page, or null when this page is complete. */
+  nextCursor: string | null;
+};
+
+/** User-safe summary of one Credit Ledger Entry used for bounded relationship expansion. */
+export type UserCreditLedgerEntrySummary = {
+  /** Stable Ledger Entry identifier. */
+  id: string;
+  /** Public balance-change category. */
+  kind: "initial-grant" | "usage-charge" | "admin-grant" | "admin-deduction" |
+    "admin-reconciliation" | "credit-reversal";
+  /** Exact signed Usage Credit change. */
+  deltaSubunits: bigint;
+  /** Canonical UTC creation time. */
+  createdAt: string;
+};
+
+/** User-safe projection of one Credit Ledger Entry. */
+export type UserCreditLedgerEntry = UserCreditLedgerEntrySummary & {
+  /** Safe original-entry summary linked by a Credit Reversal, or null. */
+  reversalOfLedgerEntry: UserCreditLedgerEntrySummary | null;
+  /** Safe Credit Reversal summary that offsets this entry, or null. */
+  reversedByLedgerEntry: UserCreditLedgerEntrySummary | null;
+};
+
+/** One bounded page of the authenticated User's own Credit Ledger. */
+export type UserCreditLedgerPage = {
+  /** User-safe Ledger Entries in stable keyset order. */
+  entries: UserCreditLedgerEntry[];
+  /** Opaque cursor for the next page, or null when this page is complete. */
+  nextCursor: string | null;
+};
+
+/** One public Gatekeeper method's current Usage Rate or explicit Unpriced state. */
+export type PublishedApiRate = {
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Stable caller-visible business-method key. */
+  billingMethodKey: string;
+  /** Current strong-consistency pricing classification. */
+  pricing: "priced" | "unpriced";
+  /** Exact Credit per Billable API Operation, or null for Unpriced. */
+  amountSubunits: bigint | null;
+};
+
+/** Bounded keyset request for current public Gatekeeper Usage Rates. */
+export type PublishedApiRatePageRequest = {
+  /** Opaque cursor returned by the previous page; omit for the first page. */
+  cursor?: string;
+  /** Optional page size from 1 through 100; defaults to 50. */
+  limit?: number;
+};
+
+/** One bounded page of current public Gatekeeper Usage Rates. */
+export type PublishedApiRatePage = {
+  /** Rates in stable Gatekeeper vendor and billing-method order. */
+  rates: PublishedApiRate[];
+  /** Opaque cursor for the next page, or null when this page is complete. */
+  nextCursor: string | null;
+  /** True while the User's bounded dynamic inventory is incomplete or omitted later discoveries. */
+  truncated: boolean;
 };
 
 /** Number of exact integer rate subunits in one US dollar. */
@@ -1194,8 +1314,28 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Get the logged-in User's available and reserved Usage Credit balances. */
   getUsageCreditBalance(): Promise<UsageCreditBalance>;
 
+  /**
+   * Subscribe to the logged-in User's authoritative Usage Credit balance.
+   * Dispose the returned stub to cancel the subscription.
+   */
+  subscribeUsageCreditBalance(
+    subscriber: RpcStub<UsageCreditBalanceSubscriber>,
+  ): Promise<RpcStub<{}>>;
+
+  /** Idempotently acknowledge this User's pending legacy activation notice. */
+  acknowledgeUsageActivationNotice(noticeId: string): Promise<UsageCreditBalance>;
+
   /** List a bounded page of the logged-in User's own content-free Usage Records. */
   listOwnUsageRecords(request: UserUsageRecordPageRequest): Promise<UserUsageRecordPage>;
+
+  /** List a bounded page of the logged-in User's own Credit Reservations. */
+  listOwnCreditReservations(request: UserCreditPageRequest): Promise<UserCreditReservationPage>;
+
+  /** List a bounded page of the logged-in User's own Credit Ledger. */
+  listOwnCreditLedger(request: UserCreditPageRequest): Promise<UserCreditLedgerPage>;
+
+  /** List a bounded page of current public Gatekeeper method rates and Unpriced methods. */
+  listPublishedApiRates(request: PublishedApiRatePageRequest): Promise<PublishedApiRatePage>;
 
   /**
    * Get the user's preferred model, chosen during onboarding. Returns null if the user has not

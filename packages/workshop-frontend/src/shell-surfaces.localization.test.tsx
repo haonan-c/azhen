@@ -18,6 +18,14 @@ const testState = vi.hoisted(() => {
     }],
     navigate: vi.fn<(options: unknown) => void>(),
     pathname: '/',
+    usageBalance: {
+      availableSubunits: 1_000_000_000_000_000_000_000n,
+      reservedSubunits: 0n,
+      revision: 1n,
+      lowBalance: false,
+      lowBalanceThresholdSubunits: 100_000_000_000_000_000_000n,
+      activationNotice: null,
+    },
   }
   const authenticatedApi = {
     listGadgets: async () => state.gadgets,
@@ -34,8 +42,20 @@ const testState = vi.hoisted(() => {
     }],
     listOwnBlueprints: async () => [],
     whoami: async () => ({ type: 'user', id: 'user-1', name: '用户 原名' }),
+    subscribeUsageCreditBalance: (subscriber: { update(balance: unknown): Promise<void> }) => {
+      void subscriber.update(state.usageBalance)
+      return Object.assign(Promise.resolve({ [Symbol.dispose]() {} }), { [Symbol.dispose]() {} })
+    },
+    acknowledgeUsageActivationNotice: async () => ({
+      availableSubunits: 1_000_000_000_000_000_000_000n,
+      reservedSubunits: 0n,
+      revision: 1n,
+      lowBalance: false,
+      lowBalanceThresholdSubunits: 100_000_000_000_000_000_000n,
+      activationNotice: null,
+    }),
   }
-  return { ...state, authenticatedApi }
+  return Object.assign(state, { authenticatedApi })
 })
 
 vi.mock('@tanstack/react-router', async (importOriginal) => ({
@@ -146,6 +166,14 @@ describe('localized Workshop shell surfaces', () => {
     localStorage.clear()
     window.history.replaceState({}, '', '/')
     testState.pathname = '/'
+    testState.usageBalance = {
+      availableSubunits: 1_000_000_000_000_000_000_000n,
+      reservedSubunits: 0n,
+      revision: 1n,
+      lowBalance: false,
+      lowBalanceThresholdSubunits: 100_000_000_000_000_000_000n,
+      activationNotice: null,
+    }
     vi.clearAllMocks()
     root = undefined
     container = undefined
@@ -230,6 +258,22 @@ describe('localized Workshop shell surfaces', () => {
     expect(menu).not.toBeNull()
     await act(async () => menu.click())
     expect(container?.querySelector('[aria-label="关闭菜单"]')).not.toBeNull()
+  })
+
+  it('shows the server low-balance decision globally and links to the Chinese Usage Credit view', async () => {
+    window.history.replaceState({}, '', '/zh')
+    testState.usageBalance = {
+      ...testState.usageBalance,
+      availableSubunits: 100_000_000_000_000_000_000n,
+      lowBalance: true,
+    }
+    await render(<AppShell><div>首页内容</div></AppShell>)
+
+    await vi.waitFor(() => expect(container?.textContent).toContain('使用额度余额较低'))
+    const warning = container?.querySelector<HTMLElement>('[role="alert"]')
+    const link = warning?.querySelector<HTMLAnchorElement>('a')
+    expect(link?.getAttribute('href')).toBe('/zh/profile#usage')
+    expect(link?.getAttribute('role')).toBeNull()
   })
 
   it('localizes the announcement dismiss control without changing the announcement', async () => {
