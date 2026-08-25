@@ -374,13 +374,18 @@ function DetailPanel({detail, error, onClose}: {
       <dt>{messages.admin_usage_column_source()}</dt><dd>{sourceLabel(detail.record.source)}</dd>
       <dt>{messages.admin_usage_column_outcome()}</dt><dd>{outcomeLabel(detail.record.outcome)}</dd>
       <dt>{messages.admin_usage_detail_created()}</dt><dd>{detail.record.createdAt}</dd>
-      <dt>{messages.admin_usage_detail_workspace()}</dt><dd>{detail.record.workspaceId ?? "—"}</dd>
-      <dt>{messages.admin_usage_detail_conversation()}</dt><dd>{detail.record.chatId ?? "—"}</dd>
+      <dt>{messages.admin_usage_detail_workspace()}</dt><dd>{
+        detail.record.kind === "gatekeeper-reconciliation"
+          ? "—" : detail.record.workspaceId ?? "—"
+      }</dd>
+      <dt>{messages.admin_usage_detail_conversation()}</dt><dd>{
+        detail.record.kind === "gatekeeper-reconciliation" ? "—" : detail.record.chatId ?? "—"
+      }</dd>
       <dt>{messages.admin_usage_filter_gadgets()}</dt><dd>{detail.record.gadgetId ?? "—"}</dd>
       <dt>{messages.admin_usage_column_target()}</dt><dd>{detail.record.kind === "model"
         ? detail.record.deploymentModelId
         : `${detail.record.vendorId} / ${detail.record.billingMethodKey}`}</dd>
-      <dt>{messages.admin_usage_filter_external_accounts()}</dt><dd>{detail.record.kind === "gatekeeper"
+      <dt>{messages.admin_usage_filter_external_accounts()}</dt><dd>{detail.record.kind !== "model"
         ? detail.record.externalAccountId : "—"}</dd>
       <dt>{messages.admin_usage_detail_pricing()}</dt><dd>{detail.chargeSnapshot.pricing}</dd>
       <dt>{messages.admin_usage_detail_rate_version()}</dt>

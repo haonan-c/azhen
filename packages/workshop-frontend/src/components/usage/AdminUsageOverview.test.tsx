@@ -20,7 +20,6 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       cacheWriteInputTokens: 3n,
       outputTokens: 4n,
       reasoningTokens: 1n,
-      meteredUseCount: 5n,
       billableApiOperations: 5n,
       meteredUseCount: 9n,
       activeUsers: 6n,

@@ -381,6 +381,66 @@ describe("administrator frozen Usage report browser", () => {
       .toContain("This authoritative Usage Record is not available."));
   });
 
+  it("shows reconciliation-only authority without an older raw Usage Record", async () => {
+    const usageRow: AdminUsageReportRow = {
+      ...row("reconciliation-row"),
+      meteredKind: "gatekeeper",
+      outcome: "reconciled-settled",
+      deploymentModelId: null,
+      gatekeeperId: "vendor",
+      stableMethodKey: "method",
+      externalAccountId: "account",
+    };
+    const current = report([usageRow]);
+    const getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>().mockResolvedValue({
+      record: {
+        kind: "gatekeeper-reconciliation",
+        id: usageRow.rowKind === "detail" ? usageRow.safeRecordRef : "unreachable",
+        source: "agent",
+        meteredKind: "gatekeeper",
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        externalAccountId: "account",
+        gadgetId: null,
+        pricing: "priced",
+        outcome: "reconciled-settled",
+        chargeSubunits: 9n,
+        createdAt: "2026-08-24T12:00:00.000Z",
+      },
+      chargeSnapshot: {
+        kind: "gatekeeper",
+        pricing: "priced",
+        usageRateVersion: 2n,
+        issuedAt: "2026-08-24T11:59:00.000Z",
+        vendorId: "vendor",
+        billingMethodKey: "method",
+        chargeSubunits: 9n,
+      },
+      reservation: null,
+      ledgerEntries: [],
+      reconciliation: {
+        decision: "settle",
+        actorUserId: "admin@example.test",
+        reason: "Confirm provider authority",
+        createdAt: "2026-08-24T12:00:00.000Z",
+      },
+    });
+    await render(usageApi(
+      vi.fn<AdminUsageApi["openReport"]>().mockResolvedValue(current.target),
+      getRecordDetail,
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("vendor / method"));
+    const detailButton = Array.from(container!.querySelectorAll("button"))
+      .find(button => button.textContent === "View detail");
+    if (!detailButton) throw new Error("Expected the reconciliation detail button.");
+    await act(async () => detailButton.click());
+
+    await vi.waitFor(() => expect(container?.textContent)
+      .toContain("gatekeeper-reconciliation"));
+    expect(container?.textContent).toContain("Confirm provider authority");
+    expect(container?.textContent).toContain("account");
+  });
+
   it("localizes the report filters, outcomes, columns, and empty state in Chinese", async () => {
     window.history.replaceState({}, "", "/zh/admin");
     const current = report();
