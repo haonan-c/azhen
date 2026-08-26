@@ -1240,7 +1240,7 @@ export const ADMIN_USAGE_MAX_OPEN_REPORTS = 4;
 const ADMIN_USAGE_REPORT_CURSOR_LIMIT = 1_024;
 
 type UsageReportProjection = Pick<DurableObjectStub<UsageProjection>,
-  "readHealth" | "readReportMetrics" | "listReportRows">;
+  "assertReportSnapshot" | "readHealth" | "readReportMetrics" | "listReportRows">;
 
 /** Frozen administrator Usage report backed by one Projection generation and watermark. */
 @validateRpc()
@@ -1352,6 +1352,10 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
       if (cancelled || this.disposed) {
         throw ownerError ?? new Error("Usage report is closed.");
       }
+      await this.projection.assertReportSnapshot(this.query);
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
       await this.assertActive();
       if (cancelled || this.disposed) {
         throw ownerError ?? new Error("Usage report is closed.");
@@ -1373,6 +1377,8 @@ export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport 
           if (cancelled) return;
           let chunk: Uint8Array;
           if (firstPull) {
+            await this.projection.assertReportSnapshot(this.query);
+            if (cancelled) return;
             firstPull = false;
             chunk = encoder.encode(csvPreamble(this.query, generatedAt, health));
           } else {

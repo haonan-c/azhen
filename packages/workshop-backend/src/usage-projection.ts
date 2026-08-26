@@ -512,6 +512,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
   }
 
+  /** Reject unless one frozen report snapshot still names complete current Projection state. */
+  assertReportSnapshot(query: FrozenUsageReportQuery): void {
+    this.#assertCurrentReportSnapshot(query);
+  }
+
   /** Read one stable keyset page through the shared normalized report predicate. */
   listReportRows(
       query: FrozenUsageReportQuery,
@@ -698,7 +703,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
   #assertCurrentReportSnapshot(query: FrozenUsageReportQuery): void {
     const meta = this.#meta();
-    if (query.snapshot.projectionGeneration.toString() !== meta.active_generation ||
+    if (meta.projection_schema_version !== CURRENT_PROJECTION_SCHEMA_VERSION ||
+        meta.bootstrap_state !== "complete" ||
+        query.snapshot.projectionGeneration.toString() !== meta.active_generation ||
         query.snapshot.ingestionWatermark > BigInt(meta.report_watermark) ||
         query.detailRetentionRevision !== BigInt(meta.detail_retention_revision)) {
       throw new Error("Usage report snapshot is stale.");
