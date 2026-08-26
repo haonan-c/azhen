@@ -190,20 +190,20 @@ released_reservations,settled_reservations,unreserved_attempts
 | Focused Summary/retention workerd group | PASS, 28/28 at `7679e43` |
 | Full focused Projection workerd | PASS, 60/60 at `7679e43`; populated-v3 to empty-v4 shadow migration, crash re-entry, and bounded retired cleanup are included |
 | Frontend report/file-transfer follow-up tests | PASS, 30/30 |
-| Full Frontend package tests | PASS in the superseded root diagnostic run, 78 files and 394 tests, plus first-party copy 1/1 |
+| Full Frontend package tests | PASS at `b7f2da2`, 78/78 files and 394/394 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Real production-Harness second-page legacy/deleted-User coordination | PASS, 1/1; 17 unrelated tests skipped; 15.80 seconds |
 | Real production-Harness retained-detail cross-DO replay | PASS, 1/1; 18 unrelated tests skipped; 16.72 seconds |
-| Full Action billing Harness | Historical PASS, 31/31 at `dbe4000`; 167.80 seconds; this v4-only correction does not change Action code |
-| Full Integration Tests package | PASS, 13/13 files and 131/131 tests at `7679e43`; 790.72 seconds |
+| Full Action billing Harness | PASS at `b7f2da2`, 31/31; 155.44 seconds |
+| Full Integration Tests package | PASS at `b7f2da2`, 13/13 files and 131/131 tests; 801.19 seconds |
 | Backend Worker `capnweb-validate` build | PASS |
-| Full Backend package tests | Historical PASS at superseded fixed point `1b3abfe`; the current `7679e43` full Backend/root test gate is pending and is not claimed as PASS |
+| Full Backend package tests | PASS at `b7f2da2`, 671 passed with 4 expected skips across the Browser and focused Backend stages |
 | Root `corepack pnpm build` | PASS at `7679e43`, 52 tasks; Backend and Integration package builds also passed |
 | Root `corepack pnpm lint` | PASS, configured non-blocking warnings only |
 | Release-manifest golden | PASS, 4/4 |
-| `corepack pnpm types:generate` | PASS at `6bee6df`; no Issue #63 generated change; unrelated UGC Ads drift precisely restored |
-| Production-shape release dry-run | PASS at `6bee6df`, 19 Workers, 85 modules, 37 asset blobs, 29,168 KiB |
-| Root `corepack pnpm test` | Superseded diagnostic PASS at `1b3abfe174ed9d74062f69204371b95d50a9837e`: exit 0 in 1,340.53 seconds; current `7679e43` final root gate remains pending |
+| `corepack pnpm types:generate` | PASS at `b7f2da2`; no Issue #63 generated change; unrelated UGC Ads workerd drift precisely restored |
+| Production-shape release dry-run | PASS at `b7f2da2`, 19 Workers, 85 modules, 37 asset blobs, 29,168 KiB |
+| Root `corepack pnpm test` | PASS at `b7f2da2`: exit 0 in 1,318.56 seconds; major counts are recorded below |
 | Standards/specification fixed-point review | PASS at evidence fixed point `55b37a9`; both independent axes reported no P0-P2 finding |
 | `git diff --check` | PASS |
 
@@ -431,9 +431,28 @@ The current code fixed point is `7679e4391d3b856785801d3345338df9e04d7ee8`.
   crash-safe pending state, bounded retired cleanup, fail-closed reports, and the legacy outcome
   query plan without a temporary sort.
 - This is an internal SQLite schema behavior change only. It adds no Durable Object class, binding,
-  Wrangler migration, or release-manifest shape. The earlier final-shape `types:generate` and local
-  production-shape dry-run remain the applicable artifact-shape evidence. The full current Backend
-  package and root test are still pending; no current PASS is claimed for either.
+  Wrangler migration, or release-manifest shape.
+
+## Final schema v4 branch gate
+
+The clean evidence fixed point `b7f2da2bd6a671aaadf43ce34d6a17772b1019a2` passed the final
+exclusive `corepack pnpm test` with exit 0 in 1,318.56 seconds. Major counts were: root Node
+117/117; Browser 1/1; Backend base 468/468; Projection 60/60; retention 28/28; administrator Usage
+18/18; report 26/26; Metered Model 35/35; Open Gadget 1/1; the four-file RPC group 27 pass and 4
+expected skips; Registry 2/2; retention RPC 1/1; DOCX 4/4; production Harness 131/131; Frontend
+394/394 plus first-party copy 1/1. All remaining workspace packages exited 0.
+
+The same fixed point passed `corepack pnpm types:generate`. It produced no Issue #63 generated
+change. The one unrelated UGC Ads workerd runtime-version drift was reviewed and precisely restored.
+The release-manifest golden passed 4/4 with no diff.
+
+The local production-shape release builder used Node 24.19.0, pnpm 11.17.0, Wrangler 4.119.0, and
+release ID `issue-63-v4-local`. It passed 19 Worker dry-runs and produced 85 modules, 37 unique asset
+blobs, and 29,168 KiB under `/tmp/azhen-issue63-v4.AxgAr2/release-out`. Manifest SHA-256 is
+`67691a9544ea9b3ebded0444883d3fbbf5cfc035e56d4f564ffc303ebebbd3a5`; the sorted local
+artifact-list SHA-256 is `0f0ef427c28cece3f72dfb1ea33154f8ed3fadf94de36b297706f64ec180546e`.
+This was a local dry-run only. It did not upload, promote, deploy, change production configuration,
+enable charging, or contact production Users.
 
 This evidence uses local real production code paths, controlled identities, and controlled external
 mocks. It does not claim production deployment or production traffic. No upload, promotion,

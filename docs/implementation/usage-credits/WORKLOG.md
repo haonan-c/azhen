@@ -1033,8 +1033,29 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   Usage 18/18, and complete Integration 13/13 files with 131/131 tests in 790.72 seconds. Backend,
   Integration, and root builds passed. Root lint, release-manifest golden 4/4, and
   `git diff --check` passed.
-- Code fixed point is `7679e4391d3b856785801d3345338df9e04d7ee8`. The earlier full Backend and
-  root results are historical diagnostic evidence only; the current full Backend/root test and
-  current root test remain pending. Independent Standards and Spec reviews at evidence fixed point
+- Code fixed point is `7679e4391d3b856785801d3345338df9e04d7ee8`. At this pre-final checkpoint,
+  the earlier full Backend and root results were historical diagnostic evidence only and the
+  current root test remained pending. Independent Standards and Spec reviews at evidence fixed point
   `55b37a9` both reported no P0-P2 finding. No binding, Wrangler migration, generated type, or
   release-manifest shape changed, and no remote or production mutation occurred.
+
+### 2026-08-26 — Issue #63 final schema v4 branch gate
+
+- The clean evidence fixed point `b7f2da2bd6a671aaadf43ce34d6a17772b1019a2` passed the final
+  exclusive root `corepack pnpm test` with exit 0 in 1,318.56 seconds. Major counts were root Node
+  117/117; Backend Browser 1/1 and base 468/468; Projection 60/60; retention 28/28; administrator
+  Usage 18/18; report 26/26; Metered Model 35/35; Open Gadget 1/1; RPC 27 pass with 4 expected
+  skips; Registry 2/2; retention RPC 1/1; DOCX 4/4; Integration 131/131; Frontend 394/394 plus
+  first-party copy 1/1. Every remaining workspace package exited 0.
+- `corepack pnpm types:generate` exited 0 at the same fixed point and produced no Issue #63
+  generated change. One unrelated UGC Ads workerd runtime-version drift was reviewed and precisely
+  restored. The release-manifest golden passed 4/4 with no diff.
+- The local production-shape builder used Node 24.19.0, pnpm 11.17.0, Wrangler 4.119.0, and release
+  ID `issue-63-v4-local`. It passed 19 Worker dry-runs and produced 85 modules, 37 unique asset
+  blobs, and 29,168 KiB under `/tmp/azhen-issue63-v4.AxgAr2/release-out`. Manifest SHA-256 is
+  `67691a9544ea9b3ebded0444883d3fbbf5cfc035e56d4f564ffc303ebebbd3a5`; sorted local artifact-list
+  SHA-256 is `0f0ef427c28cece3f72dfb1ea33154f8ed3fadf94de36b297706f64ec180546e`.
+- All evidence is local execution of real production code paths with controlled identities and
+  controlled external mocks. No upload, promotion, deployment, production configuration or
+  charging change, production contact, push, merge, pull request, Issue closure, or worktree
+  deletion occurred.
