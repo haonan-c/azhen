@@ -176,7 +176,11 @@ async function retainedReplayStage<T>(
   }
 }
 
-function closeRetainedReplayWebSocket(socket: WebSocket, timeoutMs = 5_000): Promise<void> {
+function closeRetainedReplayWebSocket(
+  socket: WebSocket,
+  reason: string,
+  timeoutMs = 5_000,
+): Promise<void> {
   return new Promise<void>((fulfill, reject) => {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
@@ -194,7 +198,7 @@ function closeRetainedReplayWebSocket(socket: WebSocket, timeoutMs = 5_000): Pro
     socket.addEventListener("close", onClose, {once: true});
     timeout = setTimeout(onTimeout, timeoutMs);
     try {
-      socket.close(3_000, "test disconnect after Action request");
+      socket.close(3_000, reason);
     } catch (error) {
       cleanup();
       reject(error);
@@ -509,7 +513,7 @@ describe("bounded administrator Usage readiness", () => {
       const target = new EventTarget();
       const remove = vi.spyOn(target, "removeEventListener");
       const socket = Object.assign(target, {close}) as unknown as WebSocket;
-      await expect(closeRetainedReplayWebSocket(socket, 0)).rejects.toThrow(
+      await expect(closeRetainedReplayWebSocket(socket, "test disconnect", 0)).rejects.toThrow(
         close.mock.results[0]?.type === "throw"
           ? "close failed"
           : "Timed out closing the retained replay WebSocket.",
@@ -1483,52 +1487,68 @@ describe("approved Action billing", () => {
     const providerCallStart = providerCalls.length;
 
     {
-      let initialSocket: WebSocket | undefined;
       const userSession = await retainedReplayStage(
-        "open-new-user", () => openNewUserWhenAvailable(username, {
-          ...productionNewUserReadiness,
+        "open-new-user", () => openNewUserWhenAvailable(username),
+      );
+      using _creationPublicApi = userSession.publicApi;
+      using creationUser = userSession.user;
+      let newGadgetCalls = 0;
+      const workspacePromise = creationUser.newGadget();
+      newGadgetCalls += 1;
+      const metadataPromise = workspacePromise.getMetadata();
+      using _createdWorkspace = await retainedReplayStage(
+        "new-gadget", () => workspacePromise,
+      );
+      expect(newGadgetCalls).toBe(1);
+      workspaceId = (await retainedReplayStage(
+        "read-pipelined-workspace-id", () => metadataPromise,
+      )).id;
+    }
+
+    {
+      let actionSocket: WebSocket | undefined;
+      const actionUserSession = await retainedReplayStage(
+        "reconnect-user-for-action", () => openExistingUserWhenAvailable(username, {
+          ...productionExistingUserReadiness,
           open: () => {
             const connection = connectWithSocket(harness.url);
-            initialSocket = connection.socket;
+            actionSocket = connection.socket;
             return connection.publicApi;
           },
         }),
       );
-      using _initialPublicApi = userSession.publicApi;
-      using initialUser = userSession.user;
+      using _actionPublicApi = actionUserSession.publicApi;
+      using actionUser = actionUserSession.user;
       const account = await retainedReplayStage(
-        "provision-account", () => provisionAccount(initialUser),
+        "provision-account", () => provisionAccount(actionUser),
       );
-      using initialWorkspace = await retainedReplayStage(
-        "new-gadget", () => initialUser.newGadget(),
+      using actionWorkspace = await retainedReplayStage(
+        "reopen-created-workspace", () => actionUser.openGadget(workspaceId),
       );
-      workspaceId = (await retainedReplayStage(
-        "read-workspace-id", () => initialWorkspace.getMetadata(),
-      )).id;
-      using initialGatekeeper = await retainedReplayStage(
+      using actionGatekeeper = await retainedReplayStage(
         "new-gatekeeper",
-        () => initialWorkspace.newGatekeeper(
+        () => actionWorkspace.newGatekeeper(
           account.id,
           `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
         ),
       );
-      if (!initialGatekeeper) throw new Error("Expected the test Gatekeeper.");
-      using initialSession = await retainedReplayStage(
-        "open-gatekeeper-session", () => initialGatekeeper.openSession(),
+      if (!actionGatekeeper) throw new Error("Expected the test Gatekeeper.");
+      using actionSession = await retainedReplayStage(
+        "open-gatekeeper-session", () => actionGatekeeper.openSession(),
       ) as RpcStub<TestSession>;
       before = await retainedReplayStage(
-        "read-balance-before-action", () => initialUser.getUsageCreditBalance(),
+        "read-balance-before-action", () => actionUser.getUsageCreditBalance(),
       );
       await retainedReplayStage(
-        "request-billable-action", () => initialSession.requestBillableAction(label),
+        "request-billable-action", () => actionSession.requestBillableAction(label),
       );
-      if (!initialSocket || initialSocket.readyState !== WebSocket.OPEN) {
+      if (!actionSocket || actionSocket.readyState !== WebSocket.OPEN) {
         throw new Error("Expected the retained replay WebSocket to be open after the Action request.");
       }
-      await closeRetainedReplayWebSocket(initialSocket);
+      await closeRetainedReplayWebSocket(actionSocket, "test disconnect after Action request");
       await expectRetainedReplayRejection(
         "verify-pending-read-disconnected",
-        () => initialWorkspace.listActions(),
+        () => actionWorkspace.listActions(),
         "Peer closed WebSocket: 3000 test disconnect after Action request",
       );
     }
