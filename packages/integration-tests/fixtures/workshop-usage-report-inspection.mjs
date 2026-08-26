@@ -21,6 +21,7 @@ const SEED_PATH = "/__integration__/usage-report-seed";
 const LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
 const LEGACY_ACTION_STATE_PATH = "/__integration__/usage-report-legacy-action-state";
 const REPLAY_CRASH_PATH = "/__integration__/usage-report-replay-crash";
+const OUTBOX_DRAIN_PATH = "/__integration__/usage-report-drain-outbox";
 const MAX_TELEMETRY_EVENTS = 4_096;
 const SEED_EXTERNAL_ACCOUNT_ID = `issue63-seed-account-${"a".repeat(179)}`;
 const telemetryEvents = [];
@@ -171,6 +172,18 @@ export class UserDurableObject extends ProductionUserDurableObject {
       preparationOperationId: preparation?.operationId ?? null,
     };
   }
+
+  /** Drain only this User's real Projection outbox through the production alarm path. */
+  async drainUsageProjectionOutboxForTest() {
+    const account = new UsageAccount(this.ctx.storage);
+    let batches = 0;
+    while (account.listPendingProjectionOutbox(1).length > 0) {
+      if (batches >= 512) throw new Error("Usage Projection outbox did not converge.");
+      await this.alarm();
+      batches += 1;
+    }
+    return {batches, pending: account.listPendingProjectionOutbox(1).length};
+  }
 }
 
 /** Production Overseer with a test-only seam that reproduces an unbuilt legacy Action index. */
@@ -287,6 +300,14 @@ export default {
         ? await user.armUnknownUsageSafeResultFailureForTest(safeRecordRef)
         : await user.expireReconciledUsageDetailForTest(safeRecordRef);
       return new Response(serialize(result ?? {ok: true}), {
+        headers: {"content-type": "application/json"},
+      });
+    }
+    if (url.pathname === OUTBOX_DRAIN_PATH) {
+      const username = url.searchParams.get("username");
+      if (!username) return new Response("Missing outbox User.", {status: 400});
+      const user = env.USAGE_TEST_USERS.get(env.USAGE_TEST_USERS.idFromName(username));
+      return new Response(serialize(await user.drainUsageProjectionOutboxForTest()), {
         headers: {"content-type": "application/json"},
       });
     }

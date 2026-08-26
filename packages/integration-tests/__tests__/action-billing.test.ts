@@ -40,6 +40,7 @@ const REPORT_SEED_PATH = "/__integration__/usage-report-seed";
 const REPORT_LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
 const REPORT_LEGACY_ACTION_STATE_PATH = "/__integration__/usage-report-legacy-action-state";
 const REPORT_REPLAY_CRASH_PATH = "/__integration__/usage-report-replay-crash";
+const REPORT_OUTBOX_DRAIN_PATH = "/__integration__/usage-report-drain-outbox";
 const CAPNWEB_INITIAL_FLOW_CONTROL_WINDOW_BYTES = 256 * 1024;
 const USAGE_REPORT_MAX_CHUNK_BYTES = 256 * 1024;
 const USAGE_REPORT_SEED_ROWS = 1_024;
@@ -516,7 +517,13 @@ async function reconcileUnknownRecordWhenAvailable(
     );
   } catch (error) {
     if (!isRetainedReplayTransportFailure(error)) throw error;
-    await inspectAfterInitialTransport?.();
+    if (inspectAfterInitialTransport !== undefined) {
+      await awaitBeforeDeadline(
+        inspectAfterInitialTransport,
+        deadline,
+        "inspect-reconciliation-after-transport",
+      );
+    }
     let connectionFailure = error;
     for (let attempt = 0; attempt < RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT; attempt += 1) {
       let scope: UsageAdminScope | undefined;
@@ -722,6 +729,17 @@ async function readLegacyActionAuthorityState(
   );
   expect(response.status).toBe(200);
   return response.json() as Promise<LegacyActionAuthorityState>;
+}
+
+async function drainUsageProjectionOutbox(
+    username: string): Promise<{batches: number; pending: number}> {
+  const query = new URLSearchParams({username});
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_OUTBOX_DRAIN_PATH}?${query}`,
+  );
+  expect(response.status).toBe(200);
+  return response.json() as Promise<{batches: number; pending: number}>;
 }
 
 async function controlUnknownUsageReplayCrash(
@@ -998,6 +1016,18 @@ describe("bounded administrator Usage readiness", () => {
     )).rejects.toThrow("conflict");
     expect(reopenAfterConflict).not.toHaveBeenCalled();
     expect(inspectAfterConflict).not.toHaveBeenCalled();
+
+    const inspectNeverCompletes = vi.fn(() => new Promise<void>(() => {}));
+    const reopenAfterInspectTimeout = vi.fn();
+    await expect(reconcileUnknownRecordWhenAvailable(
+      request,
+      () => Promise.reject(new Error("WebSocket connection failed.")),
+      reopenAfterInspectTimeout,
+      Date.now() + 10,
+      inspectNeverCompletes,
+    )).rejects.toThrow("did not become ready during inspect-reconciliation-after-transport");
+    expect(inspectNeverCompletes).toHaveBeenCalledOnce();
+    expect(reopenAfterInspectTimeout).not.toHaveBeenCalled();
 
     const expiredInitial = vi.fn(() => Promise.resolve(result));
     await expect(reconcileUnknownRecordWhenAvailable(
@@ -1910,64 +1940,95 @@ describe("approved Action billing", () => {
         decision: "settle",
         reason: "Provider confirmed the retained pre-upgrade Action executed",
       };
-      let stateAfterTransport: LegacyActionAuthorityState | undefined;
-      try {
-        const candidate = await retainedReplayStage(
-          "legacy-prepare-authority",
-          () => reconcileUnknownRecordWhenAvailable(
-            request,
-            () => usage.reconcileUnknownRecord(request),
-            openUsageAdminAttemptBeforeDeadline,
-            Date.now() + 15_000,
-            async () => {
-              stateAfterTransport = await readLegacyActionAuthorityState(
-                username, workspaceId, safeRecordRef,
-              );
-            },
-          ),
-        );
-        if (stateAfterTransport === undefined) {
-          throw new Error("Legacy Action authority completed before its second bounded batch.");
-        }
-        settled = candidate;
-      } catch (error) {
-        const cause = error instanceof Error &&
-          error.message === "Retained replay failed during legacy-prepare-authority."
-          ? error.cause : error;
-        if (!(cause instanceof Error) ||
-            cause.message !== "Legacy Action authority is being prepared. Retry the request.") {
-          throw error;
-        }
-      }
-      if (stateAfterTransport !== undefined) {
-        const dispatchDidNotAdvance = stateAfterTransport.migrationCursor === -1 &&
-          stateAfterTransport.indexedActionId === null &&
-          stateAfterTransport.preparationState === "absent";
-        const lostResponseAfterProgress = stateAfterTransport.migrationCursor >= 0 ||
-          stateAfterTransport.indexedActionId !== null ||
-          stateAfterTransport.preparationState !== "absent";
-        expect(dispatchDidNotAdvance || lostResponseAfterProgress).toBe(true);
-        if (stateAfterTransport.preparationOperationId !== null) {
-          expect(stateAfterTransport.preparationOperationId).toBe(request.operationId);
-        }
-      }
-    }
-
-    if (settled === undefined) {
-      const settleSession = await retainedReplayStage(
-        "legacy-open-settle-admin", () => openUsageAdminWhenAvailable(),
+      let preDispatchState: LegacyActionAuthorityState | undefined;
+      const failBeforeDispatch = vi.fn(
+        () => Promise.reject(new Error("WebSocket connection failed.")),
       );
-      using _settlePublicApi = settleSession.publicApi;
-      using _settleAuthenticatedAdmin = settleSession.user;
-      using _settleAdmin = settleSession.admin;
-      using settleUsage = settleSession.usage;
-      settled = await retainedReplayStage(
-        "legacy-settle-authority", () => reconcileUnknownRecordWhenAvailable(
+      await expectRetainedReplayRejection(
+        "legacy-pre-dispatch-recovery",
+        () => reconcileUnknownRecordWhenAvailable(
           request,
-          () => settleUsage.reconcileUnknownRecord(request),
+          failBeforeDispatch,
+          openUsageAdminAttemptBeforeDeadline,
+          Date.now() + 15_000,
+          async () => {
+            preDispatchState = await readLegacyActionAuthorityState(
+              username, workspaceId, safeRecordRef,
+            );
+          },
+        ),
+        "Legacy Action authority is being prepared. Retry the request.",
+      );
+      expect(failBeforeDispatch).toHaveBeenCalledOnce();
+      expect(preDispatchState).toMatchObject({
+        preparationState: "absent",
+        preparationOperationId: null,
+        migrationCursor: -1,
+        indexedActionId: null,
+      });
+      const afterPreDispatchRecovery = await readLegacyActionAuthorityState(
+        username, workspaceId, safeRecordRef,
+      );
+      expect(afterPreDispatchRecovery).toMatchObject({
+        preparationState: "prepared",
+        preparationOperationId: request.operationId,
+        indexedActionId: null,
+      });
+      expect(afterPreDispatchRecovery.migrationCursor).toBeGreaterThanOrEqual(0);
+      expect(afterPreDispatchRecovery.migrationCursor).toBeLessThan(target.id);
+
+      await retainedReplayStage(
+        "legacy-reset-before-response-loss",
+        () => makeUnknownActionLegacy(username, workspaceId, safeRecordRef),
+      );
+      expect(await readLegacyActionAuthorityState(username, workspaceId, safeRecordRef))
+        .toMatchObject({
+          preparationState: "prepared",
+          preparationOperationId: request.operationId,
+          migrationCursor: -1,
+          indexedActionId: null,
+        });
+      await expectRetainedReplayRejection(
+        "legacy-advance-before-response-loss",
+        () => reconcileUnknownRecordWhenAvailable(
+          request,
+          () => usage.reconcileUnknownRecord(request),
+        ),
+        "Legacy Action authority is being prepared. Retry the request.",
+      );
+      const progressedState = await readLegacyActionAuthorityState(
+        username, workspaceId, safeRecordRef,
+      );
+      expect(progressedState).toMatchObject({
+        preparationState: "prepared",
+        preparationOperationId: request.operationId,
+        indexedActionId: null,
+      });
+      expect(progressedState.migrationCursor).toBeGreaterThanOrEqual(0);
+      expect(progressedState.migrationCursor).toBeLessThan(target.id);
+
+      let responseLostState: LegacyActionAuthorityState | undefined;
+      const loseResponseAfterProgress = vi.fn(
+        () => Promise.reject(new Error("WebSocket connection failed.")),
+      );
+      settled = await retainedReplayStage(
+        "legacy-response-lost-after-progress",
+        () => reconcileUnknownRecordWhenAvailable(
+          request,
+          loseResponseAfterProgress,
+          openUsageAdminAttemptBeforeDeadline,
+          Date.now() + 15_000,
+          async () => {
+            responseLostState = await readLegacyActionAuthorityState(
+              username, workspaceId, safeRecordRef,
+            );
+          },
         ),
       );
+      expect(loseResponseAfterProgress).toHaveBeenCalledOnce();
+      expect(responseLostState).toEqual(progressedState);
     }
+
     if (settled === undefined) throw new Error("Legacy Action authority did not settle.");
     const replaySession = await retainedReplayStage(
       "legacy-reconnect-admin", () => openExistingUserWhenAvailable(ADMIN_USERNAME),
@@ -2273,6 +2334,9 @@ describe("approved Action billing", () => {
       expect.objectContaining({kind: "usage-charge", deltaSubunits: -ACTION_CHARGE}),
     ]);
     expect(afterCommitLedger).toHaveLength(beforeLedger.length + 1);
+    expect((await retainedReplayStage(
+      "drain-committed-projection-outbox", () => drainUsageProjectionOutbox(username),
+    )).pending).toBe(0);
 
     {
       const projectionSession = await retainedReplayStage(
@@ -2300,6 +2364,9 @@ describe("approved Action billing", () => {
     await retainedReplayStage(
       "expire-raw-detail", () => controlUnknownUsageReplayCrash(username, safeRecordRef, "expire"),
     );
+    expect((await retainedReplayStage(
+      "drain-projection-before-replays", () => drainUsageProjectionOutbox(username),
+    )).pending).toBe(0);
     {
       const replaySession = await retainedReplayStage(
         "open-replay-admin", () => openUsageAdminWhenAvailable(),
@@ -2348,6 +2415,9 @@ describe("approved Action billing", () => {
         }),
         "Usage Record does not exist.",
       );
+      expect(await retainedReplayStage(
+        "verify-replays-created-no-outbox", () => drainUsageProjectionOutbox(username),
+      )).toEqual({batches: 0, pending: 0});
       const afterReplayProjection = await retainedReplayStage(
         "read-projection-after-replays",
         () => readRetainedReplayProjectionSnapshot(replayUsage, request.registeredUserRef),
