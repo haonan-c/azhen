@@ -7,6 +7,7 @@ import {fileURLToPath} from "node:url";
 import type { RpcStub } from "capnweb";
 import type {
   AdminApi, AdminUnknownUsageReconciliationRequest, AdminUsageApi, AuthenticatedApi,
+  Overseer,
 } from "@gadgets/workshop-shared/api";
 import type {
   TestPrivateActionContent, TestSession,
@@ -42,6 +43,11 @@ const CAPNWEB_INITIAL_FLOW_CONTROL_WINDOW_BYTES = 256 * 1024;
 const USAGE_REPORT_MAX_CHUNK_BYTES = 256 * 1024;
 const USAGE_REPORT_SEED_ROWS = 1_024;
 const USAGE_REPORT_SEED_EXTERNAL_ACCOUNT_ID = `issue63-seed-account-${"a".repeat(179)}`;
+const RETAINED_REPLAY_TRANSPORT_FAILURES = [
+  "Peer closed WebSocket: 3000 test disconnect after Action request",
+  "WebSocket connection failed.",
+] as const;
+const RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT = 3;
 
 let harness: Harness;
 let interceptor: NetworkInterceptor;
@@ -392,6 +398,70 @@ async function openNewUserWhenAvailable(
   });
 }
 
+type RetainedReplayGatekeeperScope = {
+  publicApi: ReturnType<typeof connect>;
+  user: RpcStub<AuthenticatedApi>;
+  workspace: RpcStub<Overseer>;
+  gatekeeper: Awaited<ReturnType<RpcStub<Overseer>["getGatekeeperById"]>>;
+  session?: RpcStub<TestSession>;
+};
+
+function disposeRetainedReplayGatekeeperScope(scope: RetainedReplayGatekeeperScope): void {
+  scope.session?.[Symbol.dispose]();
+  scope.gatekeeper[Symbol.dispose]();
+  scope.workspace[Symbol.dispose]();
+  scope.user[Symbol.dispose]();
+  scope.publicApi[Symbol.dispose]();
+}
+
+function isRetainedReplayTransportFailure(error: unknown): error is Error {
+  return error instanceof Error &&
+    RETAINED_REPLAY_TRANSPORT_FAILURES.includes(
+      error.message as typeof RETAINED_REPLAY_TRANSPORT_FAILURES[number],
+    );
+}
+
+async function openRetainedReplayGatekeeperSessionWhenAvailable(
+    initial: RetainedReplayGatekeeperScope,
+    reopen: () => PromiseLike<RetainedReplayGatekeeperScope>,
+    deadline = Date.now() + 15_000): Promise<Required<RetainedReplayGatekeeperScope>> {
+  let scope = initial;
+  let reconnects = 0;
+  for (;;) {
+    try {
+      const session = await awaitBeforeDeadline(
+        () => scope.gatekeeper.openSession(),
+        deadline,
+        "open-gatekeeper-session",
+        lateSession => lateSession[Symbol.dispose](),
+      );
+      return {...scope, session: session as RpcStub<TestSession>};
+    } catch (error) {
+      disposeRetainedReplayGatekeeperScope(scope);
+      if (!isRetainedReplayTransportFailure(error)) throw error;
+      let connectionFailure = error;
+      let reopened: RetainedReplayGatekeeperScope | undefined;
+      while (reopened === undefined &&
+          reconnects < RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT) {
+        reconnects += 1;
+        try {
+          reopened = await awaitBeforeDeadline(
+            reopen,
+            deadline,
+            "reopen-gatekeeper-session",
+            disposeRetainedReplayGatekeeperScope,
+          );
+        } catch (reopenError) {
+          if (!isRetainedReplayTransportFailure(reopenError)) throw reopenError;
+          connectionFailure = reopenError;
+        }
+      }
+      if (reopened === undefined) throw connectionFailure;
+      scope = reopened;
+    }
+  }
+}
+
 async function setActionRate(amountSubunits: bigint, reason: string): Promise<void> {
   using publicApi = connect(harness.url);
   using authenticatedAdmin = await signIn(publicApi, ADMIN_USERNAME);
@@ -547,18 +617,15 @@ describe("bounded administrator Usage readiness", () => {
   });
 
   it("accepts only the two exact retained replay transport failures without retrying", async () => {
-    const expectedTransportFailures = [
-      "Peer closed WebSocket: 3000 test disconnect after Action request",
-      "WebSocket connection failed.",
-    ] as const;
-    for (const message of expectedTransportFailures) {
+    for (const message of RETAINED_REPLAY_TRANSPORT_FAILURES) {
       const start = vi.fn(() => Promise.reject(new Error(message)));
       await expectRetainedReplayRejection(
         "verify-pending-read-disconnected",
         start,
-        expectedTransportFailures,
+        RETAINED_REPLAY_TRANSPORT_FAILURES,
       );
       expect(start).toHaveBeenCalledOnce();
+      expect(isRetainedReplayTransportFailure(new Error(message))).toBe(true);
     }
 
     for (const rejection of [
@@ -569,9 +636,103 @@ describe("bounded administrator Usage readiness", () => {
       await expect(expectRetainedReplayRejection(
         "verify-pending-read-disconnected",
         start,
-        expectedTransportFailures,
+        RETAINED_REPLAY_TRANSPORT_FAILURES,
       )).rejects.toThrow("Retained replay rejection did not match");
       expect(start).toHaveBeenCalledOnce();
+      expect(isRetainedReplayTransportFailure(rejection)).toBe(false);
+    }
+  });
+
+  it("bounds fresh Gatekeeper session recovery and rejects other failures", async () => {
+    const makeScope = (message: string, session?: RpcStub<TestSession>) => {
+      const dispose = {
+        publicApi: vi.fn(),
+        user: vi.fn(),
+        workspace: vi.fn(),
+        gatekeeper: vi.fn(),
+      };
+      const scope = {
+        publicApi: {[Symbol.dispose]: dispose.publicApi} as unknown as ReturnType<typeof connect>,
+        user: {[Symbol.dispose]: dispose.user} as unknown as RpcStub<AuthenticatedApi>,
+        workspace: {[Symbol.dispose]: dispose.workspace} as unknown as RpcStub<Overseer>,
+        gatekeeper: {
+          [Symbol.dispose]: dispose.gatekeeper,
+          openSession: vi.fn(() => session === undefined
+            ? Promise.reject(new Error(message)) : Promise.resolve(session)),
+        } as unknown as RetainedReplayGatekeeperScope["gatekeeper"],
+      };
+      return {scope, dispose};
+    };
+
+    const businessFailure = makeScope("Gatekeeper session is not authorized.");
+    const reopenAfterBusinessFailure = vi.fn();
+    await expect(openRetainedReplayGatekeeperSessionWhenAvailable(
+      businessFailure.scope,
+      reopenAfterBusinessFailure,
+      Date.now() + 1_000,
+    )).rejects.toThrow("Gatekeeper session is not authorized.");
+    expect(reopenAfterBusinessFailure).not.toHaveBeenCalled();
+    for (const dispose of Object.values(businessFailure.dispose)) {
+      expect(dispose).toHaveBeenCalledOnce();
+    }
+
+    const expired = makeScope("unreachable");
+    const reopenAfterDeadline = vi.fn();
+    await expect(openRetainedReplayGatekeeperSessionWhenAvailable(
+      expired.scope,
+      reopenAfterDeadline,
+      Date.now() - 1,
+    )).rejects.toThrow("did not become ready during open-gatekeeper-session");
+    expect(expired.scope.gatekeeper.openSession).not.toHaveBeenCalled();
+    expect(reopenAfterDeadline).not.toHaveBeenCalled();
+    for (const dispose of Object.values(expired.dispose)) {
+      expect(dispose).toHaveBeenCalledOnce();
+    }
+
+    const initialReconnectFailure = makeScope("WebSocket connection failed.");
+    const recoveredSessionDispose = vi.fn();
+    const recoveredSession = {
+      [Symbol.dispose]: recoveredSessionDispose,
+    } as unknown as RpcStub<TestSession>;
+    const recoveredScope = makeScope("unused", recoveredSession);
+    const recoverAfterFreshFailure = vi.fn()
+      .mockRejectedValueOnce(new Error("WebSocket connection failed."))
+      .mockResolvedValueOnce(recoveredScope.scope);
+    const recovered = await openRetainedReplayGatekeeperSessionWhenAvailable(
+      initialReconnectFailure.scope,
+      recoverAfterFreshFailure,
+      Date.now() + 1_000,
+    );
+    expect(recoverAfterFreshFailure).toHaveBeenCalledTimes(2);
+    expect(recovered).toMatchObject({session: recoveredSession});
+    for (const dispose of Object.values(initialReconnectFailure.dispose)) {
+      expect(dispose).toHaveBeenCalledOnce();
+    }
+    for (const dispose of Object.values(recoveredScope.dispose)) {
+      expect(dispose).not.toHaveBeenCalled();
+    }
+    disposeRetainedReplayGatekeeperScope(recovered);
+    expect(recoveredSessionDispose).toHaveBeenCalledOnce();
+    for (const dispose of Object.values(recoveredScope.dispose)) {
+      expect(dispose).toHaveBeenCalledOnce();
+    }
+
+    const transportScopes = Array.from(
+      {length: RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT + 1},
+      () => makeScope("WebSocket connection failed."),
+    );
+    const reopen = vi.fn(() => Promise.resolve(transportScopes[reopen.mock.calls.length].scope));
+    await expect(openRetainedReplayGatekeeperSessionWhenAvailable(
+      transportScopes[0].scope,
+      reopen,
+      Date.now() + 1_000,
+    )).rejects.toThrow("WebSocket connection failed.");
+    expect(reopen).toHaveBeenCalledTimes(RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT);
+    for (const {dispose} of transportScopes) {
+      for (const target of Object.values(dispose)) expect(target).toHaveBeenCalledOnce();
+    }
+    for (const {scope} of transportScopes) {
+      expect(scope.gatekeeper.openSession).toHaveBeenCalledOnce();
     }
   });
 
@@ -1515,6 +1676,9 @@ describe("approved Action billing", () => {
     let safeRecordRef!: string;
     let before!: Awaited<ReturnType<AuthenticatedApi["getUsageCreditBalance"]>>;
     let request!: AdminUnknownUsageReconciliationRequest;
+    let newGatekeeperCalls = 0;
+    let requestBillableActionCalls = 0;
+    let approveActionCalls = 0;
     const label = `unknown-retained-replay-${crypto.randomUUID()}`;
     const providerCallStart = providerCalls.length;
 
@@ -1549,47 +1713,97 @@ describe("approved Action billing", () => {
           },
         }),
       );
-      using _actionPublicApi = actionUserSession.publicApi;
-      using actionUser = actionUserSession.user;
       const account = await retainedReplayStage(
-        "provision-account", () => provisionAccount(actionUser),
+        "provision-account", () => provisionAccount(actionUserSession.user),
       );
-      using actionWorkspace = await retainedReplayStage(
-        "reopen-created-workspace", () => actionUser.openGadget(workspaceId),
+      const actionWorkspace = await retainedReplayStage(
+        "reopen-created-workspace", () => actionUserSession.user.openGadget(workspaceId),
       );
-      using actionGatekeeper = await retainedReplayStage(
+      const actionGatekeeper = await retainedReplayStage(
         "new-gatekeeper",
-        () => actionWorkspace.newGatekeeper(
-          account.id,
-          `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
-        ),
+        () => {
+          newGatekeeperCalls += 1;
+          return actionWorkspace.newGatekeeper(
+            account.id,
+            `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
+          );
+        },
       );
       if (!actionGatekeeper) throw new Error("Expected the test Gatekeeper.");
-      using actionSession = await retainedReplayStage(
-        "open-gatekeeper-session", () => actionGatekeeper.openSession(),
-      ) as RpcStub<TestSession>;
-      before = await retainedReplayStage(
-        "read-balance-before-action", () => actionUser.getUsageCreditBalance(),
-      );
-      await retainedReplayStage(
-        "request-billable-action", () => actionSession.requestBillableAction(label),
+      const gatekeeperId = await retainedReplayStage(
+        "read-new-gatekeeper-id", () => actionGatekeeper.getId(),
       );
       if (!actionSocket || actionSocket.readyState !== WebSocket.OPEN) {
-        throw new Error("Expected the retained replay WebSocket to be open after the Action request.");
+        throw new Error("Expected the retained replay WebSocket before opening the session.");
       }
-      // Fix the client-side transport error before the real close handshake can wrap its reason
-      // through both Cap'n Web peers. The stale capability must observe the browser's standard
-      // connection failure, while the awaited close below still releases the real socket.
       actionSocket.dispatchEvent(new Event("error"));
-      await closeRetainedReplayWebSocket(actionSocket, "test disconnect after Action request");
-      await expectRetainedReplayRejection(
-        "verify-pending-read-disconnected",
-        () => actionWorkspace.listActions(),
-        [
-          "Peer closed WebSocket: 3000 test disconnect after Action request",
-          "WebSocket connection failed.",
-        ],
+      await closeRetainedReplayWebSocket(actionSocket, "test disconnect before Gatekeeper session");
+      const opened = await retainedReplayStage(
+        "recover-open-gatekeeper-session",
+        () => openRetainedReplayGatekeeperSessionWhenAvailable({
+          publicApi: actionUserSession.publicApi,
+          user: actionUserSession.user,
+          workspace: actionWorkspace,
+          gatekeeper: actionGatekeeper,
+        }, async () => {
+          const reconnected = await openExistingUserWhenAvailable(username, {
+            ...productionExistingUserReadiness,
+            open: () => {
+              const connection = connectWithSocket(harness.url);
+              actionSocket = connection.socket;
+              return connection.publicApi;
+            },
+          });
+          let workspace: RpcStub<Overseer> | undefined;
+          let gatekeeper: RetainedReplayGatekeeperScope["gatekeeper"] | undefined;
+          try {
+            workspace = await reconnected.user.openGadget(workspaceId);
+            gatekeeper = await workspace.getGatekeeperById(gatekeeperId);
+            return {
+              publicApi: reconnected.publicApi,
+              user: reconnected.user,
+              workspace,
+              gatekeeper,
+            };
+          } catch (error) {
+            gatekeeper?.[Symbol.dispose]();
+            workspace?.[Symbol.dispose]();
+            reconnected.user[Symbol.dispose]();
+            reconnected.publicApi[Symbol.dispose]();
+            throw error;
+          }
+        }),
       );
+      try {
+        expect(newGatekeeperCalls).toBe(1);
+        before = await retainedReplayStage(
+          "read-balance-before-action", () => opened.user.getUsageCreditBalance(),
+        );
+        await retainedReplayStage(
+          "request-billable-action", () => {
+            requestBillableActionCalls += 1;
+            return opened.session.requestBillableAction(label);
+          },
+        );
+        expect(requestBillableActionCalls).toBe(1);
+        if (!actionSocket || actionSocket.readyState !== WebSocket.OPEN) {
+          throw new Error(
+            "Expected the retained replay WebSocket to be open after the Action request.",
+          );
+        }
+        // Fix the client-side transport error before the real close handshake can wrap its reason
+        // through both Cap'n Web peers. The stale capability must observe the browser's standard
+        // connection failure, while the awaited close below still releases the real socket.
+        actionSocket.dispatchEvent(new Event("error"));
+        await closeRetainedReplayWebSocket(actionSocket, "test disconnect after Action request");
+        await expectRetainedReplayRejection(
+          "verify-pending-read-disconnected",
+          () => opened.workspace.listActions(),
+          RETAINED_REPLAY_TRANSPORT_FAILURES,
+        );
+      } finally {
+        disposeRetainedReplayGatekeeperScope(opened);
+      }
     }
 
     {
@@ -1609,8 +1823,14 @@ describe("approved Action billing", () => {
       if (!action) throw new Error("Expected the retained replay Action.");
       actionId = action.id;
       const approval = await retainedReplayStage(
-        "approve-action-on-reconnected-workspace", () => pendingWorkspace.approveAction(actionId),
+        "approve-action-on-reconnected-workspace", () => {
+          approveActionCalls += 1;
+          return pendingWorkspace.approveAction(actionId);
+        },
       );
+      expect(newGatekeeperCalls).toBe(1);
+      expect(requestBillableActionCalls).toBe(1);
+      expect(approveActionCalls).toBe(1);
       expect(approval).toBe("unknown");
       expect(providerCalls.slice(providerCallStart).filter(call =>
         new URL(call.url).pathname === `/effects/${label}`)).toHaveLength(1);
