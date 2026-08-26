@@ -357,7 +357,9 @@ const RESERVATION_STATUSES = new Set<AdminUsageReservationStatus>([
   "held", "released", "settled", "none",
 ]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const CURRENT_PROJECTION_SCHEMA_VERSION = "2";
+const CURRENT_PROJECTION_SCHEMA_VERSION = "3";
+const RETIRED_FACTS_TABLE = "usage_projection_facts_retired_v2";
+const RETIRED_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
 
 /** Replaceable SQLite-backed deployment Usage Projection. It never stores authoritative balances. */
 export class UsageProjection extends DurableObject<Cloudflare.Env> {
@@ -956,6 +958,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       await this.#runCleanupStep();
       this.#setMaintenanceTurn("drain");
     }
+    await this.#runRetiredProjectionCleanupStep();
     await this.#scheduleRemainingMaintenance();
   }
 
@@ -1021,9 +1024,36 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   async #scheduleRemainingMaintenance(): Promise<void> {
     const meta = this.#meta();
     const hasDrain = this.#hasApplyDrain();
-    if (hasDrain || meta.rebuild_state === "rebuilding" || meta.cleanup_generation !== null) {
+    if (hasDrain || meta.rebuild_state === "rebuilding" || meta.cleanup_generation !== null ||
+        this.#hasRetiredProjectionTable()) {
       await this.ctx.storage.setAlarm(Date.now() + (hasDrain ? 1_000 : 0));
     }
+  }
+
+  #hasRetiredProjectionTable(): boolean {
+    return this.ctx.storage.sql.exec<{present: number}>(`
+      SELECT COUNT(*) AS present FROM sqlite_master
+      WHERE type = 'table' AND name IN (?, ?)
+    `, RETIRED_FACTS_TABLE, RETIRED_SUMMARIES_TABLE).one().present > 0;
+  }
+
+  async #runRetiredProjectionCleanupStep(): Promise<void> {
+    const tables = new Set(this.ctx.storage.sql.exec<{name: string}>(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name IN (?, ?)
+    `, RETIRED_FACTS_TABLE, RETIRED_SUMMARIES_TABLE).toArray().map(row => row.name));
+    const table = tables.has(RETIRED_FACTS_TABLE)
+      ? RETIRED_FACTS_TABLE : tables.has(RETIRED_SUMMARIES_TABLE)
+        ? RETIRED_SUMMARIES_TABLE : null;
+    if (table === null) return;
+    this.ctx.storage.sql.exec(`
+      DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} LIMIT 64)
+    `);
+    const hasRows = this.ctx.storage.sql.exec<{present: number}>(`
+      SELECT EXISTS(SELECT 1 FROM ${table} LIMIT 1) AS present
+    `).one().present > 0;
+    if (!hasRows) this.ctx.storage.sql.exec(`DROP TABLE ${table}`);
+    if (hasRows || tables.size > 1) await this.ctx.storage.setAlarm(Date.now());
   }
 
   async #runRebuildStep(): Promise<void> {
@@ -2006,6 +2036,101 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, generation).one();
   }
 
+  #createCurrentFactsTableAndIndexes(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_facts (
+        generation TEXT NOT NULL, fact_id TEXT NOT NULL, fact_hash TEXT NOT NULL,
+        principal_ref TEXT NOT NULL, source_sequence TEXT NOT NULL, occurred_at TEXT,
+        safe_record_ref TEXT, safe_attempt_ref TEXT, reservation_status TEXT,
+        bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
+        summary_dimension_key TEXT, summary_snapshot_value TEXT,
+        source TEXT NOT NULL, row_kind TEXT NOT NULL, metered_kind TEXT, usage_kind TEXT NOT NULL,
+        outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT, vendor_id TEXT,
+        billing_method_key TEXT, external_account_id TEXT, gadget_id TEXT,
+        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
+        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
+        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
+        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
+        billable_api_operations TEXT NOT NULL,
+        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
+        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
+        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
+        unreserved_attempts TEXT NOT NULL,
+        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
+        unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
+        applied_watermark TEXT,
+        PRIMARY KEY (generation, fact_id), UNIQUE (generation, principal_ref, source_sequence),
+        CHECK ((row_kind = 'detail' AND occurred_at IS NOT NULL AND bucket_start IS NULL AND
+                metered_kind IS NULL AND
+                summary_fact_id IS NULL AND summary_revision IS NULL AND
+                summary_dimension_key IS NULL AND summary_snapshot_value IS NULL) OR
+               (row_kind = 'aggregate' AND occurred_at IS NULL AND safe_record_ref IS NULL AND
+                safe_attempt_ref IS NULL AND reservation_status IS NULL AND
+                metered_kind IS NOT NULL AND
+                bucket_start IS NOT NULL AND
+                summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
+                summary_dimension_key IS NOT NULL AND summary_snapshot_value IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v3
+      ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start));
+      CREATE INDEX IF NOT EXISTS usage_projection_report_time_v3
+      ON usage_projection_facts(
+        generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
+      );
+      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time_v3
+      ON usage_projection_facts(generation, principal_ref,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time_v3
+      ON usage_projection_facts(generation, gadget_id,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time_v3
+      ON usage_projection_facts(generation, deployment_model_id,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time_v3
+      ON usage_projection_facts(generation, vendor_id, billing_method_key,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time_v3
+      ON usage_projection_facts(generation, external_account_id,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time_v3
+      ON usage_projection_facts(generation, source,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time_v3
+      ON usage_projection_facts(generation, outcome,
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v3
+      ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
+        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v3
+      ON usage_projection_facts(
+        generation, summary_fact_id, applied, applied_watermark, summary_revision
+      )
+    `);
+  }
+
+  #createCurrentSummariesTableAndIndex(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_summaries (
+        generation TEXT NOT NULL, summary_fact_id TEXT NOT NULL, summary_revision TEXT NOT NULL,
+        dimension_key TEXT NOT NULL, snapshot_value TEXT NOT NULL, metered_kind TEXT NOT NULL,
+        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
+        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
+        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
+        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
+        billable_api_operations TEXT NOT NULL,
+        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
+        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
+        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
+        unreserved_attempts TEXT NOT NULL,
+        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
+        unpriced_api_operations TEXT NOT NULL,
+        PRIMARY KEY (generation, summary_fact_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension_v3
+      ON usage_projection_summaries(generation, dimension_key)
+    `);
+  }
+
   #initializeSchema(): void {
     let schemaUpgradeStarted = false;
     this.ctx.storage.sql.exec(`
@@ -2105,7 +2230,49 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     }>(`
       SELECT projection_schema_version FROM usage_projection_meta WHERE singleton = 1
     `).one().projection_schema_version;
-    if (storedSchemaVersion !== CURRENT_PROJECTION_SCHEMA_VERSION) beginSchemaUpgrade();
+    const tables = new Set(this.ctx.storage.sql.exec<{name: string}>(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
+        'usage_projection_facts', 'usage_projection_summaries', ?, ?
+      )
+    `, RETIRED_FACTS_TABLE, RETIRED_SUMMARIES_TABLE).toArray().map(row => row.name));
+    const currentFactColumns = new Set(tables.has("usage_projection_facts")
+      ? this.ctx.storage.sql.exec<{name: string}>(
+          "PRAGMA table_info(usage_projection_facts)",
+        ).toArray().map(column => column.name) : []);
+    const currentSummaryColumns = new Set(tables.has("usage_projection_summaries")
+      ? this.ctx.storage.sql.exec<{name: string}>(
+          "PRAGMA table_info(usage_projection_summaries)",
+        ).toArray().map(column => column.name) : []);
+    const missingCurrentFactColumn = tables.has("usage_projection_facts") && [
+      "safe_attempt_ref", "reservation_status", "metered_kind", "metered_use_count",
+      "pre_execution_failures", "unknown_operations", "metering_attempts", "held_reservations",
+      "released_reservations", "settled_reservations", "unreserved_attempts",
+      "applied_watermark",
+    ].some(required => !currentFactColumns.has(required));
+    const missingCurrentSummaryColumn = tables.has("usage_projection_summaries") && [
+      "metered_kind", "metered_use_count", "pre_execution_failures", "unknown_operations",
+      "metering_attempts", "held_reservations", "released_reservations",
+      "settled_reservations", "unreserved_attempts",
+    ].some(required => !currentSummaryColumns.has(required));
+    const needsShadowMigration = storedSchemaVersion !== CURRENT_PROJECTION_SCHEMA_VERSION ||
+      missingCurrentFactColumn || missingCurrentSummaryColumn;
+    if (needsShadowMigration) beginSchemaUpgrade();
+    if (needsShadowMigration) {
+      this.ctx.storage.transactionSync(() => {
+        if (tables.has("usage_projection_facts") && !tables.has(RETIRED_FACTS_TABLE)) {
+          this.ctx.storage.sql.exec(`
+            ALTER TABLE usage_projection_facts RENAME TO ${RETIRED_FACTS_TABLE}
+          `);
+        }
+        if (tables.has("usage_projection_summaries") && !tables.has(RETIRED_SUMMARIES_TABLE)) {
+          this.ctx.storage.sql.exec(`
+            ALTER TABLE usage_projection_summaries RENAME TO ${RETIRED_SUMMARIES_TABLE}
+          `);
+        }
+        this.#createCurrentFactsTableAndIndexes();
+        this.#createCurrentSummariesTableAndIndex();
+      });
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_totals (
         generation TEXT PRIMARY KEY, totals_source TEXT NOT NULL,
@@ -2220,110 +2387,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       INSERT OR IGNORE INTO usage_projection_drain_cursor (singleton, after_rowid)
       VALUES (1, NULL)
     `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS usage_projection_facts (
-        generation TEXT NOT NULL, fact_id TEXT NOT NULL, fact_hash TEXT NOT NULL,
-        principal_ref TEXT NOT NULL, source_sequence TEXT NOT NULL, occurred_at TEXT,
-        safe_record_ref TEXT, safe_attempt_ref TEXT, reservation_status TEXT,
-        bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
-        summary_dimension_key TEXT, summary_snapshot_value TEXT,
-        source TEXT NOT NULL, row_kind TEXT NOT NULL, metered_kind TEXT, usage_kind TEXT NOT NULL,
-        outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT, vendor_id TEXT,
-        billing_method_key TEXT, external_account_id TEXT, gadget_id TEXT,
-        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
-        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
-        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
-        billable_api_operations TEXT NOT NULL,
-        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
-        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
-        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
-        unreserved_attempts TEXT NOT NULL,
-        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
-        unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
-        applied_watermark TEXT,
-        PRIMARY KEY (generation, fact_id), UNIQUE (generation, principal_ref, source_sequence),
-        CHECK ((row_kind = 'detail' AND occurred_at IS NOT NULL AND bucket_start IS NULL AND
-                metered_kind IS NULL AND
-                summary_fact_id IS NULL AND summary_revision IS NULL AND
-                summary_dimension_key IS NULL AND summary_snapshot_value IS NULL) OR
-               (row_kind = 'aggregate' AND occurred_at IS NULL AND safe_record_ref IS NULL AND
-                safe_attempt_ref IS NULL AND reservation_status IS NULL AND
-                metered_kind IS NOT NULL AND
-                bucket_start IS NOT NULL AND
-                summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
-                summary_dimension_key IS NOT NULL AND summary_snapshot_value IS NOT NULL))
-      )
-    `);
-    const factColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
-      "PRAGMA table_info(usage_projection_facts)",
-    ).toArray().map(column => column.name));
-    if (!factColumns.has("safe_record_ref")) {
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts ADD COLUMN safe_record_ref TEXT
-      `);
-    }
-    if (!factColumns.has("safe_attempt_ref")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts ADD COLUMN safe_attempt_ref TEXT
-      `);
-    }
-    if (!factColumns.has("reservation_status")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts ADD COLUMN reservation_status TEXT
-      `);
-    }
-    if (!factColumns.has("metered_kind")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts ADD COLUMN metered_kind TEXT
-      `);
-    }
-    if (!factColumns.has("pre_execution_failures")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts
-        ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
-      `);
-    }
-    if (!factColumns.has("metered_use_count")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts
-        ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
-      `);
-    }
-    if (!factColumns.has("unknown_operations")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_facts
-        ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
-      `);
-    }
-    for (const column of [
-      "metering_attempts", "held_reservations", "released_reservations",
-      "settled_reservations", "unreserved_attempts",
-    ]) {
-      if (!factColumns.has(column)) {
-        beginSchemaUpgrade();
-        this.ctx.storage.sql.exec(`
-          ALTER TABLE usage_projection_facts
-          ADD COLUMN ${column} TEXT NOT NULL DEFAULT '0'
-        `);
-      }
-    }
-    if (!factColumns.has("applied_watermark")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE usage_projection_facts ADD COLUMN applied_watermark TEXT",
-      );
-    }
-    this.ctx.storage.sql.exec(`
-      CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v2
-      ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start))
-    `);
+    this.#createCurrentFactsTableAndIndexes();
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_expired_sequences (
         generation TEXT NOT NULL, fact_id TEXT NOT NULL, principal_ref TEXT NOT NULL,
@@ -2335,40 +2399,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_detail_watermarks (
         principal_ref TEXT PRIMARY KEY, cutoff_utc TEXT NOT NULL
-      )
-    `);
-    this.ctx.storage.sql.exec(`
-      CREATE INDEX IF NOT EXISTS usage_projection_report_time
-      ON usage_projection_facts(
-        generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
-      );
-      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time
-      ON usage_projection_facts(generation, principal_ref,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time
-      ON usage_projection_facts(generation, gadget_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time
-      ON usage_projection_facts(generation, deployment_model_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time
-      ON usage_projection_facts(generation, vendor_id, billing_method_key,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time
-      ON usage_projection_facts(generation, external_account_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time
-      ON usage_projection_facts(generation, source,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time
-      ON usage_projection_facts(generation, outcome,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time
-      ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision
-      ON usage_projection_facts(
-        generation, summary_fact_id, applied, applied_watermark, summary_revision
       )
     `);
     this.ctx.storage.sql.exec(`
@@ -2390,67 +2420,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         PRIMARY KEY (generation, principal_ref)
       )
     `);
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS usage_projection_summaries (
-        generation TEXT NOT NULL, summary_fact_id TEXT NOT NULL, summary_revision TEXT NOT NULL,
-        dimension_key TEXT NOT NULL, snapshot_value TEXT NOT NULL, metered_kind TEXT NOT NULL,
-        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
-        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
-        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
-        billable_api_operations TEXT NOT NULL,
-        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
-        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
-        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
-        unreserved_attempts TEXT NOT NULL,
-        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
-        unpriced_api_operations TEXT NOT NULL,
-        PRIMARY KEY (generation, summary_fact_id)
-      )
-    `);
-    const summaryColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
-      "PRAGMA table_info(usage_projection_summaries)",
-    ).toArray().map(column => column.name));
-    if (!summaryColumns.has("metered_kind")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_summaries
-        ADD COLUMN metered_kind TEXT NOT NULL DEFAULT 'attempt'
-      `);
-    }
-    if (!summaryColumns.has("pre_execution_failures")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_summaries
-        ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
-      `);
-    }
-    if (!summaryColumns.has("metered_use_count")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_summaries
-        ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
-      `);
-    }
-    if (!summaryColumns.has("unknown_operations")) {
-      beginSchemaUpgrade();
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_summaries
-        ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
-      `);
-    }
-    for (const column of [
-      "metering_attempts", "held_reservations", "released_reservations",
-      "settled_reservations", "unreserved_attempts",
-    ]) {
-      if (!summaryColumns.has(column)) {
-        beginSchemaUpgrade();
-        this.ctx.storage.sql.exec(`
-          ALTER TABLE usage_projection_summaries
-          ADD COLUMN ${column} TEXT NOT NULL DEFAULT '0'
-        `);
-      }
-    }
+    this.#createCurrentSummariesTableAndIndex();
     if (schemaUpgradeStarted) {
       this.ctx.storage.sql.exec(`
         UPDATE usage_projection_meta
@@ -2458,10 +2428,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         WHERE singleton = 1
       `);
     }
-    this.ctx.storage.sql.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension
-      ON usage_projection_summaries(generation, dimension_key)
-    `);
+    if (this.#hasRetiredProjectionTable()) {
+      this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now()));
+    }
   }
 }
 
