@@ -198,6 +198,31 @@ async function retainedReplayStage<T>(
   }
 }
 
+async function expectRetainedReplayRejection(
+    stage: string,
+    start: () => PromiseLike<unknown>,
+    expectedMessage: string): Promise<void> {
+  let rejection: unknown;
+  try {
+    await start();
+  } catch (error) {
+    rejection = error;
+  }
+  if (rejection === undefined) {
+    throw new Error(`Retained replay did not reject during ${stage}.`);
+  }
+  if (!(rejection instanceof Error) || !rejection.message.includes(expectedMessage)) {
+    const assertionError = new Error(
+      `Retained replay rejection did not contain the required message during ${stage}.`,
+    );
+    throw new AggregateError(
+      [rejection, assertionError],
+      `Retained replay rejection did not match during ${stage}.`,
+      {cause: rejection},
+    );
+  }
+}
+
 async function openUsageAdminWhenAvailable(): Promise<{
   publicApi: ReturnType<typeof connect>;
   user: RpcStub<AuthenticatedApi>;
@@ -424,6 +449,25 @@ async function controlUnknownUsageReplayCrash(
 }
 
 describe("bounded administrator Usage readiness", () => {
+  it("preserves the raw retained replay rejection when its assertion fails", async () => {
+    const rpcError = new Error("WebSocket connection failed.");
+    let thrown: unknown;
+    try {
+      await expectRetainedReplayRejection(
+        "read-expired-detail",
+        () => Promise.reject(rpcError),
+        "Usage Record does not exist.",
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).cause).toBe(rpcError);
+    expect((thrown as AggregateError).errors[0]).toBe(rpcError);
+    expect((thrown as AggregateError).errors[1]).toBeInstanceOf(Error);
+  });
+
   it("does not start an RPC after its absolute deadline", async () => {
     const start = vi.fn(() => Promise.resolve("unreachable"));
     await expect(awaitBeforeDeadline(start, Date.now() - 1, "expired"))
@@ -1277,10 +1321,10 @@ describe("approved Action billing", () => {
       "arm-lost-safe-result", () => controlUnknownUsageReplayCrash(username, safeRecordRef, "arm"),
     );
 
-    await retainedReplayStage(
+    await expectRetainedReplayRejection(
       "commit-unknown-decision-with-lost-response",
-      () => expect(usage.reconcileUnknownRecord(request))
-        .rejects.toThrow("Simulated lost administrator safe-result response"),
+      () => usage.reconcileUnknownRecord(request),
+      "Simulated lost administrator safe-result response",
     );
     const committedActions = await retainedReplayStage(
       "read-action-after-commit", () => workspace.listActions(),
@@ -1298,12 +1342,13 @@ describe("approved Action billing", () => {
     await retainedReplayStage(
       "expire-raw-detail", () => controlUnknownUsageReplayCrash(username, safeRecordRef, "expire"),
     );
-    await retainedReplayStage(
+    await expectRetainedReplayRejection(
       "verify-raw-detail-expired",
-      () => expect(usage.getRecordDetail({
+      () => usage.getRecordDetail({
         registeredUserRef: registered.registeredUserRef,
         safeRecordRef,
-      })).rejects.toThrow(),
+      }),
+      "Usage Record does not exist.",
     );
 
     const replaySession = await retainedReplayStage(
@@ -1333,12 +1378,13 @@ describe("approved Action billing", () => {
       "read-final-balance", () => user.getUsageCreditBalance(),
     );
     expect(finalBalance).toEqual(afterCommit);
-    await retainedReplayStage(
+    await expectRetainedReplayRejection(
       "verify-final-detail-expired",
-      () => expect(replayUsage.getRecordDetail({
+      () => replayUsage.getRecordDetail({
         registeredUserRef: registered.registeredUserRef,
         safeRecordRef,
-      })).rejects.toThrow(),
+      }),
+      "Usage Record does not exist.",
     );
   });
 
