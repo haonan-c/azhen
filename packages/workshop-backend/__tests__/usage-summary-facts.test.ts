@@ -440,6 +440,49 @@ describe("authoritative 15-minute UTC Usage Summary Facts", () => {
     });
   });
 
+  it("rebuilds a legacy Unpriced Gatekeeper unknown with its authoritative unreserved state",
+      async () => {
+    await withAccount((account, storage) => {
+      const operationId = "gatekeeper-operation:legacy-unpriced-unknown";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "unknown");
+      const recordKey = `usageAccount:gatekeeperUsageRecord:${operationId}`;
+      const current = storage.kv.get<Record<string, unknown>>(recordKey)!;
+      const {reservationStatusAtCompletion: _status, ...legacy} = current;
+      storage.kv.put(recordKey, legacy);
+      for (const prefix of [
+        "usageAccount:projection", "usageAccount:summary", "usageAccount:detail",
+      ]) {
+        for (const [key] of Array.from(storage.kv.list({prefix}))) storage.kv.delete(key);
+      }
+
+      for (let turn = 0; turn < 8 && !account.backfillProjectionFactsBatch(32); turn += 1) {
+        // Continue the production bounded backfill until all authority stages finish.
+      }
+      const facts = account.listUsageProjectionFacts(null, 10).facts;
+      expect(facts).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          rowKind: "detail",
+          outcome: "usage-unknown-released",
+          reservationStatus: "none",
+          meteringAttempts: 1n,
+          heldReservations: 0n,
+          releasedReservations: 0n,
+          unreservedAttempts: 1n,
+        }),
+        expect.objectContaining({
+          rowKind: "aggregate",
+          outcome: "usage-unknown-released",
+          meteringAttempts: 1n,
+          heldReservations: 0n,
+          releasedReservations: 0n,
+          unreservedAttempts: 1n,
+        }),
+      ]));
+    });
+  });
+
   it("keeps unknown and reconciliation as separate audit facts without double-counting use",
       async () => {
     vi.useFakeTimers();

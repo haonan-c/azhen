@@ -751,8 +751,54 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     });
     const legacyReleasedAggregate = omitExplainabilityFields(releasedAggregate);
     const legacyHeldAggregate = omitExplainabilityFields(heldAggregate);
+    const unreserved = detail(principal, {
+      sourceSequence: 5n,
+      kind: "gatekeeper",
+      outcome: "usage-unknown",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "legacy-unreserved-vendor",
+      billingMethodKey: "legacy.unreserved.v1",
+      externalAccountId: "legacy-unreserved-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const unreservedAggregate = aggregate(principal, {
+      sourceSequence: 6n,
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "usage-unknown",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "legacy-unreserved-vendor",
+      billingMethodKey: "legacy.unreserved.v1",
+      externalAccountId: "legacy-unreserved-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const legacyUnreserved = omitExplainabilityFields(unreserved);
+    const legacyUnreservedAggregate = omitExplainabilityFields(unreservedAggregate);
     const outOfOrder = [
-      legacyHeldAggregate, legacyHeld, legacyReleasedAggregate, legacyReleased,
+      legacyUnreservedAggregate, legacyHeldAggregate, legacyUnreserved,
+      legacyHeld, legacyReleasedAggregate, legacyReleased,
     ];
     expect(await projection.ingest(outOfOrder)).toMatchObject({rejected: []});
     expect(await projection.ingest(outOfOrder)).toMatchObject({rejected: []});
@@ -778,7 +824,10 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     } as never);
     const releasedRows = (await releasedReport.listRows({limit: 10})).rows;
     const heldRows = (await heldReport.listRows({limit: 10})).rows;
-    const releasedDetail = releasedRows.find(row => row.rowKind === "detail");
+    const releasedDetail = releasedRows.find(row => row.rowKind === "detail" &&
+      row.rowId === released.projectionFactId);
+    const unreservedDetail = releasedRows.find(row => row.rowKind === "detail" &&
+      row.rowId === unreserved.projectionFactId);
     const heldDetail = heldRows.find(row => row.rowKind === "detail");
     expect(releasedDetail).toEqual(
       expect.objectContaining({
@@ -806,7 +855,21 @@ describe("Issue #63 frozen administrator Usage reports", () => {
         }),
       }),
     );
-    const releasedSummary = releasedRows.find(row => row.rowKind === "aggregate");
+    expect(unreservedDetail).toEqual(expect.objectContaining({
+      outcome: "usage-unknown-released",
+      safeAttemptRef: unreserved.safeRecordRef,
+      reservationStatus: "none",
+      metrics: expect.objectContaining({
+        meteringAttempts: 1n,
+        heldReservations: 0n,
+        releasedReservations: 0n,
+        unreservedAttempts: 1n,
+      }),
+    }));
+    const releasedSummary = releasedRows.find(row => row.rowKind === "aggregate" &&
+      row.summaryFactId === releasedAggregate.summaryFactId);
+    const unreservedSummary = releasedRows.find(row => row.rowKind === "aggregate" &&
+      row.summaryFactId === unreservedAggregate.summaryFactId);
     const heldSummary = heldRows.find(row => row.rowKind === "aggregate");
     expect(releasedSummary).toMatchObject({
       outcome: "usage-unknown-released",
@@ -816,18 +879,23 @@ describe("Issue #63 frozen administrator Usage reports", () => {
       outcome: "usage-unknown-held",
       metrics: {meteringAttempts: 1n, heldReservations: 1n},
     });
-    for (const summary of [releasedSummary, heldSummary]) {
+    expect(unreservedSummary).toMatchObject({
+      outcome: "usage-unknown-released",
+      metrics: {meteringAttempts: 1n, unreservedAttempts: 1n},
+    });
+    for (const summary of [releasedSummary, unreservedSummary, heldSummary]) {
       expect(summary).not.toHaveProperty("safeRecordRef");
       expect(summary).not.toHaveProperty("safeAttemptRef");
       expect(summary).not.toHaveProperty("reservationStatus");
       expect(summary).not.toHaveProperty("occurredAtUtc");
     }
-    expect((await legacyReport.listRows({limit: 10})).rows).toHaveLength(4);
+    expect((await legacyReport.listRows({limit: 10})).rows).toHaveLength(6);
     expect((await releasedReport.getOverview()).metrics).toMatchObject({
-      unknownOperations: 1n,
-      meteringAttempts: 1n,
+      unknownOperations: 2n,
+      meteringAttempts: 2n,
       heldReservations: 0n,
       releasedReservations: 1n,
+      unreservedAttempts: 1n,
     });
     expect((await heldReport.getOverview()).metrics).toMatchObject({
       unknownOperations: 1n,

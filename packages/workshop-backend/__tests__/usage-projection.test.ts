@@ -89,6 +89,64 @@ function aggregateFact(
 }
 
 describe("deployment Usage Projection", () => {
+  it("keeps a schema marker fail-closed after a partial Projection upgrade", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const input = fact();
+    expect(await projection.ingest([input])).toMatchObject({rejected: []});
+    await runDurableObjectAlarm(projection);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET projection_schema_version = '0',
+          bootstrap_state = 'complete' WHERE singleton = 1
+      `);
+    });
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart partial Projection schema upgrade");
+    })).rejects.toThrow("restart partial Projection schema upgrade");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    expect(await runInDurableObject(restarted, (_instance, state) =>
+      state.storage.sql.exec<{
+        projection_schema_version: string;
+        bootstrap_state: string;
+      }>(`
+        SELECT projection_schema_version, bootstrap_state
+        FROM usage_projection_meta WHERE singleton = 1
+      `).one())).toEqual({projection_schema_version: "2", bootstrap_state: "pending"});
+    expect(await restarted.ensureBootstrap()).toBe(false);
+  });
+
+  it("does not scan applied facts while migrating their report watermark", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const input = fact();
+    expect(await projection.ingest([input])).toMatchObject({rejected: []});
+    await runDurableObjectAlarm(projection);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec("DROP INDEX usage_projection_report_summary_revision");
+      state.storage.sql.exec("ALTER TABLE usage_projection_facts DROP COLUMN applied_watermark");
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET projection_schema_version = '0',
+          bootstrap_state = 'complete' WHERE singleton = 1
+      `);
+    });
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart report watermark migration");
+    })).rejects.toThrow("restart report watermark migration");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    expect(await runInDurableObject(restarted, (_instance, state) => ({
+      bootstrap: state.storage.sql.exec<{bootstrap_state: string}>(`
+        SELECT bootstrap_state FROM usage_projection_meta WHERE singleton = 1
+      `).one().bootstrap_state,
+      oldWatermark: state.storage.sql.exec<{applied_watermark: string | null}>(`
+        SELECT applied_watermark FROM usage_projection_facts WHERE fact_id = ?
+      `, input.projectionFactId).one().applied_watermark,
+    }))).toEqual({bootstrap: "pending", oldWatermark: null});
+    expect(await restarted.ensureBootstrap()).toBe(false);
+  });
+
   it("fails closed and rebuilds instead of scanning legacy facts for explainability", async () => {
     const projectionName = crypto.randomUUID();
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
