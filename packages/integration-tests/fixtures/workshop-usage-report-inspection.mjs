@@ -19,6 +19,7 @@ const BOOTSTRAP_PATH = "/__integration__/usage-report-bootstrap";
 const USER_STATE_PATH = "/__integration__/usage-report-user-state";
 const SEED_PATH = "/__integration__/usage-report-seed";
 const LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
+const LEGACY_ACTION_STATE_PATH = "/__integration__/usage-report-legacy-action-state";
 const REPLAY_CRASH_PATH = "/__integration__/usage-report-replay-crash";
 const MAX_TELEMETRY_EVENTS = 4_096;
 const SEED_EXTERNAL_ACCOUNT_ID = `issue63-seed-account-${"a".repeat(179)}`;
@@ -154,6 +155,22 @@ export class UserDurableObject extends ProductionUserDurableObject {
     const {actionId: _actionId, ...attribution} = record.attribution;
     this.ctx.storage.kv.put(key, {...record, attribution});
   }
+
+  /** Read content-free compatibility state without advancing migration or reconciliation. */
+  inspectUnknownUsageLegacyStateForTest(safeRecordRef) {
+    const account = new UsageAccount(this.ctx.storage);
+    const locator = account.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper") throw new Error("Unknown Usage detail is invalid.");
+    const preparation = this.ctx.storage.kv.get(
+      `usageAccount:adminUnknownReconciliation:v1:${safeRecordRef}`,
+    );
+    return {
+      billingOperationId: locator.operationId,
+      preparationState: preparation === undefined
+        ? "absent" : preparation.result === null ? "prepared" : "completed",
+      preparationOperationId: preparation?.operationId ?? null,
+    };
+  }
 }
 
 /** Production Overseer with a test-only seam that reproduces an unbuilt legacy Action index. */
@@ -164,6 +181,15 @@ export class OverseerDurableObject extends ProductionOverseerDurableObject {
       this.impl.storage.billingActionAuthorities.delete(record.billingOperationId);
     }
     this.impl.storage.billingActionAuthorityMigrationCursor.put(-1);
+  }
+
+  /** Read the content-free compatibility cursor without advancing its bounded migration. */
+  inspectBillingActionAuthorityMigrationForTest(billingOperationId) {
+    const indexed = this.impl.storage.billingActionAuthorities.get(billingOperationId);
+    return {
+      migrationCursor: this.impl.storage.billingActionAuthorityMigrationCursor.get(),
+      indexedActionId: indexed?.actionId ?? null,
+    };
   }
 }
 
@@ -229,6 +255,25 @@ export default {
       );
       await overseer.resetBillingActionAuthorityIndexForTest();
       return new Response("ok");
+    }
+    if (url.pathname === LEGACY_ACTION_STATE_PATH) {
+      const username = url.searchParams.get("username");
+      const workspaceId = url.searchParams.get("workspaceId");
+      const safeRecordRef = url.searchParams.get("safeRecordRef");
+      if (!username || !workspaceId || !safeRecordRef) {
+        return new Response("Missing legacy Action state input.", {status: 400});
+      }
+      const user = env.USAGE_TEST_USERS.get(env.USAGE_TEST_USERS.idFromName(username));
+      const userState = await user.inspectUnknownUsageLegacyStateForTest(safeRecordRef);
+      const overseer = env.USAGE_TEST_OVERSEERS.get(
+        env.USAGE_TEST_OVERSEERS.idFromString(workspaceId),
+      );
+      const migration = await overseer.inspectBillingActionAuthorityMigrationForTest(
+        userState.billingOperationId,
+      );
+      return new Response(serialize({...userState, ...migration}), {
+        headers: {"content-type": "application/json"},
+      });
     }
     if (url.pathname === REPLAY_CRASH_PATH) {
       const username = url.searchParams.get("username");

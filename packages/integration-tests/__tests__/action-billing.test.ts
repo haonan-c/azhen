@@ -6,8 +6,8 @@ import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import type { RpcStub } from "capnweb";
 import type {
-  AdminApi, AdminUnknownUsageReconciliationRequest, AdminUsageApi, AuthenticatedApi,
-  Overseer,
+  AdminApi, AdminUnknownUsageReconciliationRequest, AdminUsageApi, AdminUsageReportMetrics,
+  AuthenticatedApi, Overseer, UserCreditLedgerEntry,
 } from "@gadgets/workshop-shared/api";
 import type {
   TestPrivateActionContent, TestSession,
@@ -38,6 +38,7 @@ const REPORT_BOOTSTRAP_PATH = "/__integration__/usage-report-bootstrap";
 const REPORT_USER_STATE_PATH = "/__integration__/usage-report-user-state";
 const REPORT_SEED_PATH = "/__integration__/usage-report-seed";
 const REPORT_LEGACY_ACTION_PATH = "/__integration__/usage-report-legacy-action";
+const REPORT_LEGACY_ACTION_STATE_PATH = "/__integration__/usage-report-legacy-action-state";
 const REPORT_REPLAY_CRASH_PATH = "/__integration__/usage-report-replay-crash";
 const CAPNWEB_INITIAL_FLOW_CONTROL_WINDOW_BYTES = 256 * 1024;
 const USAGE_REPORT_MAX_CHUNK_BYTES = 256 * 1024;
@@ -507,6 +508,7 @@ async function reconcileUnknownRecordWhenAvailable(
     reopen: (deadline: number) => PromiseLike<UsageAdminScope> =
       openUsageAdminAttemptBeforeDeadline,
     deadline = Date.now() + 15_000,
+    inspectAfterInitialTransport?: () => PromiseLike<void>,
 ): Promise<Awaited<ReturnType<AdminUsageApi["reconcileUnknownRecord"]>>> {
   try {
     return await awaitBeforeDeadline(
@@ -514,6 +516,7 @@ async function reconcileUnknownRecordWhenAvailable(
     );
   } catch (error) {
     if (!isRetainedReplayTransportFailure(error)) throw error;
+    await inspectAfterInitialTransport?.();
     let connectionFailure = error;
     for (let attempt = 0; attempt < RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT; attempt += 1) {
       let scope: UsageAdminScope | undefined;
@@ -615,6 +618,68 @@ async function waitForNextUnknownUsageReference(
   return safeRecordRef;
 }
 
+async function listAllOwnCreditLedger(
+    user: RpcStub<AuthenticatedApi>): Promise<UserCreditLedgerEntry[]> {
+  const entries: UserCreditLedgerEntry[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await user.listOwnCreditLedger({limit: 100, ...(cursor ? {cursor} : {})});
+    entries.push(...page.entries);
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+  return entries;
+}
+
+type RetainedReplayProjectionSnapshot = {
+  metrics: AdminUsageReportMetrics;
+  generation: bigint;
+  ingestionWatermark: bigint;
+  summaryRevisions: Array<{summaryFactId: string; summaryRevision: bigint}>;
+};
+
+async function readRetainedReplayProjectionSnapshot(
+    usage: RpcStub<AdminUsageApi>, registeredUserRef: string,
+): Promise<RetainedReplayProjectionSnapshot> {
+  using report = await usage.openReport({
+    registeredUserRefs: [registeredUserRef],
+    gatekeeperIds: [TEST_VENDOR_ID],
+    methods: [{gatekeeperId: TEST_VENDOR_ID, stableMethodKey: ACTION_METHOD_KEY}],
+  });
+  const overview = await report.getOverview();
+  const summaryRevisions: RetainedReplayProjectionSnapshot["summaryRevisions"] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await report.listRows({limit: 200, ...(cursor ? {cursor} : {})});
+    summaryRevisions.push(...page.rows.flatMap(row => row.rowKind === "aggregate"
+      ? [{summaryFactId: row.summaryFactId, summaryRevision: row.summaryRevision}]
+      : []));
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+  summaryRevisions.sort((left, right) => left.summaryFactId.localeCompare(right.summaryFactId));
+  return {
+    metrics: overview.metrics,
+    generation: overview.snapshot.projectionGeneration,
+    ingestionWatermark: overview.snapshot.ingestionWatermark,
+    summaryRevisions,
+  };
+}
+
+async function waitForRetainedReplayProjectionSnapshot(
+    usage: RpcStub<AdminUsageApi>, registeredUserRef: string,
+    predicate: (snapshot: RetainedReplayProjectionSnapshot) => boolean,
+): Promise<RetainedReplayProjectionSnapshot> {
+  return waitFor("the retained replay totals to reach Projection", async () => {
+    try {
+      const snapshot = await readRetainedReplayProjectionSnapshot(usage, registeredUserRef);
+      return predicate(snapshot) ? snapshot : null;
+    } catch (error) {
+      if (error instanceof Error &&
+          error.message === "Usage Projection bootstrap is incomplete.") return null;
+      throw error;
+    }
+  }, 90_000);
+}
+
 async function seedUsageReportRows(
     username: string, workspaceId: string, count: number): Promise<void> {
   const query = new URLSearchParams({username, workspaceId, count: count.toString()});
@@ -637,6 +702,26 @@ async function makeUnknownActionLegacy(
     `http://workshop.test${REPORT_LEGACY_ACTION_PATH}?${query}`,
   );
   expect(response.status).toBe(200);
+}
+
+type LegacyActionAuthorityState = {
+  billingOperationId: string;
+  preparationState: "absent" | "prepared" | "completed";
+  preparationOperationId: string | null;
+  migrationCursor: number;
+  indexedActionId: number | null;
+};
+
+async function readLegacyActionAuthorityState(
+    username: string, workspaceId: string, safeRecordRef: string,
+): Promise<LegacyActionAuthorityState> {
+  const query = new URLSearchParams({username, workspaceId, safeRecordRef});
+  const response = await harness.fetchWorker(
+    WORKSHOP_WORKER,
+    `http://workshop.test${REPORT_LEGACY_ACTION_STATE_PATH}?${query}`,
+  );
+  expect(response.status).toBe(200);
+  return response.json() as Promise<LegacyActionAuthorityState>;
 }
 
 async function controlUnknownUsageReplayCrash(
@@ -891,10 +976,12 @@ describe("bounded administrator Usage readiness", () => {
     const freshScopes = [failedFresh, successfulFresh];
     const reopen = vi.fn(() => Promise.resolve(freshScopes[reopen.mock.calls.length - 1].scope));
     const initial = vi.fn(() => Promise.reject(new Error("WebSocket connection failed.")));
+    const inspectAfterInitialTransport = vi.fn(() => Promise.resolve());
     await expect(reconcileUnknownRecordWhenAvailable(
-      request, initial, reopen, Date.now() + 1_000,
+      request, initial, reopen, Date.now() + 1_000, inspectAfterInitialTransport,
     )).resolves.toEqual(result);
     expect(initial).toHaveBeenCalledOnce();
+    expect(inspectAfterInitialTransport).toHaveBeenCalledOnce();
     expect(reopen).toHaveBeenCalledTimes(2);
     for (const fresh of freshScopes) {
       expect(fresh.reconcileUnknownRecord).toHaveBeenCalledOnce();
@@ -904,10 +991,13 @@ describe("bounded administrator Usage readiness", () => {
 
     const nonTransportInitial = vi.fn(() => Promise.reject(new Error("conflict")));
     const reopenAfterConflict = vi.fn();
+    const inspectAfterConflict = vi.fn();
     await expect(reconcileUnknownRecordWhenAvailable(
       request, nonTransportInitial, reopenAfterConflict, Date.now() + 1_000,
+      inspectAfterConflict,
     )).rejects.toThrow("conflict");
     expect(reopenAfterConflict).not.toHaveBeenCalled();
+    expect(inspectAfterConflict).not.toHaveBeenCalled();
 
     const expiredInitial = vi.fn(() => Promise.resolve(result));
     await expect(reconcileUnknownRecordWhenAvailable(
@@ -1764,6 +1854,7 @@ describe("approved Action billing", () => {
     );
 
     let request!: AdminUnknownUsageReconciliationRequest;
+    let settled: Awaited<ReturnType<AdminUsageApi["reconcileUnknownRecord"]>> | undefined;
     {
       using adminPublicApi = connect(harness.url);
       using authenticatedAdmin = await retainedReplayStage(
@@ -1819,15 +1910,50 @@ describe("approved Action billing", () => {
         decision: "settle",
         reason: "Provider confirmed the retained pre-upgrade Action executed",
       };
-      await expectRetainedReplayRejection(
-        "legacy-prepare-authority",
-        () => usage.reconcileUnknownRecord(request),
-        "Legacy Action authority is being prepared",
-      );
+      let stateAfterTransport: LegacyActionAuthorityState | undefined;
+      try {
+        const candidate = await retainedReplayStage(
+          "legacy-prepare-authority",
+          () => reconcileUnknownRecordWhenAvailable(
+            request,
+            () => usage.reconcileUnknownRecord(request),
+            openUsageAdminAttemptBeforeDeadline,
+            Date.now() + 15_000,
+            async () => {
+              stateAfterTransport = await readLegacyActionAuthorityState(
+                username, workspaceId, safeRecordRef,
+              );
+            },
+          ),
+        );
+        if (stateAfterTransport === undefined) {
+          throw new Error("Legacy Action authority completed before its second bounded batch.");
+        }
+        settled = candidate;
+      } catch (error) {
+        const cause = error instanceof Error &&
+          error.message === "Retained replay failed during legacy-prepare-authority."
+          ? error.cause : error;
+        if (!(cause instanceof Error) ||
+            cause.message !== "Legacy Action authority is being prepared. Retry the request.") {
+          throw error;
+        }
+      }
+      if (stateAfterTransport !== undefined) {
+        const dispatchDidNotAdvance = stateAfterTransport.migrationCursor === -1 &&
+          stateAfterTransport.indexedActionId === null &&
+          stateAfterTransport.preparationState === "absent";
+        const lostResponseAfterProgress = stateAfterTransport.migrationCursor >= 0 ||
+          stateAfterTransport.indexedActionId !== null ||
+          stateAfterTransport.preparationState !== "absent";
+        expect(dispatchDidNotAdvance || lostResponseAfterProgress).toBe(true);
+        if (stateAfterTransport.preparationOperationId !== null) {
+          expect(stateAfterTransport.preparationOperationId).toBe(request.operationId);
+        }
+      }
     }
 
-    let settled!: Awaited<ReturnType<AdminUsageApi["reconcileUnknownRecord"]>>;
-    {
+    if (settled === undefined) {
       const settleSession = await retainedReplayStage(
         "legacy-open-settle-admin", () => openUsageAdminWhenAvailable(),
       );
@@ -1842,6 +1968,7 @@ describe("approved Action billing", () => {
         ),
       );
     }
+    if (settled === undefined) throw new Error("Legacy Action authority did not settle.");
     const replaySession = await retainedReplayStage(
       "legacy-reconnect-admin", () => openExistingUserWhenAvailable(ADMIN_USERNAME),
     );
@@ -1877,6 +2004,11 @@ describe("approved Action billing", () => {
     let actionId!: number;
     let safeRecordRef!: string;
     let before!: Awaited<ReturnType<AuthenticatedApi["getUsageCreditBalance"]>>;
+    let beforeReconciliation!: Awaited<ReturnType<AuthenticatedApi["getUsageCreditBalance"]>>;
+    let beforeLedger!: UserCreditLedgerEntry[];
+    let beforeProjection!: RetainedReplayProjectionSnapshot;
+    let afterCommitLedger!: UserCreditLedgerEntry[];
+    let afterCommitProjection!: RetainedReplayProjectionSnapshot;
     let request!: AdminUnknownUsageReconciliationRequest;
     let newGatekeeperCalls = 0;
     let requestBillableActionCalls = 0;
@@ -2055,6 +2187,17 @@ describe("approved Action billing", () => {
         "read-unknown-safe-record-ref",
         () => waitForNextUnknownUsageReference(username, new Set()),
       );
+      beforeReconciliation = await retainedReplayStage(
+        "read-balance-before-reconciliation", () => pendingUser.getUsageCreditBalance(),
+      );
+      beforeLedger = await retainedReplayStage(
+        "read-ledger-before-reconciliation", () => listAllOwnCreditLedger(pendingUser),
+      );
+      expect(beforeReconciliation).toMatchObject({
+        reservedSubunits: ACTION_CHARGE,
+        availableSubunits: before.availableSubunits - ACTION_CHARGE,
+      });
+      expect(beforeLedger.filter(entry => entry.kind === "usage-charge")).toEqual([]);
     }
 
     {
@@ -2078,6 +2221,17 @@ describe("approved Action billing", () => {
         decision: "settle",
         reason: "Replay the committed Action after raw detail retention",
       };
+      beforeProjection = await retainedReplayStage(
+        "read-projection-before-reconciliation",
+        () => waitForRetainedReplayProjectionSnapshot(
+          initialUsage, registered.registeredUserRef,
+          snapshot => snapshot.metrics.unknownOperations === 1n &&
+            snapshot.metrics.heldReservations === 1n &&
+            snapshot.metrics.chargedUsageCreditSubunits === 0n &&
+            snapshot.metrics.meteredUseCount === 0n &&
+            snapshot.metrics.billableApiOperations === 0n,
+        ),
+      );
       await retainedReplayStage(
         "arm-lost-safe-result",
         () => controlUnknownUsageReplayCrash(username, safeRecordRef, "arm"),
@@ -2106,11 +2260,42 @@ describe("approved Action billing", () => {
       afterCommit = await retainedReplayStage(
         "read-balance-after-reconnect", () => committedUser.getUsageCreditBalance(),
       );
+      afterCommitLedger = await retainedReplayStage(
+        "read-ledger-after-reconnect", () => listAllOwnCreditLedger(committedUser),
+      );
     }
     expect(afterCommit).toMatchObject({
       reservedSubunits: 0n,
       availableSubunits: before.availableSubunits - ACTION_CHARGE,
     });
+    expect(afterCommit.revision).toBeGreaterThan(beforeReconciliation.revision);
+    expect(afterCommitLedger.filter(entry => entry.kind === "usage-charge")).toEqual([
+      expect.objectContaining({kind: "usage-charge", deltaSubunits: -ACTION_CHARGE}),
+    ]);
+    expect(afterCommitLedger).toHaveLength(beforeLedger.length + 1);
+
+    {
+      const projectionSession = await retainedReplayStage(
+        "open-admin-for-committed-projection", () => openUsageAdminWhenAvailable(),
+      );
+      using _projectionPublicApi = projectionSession.publicApi;
+      using _projectionAuthenticatedAdmin = projectionSession.user;
+      using _projectionAdmin = projectionSession.admin;
+      using projectionUsage = projectionSession.usage;
+      afterCommitProjection = await retainedReplayStage(
+        "read-committed-projection",
+        () => waitForRetainedReplayProjectionSnapshot(
+          projectionUsage, request.registeredUserRef,
+          snapshot => snapshot.metrics.chargedUsageCreditSubunits === ACTION_CHARGE &&
+            snapshot.metrics.meteredUseCount === 1n &&
+            snapshot.metrics.billableApiOperations === 1n,
+        ),
+      );
+    }
+    expect(afterCommitProjection.generation).toBe(beforeProjection.generation);
+    expect(afterCommitProjection.ingestionWatermark)
+      .toBeGreaterThan(beforeProjection.ingestionWatermark);
+    expect(afterCommitProjection.summaryRevisions).not.toEqual(beforeProjection.summaryRevisions);
 
     await retainedReplayStage(
       "expire-raw-detail", () => controlUnknownUsageReplayCrash(username, safeRecordRef, "expire"),
@@ -2148,6 +2333,14 @@ describe("approved Action billing", () => {
         reason: request.reason,
       });
       await expectRetainedReplayRejection(
+        "reject-different-operation-after-detail-expired",
+        () => replayUsage.reconcileUnknownRecord({
+          ...request,
+          operationId: `retained-replay-conflict:${crypto.randomUUID()}`,
+        }),
+        "Administrator unknown Usage detail conflicts with its stored decision.",
+      );
+      await expectRetainedReplayRejection(
         "verify-final-detail-expired",
         () => replayUsage.getRecordDetail({
           registeredUserRef: request.registeredUserRef,
@@ -2155,6 +2348,11 @@ describe("approved Action billing", () => {
         }),
         "Usage Record does not exist.",
       );
+      const afterReplayProjection = await retainedReplayStage(
+        "read-projection-after-replays",
+        () => readRetainedReplayProjectionSnapshot(replayUsage, request.registeredUserRef),
+      );
+      expect(afterReplayProjection).toEqual(afterCommitProjection);
     }
 
     const finalUserSession = await retainedReplayStage(
@@ -2165,7 +2363,18 @@ describe("approved Action billing", () => {
     const finalBalance = await retainedReplayStage(
       "read-final-balance", () => finalUser.getUsageCreditBalance(),
     );
+    const finalLedger = await retainedReplayStage(
+      "read-final-ledger", () => listAllOwnCreditLedger(finalUser),
+    );
+    using finalWorkspace = await retainedReplayStage(
+      "reopen-workspace-for-final-action", () => finalUser.openGadget(workspaceId),
+    );
+    const finalActions = await retainedReplayStage(
+      "read-final-action", () => finalWorkspace.listActions(),
+    );
     expect(finalBalance).toEqual(afterCommit);
+    expect(finalLedger).toEqual(afterCommitLedger);
+    expect(finalActions.find(entry => entry.id === actionId)?.state).toBe("accepted");
   });
 
   it("reverts an accepted Action without charging or reversing its original charge", async () => {
