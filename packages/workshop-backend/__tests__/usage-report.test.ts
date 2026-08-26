@@ -1,0 +1,1543 @@
+import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
+import type {
+  AdminUsageApi,
+  AdminUsageProjectionHealth,
+  AdminUsageReportMetrics,
+  AdminUsageReportRow,
+} from "@gadgets/workshop-shared/api";
+import {RpcStub} from "cloudflare:workers";
+import {beforeAll, describe, expect, it} from "vitest";
+import {
+  ADMIN_USAGE_CSV_MAX_CHUNK_BYTES,
+  ADMIN_USAGE_CSV_PAGE_SIZE,
+  ADMIN_USAGE_MAX_OPEN_REPORTS,
+  AdminUsageApiImpl,
+  AdminUsageReportImpl,
+  type AdminSettings,
+} from "../src/admin-settings.js";
+import type {
+  UsageProjection,
+  UsageProjectionAggregateFact,
+  UsageProjectionDetailFact,
+  UsageProjectionFact,
+} from "../src/usage-projection.js";
+import {
+  buildUsageReportPredicate,
+  freezeUsageReportQuery,
+  normalizeAdminUsageReportFilter,
+  reportLocalTimestamp,
+} from "../src/usage-report-query.js";
+import type {UserDurableObject} from "../src/user.js";
+
+const testEnv = env as unknown as {
+  TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
+  TEST_USER: DurableObjectNamespace<UserDurableObject>;
+  TEST_USAGE_PROJECTION: DurableObjectNamespace<UsageProjection>;
+};
+
+const HEALTHY_PROJECTION: AdminUsageProjectionHealth = {
+  state: "healthy",
+  lastIngestedAt: "2026-08-24T13:00:00.000Z",
+  latestAppliedSourceAt: "2026-08-24T13:00:00.000Z",
+  oldestPendingAt: null,
+  pendingEventCount: 0n,
+  deliveryPendingEventCount: 0n,
+  sequenceGapCount: 0n,
+  failedIngestionCount: 0n,
+  failureCode: null,
+  rebuildFailureCode: null,
+  rebuildRequestId: null,
+  rebuildUsersProcessed: 0n,
+  asOf: "2026-08-24T13:00:00.000Z",
+};
+
+const EMPTY_METRICS: AdminUsageReportMetrics = {
+  providerCostUsdSubunits: 0n,
+  chargedUsageCreditSubunits: 0n,
+  cacheHitInputTokens: 0n,
+  cacheMissInputTokens: 0n,
+  cacheWriteInputTokens: 0n,
+  outputTokens: 0n,
+  reasoningTokens: 0n,
+  billableApiOperations: 0n,
+  meteredUseCount: 0n,
+  preExecutionFailures: 0n,
+  unknownOperations: 0n,
+  meteringAttempts: 0n,
+  heldReservations: 0n,
+  releasedReservations: 0n,
+  settledReservations: 0n,
+  unreservedAttempts: 0n,
+  activeUsers: 0n,
+  unpricedModelUses: 0n,
+  unpricedApiOperations: 0n,
+};
+
+const CSV_ROW: AdminUsageReportRow = {
+  rowKind: "detail",
+  rowId: "row",
+  registeredUserRef: "registered-user",
+  safeRecordRef: "record",
+  safeAttemptRef: "attempt",
+  reservationStatus: "settled",
+  meteredKind: "model",
+  source: "agent",
+  outcome: "settled",
+  pricingStatus: "priced",
+  gadgetId: "gadget",
+  deploymentModelId: "model",
+  gatekeeperId: null,
+  stableMethodKey: null,
+  externalAccountId: null,
+  occurredAtUtc: "2026-08-24T13:00:00.000Z",
+  reportLocalTimestamp: "2026-08-24T13:00:00.000+00:00",
+  reportTimeZone: "UTC",
+  metrics: {
+    providerCostUsdSubunits: 1n,
+    chargedUsageCreditSubunits: 2n,
+    cacheHitInputTokens: 3n,
+    cacheMissInputTokens: 4n,
+    cacheWriteInputTokens: 5n,
+    outputTokens: 6n,
+    reasoningTokens: 7n,
+    billableApiOperations: 0n,
+    meteredUseCount: 1n,
+    preExecutionFailures: 0n,
+    unknownOperations: 0n,
+    meteringAttempts: 1n,
+    heldReservations: 0n,
+    releasedReservations: 0n,
+    settledReservations: 1n,
+    unreservedAttempts: 0n,
+    unpricedModelUses: 0n,
+    unpricedApiOperations: 0n,
+  },
+};
+
+function aggregate(
+    principal: string,
+    overrides: Partial<UsageProjectionAggregateFact> = {}): UsageProjectionAggregateFact {
+  const kind = overrides.kind ?? "model";
+  const activeUserContribution = overrides.activeUserContribution ?? 1n;
+  const meteredUseCount = overrides.meteredUseCount ?? activeUserContribution;
+  const outcome = overrides.outcome ?? "settled";
+  const preExecutionFailures = overrides.preExecutionFailures ?? 0n;
+  const unknownOperations = overrides.unknownOperations ?? 0n;
+  const meteringAttempts = overrides.meteringAttempts ??
+    (outcome === "reconciled-settled" || outcome === "reconciled-released" ? 0n
+      : outcome === "settled" ? meteredUseCount
+        : outcome === "failed-before-execution" ? preExecutionFailures : unknownOperations);
+  const reservationStatus = overrides.pricing === "unpriced" ? "none"
+    : outcome === "usage-unknown-held" || outcome === "reconciliation-required" ? "held"
+      : outcome === "usage-unknown-released" || outcome === "failed-before-execution"
+        ? "released" : "settled";
+  return {
+    schemaVersion: 1,
+    projectionFactId: crypto.randomUUID(),
+    sourceSequence: 1n,
+    usagePrincipalRef: principal,
+    rowKind: "aggregate",
+    bucketStart: "2026-08-24T12:00:00.000Z",
+    summaryFactId: crypto.randomUUID(),
+    summaryRevision: 1n,
+    source: "agent",
+    kind,
+    meteredKind: overrides.meteredKind ??
+      (activeUserContribution > 0n ? kind : "attempt"),
+    outcome,
+    pricing: "priced",
+    deploymentModelId: "model-report",
+    vendorId: null,
+    billingMethodKey: null,
+    externalAccountId: null,
+    gadgetId: "gadget-report",
+    cacheHitInputTokens: 9_007_199_254_740_993n,
+    cacheMissInputTokens: 2n,
+    cacheWriteInputTokens: 3n,
+    outputTokens: 5n,
+    reasoningTokens: 1n,
+    providerCostUsdSubunits: 9_007_199_254_740_999n,
+    chargedUsageCreditSubunits: 7n,
+    meteredUseCount,
+    billableApiOperations: 0n,
+    preExecutionFailures,
+    unknownOperations,
+    meteringAttempts,
+    heldReservations: reservationStatus === "held" ? meteringAttempts : 0n,
+    releasedReservations: reservationStatus === "released" ? meteringAttempts : 0n,
+    settledReservations: reservationStatus === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: reservationStatus === "none" ? meteringAttempts : 0n,
+    activeUserContribution,
+    unpricedModelUses: 0n,
+    unpricedApiOperations: 0n,
+    ...overrides,
+  };
+}
+
+function detail(
+    principal: string,
+    overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjectionDetailFact {
+  const {bucketStart: _bucketStart, summaryFactId: _summaryFactId,
+    summaryRevision: _summaryRevision, meteredKind: _meteredKind, ...base} = aggregate(principal);
+  return {
+    ...base,
+    projectionFactId: crypto.randomUUID(),
+    sourceSequence: 2n,
+    rowKind: "detail",
+    safeRecordRef: crypto.randomUUID(),
+    safeAttemptRef: crypto.randomUUID(),
+    reservationStatus: "settled",
+    occurredAt: "2026-08-24T13:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function omitExplainabilityFields<T extends UsageProjectionFact>(fact: T): T {
+  const {
+    safeAttemptRef: _safeAttemptRef,
+    reservationStatus: _reservationStatus,
+    meteringAttempts: _meteringAttempts,
+    heldReservations: _heldReservations,
+    releasedReservations: _releasedReservations,
+    settledReservations: _settledReservations,
+    unreservedAttempts: _unreservedAttempts,
+    ...legacy
+  } = fact;
+  return legacy as T;
+}
+
+function adminUsage(): AdminUsageApi {
+  return new AdminUsageApiImpl(
+    testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+    testEnv.TEST_USER,
+    "issue-63-admin@example.test",
+    undefined,
+    testEnv.TEST_USAGE_PROJECTION,
+  );
+}
+
+beforeAll(async () => {
+  await runInDurableObject(testEnv.TEST_USAGE_PROJECTION.getByName(""), (_instance, state) => {
+    state.storage.sql.exec(`
+      UPDATE usage_projection_meta SET bootstrap_state = 'complete' WHERE singleton = 1
+    `);
+  });
+});
+
+describe("Issue #63 frozen administrator Usage reports", () => {
+  it("normalizes bounded filter values and rejects client-controlled query material", () => {
+    const principal = crypto.randomUUID();
+    expect(normalizeAdminUsageReportFilter({
+      registeredUserRefs: [principal, principal],
+      gadgetIds: ["z-gadget", "a-gadget", "z-gadget"],
+      methods: [
+        {gatekeeperId: "vendor", stableMethodKey: "write"},
+        {gatekeeperId: "vendor", stableMethodKey: "read"},
+        {gatekeeperId: "vendor", stableMethodKey: "write"},
+      ],
+      meteredKinds: ["attempt", "model", "attempt"],
+    })).toEqual({
+      registeredUserRefs: [principal],
+      gadgetIds: ["a-gadget", "z-gadget"],
+      methods: [
+        {gatekeeperId: "vendor", stableMethodKey: "read"},
+        {gatekeeperId: "vendor", stableMethodKey: "write"},
+      ],
+      meteredKinds: ["attempt", "model"],
+    });
+    expect(() => normalizeAdminUsageReportFilter({sql: "DROP TABLE"} as never))
+      .toThrow("Usage report filter is invalid.");
+    expect(() => normalizeAdminUsageReportFilter({startDateInclusive: "2026-02-30"}))
+      .toThrow("Usage report date is invalid.");
+    expect(() => normalizeAdminUsageReportFilter({registeredUserRefs: ["username"]}))
+      .toThrow("Usage report filter dimension is invalid.");
+    expect(() => normalizeAdminUsageReportFilter({gadgetIds: ["https://private.test"]}))
+      .toThrow("Usage report filter dimension is invalid.");
+    expect(() => normalizeAdminUsageReportFilter({
+      gadgetIds: Array.from({length: 33}, (_, index) => `gadget-${index}`),
+    })).toThrow("Usage report filter dimension is invalid.");
+    expect(() => normalizeAdminUsageReportFilter({
+      methods: [{gatekeeperId: "vendor"}] as never,
+    })).toThrow("Usage report method filter is invalid.");
+  });
+
+  it("freezes DST and non-hour local-date boundaries without fixed 24-hour arithmetic", () => {
+    const cases = [
+      ["UTC", "2026-03-08T00:00:00.000Z", "2026-03-09T00:00:00.000Z"],
+      ["America/New_York", "2026-03-08T05:00:00.000Z", "2026-03-09T04:00:00.000Z"],
+      ["Asia/Kathmandu", "2026-03-07T18:15:00.000Z", "2026-03-08T18:15:00.000Z"],
+      ["Australia/Lord_Howe", "2026-04-04T13:00:00.000Z", "2026-04-05T13:30:00.000Z"],
+    ] as const;
+    for (const [timeZone, start, end] of cases) {
+      const query = freezeUsageReportQuery({
+        startDateInclusive: "2026-03-08",
+        endDateExclusive: "2026-03-09",
+      }, timeZone, 1n, 1n, 0n);
+      if (timeZone === "Australia/Lord_Howe") {
+        const lordHowe = freezeUsageReportQuery({
+          startDateInclusive: "2026-04-05",
+          endDateExclusive: "2026-04-06",
+        }, timeZone, 1n, 1n, 0n);
+        expect(lordHowe.snapshot.startAtUtcInclusive).toBe(start);
+        expect(lordHowe.snapshot.endAtUtcExclusive).toBe(end);
+      } else {
+        expect(query.snapshot.startAtUtcInclusive).toBe(start);
+        expect(query.snapshot.endAtUtcExclusive).toBe(end);
+      }
+    }
+    const fallBack = freezeUsageReportQuery({
+      startDateInclusive: "2026-11-01",
+      endDateExclusive: "2026-11-02",
+    }, "America/New_York", 1n, 1n, 0n);
+    expect(fallBack.snapshot.startAtUtcInclusive).toBe("2026-11-01T04:00:00.000Z");
+    expect(fallBack.snapshot.endAtUtcExclusive).toBe("2026-11-02T05:00:00.000Z");
+    expect(reportLocalTimestamp("2026-11-01T05:30:00.000Z", "America/New_York"))
+      .toBe("2026-11-01T01:30:00.000-04:00");
+    expect(reportLocalTimestamp("2026-11-01T06:30:00.000Z", "America/New_York"))
+      .toBe("2026-11-01T01:30:00.000-05:00");
+  });
+
+  it("includes the exact local-date lower bound and excludes the upper bound", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const lower = aggregate(principal, {
+      sourceSequence: 1n,
+      bucketStart: "2026-08-24T00:00:00.000Z",
+    });
+    const upper = aggregate(principal, {
+      sourceSequence: 2n,
+      bucketStart: "2026-08-25T00:00:00.000Z",
+    });
+    await projection.ingest([lower, upper]);
+    using report = await adminUsage().openReport({
+      startDateInclusive: "2026-08-24",
+      endDateExclusive: "2026-08-25",
+      registeredUserRefs: [principal],
+    });
+    expect((await report.listRows({limit: 10})).rows.map(row => row.rowId))
+      .toEqual([lower.projectionFactId]);
+  });
+
+  it("shares one filter, generation, and watermark across overview, keyset rows, and CSV", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const summary = aggregate(principal);
+    const event = detail(principal);
+    await projection.ingest([summary, event]);
+
+    using report = await adminUsage().openReport({
+      registeredUserRefs: [principal, principal],
+      gadgetIds: ["gadget-report"],
+      deploymentModelIds: ["model-report"],
+      sources: ["agent"],
+      outcomes: ["settled"],
+      pricingStatuses: ["priced"],
+      meteredKinds: ["model"],
+    });
+    const overview = await report.getOverview();
+    expect(overview.metrics).toMatchObject({
+      providerCostUsdSubunits: 9_007_199_254_740_999n,
+      cacheHitInputTokens: 9_007_199_254_740_993n,
+      activeUsers: 1n,
+    });
+    expect(overview.snapshot.filter.registeredUserRefs).toEqual([principal]);
+
+    const first = await report.listRows({limit: 1});
+    expect(first.rows).toEqual([
+      expect.objectContaining({
+        rowKind: "detail",
+        safeRecordRef: event.safeRecordRef,
+        reportLocalTimestamp: "2026-08-24T13:00:00.000+00:00",
+      }),
+    ]);
+    expect(first.nextCursor).not.toBeNull();
+
+    await projection.ingest([detail(principal, {
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 3n,
+      safeRecordRef: crypto.randomUUID(),
+      occurredAt: "2026-08-24T11:00:00.000Z",
+    })]);
+    const second = await report.listRows({cursor: first.nextCursor!, limit: 10});
+    expect(second.rows).toEqual([
+      expect.objectContaining({
+        rowKind: "aggregate",
+        summaryFactId: summary.summaryFactId,
+        bucketStartUtc: summary.bucketStart,
+      }),
+    ]);
+    expect(second.nextCursor).toBeNull();
+
+    const csv = await report.exportCsv();
+    const text = await new Response(csv).text();
+    expect(text).toContain("schema_version,admin-usage-v1\r\n");
+    expect(text).toContain(`projection_generation,${overview.snapshot.projectionGeneration}`);
+    expect(text).toContain(`ingestion_watermark,${overview.snapshot.ingestionWatermark}`);
+    expect(text).toContain(event.safeRecordRef);
+    expect(text).not.toContain("2026-08-24T11:00:00.000Z");
+  });
+
+  it("rejects a cursor from another report and preserves the old timezone version", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    await projection.ingest([aggregate(principal), detail(principal)]);
+    const usage = adminUsage();
+    using oldReport = await usage.openReport({registeredUserRefs: [principal]});
+    const first = await oldReport.listRows({limit: 1});
+
+    await testEnv.TEST_ADMIN_SETTINGS.getByName("").updateUsageRates(
+      [{kind: "report-time-zone", timeZone: "America/New_York"}],
+      "Change the report timezone for the freeze test",
+      "issue-63-admin@example.test",
+    );
+    using newReport = await usage.openReport({registeredUserRefs: [principal]});
+    expect((await oldReport.getOverview()).snapshot.reportTimeZone).toBe("UTC");
+    expect((await newReport.getOverview()).snapshot.reportTimeZone).toBe("America/New_York");
+    expect((await newReport.getOverview()).snapshot.reportTimeZoneVersion)
+      .toBeGreaterThan((await oldReport.getOverview()).snapshot.reportTimeZoneVersion);
+    await expect(newReport.listRows({cursor: first.nextCursor!, limit: 1}))
+      .rejects.toThrow("Usage report cursor is invalid.");
+  });
+
+  it("applies every model dimension through one predicate for overview, rows, and CSV", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const otherPrincipal = crypto.randomUUID();
+    const base = aggregate(principal, {
+      projectionFactId: crypto.randomUUID(),
+      summaryFactId: crypto.randomUUID(),
+      sourceSequence: 1n,
+      bucketStart: "2026-08-24T12:00:00.000Z",
+      gadgetId: "filter-gadget",
+      deploymentModelId: "filter-model",
+      providerCostUsdSubunits: 101n,
+    });
+    const facts = [
+      base,
+      aggregate(otherPrincipal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        usagePrincipalRef: otherPrincipal,
+        providerCostUsdSubunits: 102n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 2n,
+        bucketStart: "2026-08-23T12:00:00.000Z",
+        providerCostUsdSubunits: 103n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 3n,
+        gadgetId: "other-gadget",
+        providerCostUsdSubunits: 104n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 4n,
+        deploymentModelId: "other-model",
+        providerCostUsdSubunits: 105n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 5n,
+        source: "gadget",
+        providerCostUsdSubunits: 106n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 6n,
+        outcome: "failed-before-execution",
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        chargedUsageCreditSubunits: 0n,
+        preExecutionFailures: 1n,
+        activeUserContribution: 0n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 7n,
+        pricing: "unpriced",
+        providerCostUsdSubunits: 0n,
+        chargedUsageCreditSubunits: 0n,
+        unpricedModelUses: 1n,
+      }),
+      aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence: 8n,
+        kind: "gatekeeper",
+        deploymentModelId: null,
+        vendorId: "other-vendor",
+        billingMethodKey: "other-method",
+        externalAccountId: "other-account",
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        billableApiOperations: 1n,
+      }),
+    ];
+    await projection.ingest(facts);
+
+    using report = await adminUsage().openReport({
+      startDateInclusive: "2026-08-24",
+      endDateExclusive: "2026-08-25",
+      registeredUserRefs: [principal],
+      gadgetIds: ["filter-gadget"],
+      deploymentModelIds: ["filter-model"],
+      sources: ["agent"],
+      outcomes: ["settled"],
+      pricingStatuses: ["priced"],
+      meteredKinds: ["model"],
+    });
+    expect((await report.getOverview()).metrics.providerCostUsdSubunits).toBe(101n);
+    const page = await report.listRows({limit: 200});
+    expect(page.rows.map(item => item.rowId)).toEqual([base.projectionFactId]);
+    const csv = await new Response(await report.exportCsv()).text();
+    expect(csv).toContain(base.summaryFactId);
+    for (const fact of facts.slice(1)) expect(csv).not.toContain(fact.summaryFactId);
+  });
+
+  it("scopes a stable method to its Gatekeeper and external account dimension", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const gatekeeper = (sourceSequence: bigint, overrides: Partial<UsageProjectionAggregateFact>) =>
+      aggregate(principal, {
+        projectionFactId: crypto.randomUUID(),
+        summaryFactId: crypto.randomUUID(),
+        sourceSequence,
+        kind: "gatekeeper",
+        deploymentModelId: null,
+        vendorId: "filter-vendor",
+        billingMethodKey: "filter-method",
+        externalAccountId: "=filter-account",
+        gadgetId: "filter-gatekeeper-gadget",
+        source: "scheduled",
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        billableApiOperations: 1n,
+        ...overrides,
+      });
+    const base = gatekeeper(1n, {chargedUsageCreditSubunits: 201n});
+    const facts = [
+      base,
+      gatekeeper(2n, {vendorId: "other-vendor", chargedUsageCreditSubunits: 202n}),
+      gatekeeper(3n, {billingMethodKey: "other-method", chargedUsageCreditSubunits: 203n}),
+      gatekeeper(4n, {externalAccountId: "other-account", chargedUsageCreditSubunits: 204n}),
+    ];
+    await projection.ingest(facts);
+
+    using report = await adminUsage().openReport({
+      registeredUserRefs: [principal],
+      gadgetIds: ["filter-gatekeeper-gadget"],
+      gatekeeperIds: ["filter-vendor"],
+      methods: [{gatekeeperId: "filter-vendor", stableMethodKey: "filter-method"}],
+      externalAccountIds: ["=filter-account"],
+      sources: ["scheduled"],
+      outcomes: ["settled"],
+      pricingStatuses: ["priced"],
+      meteredKinds: ["gatekeeper"],
+    });
+    expect((await report.getOverview()).metrics.chargedUsageCreditSubunits).toBe(201n);
+    expect((await report.listRows({limit: 200})).rows.map(item => item.rowId))
+      .toEqual([base.projectionFactId]);
+    const csv = await new Response(await report.exportCsv()).text();
+    expect(csv).toContain(base.summaryFactId);
+    expect(csv).toContain("'=filter-account");
+    for (const fact of facts.slice(1)) expect(csv).not.toContain(fact.summaryFactId);
+  });
+
+  it("uses only the latest absolute Summary revision and never double counts its history", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const first = aggregate(principal, {
+      projectionFactId: crypto.randomUUID(),
+      summaryFactId,
+      sourceSequence: 1n,
+      summaryRevision: 1n,
+      providerCostUsdSubunits: 10n,
+    });
+    await projection.ingest([first]);
+    using oldReport = await adminUsage().openReport({registeredUserRefs: [principal]});
+    const latest = aggregate(principal, {
+      ...first,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 2n,
+      summaryRevision: 2n,
+      providerCostUsdSubunits: 25n,
+    });
+    await projection.ingest([latest]);
+    const duplicate = {
+      ...latest,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 3n,
+    };
+    await projection.ingest([duplicate]);
+
+    using report = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await oldReport.getOverview()).metrics.providerCostUsdSubunits).toBe(10n);
+    expect((await oldReport.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({rowId: first.projectionFactId, summaryRevision: 1n}),
+    ]);
+    expect((await report.getOverview()).metrics.providerCostUsdSubunits).toBe(25n);
+    expect((await report.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({rowId: latest.projectionFactId, summaryRevision: 2n}),
+    ]);
+    const csv = await new Response(await report.exportCsv()).text();
+    expect(csv).toContain(latest.projectionFactId);
+    expect(csv).not.toContain(first.projectionFactId);
+    expect(csv).not.toContain(duplicate.projectionFactId);
+  });
+
+  it("filters and exports attempt-only Summary rows without inventing event time", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const attempt = aggregate(principal, {
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "failed-before-execution",
+      deploymentModelId: null,
+      vendorId: "attempt-vendor",
+      billingMethodKey: "attempt.method.v1",
+      externalAccountId: "attempt-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      preExecutionFailures: 1n,
+      activeUserContribution: 0n,
+    });
+    await projection.ingest([attempt]);
+
+    using report = await adminUsage().openReport({
+      registeredUserRefs: [principal],
+      meteredKinds: ["attempt"],
+    });
+    expect((await report.getOverview()).metrics).toMatchObject({
+      activeUsers: 0n,
+      meteredUseCount: 0n,
+      preExecutionFailures: 1n,
+    });
+    expect((await report.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({
+        rowKind: "aggregate",
+        rowId: attempt.projectionFactId,
+        meteredKind: "attempt",
+        bucketStartUtc: attempt.bucketStart,
+      }),
+    ]);
+    const csv = await new Response(await report.exportCsv()).text();
+    expect(csv).toContain("\r\naggregate,");
+    expect(csv).toContain(",attempt,");
+    const lines = csv.split("\r\n");
+    const header = lines.find(line => line.startsWith("row_kind,"))!.split(",");
+    const row = lines.find(line => line.startsWith("aggregate,"))!.split(",");
+    expect(row[header.indexOf("occurred_at_utc")]).toBe("");
+    expect(row[header.indexOf("report_local_timestamp")]).toBe("");
+  });
+
+  it("maps legacy unknown facts to released and held report outcomes without hiding reservation semantics",
+      async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const released = detail(principal, {
+      sourceSequence: 1n,
+      kind: "model",
+      outcome: "usage-unknown",
+      deploymentModelId: "legacy-model-unknown",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const held = detail(principal, {
+      sourceSequence: 2n,
+      kind: "gatekeeper",
+      outcome: "usage-unknown",
+      pricing: "priced",
+      deploymentModelId: null,
+      vendorId: "legacy-held-vendor",
+      billingMethodKey: "legacy.held.v1",
+      externalAccountId: "legacy-held-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const legacyReleased = omitExplainabilityFields(released);
+    const legacyHeld = omitExplainabilityFields(held);
+    const releasedAggregate = aggregate(principal, {
+      sourceSequence: 3n,
+      kind: "model",
+      meteredKind: "attempt",
+      outcome: "usage-unknown",
+      deploymentModelId: "legacy-model-unknown",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const heldAggregate = aggregate(principal, {
+      sourceSequence: 4n,
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "usage-unknown",
+      pricing: "priced",
+      deploymentModelId: null,
+      vendorId: "legacy-held-vendor",
+      billingMethodKey: "legacy.held.v1",
+      externalAccountId: "legacy-held-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const legacyReleasedAggregate = omitExplainabilityFields(releasedAggregate);
+    const legacyHeldAggregate = omitExplainabilityFields(heldAggregate);
+    const unreserved = detail(principal, {
+      sourceSequence: 5n,
+      kind: "gatekeeper",
+      outcome: "usage-unknown",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "legacy-unreserved-vendor",
+      billingMethodKey: "legacy.unreserved.v1",
+      externalAccountId: "legacy-unreserved-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const unreservedAggregate = aggregate(principal, {
+      sourceSequence: 6n,
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "usage-unknown",
+      pricing: "unpriced",
+      deploymentModelId: null,
+      vendorId: "legacy-unreserved-vendor",
+      billingMethodKey: "legacy.unreserved.v1",
+      externalAccountId: "legacy-unreserved-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const legacyUnreserved = omitExplainabilityFields(unreserved);
+    const legacyUnreservedAggregate = omitExplainabilityFields(unreservedAggregate);
+    const outOfOrder = [
+      legacyUnreservedAggregate, legacyHeldAggregate, legacyUnreserved,
+      legacyHeld, legacyReleasedAggregate, legacyReleased,
+    ];
+    expect(await projection.ingest(outOfOrder)).toMatchObject({rejected: []});
+    expect(await projection.ingest(outOfOrder)).toMatchObject({rejected: []});
+
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      "issue-63-admin@example.test",
+      undefined,
+      testEnv.TEST_USAGE_PROJECTION,
+    );
+    using releasedReport = await usage.openReport({
+      registeredUserRefs: [principal],
+      outcomes: ["usage-unknown-released"],
+    } as never);
+    using heldReport = await usage.openReport({
+      registeredUserRefs: [principal],
+      outcomes: ["usage-unknown-held"],
+    } as never);
+    using legacyReport = await usage.openReport({
+      registeredUserRefs: [principal],
+      outcomes: ["usage-unknown"],
+    } as never);
+    const releasedRows = (await releasedReport.listRows({limit: 10})).rows;
+    const heldRows = (await heldReport.listRows({limit: 10})).rows;
+    const releasedDetail = releasedRows.find(row => row.rowKind === "detail" &&
+      row.rowId === released.projectionFactId);
+    const unreservedDetail = releasedRows.find(row => row.rowKind === "detail" &&
+      row.rowId === unreserved.projectionFactId);
+    const heldDetail = heldRows.find(row => row.rowKind === "detail");
+    expect(releasedDetail).toEqual(
+      expect.objectContaining({
+        rowId: released.projectionFactId,
+        outcome: "usage-unknown-released",
+        safeAttemptRef: released.safeRecordRef,
+        reservationStatus: "released",
+        metrics: expect.objectContaining({
+          meteringAttempts: 1n,
+          releasedReservations: 1n,
+          heldReservations: 0n,
+        }),
+      }),
+    );
+    expect(heldDetail).toEqual(
+      expect.objectContaining({
+        rowId: held.projectionFactId,
+        outcome: "usage-unknown-held",
+        safeAttemptRef: held.safeRecordRef,
+        reservationStatus: "held",
+        metrics: expect.objectContaining({
+          meteringAttempts: 1n,
+          releasedReservations: 0n,
+          heldReservations: 1n,
+        }),
+      }),
+    );
+    expect(unreservedDetail).toEqual(expect.objectContaining({
+      outcome: "usage-unknown-released",
+      safeAttemptRef: unreserved.safeRecordRef,
+      reservationStatus: "none",
+      metrics: expect.objectContaining({
+        meteringAttempts: 1n,
+        heldReservations: 0n,
+        releasedReservations: 0n,
+        unreservedAttempts: 1n,
+      }),
+    }));
+    const releasedSummary = releasedRows.find(row => row.rowKind === "aggregate" &&
+      row.summaryFactId === releasedAggregate.summaryFactId);
+    const unreservedSummary = releasedRows.find(row => row.rowKind === "aggregate" &&
+      row.summaryFactId === unreservedAggregate.summaryFactId);
+    const heldSummary = heldRows.find(row => row.rowKind === "aggregate");
+    expect(releasedSummary).toMatchObject({
+      outcome: "usage-unknown-released",
+      metrics: {meteringAttempts: 1n, releasedReservations: 1n},
+    });
+    expect(heldSummary).toMatchObject({
+      outcome: "usage-unknown-held",
+      metrics: {meteringAttempts: 1n, heldReservations: 1n},
+    });
+    expect(unreservedSummary).toMatchObject({
+      outcome: "usage-unknown-released",
+      metrics: {meteringAttempts: 1n, unreservedAttempts: 1n},
+    });
+    for (const summary of [releasedSummary, unreservedSummary, heldSummary]) {
+      expect(summary).not.toHaveProperty("safeRecordRef");
+      expect(summary).not.toHaveProperty("safeAttemptRef");
+      expect(summary).not.toHaveProperty("reservationStatus");
+      expect(summary).not.toHaveProperty("occurredAtUtc");
+    }
+    expect((await legacyReport.listRows({limit: 10})).rows).toHaveLength(6);
+    expect((await releasedReport.getOverview()).metrics).toMatchObject({
+      unknownOperations: 2n,
+      meteringAttempts: 2n,
+      heldReservations: 0n,
+      releasedReservations: 1n,
+      unreservedAttempts: 1n,
+    });
+    expect((await heldReport.getOverview()).metrics).toMatchObject({
+      unknownOperations: 1n,
+      meteringAttempts: 1n,
+      heldReservations: 1n,
+      releasedReservations: 0n,
+    });
+    const releasedCsv = await new Response(await releasedReport.exportCsv()).text();
+    const heldCsv = await new Response(await heldReport.exportCsv()).text();
+    expect(releasedCsv).toContain("safe_attempt_ref,reservation_status,metering_attempts");
+    expect(releasedCsv).toContain(",usage-unknown-released,");
+    expect(releasedCsv).toContain(`,${released.safeRecordRef},released,`);
+    expect(heldCsv).toContain(",usage-unknown-held,");
+    expect(heldCsv).toContain(`,${held.safeRecordRef},held,`);
+  });
+
+  it("uses the legacy Projection fact identity as its safe detail alias", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const current = detail(principal, {sourceSequence: 1n});
+    const {
+      safeRecordRef: _safeRecordRef,
+      safeAttemptRef: _safeAttemptRef,
+      reservationStatus: _reservationStatus,
+      meteredUseCount: _meteredUseCount,
+      preExecutionFailures: _preExecutionFailures,
+      unknownOperations: _unknownOperations,
+      meteringAttempts: _meteringAttempts,
+      heldReservations: _heldReservations,
+      releasedReservations: _releasedReservations,
+      settledReservations: _settledReservations,
+      unreservedAttempts: _unreservedAttempts,
+      ...legacy
+    } = current;
+    await projection.ingest([legacy as UsageProjectionFact]);
+
+    using report = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({
+        rowKind: "detail",
+        rowId: legacy.projectionFactId,
+        safeRecordRef: legacy.projectionFactId,
+      }),
+    ]);
+  });
+
+  it("fails a frozen report closed after retention removes physical detail", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const expired = detail(principal, {
+      sourceSequence: 1n,
+      occurredAt: "2024-08-24T12:00:00.000Z",
+    });
+    await projection.ingest([expired]);
+    using report = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+
+    expect(await projection.expireDetailBefore(
+      principal, "2026-08-24T12:00:00.000Z",
+    )).toBe(true);
+    await expect(report.listRows({limit: 10}))
+      .rejects.toThrow("Usage report snapshot is stale.");
+
+    using current = await adminUsage().openReport({registeredUserRefs: [principal]});
+    expect((await current.listRows({limit: 10})).rows).toEqual([]);
+  });
+
+  it("fails old and new reports closed across a pending bootstrap restart", async () => {
+    const projectionName = `issue-63-pending-report-${crypto.randomUUID()}`;
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const projectionNamespace = {
+      getByName: () => testEnv.TEST_USAGE_PROJECTION.getByName(projectionName),
+    } as DurableObjectNamespace<UsageProjection>;
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      "issue-63-admin@example.test",
+      undefined,
+      projectionNamespace,
+    );
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete'
+        WHERE singleton = 1
+      `);
+    });
+    const principal = crypto.randomUUID();
+    await projection.ingest([aggregate(principal)]);
+    using report = await usage.openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+
+    const beforePreamble = (await report.exportCsv()).getReader();
+    const afterPreamble = (await report.exportCsv()).getReader();
+    expect(new TextDecoder().decode((await afterPreamble.read()).value)).toContain(
+      "schema_version,admin-usage-v1\r\n",
+    );
+    const setBootstrapState = (state: "complete" | "pending") =>
+      runInDurableObject(projection, (_instance, durableState) => {
+        durableState.storage.sql.exec(`
+          UPDATE usage_projection_meta SET bootstrap_state = ? WHERE singleton = 1
+        `, state);
+      });
+    await setBootstrapState("pending");
+    await expect(beforePreamble.read()).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(afterPreamble.read()).rejects.toThrow("Usage report snapshot is stale.");
+    beforePreamble.releaseLock();
+    afterPreamble.releaseLock();
+
+    await setBootstrapState("complete");
+    const replacementBeforePreamble = await report.exportCsv();
+    const replacementAfterPreamble = await report.exportCsv();
+    await replacementBeforePreamble.cancel("prove the first stale stream released its slot");
+    await replacementAfterPreamble.cancel("prove the second stale stream released its slot");
+    await setBootstrapState("pending");
+    await expect(report.getOverview()).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(report.listRows({limit: 10})).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(report.exportCsv()).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart during pending report bootstrap");
+    })).rejects.toThrow("restart during pending report bootstrap");
+
+    await expect(usage.openReport({registeredUserRefs: [principal]}))
+      .rejects.toThrow("Usage Projection bootstrap is incomplete.");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    for (let turn = 0; turn < 20 && !await restarted.ensureBootstrap(); turn += 1) {
+      await runDurableObjectAlarm(restarted);
+    }
+    expect(await restarted.ensureBootstrap()).toBe(true);
+    using current = await usage.openReport({registeredUserRefs: [principal]});
+    expect((await current.getOverview()).metrics.meteredUseCount).toBe(0n);
+    expect((await current.listRows({limit: 10})).rows).toEqual([]);
+    expect(await new Response(await current.exportCsv()).text()).toContain(
+      "schema_version,admin-usage-v1\r\n",
+    );
+  });
+
+  it("revokes an already-minted report when its administrator deletion starts", async () => {
+    const identity = `issue-63-report-admin-${crypto.randomUUID()}@example.test`;
+    const user = testEnv.TEST_USER.getByName(identity);
+    const session = await user.createAccount(
+      identity, "Issue 63 report administrator", new Uint8Array([6, 3]),
+    );
+    if (session === null) throw new Error("Expected a fresh report administrator.");
+    await user.activateUsageAccount();
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      identity,
+      undefined,
+      testEnv.TEST_USAGE_PROJECTION,
+    );
+    using report = await usage.openReport({});
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    await user.beginUsageUserDeletion(
+      `issue-63-delete-${crypto.randomUUID()}`,
+      "Revoke an already-minted Usage report",
+      "other-admin@example.test",
+    );
+
+    await expect(report.getOverview()).rejects.toThrow("capability has been revoked");
+    await expect(report.listRows({limit: 1})).rejects.toThrow("capability has been revoked");
+    await expect(reader.read()).rejects.toThrow("capability has been revoked");
+    reader.releaseLock();
+  });
+
+  it("keeps same-time keyset pages stable, rejects tampering, and fails closed on generation change",
+      async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const facts = Array.from({length: 5}, (_, index) => detail(principal, {
+      projectionFactId: crypto.randomUUID(),
+      safeRecordRef: crypto.randomUUID(),
+      sourceSequence: BigInt(index + 1),
+      occurredAt: "2026-08-24T13:30:00.000Z",
+    }));
+    await projection.ingest([...facts, facts[0]!]);
+    using report = await adminUsage().openReport({registeredUserRefs: [principal]});
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await report.listRows({...(cursor ? {cursor} : {}), limit: 2});
+      collected.push(...page.rows.map(row => row.rowId));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    expect(collected).toEqual(facts.map(fact => fact.projectionFactId).toSorted().toReversed());
+    expect(new Set(collected).size).toBe(facts.length);
+
+    const first = await report.listRows({limit: 1});
+    const tampered = `${first.nextCursor!.startsWith("A") ? "B" : "A"}${first.nextCursor!.slice(1)}`;
+    await expect(report.listRows({cursor: tampered, limit: 1}))
+      .rejects.toThrow("Usage report cursor is invalid.");
+    await expect(report.listRows({cursor: "x".repeat(1_025), limit: 1}))
+      .rejects.toThrow("Usage report cursor is invalid.");
+    await expect(report.listRows({limit: 0})).rejects.toThrow("Usage report page limit is invalid.");
+    await expect(report.listRows({limit: 201}))
+      .rejects.toThrow("Usage report page limit is invalid.");
+
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET active_generation = '2' WHERE singleton = 1
+      `);
+    });
+    try {
+      await expect(report.listRows({limit: 1})).rejects.toThrow("Usage report snapshot is stale.");
+    } finally {
+      await runInDurableObject(projection, (_instance, state) => {
+        state.storage.sql.exec(`
+          UPDATE usage_projection_meta SET active_generation = '1' WHERE singleton = 1
+        `);
+      });
+    }
+  });
+
+  it("uses a dimension-and-time index without a temporary keyset sort", async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    await projection.ingest([aggregate(principal, {deploymentModelId: "query-plan-model"})]);
+    const coordinates = await projection.getReportCoordinates();
+    const query = freezeUsageReportQuery({
+      startDateInclusive: "2026-08-24",
+      endDateExclusive: "2026-08-25",
+      deploymentModelIds: ["query-plan-model"],
+    }, "UTC", 1n, coordinates.projectionGeneration, coordinates.ingestionWatermark);
+    const predicate = buildUsageReportPredicate(query, "all");
+    const plan = await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT facts.fact_id FROM usage_projection_facts AS facts${
+          predicate.indexName === null ? "" : ` INDEXED BY ${predicate.indexName}`
+        }
+        WHERE ${predicate.sql}
+        ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+        LIMIT 200
+      `, ...predicate.params).toArray().map(row => row.detail).join("\n"));
+    expect(plan).toContain("usage_projection_report_model_time");
+    expect(plan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+  });
+
+  it("uses the canonical outcome-and-time index for matching and empty date queries", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      "issue-63-admin@example.test",
+      undefined,
+      {getByName: () => testEnv.TEST_USAGE_PROJECTION.getByName(projectionName)} as
+        DurableObjectNamespace<UsageProjection>,
+    );
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete' WHERE singleton = 1
+      `);
+    });
+    const principal = crypto.randomUUID();
+    expect(await projection.ingest([
+      aggregate(principal, {
+        sourceSequence: 1n,
+        kind: "gatekeeper",
+        outcome: "usage-unknown-held",
+        meteredKind: "attempt",
+        deploymentModelId: null,
+        vendorId: "outcome-query-plan-vendor",
+        billingMethodKey: "outcome.query-plan.v1",
+        externalAccountId: "outcome-query-plan-account",
+        meteredUseCount: 0n,
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        chargedUsageCreditSubunits: 0n,
+        unknownOperations: 1n,
+        activeUserContribution: 0n,
+      }),
+      aggregate(principal, {
+        sourceSequence: 2n,
+        outcome: "usage-unknown-released",
+        meteredKind: "attempt",
+        meteredUseCount: 0n,
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        chargedUsageCreditSubunits: 0n,
+        unknownOperations: 1n,
+        activeUserContribution: 0n,
+      }),
+    ])).toMatchObject({rejected: []});
+    const coordinates = await projection.getReportCoordinates();
+    for (const outcome of [
+      "usage-unknown-held", "usage-unknown-released", "reconciliation-required",
+    ] as const) {
+      const filter = {
+        startDateInclusive: "2026-08-24",
+        endDateExclusive: "2026-08-25",
+        outcomes: [outcome],
+      } as const;
+      const query = freezeUsageReportQuery(
+        filter, "UTC", 1n, coordinates.projectionGeneration, coordinates.ingestionWatermark,
+      );
+      const predicate = buildUsageReportPredicate(query, "all");
+      const plan = await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{detail: string}>(`
+          EXPLAIN QUERY PLAN
+          SELECT facts.fact_id FROM usage_projection_facts AS facts${
+            predicate.indexName === null ? "" : ` INDEXED BY ${predicate.indexName}`
+          }
+          WHERE ${predicate.sql}
+          ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+          LIMIT 200
+        `, ...predicate.params).toArray().map(row => row.detail).join("\n"));
+      expect(plan).toContain("usage_projection_report_outcome_time_v4");
+      expect(plan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+
+      using report = await usage.openReport(filter);
+      const overview = await report.getOverview();
+      const rows = (await report.listRows({limit: 10})).rows;
+      const csv = await new Response(await report.exportCsv()).text();
+      const csvRowIds = csv.split("\r\n")
+        .filter(line => line.startsWith("aggregate,"))
+        .map(line => line.split(",")[1]);
+      const expectedCount = outcome === "reconciliation-required" ? 0 : 1;
+      expect(rows).toHaveLength(expectedCount);
+      expect(overview.metrics.unknownOperations).toBe(BigInt(expectedCount));
+      expect(csvRowIds).toEqual(rows.map(row => row.rowId));
+    }
+
+    const legacyFilter = {
+      startDateInclusive: "2026-08-24",
+      endDateExclusive: "2026-08-25",
+      outcomes: ["usage-unknown"],
+    } as const;
+    const legacyQuery = freezeUsageReportQuery(
+      legacyFilter, "UTC", 1n, coordinates.projectionGeneration,
+      coordinates.ingestionWatermark,
+    );
+    const legacyPredicate = buildUsageReportPredicate(legacyQuery, "all");
+    const legacyPlan = await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT facts.fact_id FROM usage_projection_facts AS facts${
+          legacyPredicate.indexName === null
+            ? "" : ` INDEXED BY ${legacyPredicate.indexName}`
+        }
+        WHERE ${legacyPredicate.sql}
+        ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+        LIMIT 200
+      `, ...legacyPredicate.params).toArray().map(row => row.detail).join("\n"));
+    expect(legacyPlan).toContain("usage_projection_report_unknown_time_v4");
+    expect(legacyPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+
+    using legacyReport = await usage.openReport(legacyFilter);
+    const legacyOverview = await legacyReport.getOverview();
+    const legacyRows = (await legacyReport.listRows({limit: 10})).rows;
+    const legacyCsv = await new Response(await legacyReport.exportCsv()).text();
+    const legacyCsvRowIds = legacyCsv.split("\r\n")
+      .filter(line => line.startsWith("aggregate,"))
+      .map(line => line.split(",")[1]);
+    expect(legacyRows.map(row => row.outcome).toSorted()).toEqual([
+      "usage-unknown-held", "usage-unknown-released",
+    ]);
+    expect(legacyOverview.metrics.unknownOperations).toBe(2n);
+    expect(legacyCsvRowIds.toSorted()).toEqual(legacyRows.map(row => row.rowId).toSorted());
+  });
+
+  it("keeps a one-million-row CSV lazy and bounded by one 64-row page", async () => {
+    const totalRows = 1_000_000;
+    let calls = 0;
+    let servedRows = 0;
+    let maxRows = 0;
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows(_query: unknown, cursor: string | undefined, limit: number) {
+        calls += 1;
+        const start = cursor === undefined ? 0 : Number(cursor);
+        const count = Math.min(limit, totalRows - start);
+        maxRows = Math.max(maxRows, count);
+        servedRows += count;
+        return {
+          rows: Array.from({length: count}, (_, index) => ({
+            ...CSV_ROW,
+            rowId: `row-${start + index}`,
+          })),
+          nextCursor: start + count < totalRows ? String(start + count) : null,
+        };
+      },
+    };
+    using report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, BigInt(totalRows),
+    ));
+    const reader = (await report.exportCsv()).getReader();
+    let maxChunkBytes = 0;
+    let totalBytes = 0n;
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      maxChunkBytes = Math.max(maxChunkBytes, next.value.byteLength);
+      totalBytes += BigInt(next.value.byteLength);
+    }
+    reader.releaseLock();
+
+    expect(servedRows).toBe(totalRows);
+    expect(calls).toBe(Math.ceil(totalRows / ADMIN_USAGE_CSV_PAGE_SIZE));
+    expect(maxRows).toBe(ADMIN_USAGE_CSV_PAGE_SIZE);
+    expect(maxChunkBytes).toBeLessThanOrEqual(ADMIN_USAGE_CSV_MAX_CHUNK_BYTES);
+    expect(totalBytes).toBeGreaterThan(0n);
+  }, 60_000);
+
+  it("does not prefetch row pages past stream backpressure and stops after cancel", async () => {
+    let calls = 0;
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() {
+        calls += 1;
+        return {rows: [CSV_ROW], nextCursor: "next"};
+      },
+    };
+    using report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1_000n,
+    ));
+    const stream = await report.exportCsv();
+    await Promise.resolve();
+    expect(calls).toBe(0);
+
+    const reader = stream.getReader();
+    expect((await reader.read()).done).toBe(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toBeLessThanOrEqual(1);
+    await reader.cancel("test backpressure cancellation");
+    const callsAtCancel = calls;
+    await Promise.resolve();
+    expect(calls).toBe(callsAtCancel);
+
+    const replacement = await report.exportCsv();
+    await replacement.cancel("prove the operation slot was released");
+  });
+
+  it("explicitly cancels an active Cap'n Web CSV source and releases its operation slot",
+      async () => {
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() {
+        return {rows: [CSV_ROW], nextCursor: "next"};
+      },
+    };
+    using report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1_000n,
+    ));
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    await (report as unknown as {cancelCsvExports(): Promise<void>}).cancelCsvExports();
+
+    await expect(reader.read()).rejects.toThrow("CSV export was cancelled");
+    reader.releaseLock();
+    const replacement = await report.exportCsv();
+    await replacement.cancel("prove explicit cancellation released the slot");
+  });
+
+  it("registers CSV cancellation before its first asynchronous authority check", async () => {
+    let authorityChecks = 0;
+    let firstCheckReached!: () => void;
+    const reachedFirstCheck = new Promise<void>(resolve => { firstCheckReached = resolve });
+    let releaseFirstCheck!: () => void;
+    const firstCheckBlocked = new Promise<void>(resolve => { releaseFirstCheck = resolve });
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
+    };
+    using report = new AdminUsageReportImpl(
+      projection,
+      freezeUsageReportQuery({}, "UTC", 1n, 1n, 1n),
+      () => undefined,
+      async () => {
+        authorityChecks += 1;
+        if (authorityChecks === 1) {
+          firstCheckReached();
+          await firstCheckBlocked;
+        }
+      },
+    );
+    const exporting = report.exportCsv();
+    await reachedFirstCheck;
+
+    await report.cancelCsvExports();
+    releaseFirstCheck();
+
+    await expect(exporting).rejects.toThrow("CSV export was cancelled");
+    const replacement = await report.exportCsv();
+    await replacement.cancel("prove early cancellation released the slot");
+  });
+
+  it("terminates an active CSV reader when its report capability is disposed", async () => {
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() {
+        return {rows: [CSV_ROW], nextCursor: "next"};
+      },
+    };
+    const report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1n,
+    ));
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+
+    report[Symbol.dispose]();
+
+    await expect(reader.read()).rejects.toThrow("Usage report is closed.");
+    reader.releaseLock();
+  });
+
+  it("does not return a CSV stream when its report is disposed during health lookup", async () => {
+    let releaseHealth!: () => void;
+    const healthBlocked = new Promise<void>(resolve => { releaseHealth = resolve });
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() {
+        await healthBlocked;
+        return HEALTHY_PROJECTION;
+      },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
+    };
+    const report = new AdminUsageReportImpl(projection, freezeUsageReportQuery(
+      {}, "UTC", 1n, 1n, 1n,
+    ));
+    const exporting = report.exportCsv();
+    await Promise.resolve();
+
+    report[Symbol.dispose]();
+    releaseHealth();
+
+    await expect(exporting).rejects.toThrow("Usage report is closed.");
+  });
+
+  it("terminates a final CSV page disposed during its post-query authority check", async () => {
+    let authorityChecks = 0;
+    let finalCheckReached!: () => void;
+    const reachedFinalCheck = new Promise<void>(resolve => { finalCheckReached = resolve });
+    let releaseFinalCheck!: () => void;
+    const finalCheckBlocked = new Promise<void>(resolve => { releaseFinalCheck = resolve });
+    const projection = {
+      async assertReportSnapshot() {},
+      async readHealth() { return HEALTHY_PROJECTION },
+      async readReportMetrics() { return EMPTY_METRICS },
+      async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
+    };
+    const report = new AdminUsageReportImpl(
+      projection,
+      freezeUsageReportQuery({}, "UTC", 1n, 1n, 1n),
+      () => undefined,
+      async () => {
+        authorityChecks += 1;
+        if (authorityChecks === 6) {
+          finalCheckReached();
+          await finalCheckBlocked;
+        }
+      },
+    );
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+    const finalRead = reader.read();
+    await reachedFinalCheck;
+
+    report[Symbol.dispose]();
+    releaseFinalCheck();
+
+    await expect(finalRead).rejects.toThrow("Usage report is closed.");
+    reader.releaseLock();
+  });
+
+  it("fails direct and promise-pipelined report openings closed during bootstrap", async () => {
+    const projection = {async ensureBootstrap() { return false }};
+    const isolatedProjection = {
+      getByName: () => projection,
+    } as DurableObjectNamespace<UsageProjection>;
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      `issue-63-bootstrap-admin-${crypto.randomUUID()}@example.test`,
+      undefined,
+      isolatedProjection,
+    );
+
+    await expect(usage.openReport({}))
+      .rejects.toThrow("Usage Projection bootstrap is incomplete.");
+
+    using rpcUsage = new RpcStub(usage);
+    const opening = rpcUsage.openReport({});
+    const [openingResult, pipelinedResult] = await Promise.allSettled([
+      opening,
+      opening.getOverview(),
+    ]);
+    expect(openingResult).toMatchObject({
+      status: "rejected",
+      reason: {message: "Usage Projection bootstrap is incomplete."},
+    });
+    expect(pipelinedResult).toMatchObject({
+      status: "rejected",
+      reason: {message: "Usage Projection bootstrap is incomplete."},
+    });
+  });
+
+  it("bounds pipelined report capabilities and releases a slot on disposal", async () => {
+    const usage = adminUsage();
+    const reports = await Promise.all(Array.from(
+      {length: ADMIN_USAGE_MAX_OPEN_REPORTS},
+      () => usage.openReport({}),
+    ));
+    try {
+      await expect(usage.openReport({})).rejects.toThrow("Too many Usage reports are open.");
+      reports[0]![Symbol.dispose]();
+      using replacement = await usage.openReport({});
+      const replacementOverview = await replacement.getOverview();
+      expect(replacementOverview.snapshot.projectionGeneration).toBe(1n);
+      expect(replacementOverview.snapshot.ingestionWatermark).toBeGreaterThanOrEqual(0n);
+      const replacementPage = await replacement.listRows({limit: 1});
+      expect(replacementPage.rows.length).toBeLessThanOrEqual(1);
+      expect(replacementPage.nextCursor === null ||
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+          replacementPage.nextCursor,
+        )).toBe(true);
+    } finally {
+      for (const report of reports.slice(1)) report[Symbol.dispose]();
+    }
+  });
+});

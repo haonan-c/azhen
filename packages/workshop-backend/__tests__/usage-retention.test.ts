@@ -195,6 +195,13 @@ describe("24 UTC calendar month Usage detail retention", () => {
         kind: "gatekeeper",
         operationId,
       });
+      expect(account.getAdminUsageRecordDetail(legacyDetail.projectionFactId)).toMatchObject({
+        record: {
+          id: legacyDetail.projectionFactId,
+          kind: "gatekeeper",
+          externalAccountId: "context-account-1",
+        },
+      });
       expect(account.getSnapshot().usageSummaryFacts).toHaveLength(1);
       acknowledgeAllProjectionFacts(account);
 
@@ -261,7 +268,7 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.completeModelUsage("model-inference:held-reconciliation-required", "invalid-report");
       const releasedRefs = account.getSnapshot().projectionFacts
         .filter(fact => fact.rowKind === "detail" && fact.kind === "model" &&
-          fact.outcome === "usage-unknown")
+          fact.outcome === "usage-unknown-released")
         .toSorted((left, right) => left.occurredAt.localeCompare(right.occurredAt));
       expect(releasedRefs).toHaveLength(2);
       acknowledgeAllProjectionFacts(account);
@@ -344,30 +351,106 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.beginGatekeeperUsage(billingOperationId, ATTRIBUTION, PRICED);
       account.markGatekeeperUsageStarted(billingOperationId);
       account.completeGatekeeperUsage(billingOperationId, "unknown");
+      const unknown = account.getSnapshot().projectionFacts.find(
+        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown-held",
+      );
+      if (!unknown || unknown.rowKind !== "detail") {
+        throw new Error("Expected an unknown Usage detail reference.");
+      }
+      expect(() => account.assertAdminUnknownUsageDetailReference(
+        unknown.safeRecordRef,
+        billingOperationId,
+      )).not.toThrow();
+      expect(() => account.assertAdminUnknownUsageDetailReference(
+        unknown.safeRecordRef,
+        "gatekeeper-operation:another-action",
+      )).toThrow("Usage Record does not match the Action");
+
+      const adminReason = "Confirm the old provider operation";
+      const adminActor = "reconciliation-admin@example.test";
+      const prepared = account.prepareAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      );
+      expect(prepared).toMatchObject({
+        safeRecordRef: unknown.safeRecordRef,
+        operationId: reconciliationOperationId,
+        decision: "settle",
+        result: null,
+        target: {
+          workspaceId: ATTRIBUTION.workspaceId,
+          actionId: null,
+          billingOperationId,
+        },
+      });
 
       vi.setSystemTime(new Date("2026-08-23T12:00:00.000Z"));
-      account.reconcileUnknownGatekeeperUsage(
+      const financial = account.reconcileUnknownGatekeeperUsage(
         billingOperationId,
         reconciliationOperationId,
         "settle",
-        "Confirm the old provider operation",
-        "reconciliation-admin@example.test",
+        adminReason,
+        adminActor,
+      );
+      const safeAdminResult = account.completeAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        {
+          operationId: reconciliationOperationId,
+          decision: "settle",
+          previousState: "unknown",
+          newState: "accepted",
+          ledgerEntryId: `${unknown.safeRecordRef}:usage-charge`,
+          actorUserId: adminActor,
+          reason: adminReason,
+          createdAt: financial.createdAt,
+        },
       );
       const details = account.getSnapshot().projectionFacts.filter(
         fact => fact.rowKind === "detail",
       );
-      const original = details.find(fact => fact.outcome === "usage-unknown");
+      const original = details.find(fact => fact.outcome === "usage-unknown-held");
       const reconciliation = details.find(fact => fact.outcome === "reconciled-settled");
       if (!original || original.rowKind !== "detail" ||
           !reconciliation || reconciliation.rowKind !== "detail") {
         throw new Error("Expected original and reconciliation detail references.");
       }
+      expect(reconciliation.safeRecordRef).not.toBe(original.safeRecordRef);
       acknowledgeAllProjectionFacts(account);
       const lifetimeSummaries = account.getSnapshot().usageSummaryFacts;
 
       vi.setSystemTime(new Date("2026-08-24T12:00:00.001Z"));
       expect(runRetentionToCompletion(account).deletedDetailCount).toBe(1n);
       expect(account.resolveUsageDetailReference(original.safeRecordRef)).toBeNull();
+      expect(() => account.assertPreparedAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        ATTRIBUTION.workspaceId,
+        17,
+        billingOperationId,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      )).not.toThrow();
+      expect(() => account.assertPreparedAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        "c".repeat(64),
+        17,
+        billingOperationId,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      )).toThrow("does not match its preparation");
+      expect(account.prepareAdminUnknownUsageReconciliation(
+        unknown.safeRecordRef,
+        reconciliationOperationId,
+        "settle",
+        adminReason,
+        adminActor,
+      ).result).toEqual(safeAdminResult);
       const authority = account.getGatekeeperReconciliationAuthority(
         reconciliation.safeRecordRef,
       );
@@ -389,6 +472,35 @@ describe("24 UTC calendar month Usage detail retention", () => {
         ledgerEntryId: expect.any(String),
         reconciledAtUtc: "2026-08-23T12:00:00.000Z",
       });
+      const reconciliationDetail = account.getAdminUsageRecordDetail(
+        reconciliation.safeRecordRef,
+      );
+      expect(reconciliationDetail).toMatchObject({
+        record: {
+          id: reconciliation.safeRecordRef,
+          kind: "gatekeeper-reconciliation",
+          source: "agent",
+          meteredKind: "gatekeeper",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "context-account-1",
+          outcome: "reconciled-settled",
+          chargeSubunits: 17n,
+          createdAt: "2026-08-23T12:00:00.000Z",
+        },
+        reservation: null,
+        ledgerEntries: [{kind: "usage-charge", deltaSubunits: -17n}],
+        reconciliation: {
+          decision: "settle",
+          actorUserId: "reconciliation-admin@example.test",
+          reason: "Confirm the old provider operation",
+          createdAt: "2026-08-23T12:00:00.000Z",
+        },
+      });
+      const encodedDetail = JSON.stringify(reconciliationDetail, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value);
+      expect(encodedDetail).not.toContain(billingOperationId);
+      expect(encodedDetail).not.toContain(reconciliationOperationId);
       const encoded = JSON.stringify(authority, (_key, value) =>
         typeof value === "bigint" ? value.toString() : value);
       expect(encoded).not.toContain("2024-08-24T12:00:00.000Z");
@@ -439,6 +551,12 @@ describe("24 UTC calendar month Usage detail retention", () => {
       expect(storage.kv.get(
         `usageAccount:gatekeeperReconciliationReplayTombstone:${billingOperationId}`,
       )).toBe(true);
+      expect(storage.kv.get(
+        `usageAccount:adminUnknownReconciliation:v1:${unknown.safeRecordRef}`,
+      )).toBeUndefined();
+      expect(storage.kv.get(
+        `usageAccount:adminUnknownReconciliationByOperation:v1:${reconciliationOperationId}`,
+      )).toBeUndefined();
       const retainedKeys = Array.from(storage.kv.list(), ([key]) => key);
       expect(retainedKeys.some(key => key.includes(reconciliationOperationId))).toBe(false);
 
@@ -469,12 +587,25 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.markGatekeeperUsageStarted(operationId);
       const record = account.completeGatekeeperUsage(operationId, "executed");
       if (record.ledgerEntryId === null) throw new Error("Expected a priced Usage Charge.");
-      account.adminReverse(
+      const detailFact = account.getSnapshot().projectionFacts.find(
+        fact => fact.rowKind === "detail",
+      );
+      if (!detailFact || detailFact.rowKind !== "detail") {
+        throw new Error("Expected a safe Usage detail reference.");
+      }
+      const publicLedgerRef = account.getAdminUsageRecordDetail(
+        detailFact.safeRecordRef,
+      ).ledgerEntries.find(entry => entry.kind === "usage-charge")?.id;
+      if (publicLedgerRef === undefined) throw new Error("Expected a public Ledger reference.");
+      const reversal = account.adminReverseByReference(
         "retention-reversal",
-        record.ledgerEntryId,
+        publicLedgerRef,
         "verify retention keeps the reversal link",
         "admin-user",
       );
+      expect(reversal.originalLedgerEntryId).toBe(publicLedgerRef);
+      expect(JSON.stringify(reversal, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value)).not.toContain(record.ledgerEntryId);
       acknowledgeAllProjectionFacts(account);
       const before = account.getSnapshot();
 
@@ -486,6 +617,61 @@ describe("24 UTC calendar month Usage detail retention", () => {
       expect(after.ledgerBalanceSubunits).toBe(before.ledgerBalanceSubunits);
       expect(after.ledgerEntries).toEqual(before.ledgerEntries);
       expect(after.adminOperations).toEqual(before.adminOperations);
+    });
+  });
+
+  it("rejects private content before User detail, Ledger, and outbox persistence", async () => {
+    await withAccount((account, storage) => {
+      const sentinels = [
+        "ISSUE63_PRIVATE_PROMPT_SENTINEL",
+        "ISSUE63_PRIVATE_OUTPUT_SENTINEL",
+        "ISSUE63_PRIVATE_ARGS_SENTINEL",
+        "ISSUE63_PRIVATE_HEADER_SENTINEL",
+        "ISSUE63_PRIVATE_TOKEN_SENTINEL",
+        "ISSUE63_PRIVATE_BODY_SENTINEL",
+        "ISSUE63_PRIVATE_ERROR_SENTINEL",
+      ];
+      let rejected: Error | undefined;
+      try {
+        account.beginGatekeeperUsage(
+          "gatekeeper-operation:private-content-rejected",
+          {
+            ...ATTRIBUTION,
+            prompt: sentinels[0],
+            output: sentinels[1],
+            args: sentinels[2],
+            headers: sentinels[3],
+            token: sentinels[4],
+            body: sentinels[5],
+            error: sentinels[6],
+          } as never,
+          PRICED,
+        );
+      } catch (caught) {
+        rejected = caught instanceof Error ? caught : new Error(String(caught));
+      }
+      expect(rejected?.message).toBe("Gatekeeper Usage attribution is invalid.");
+      const rejectedText = JSON.stringify({message: rejected?.message, stack: rejected?.stack});
+      for (const sentinel of sentinels) expect(rejectedText).not.toContain(sentinel);
+
+      const operationId = "gatekeeper-operation:content-free-authority";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, PRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const snapshot = account.getSnapshot();
+      const detailFact = snapshot.projectionFacts.find(fact => fact.rowKind === "detail");
+      if (!detailFact || detailFact.rowKind !== "detail") {
+        throw new Error("Expected a content-free Usage detail fact.");
+      }
+      const reachable = {
+        detail: account.getAdminUsageRecordDetail(detailFact.safeRecordRef),
+        ledger: snapshot.ledgerEntries,
+        outbox: account.listPendingProjectionOutbox(64),
+        storage: Array.from(storage.kv.list()),
+      };
+      const serialized = JSON.stringify(reachable, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value);
+      for (const sentinel of sentinels) expect(serialized).not.toContain(sentinel);
     });
   });
 

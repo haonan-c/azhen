@@ -25,7 +25,9 @@ import {
   type UnpricedUsageDecision,
 } from "./usage-account.js";
 import type {
+  AdminUnknownUsageReconciliationResult,
   AdminUsageBalanceState,
+  AdminUsageRecordDetail,
   AdminUsageOperationResult,
   ChargeSnapshot,
   GatekeeperChargeSnapshot,
@@ -934,6 +936,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.#assertOwnUsageSurfaceActive();
   }
 
+  #assertUsageAuthorityReady(): void {
+    if (!this.storage.created.get() || !this.usageAccount.isInitialized()) {
+      throw new Error("User Usage authority does not exist.");
+    }
+  }
+
   #assertOwnUsageSurfaceActive(): void {
     if (this.usageAccount.getUserDeletionState() !== null) {
       throw new Error("This User has been deleted.");
@@ -991,6 +999,74 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     } finally {
       this.#scheduleProjectionDelivery(preparationRevision);
     }
+  }
+
+  /** Read one authoritative Usage graph through this User's bounded random record index. */
+  async getAdminUsageRecordDetail(safeRecordRef: string): Promise<AdminUsageRecordDetail> {
+    await this.activateUsageAccount();
+    return this.usageAccount.getAdminUsageRecordDetail(safeRecordRef);
+  }
+
+  /** Resolve one unknown detail to its server-private Workspace Action locator. */
+  async getAdminUnknownUsageActionTarget(safeRecordRef: string): Promise<{
+    workspaceId: string;
+    actionId: number | null;
+    billingOperationId: string;
+  }> {
+    await this.activateUsageAccount();
+    return this.usageAccount.getAdminUnknownUsageActionTarget(safeRecordRef);
+  }
+
+  /** Freeze or replay one detail-scoped unknown decision from retained User authority. */
+  async prepareAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string) {
+    this.#assertUsageAuthorityReady();
+    return this.usageAccount.prepareAdminUnknownUsageReconciliation(
+      safeRecordRef,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
+  }
+
+  /** Verify one Action call against its retained detail-scoped administrator preparation. */
+  async assertPreparedAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      workspaceId: string,
+      actionId: number,
+      billingOperationId: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): Promise<void> {
+    this.#assertUsageAuthorityReady();
+    this.usageAccount.assertPreparedAdminUnknownUsageReconciliation(
+      safeRecordRef,
+      workspaceId,
+      actionId,
+      billingOperationId,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
+  }
+
+  /** Commit one safe response alias for idempotent unknown-decision replay. */
+  async completeAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      result: AdminUnknownUsageReconciliationResult):
+      Promise<AdminUnknownUsageReconciliationResult> {
+    this.#assertUsageAuthorityReady();
+    return this.usageAccount.completeAdminUnknownUsageReconciliation(
+      safeRecordRef,
+      result,
+    );
   }
 
   /** Reserve this User's Usage Credit for a trusted internal metering operation. */
@@ -1157,7 +1233,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       decision: "settle" | "release",
       reason: string,
       actorUserId: string) {
-    await this.activateUsageAccount();
+    this.#assertUsageAuthorityReady();
     const preparationRevision = await this.#prepareProjectionDeliveryAlarm();
     try {
       return this.usageAccount.reconcileUnknownGatekeeperUsage(
@@ -1217,18 +1293,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     );
   }
 
-  /** Apply one registered-User exact Credit Reversal without calling AdminSettings. */
+  /** Apply one registered-User exact Credit Reversal through a public Ledger reference. */
   adminReverseUsageCreditEntry(
       operationId: string,
       originalLedgerEntryId: string,
       reason: string,
       actorUserId: string): AdminUsageOperationResult {
-    return this.usageAccount.adminReverse(
-      operationId,
-      originalLedgerEntryId,
-      reason,
-      actorUserId,
-    );
+    return originalLedgerEntryId.endsWith(":usage-charge")
+      ? this.usageAccount.adminReverseByReference(
+        operationId,
+        originalLedgerEntryId,
+        reason,
+        actorUserId,
+      )
+      : this.usageAccount.adminReverse(
+        operationId,
+        originalLedgerEntryId,
+        reason,
+        actorUserId,
+      );
   }
 
   /** Like whoami(), but returns null if the account was never initialized. */

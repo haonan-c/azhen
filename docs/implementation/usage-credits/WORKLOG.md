@@ -1,6 +1,6 @@
 # Usage Credits delivery work log
 
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 ## Objective
 
@@ -726,3 +726,336 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - All Issue #65 branch gates are complete. Only main-agent `--no-ff` integration, integration-tree
   gates, push, evidence comment, and Issue closure remain. No pull request, worktree deletion, or
   production mutation occurred in this branch-gate step.
+
+### 2026-08-25 — Issue #63 pre-#65 static checkpoint
+
+- Entered the `implement`, `fable-mode`, and `tdd` gates in the isolated Issue #63 worktree based on
+  the closed Issue #62 checkpoint `98e1963`. Added one frozen `AdminUsageReport` capability over a
+  normalized allowlisted filter, strong report-timezone version, Projection generation, and applied
+  watermark. Overview, keyset rows, and CSV share the same parameterized predicate and immutable
+  snapshot.
+- Added content-free SQLite report indexes and stable keyset pagination, a capability-local bounded
+  opaque cursor map, authoritative User DO drilldown through the Registry, and concurrency limits at
+  both `AdminUsageApi` and report capability boundaries. A later Summary revision is now excluded
+  from an older frozen watermark, including when it became the Projection's current revision.
+- Added a pull-driven Cap'n Web CSV stream with 64-row pages, one queued chunk, a 256 KiB bound,
+  RFC 4180 escaping, spreadsheet-formula mitigation, cancel propagation, and deterministic snapshot
+  metadata. Chromium writes directly through the File System Access API; the fallback cancels above
+  16 MiB instead of buffering without a bound.
+- Added the administrator report browser, all specified stable filters, keyset navigation,
+  authoritative detail, English and Chinese messages, export progress/cancel, stale-response guards,
+  and complete late/replace/unmount stub disposal. The forward-compatible Summary contract now
+  exposes `model | gatekeeper | attempt` and exact `meteredUseCount`; detail remains Model or
+  Gatekeeper only.
+- The current static checkpoint passed shared, Backend, Frontend, and integration-test builds. The
+  focused report/overview/file-transfer Frontend set passed 19/19. The latest frozen-watermark test,
+  final Summary/locator compatibility, focused workerd suites, and real Cap'n Web Harness remain
+  intentionally pending until Issue #65 is integrated and this branch is rebased. The evidence and
+  pending gates are recorded in `ISSUE-63-VERIFICATION.md`.
+- No push, merge, pull request, Issue closure, deployment, upload, promotion, production
+  configuration change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #63 post-#65 rebase candidate
+
+- Rebased the isolated candidate onto `ddfb621eee9d12296b7d646f23eb30d8f30bb323`, which includes
+  the closed Issues #62, #64, and #65. The rebase preserved the frozen Summary contract: detail and
+  aggregate remain distinct; attempt-only aggregate rows use explicit `meteredKind`; exact Metered
+  Use and outcome counters remain `bigint`; Summary totals do not double-count detail.
+- RED tests exposed four integrated seams. GREEN changes keep the same Summary revision canonical
+  at its earliest applied watermark, revoke an already-minted report and active CSV stream when its
+  administrator deletion starts, retain reconciliation-only authority after the older raw Usage
+  Record expires, and fail a frozen report closed when retention physically removes its detail.
+- User-authority drill-down now validates new unknown and reconciliation facts through their
+  different random safe references. Legacy #62 facts may use `projectionFactId` only as a User DO
+  validated alias. Public reconciliation and Ledger responses do not disclose raw billing or
+  reconciliation operation identifiers.
+- Focused workerd passed Usage report 17/17 and Summary/retention 24/24. The production Harness
+  Cap'n Web stream/cancel/privacy tracer passed 1/1. Frontend focused tests passed 20/20 and the full
+  Frontend package passed 372 tests plus its copy check. The complete Backend package passed 654
+  tests with four expected skips; shared, Backend, Frontend, and integration-test builds passed.
+- Root build passed 52 tasks. Root lint passed with configured non-blocking warnings. The release
+  manifest golden passed 4/4, `types:generate` exited 0 with no Issue #63 generated diff, and
+  `git diff --check` passed. The unrelated UGC Ads workerd metadata drift from type generation was
+  reviewed and precisely restored.
+- The local production-shape release dry-run passed after the normal root-build prerequisite. It
+  used Wrangler 4.119.0 and release ID `issue-63-local`, and produced 19 Workers, 85 modules, 37
+  unique asset blobs, and 28 MiB. It did not upload, promote, deploy, change production
+  configuration, or enable charging.
+- One earlier Backend run saw an automatic cleanup alarm race the test's manual alarm. The exact
+  isolated case passed, the full Projection suite passed 56/56 twice, and the final Backend package
+  passed without changing the production `LIMIT 64` or weakening the assertion. Independent
+  standards/specification review and the coordinated root test remain the final branch gates.
+
+### 2026-08-25 — Issue #63 independent-review correction fixed point
+
+- The first independent Standards/Spec review found no P0 and reported eleven P1/P2 gaps. The
+  correction batch followed `implement` and TDD gates. It added a fail-closed Projection bootstrap
+  gate for direct and promise-pipelined report openings, report-owner termination of active CSV
+  readers, and a real data-page Cap'n Web cancellation tracer.
+- Browser fixes now reject partial Blob downloads after an abort, avoid creating an RPC stream when
+  `createWritable()` fails, dispose a report when either initial request fails, reset stale export
+  state, and clear/dispose old administrator Usage capabilities before a replacement can resolve.
+- The administrator detail panel now renders the complete Charge Snapshot, Model token,
+  Reservation, Ledger, and reconciliation graph. It reuses the existing grant, deduct, reconcile,
+  reverse, and unknown settle/release RPCs. Reasons remain bounded, retry operation IDs are stable,
+  and successful operations refresh authority. Overview and rows now expose provider cost, charged
+  credits, token categories, Unpriced totals, and pricing state in localized English and Chinese.
+- A User-authority safe Ledger alias resolves only inside that registered User before reversal. The
+  existing User RPC remains the boundary, while legacy Initial Grant and administrator-correction
+  Ledger references retain their earlier behavior. The first focused run proved the regression with
+  16/18 tests; the minimal compatibility fix restored 18/18.
+- Seven distinct prompt/output/args/header/token/body/error sentinels are now checked across the
+  Projection database, User detail, Ledger, outbox/storage, UI DOM, and raw CSV. The controlled
+  provider sees all seven values, while every Workshop reporting surface rejects or omits them.
+- Focused gates passed: Usage admin 18/18, report 19/19, retention 25/25, Projection privacy 1/1,
+  Frontend 29/29, full Frontend 381 tests plus copy 1/1, and the real production-Harness tracer 1/1.
+  The Harness produced one unknown plus 65 settled details through production Action authority,
+  read one 64-row SQLite CSV page after metadata, paused, cancelled, and then opened/read two
+  replacement streams. Backend, Frontend, and integration-test builds passed.
+- A follow-up Standards/Spec review is the next fixed-point gate. Complete Backend and root tests are
+  intentionally deferred until that review. No push, merge, pull request, Issue closure, deployment,
+  upload, promotion, production configuration change, charging change, or worktree deletion
+  occurred.
+
+### 2026-08-25 — Issue #63 follow-up review correction candidate
+
+- The follow-up Standards/Spec review found seven remaining P1/P2 seams. RED→GREEN corrections now
+  fail report opening closed until the real Projection bootstrap completes, terminate readers in
+  both asynchronous disposal races, bind unknown settle/release to the selected detail's validated
+  safe reference, cancel a late browser stream, show complete row metrics, and drive the privacy
+  matrix through the controlled provider path.
+- Cap'n Web 0.11 uses a 256 KiB initial flow-control window in addition to the application's zero
+  high-water mark. A remote reader cancellation alone can remain behind that window, so the public
+  report capability now provides explicit bounded export cancellation. Browser abort sends that
+  control call; the server terminates every active export on the report and releases its slots.
+- The real production Harness seeds 1,024 rows through production User Usage authority methods and
+  bounded outbox alarms, in addition to 66 real Action billing details. It never writes directly to
+  Usage storage. Its content-free 200-character external-account dimension contains no User identity
+  or privacy sentinel.
+- Three consecutive Harness runs passed. The evidence run completed in 199.76 seconds with 1,090
+  authority details. Metadata pause measured 7 queries, 448 rows, and 210,424 bytes. After one data
+  read returned flow-control credit, the stable no-read sample measured 15 queries, 960 rows, and
+  449,528 bytes. Explicit cancellation left those counters unchanged; total CSV size was 500,683
+  bytes. Every page remained at most 64 rows and every application chunk at most 256 KiB. Two
+  replacement streams and one replacement report target remained usable.
+- A final pre-commit self-review found that the first safe-reference patch still accepted optional
+  raw Action IDs. A new RED Harness run proved the initial detail-scoped normalizer also reused a
+  two-field exact-object validator against a five-field request and therefore rejected every valid
+  call. The GREEN path now accepts only registered User plus selected safe detail reference for
+  settle/release, resolves the Workspace/Action locator only inside User authority, omits that raw
+  locator from the response, and restricts the older Action RPC to reversals. The browser no longer
+  renders an Action-ID input.
+- The updated production Harness passed in 197.71 seconds. Wrong User, non-unknown detail, and old
+  Action-ID settle paths failed closed; the valid detail-scoped settle replayed idempotently. Its
+  exact flow-control sample remained 7/448/210,424 bytes at metadata pause and 15/960/449,528 bytes
+  at stable data pause, with zero query/byte growth after cancel. The exact maximum page was 64 rows,
+  the exact maximum application chunk was 29,888 bytes, and the full CSV was 500,683 bytes.
+- Current focused evidence is GREEN: Usage report workerd 22/22; Frontend report/file-transfer
+  23/23; and the real Harness 1/1 with 16 unrelated cases skipped. Root tests remain prohibited until
+  the third dual-axis fixed-point review. No push, merge, pull request, Issue closure, deployment,
+  upload, promotion, production configuration change, charging change, or worktree deletion
+  occurred.
+
+### 2026-08-25 — Issue #63 third review correction candidate
+
+- The third Standards/Spec review found nine P1/P2 seams and no P0. The TDD correction registers a
+  CSV terminator before the first await, so cancellation during the initial authority check rejects
+  the pending export and releases its slot.
+- Detail-scoped unknown coordination now freezes one bounded User-authoritative retry record before
+  crossing Durable Objects. It retains only the safe result until the reconciliation row expires.
+  The same operation can replay after the original detail locator is deleted, without resurrecting
+  detail or duplicating Projection facts. Results return `${safeRecordRef}:usage-charge`, never the
+  raw billing-operation Ledger ID.
+- The public raw Action request and runtime accept only `reverse`. Unknown settle/release accepts a
+  registered User and selected safe detail only. Browser retry identity includes both values. Sink,
+  16 MiB, and non-Abort read failures explicitly cancel the server export. Rows now show exact
+  Metered Use, Billable API Operation, pre-execution failure, and unknown-operation counters.
+- A separate Registry authority resolver reaches active or anonymous-tombstoned financial
+  authority only for retained unknown coordination. It does not restore Registry identity, login,
+  own-User balance, reserve, grant, Initial Grant, or new Metered Use surfaces. Focused deletion
+  tests retain those fail-closed boundaries.
+- Pre-upgrade unknown records without a User-side Action ID use a new server-only compatibility
+  index. New Actions write it directly. Migration reads no more than 64 Action rows per request.
+  The production Harness created 65 real Actions, put the target at Action ID 64, and proved that
+  the first identical request stops after the first page while the second reaches the next page.
+- Focused gates are GREEN: Usage report 23/23, Summary/retention/anonymization 25/25, Usage admin
+  18/18, and Frontend report/file transfer 27/27. Shared, Backend, Frontend, and integration-test
+  builds pass. The new legacy/deleted-User Harness passed 1/1 in 15.80 seconds with 17 unrelated
+  tests skipped. Root test remains prohibited until the next independent dual-axis fixed point.
+- No push, merge, pull request, Issue closure, deployment, upload, promotion, production
+  configuration change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #63 fourth review correction candidate
+
+- The fourth review found one cross-Durable-Object replay P1 and two browser P2 gaps. RED coverage
+  reproduced all three before production changes.
+- The exact production Harness sequence now freezes the User preparation, commits User financial
+  authority and the Overseer Action, fails the first administrator-safe result commit, expires the
+  original raw detail through production retention, and retries the same registered User, safe
+  reference, and operation ID. The old path rejected the retry because the locator was gone. The
+  corrected Overseer verifies the retained preparation and frozen target, replays the original
+  result, leaves the balance unchanged, and does not resurrect detail. The exact case passed 1/1 in
+  16.72 seconds with 18 unrelated cases skipped.
+- Chromium export now aborts an opened file writable exactly once when creating the remote CSV
+  stream fails, and it preserves the original failure. Administrator grant, deduction, balance,
+  reversal, and unknown-decision requests now refresh authority on success and failure. Refreshed
+  reconciliation and Credit Reversal terminal state removes the corresponding stale controls.
+- Focused evidence is GREEN: Frontend 29/29, Usage administrator 18/18, report 23/23, retention
+  25/25, and the retained-detail Harness 1/1. Affected Backend, Frontend, and Integration Tests
+  builds passed. Root test remains prohibited pending the next independent fixed-point review.
+- No push, merge, pull request, Issue closure, deployment, upload, promotion, production
+  configuration change, charging change, or worktree deletion occurred.
+
+### 2026-08-25 — Issue #63 final browser authority-refresh correction
+
+- The final P2 was reproduced for both a successful administrator RPC and a conflicting RPC. In
+  each RED case, the following authority refresh rejected while stale settle, release, and reverse
+  controls remained usable; the success case also retained a false success status.
+- `readDetail()` now reports whether current authority was applied. A rejected refresh clears the
+  stale detail and removes every operation control until an explicit retry succeeds. The successful
+  retry renders the reconciliation and Credit Reversal terminal graph without the stale controls.
+- Browser focused tests passed 21/21. The Frontend build, lint check, and `git diff --check` passed.
+  Root test remains prohibited until the final independent read-only review.
+
+### 2026-08-26 — Issue #63 final coordinated branch gate
+
+- The final independent Standards and Spec reviews reported no P0-P2 finding. They confirmed that
+  Cap'n Web promise-pipelined Workspace metadata keeps `newGadget()` single-shot, every committed
+  Action write remains single-shot, pure reads alone use fresh capabilities after transport loss,
+  and all old capabilities are disposed in reverse order.
+- Diagnostic root rounds were not marked PASS. They exposed only test-orchestration seams: Worker
+  Loader readiness, bounded alarm cleanup, legacy tests that bypassed the detail-scoped safe
+  reference, stage-specific WebSocket loss, and two valid Cap'n Web disconnect error spellings.
+  Each correction was written RED→GREEN, remained test-only where production behavior was already
+  correct, and received another independent Standards/Spec review with no P0-P2 finding.
+- The final test-only transport seam accepts only exact peer-close or exact generic connection
+  failure, rejects extra text and non-Error values, and proves the RPC factory is called once. It
+  first fixes the Cap'n Web client transport failure, then awaits the real WebSocket close. Focused
+  passed 2/2, Action billing passed 28/28 in 221.01 seconds, and the complete Integration Tests
+  package passed 128/128 in 846.19 seconds before the final root run.
+- The final clean code fixed point is `8cf2720adcdbe2e705c8070518fc684ed2fef5e2`. Its exclusive root
+  `corepack pnpm test` exited 0 in about 22 minutes 39 seconds. Counts were: root Node 117/117;
+  Browser 1/1; Backend 468/468; Projection 56/56; retention 25/25; administrator Usage 18/18;
+  report 23/23; Metered Model 35/35; Open Gadget 1/1; the four-file RPC group 27 pass and 4 expected
+  skips; Registry 2/2; retention RPC 1/1; DOCX 4/4; production Harness 128/128; Frontend 391/391 plus
+  first-party copy 1/1. Every remaining workspace package exited 0.
+- Root build remained GREEN at 52 tasks. Root lint, the 4/4 release-manifest golden, and
+  `git diff --check` passed. The final corrections changed only Integration Tests and documentation,
+  with no Durable Object, binding, migration, Wrangler, or manifest-shape change. The earlier
+  final-shape `types:generate` and local production-shape dry-run remain valid: Wrangler 4.119.0,
+  19 Workers, 85 modules, 37 asset blobs, and 28 MiB.
+- This evidence is local execution of real production Workshop code paths with controlled test
+  identities and controlled external mocks. It is not production deployment verification. No push,
+  merge, pull request, Issue closure, upload, promotion, deployment, production configuration or
+  charging change, production contact, worktree deletion, or release publication occurred.
+
+### 2026-08-26 — Issue #63 schema v3 and stale-report fixed point
+
+- An independent Spec review found that synchronous `CREATE INDEX` during a Projection constructor
+  upgrade could scan existing report rows. The RED migration case seeded 131 legacy facts. The
+  GREEN schema v3 transaction renames legacy facts and summaries to retired shadow tables, creates
+  indexed canonical tables while they are empty, and leaves the existing bounded authority rebuild
+  to fill the new generation. Retired cleanup remains hard-limited to 64 rows per alarm turn.
+- A second Spec review found that a report minted before the shadow swap could keep the same
+  generation, watermark, and retention coordinates and read empty or partial canonical tables.
+  The Projection now requires current schema v3 and `bootstrap_state = complete` in addition to the
+  frozen coordinates. Overview, keyset rows, CSV stream mint, CSV preamble, and every CSV data page
+  fail closed while bootstrap is pending.
+- The real workerd regression keeps one randomly named Projection across pending state, actor abort,
+  reopen, and bounded authority rebuild. One CSV reader becomes stale before its preamble and a
+  second becomes stale after its preamble. Both terminate, and two concurrent replacement streams
+  then open and cancel, proving both server operation slots were released. Pending reopen fails;
+  openReport, rows, and CSV recover only after bootstrap completes.
+- The first follow-up reviews found that the test mistakenly drove the default Projection after
+  restart and did not cover both CSV phases. The RED-to-GREEN correction bound every step to the
+  same random Projection and added both stream races. Final Standards and Spec reviews at
+  `6bee6dfd3b21f5c49a781f8b375eae75b316e53b` reported no P0-P2 findings.
+- Focused gates passed: Usage report 25/25, Projection 60/60, and retention 28/28. Backend and root
+  builds passed. Root lint passed with configured non-blocking warnings, release manifest passed
+  4/4, and `git diff --check` passed. Two initial Projection runs exposed automatic/manual alarm
+  overlap in tests; exact isolated cases and the deterministic actor-turn cleanup regression then
+  passed without changing production `LIMIT 64`.
+- Final-shape `types:generate` exited 0 and produced no Issue #63 generated change. Its unrelated UGC
+  Ads workerd metadata drift was precisely restored. The local Wrangler 4.119.0 release dry-run at
+  `6bee6df` produced 19 Workers, 85 modules, 37 asset blobs, and 29,168 KiB under
+  `/tmp/azhen-issue63-shadow.nEpDiP/release-out`; manifest SHA-256 is
+  `747ead6205ed99468b9894c823a48effa0dcbeeef0bedc8529addcb519de3e06`.
+- The root `corepack pnpm test` PASS remains historical at `8cf2720`; the main agent has not opened
+  the exclusive root fleet gate for current `6bee6df`, so this checkpoint does not claim a current
+  root PASS. No push, merge, pull request, Issue closure, upload, promotion, deployment, production
+  configuration change, charging change, production contact, or worktree deletion occurred.
+
+### 2026-08-26 — Issue #63 legacy outcome index and bounded reconnect fixed point
+
+- A later independent review found four remaining gaps at `1b3abfe`: the legacy
+  `usage-unknown` umbrella query did not prove ordered multi-value index access; retained
+  reconciliation allowed the initial dispatch plus three fresh dispatches; Workspace and
+  Gatekeeper reopen calls were not individually bounded by the shared deadline; and the evidence
+  documents still named an older fixed point.
+- The Workerd RED plan selected the general time index instead of a dedicated unknown-outcome
+  index. The correction adds a partial held/released time index to the empty schema-v3 shadow table
+  and uses it only for the exact canonical umbrella predicate. The GREEN plan names
+  `usage_projection_report_unknown_time_v3`, has no temporary order B-tree, and returns the same
+  overview, row, and CSV set. The bounded 131-row shadow-migration case confirms the index belongs
+  to the empty current table while retired rows remain in the bounded cleanup table.
+- The retained reconciliation helper now permits at most three total dispatch attempts, including
+  the initial call, under one 15-second deadline. Fresh User, Workspace, Gatekeeper, and session
+  capabilities are acquired through step-specific deadline guards. Pending Workspace,
+  Gatekeeper, and session tests prove that each late capability is disposed exactly once, partial
+  scopes are reverse-disposed, and no timeout starts another reopen.
+- Focused gates passed: report 26/26, empty-shadow migration 1/1, reconnect 3/3, and Action billing
+  31/31 in 167.80 seconds. The complete Integration Tests package passed 13/13 files and 131/131
+  tests in 800.28 seconds. Backend and Integration builds, root build, root lint, release-manifest
+  golden 4/4, and `git diff --check` also passed.
+- The clean pre-review fixed point `1b3abfe` completed an exclusive root `corepack pnpm test` with
+  exit 0 in 1,340.53 seconds: root Node 117/117, Backend stages all green, Integration 130/130,
+  Frontend 394/394 plus first-party copy 1/1, and all remaining workspace packages green. Because
+  the later review findings superseded that code while the command was running, the result is
+  diagnostic history only. Current code fixed point `dbe40008c659c69fef292684854866ebb91a6710`
+  still requires final two-axis review and a new main-agent-authorized root run.
+- All evidence is local real production code with controlled identities and controlled external
+  mocks. No production deployment, traffic claim, push, merge, pull request, Issue closure,
+  upload, promotion, configuration change, charging enablement, or worktree deletion occurred.
+
+### 2026-08-26 — Issue #63 schema v4 empty-shadow index correction
+
+- An independent Standards review found that adding the legacy unknown-outcome index to an already
+  populated schema-v3 Projection could synchronously scan and sort report rows in the Durable
+  Object constructor. The RED Workerd case kept 131 rows and v3 indexes on the canonical table.
+- The GREEN schema-v4 transaction renames populated v3 facts and summaries to retired-v3 tables,
+  leaves their v3 indexes attached, and creates every v4 index only on new empty canonical tables.
+  It performs no synchronous DROP, REINDEX, or populated CREATE INDEX. Actor restart re-enters the
+  same state without mixing generations or losing retired rows.
+- Retired-v2 and retired-v3 tables share the existing maintenance path. One alarm turn deletes at
+  most 64 rows from one retired table. Bootstrap stays pending until a bounded authority rebuild
+  completes, so old or partially rebuilt report data remains fail closed.
+- Current focused gates passed: Projection 60/60, report 26/26, retention 28/28, administrator
+  Usage 18/18, and complete Integration 13/13 files with 131/131 tests in 790.72 seconds. Backend,
+  Integration, and root builds passed. Root lint, release-manifest golden 4/4, and
+  `git diff --check` passed.
+- Code fixed point is `7679e4391d3b856785801d3345338df9e04d7ee8`. At this pre-final checkpoint,
+  the earlier full Backend and root results were historical diagnostic evidence only and the
+  current root test remained pending. Independent Standards and Spec reviews at evidence fixed point
+  `55b37a9` both reported no P0-P2 finding. No binding, Wrangler migration, generated type, or
+  release-manifest shape changed, and no remote or production mutation occurred.
+
+### 2026-08-26 — Issue #63 final schema v4 branch gate
+
+- The clean evidence fixed point `b7f2da2bd6a671aaadf43ce34d6a17772b1019a2` passed the final
+  exclusive root `corepack pnpm test` with exit 0 in 1,318.56 seconds. Major counts were root Node
+  117/117; Backend Browser 1/1 and base 468/468; Projection 60/60; retention 28/28; administrator
+  Usage 18/18; report 26/26; Metered Model 35/35; Open Gadget 1/1; RPC 27 pass with 4 expected
+  skips; Registry 2/2; retention RPC 1/1; DOCX 4/4; Integration 131/131; Frontend 394/394 plus
+  first-party copy 1/1. Every remaining workspace package exited 0.
+- `corepack pnpm types:generate` exited 0 at the same fixed point and produced no Issue #63
+  generated change. One unrelated UGC Ads workerd runtime-version drift was reviewed and precisely
+  restored. The release-manifest golden passed 4/4 with no diff.
+- The local production-shape builder used Node 24.19.0, pnpm 11.17.0, Wrangler 4.119.0, and release
+  ID `issue-63-v4-local`. It passed 19 Worker dry-runs and produced 85 modules, 37 unique asset
+  blobs, and 29,168 KiB under `/tmp/azhen-issue63-v4.AxgAr2/release-out`. Manifest SHA-256 is
+  `67691a9544ea9b3ebded0444883d3fbbf5cfc035e56d4f564ffc303ebebbd3a5`; sorted local artifact-list
+  SHA-256 is `0f0ef427c28cece3f72dfb1ea33154f8ed3fadf94de36b297706f64ec180546e`.
+- All evidence is local execution of real production code paths with controlled identities and
+  controlled external mocks. No upload, promotion, deployment, production configuration or
+  charging change, production contact, push, merge, pull request, Issue closure, or worktree
+  deletion occurred.

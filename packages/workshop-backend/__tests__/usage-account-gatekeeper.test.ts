@@ -88,6 +88,36 @@ async function withAccount<T>(
 }
 
 describe("Gatekeeper two-stage billing state machine", () => {
+  it("resolves a random detail reference only inside its authoritative User account", async () => {
+    await withAccount(account => {
+      const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, PRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      account.completeGatekeeperUsage(operationId, "executed");
+      const fact = account.getSnapshot().projectionFacts[0];
+      if (!fact || fact.rowKind !== "detail") throw new Error("Expected a detail fact.");
+
+      expect(account.getAdminUsageRecordDetail(fact.safeRecordRef)).toMatchObject({
+        record: {
+          kind: "gatekeeper",
+          vendorId: "context",
+          billingMethodKey: "context.read.v1",
+          externalAccountId: "context-account-1",
+          outcome: "settled",
+        },
+        chargeSnapshot: PRICED,
+        reservation: {
+          amountSubunits: CHARGE,
+          state: "settled",
+        },
+        ledgerEntries: [{kind: "usage-charge", deltaSubunits: -CHARGE}],
+        reconciliation: null,
+      });
+      expect(() => account.getAdminUsageRecordDetail(crypto.randomUUID()))
+        .toThrow("Usage Record does not exist.");
+    });
+  });
+
   it("holds a Credit Reservation on a priced begin and settles it on executed", async () => {
     await withAccount(account => {
       const attempt = account.beginGatekeeperUsage("op-settle", ATTRIBUTION, PRICED);
@@ -426,7 +456,7 @@ describe("Gatekeeper two-stage billing state machine", () => {
       expect(restarted.backfillProjectionFactsBatch(1)).toBe(true);
       const facts = restarted.listUsageProjectionFacts(null, 10).facts;
       expect(facts.map(item => item.outcome).toSorted()).toEqual([
-        "reconciled-settled", "settled", "usage-unknown",
+        "reconciled-settled", "settled", "usage-unknown-released",
       ]);
       expect(restarted.listUsageProjectionFacts(null, 10).facts).toEqual(facts);
       const reconciliationFact = facts.find(fact => fact.outcome === "reconciled-settled");
@@ -709,9 +739,10 @@ describe("Gatekeeper two-stage billing state machine", () => {
 
   it("holds the Credit Reservation when the outcome is unknown", async () => {
     await withAccount(account => {
-      account.beginGatekeeperUsage("op-unknown", ATTRIBUTION, PRICED);
-      account.markGatekeeperUsageStarted("op-unknown");
-      const record = account.completeGatekeeperUsage("op-unknown", "unknown");
+      const operationId = "op-unknown";
+      account.beginGatekeeperUsage(operationId, ATTRIBUTION, PRICED);
+      account.markGatekeeperUsageStarted(operationId);
+      const record = account.completeGatekeeperUsage(operationId, "unknown");
 
       expect(record.outcome).toBe("usage-unknown");
       expect(record.chargeSubunits).toBeNull();
@@ -720,7 +751,37 @@ describe("Gatekeeper two-stage billing state machine", () => {
         availableSubunits: INITIAL_BALANCE - CHARGE,
         reservedSubunits: CHARGE,
       });
-      expect(account.getSnapshot().reservations[0]!.state).toBe("reserved");
+      const snapshot = account.getSnapshot();
+      expect(snapshot.reservations[0]!.state).toBe("reserved");
+
+      const detail = snapshot.projectionFacts.find(fact => fact.rowKind === "detail");
+      expect(detail).toMatchObject({
+        outcome: "usage-unknown-held",
+        safeAttemptRef: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
+        reservationStatus: "held",
+        meteringAttempts: 1n,
+        heldReservations: 1n,
+        releasedReservations: 0n,
+        settledReservations: 0n,
+        unreservedAttempts: 0n,
+      });
+      expect(JSON.stringify(detail, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value)).not.toContain(operationId);
+      expect(snapshot.usageSummaryFacts).toEqual([
+        expect.objectContaining({
+          outcome: "usage-unknown-held",
+          meteredKind: "attempt",
+          meteringAttempts: 1n,
+          heldReservations: 1n,
+          releasedReservations: 0n,
+          settledReservations: 0n,
+          unreservedAttempts: 0n,
+          meteredUseCount: 0n,
+          unknownOperations: 1n,
+        }),
+      ]);
     });
   });
 

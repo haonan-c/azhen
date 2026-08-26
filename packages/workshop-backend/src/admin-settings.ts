@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUsageBalanceState, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUnknownUsageReconciliationRequest, type AdminUnknownUsageReconciliationResult, type AdminUsageBalanceState, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -27,8 +27,66 @@ import type {
   ConfiguredPublishedApiRatePage,
   PublishedApiRateSourceRequest,
 } from './public-api-rates.js';
+import {
+  ADMIN_USAGE_REPORT_DEFAULT_LIMIT,
+  ADMIN_USAGE_REPORT_MAX_LIMIT,
+  type AdminUsageRecordDetail,
+  type AdminUsageRecordDetailRequest,
+  type AdminUsageReport,
+  type AdminUsageReportFilter,
+  type AdminUsageReportOverview,
+  type AdminUsageReportPage,
+  type AdminUsageReportPageRequest,
+  type AdminUsageProjectionHealth,
+  type AdminUsageReportRow,
+} from "@gadgets/workshop-shared/api";
+import {
+  freezeUsageReportQuery,
+  type FrozenUsageReportQuery,
+} from "./usage-report-query.js";
 
 const logger = createWorkshopLogger("workshop.admin.settings");
+
+/** Server-private lifecycle event exposed only to an explicitly installed integration observer. */
+export type UsageReportIntegrationTestEvent = {
+  /** Opaque report instance identity generated only for process-local correlation. */
+  reportId: string;
+  /** Content-free lifecycle boundary observed by a test-only Worker entrypoint. */
+  event:
+    | "target-created"
+    | "target-disposed"
+    | "stream-reserved"
+    | "stream-cancelled"
+    | "stream-control-cancelled"
+    | "stream-owner-terminated"
+    | "stream-released"
+    | "page-query-start"
+    | "page-query-end"
+    | "chunk-enqueued";
+  /** Number of operations currently reserving this report capability. */
+  activeOperations: number;
+  /** Number of Projection page queries in flight for this stream. */
+  queryInFlight?: number;
+  /** Number of rows returned by one bounded Projection query. */
+  rowCount?: number;
+  /** Exact encoded byte length of one application-owned chunk. */
+  chunkBytes?: number;
+  /** Cumulative encoded application bytes produced by this stream. */
+  encodedBytes?: number;
+};
+
+let usageReportIntegrationTestObserver:
+  ((event: UsageReportIntegrationTestEvent) => void) | undefined;
+
+/** Install one server-private observer from a test-only Worker entrypoint, never from production. */
+export function setUsageReportIntegrationTestObserver(
+    observer: (event: UsageReportIntegrationTestEvent) => void): void {
+  usageReportIntegrationTestObserver = observer;
+}
+
+function emitUsageReportIntegrationTestEvent(event: UsageReportIntegrationTestEvent): void {
+  usageReportIntegrationTestObserver?.(event);
+}
 
 /** Server-only Deployment Model data. Model Configuration never enters a public catalog view. */
 export type DeploymentModelRecord = {
@@ -470,6 +528,11 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   /** Resolve one opaque registered-User reference for the server-only administrator facade. */
   resolveRegisteredUsageUser(registeredUserRef: string): ResolvedUsageUser | null {
     return this.usageUsers.resolve(registeredUserRef);
+  }
+
+  /** Resolve retained financial authority without restoring a deleted User's identity surface. */
+  resolveRegisteredUsageAuthorityUser(registeredUserRef: string): ResolvedUsageUser | null {
+    return this.usageUsers.resolveAuthority(registeredUserRef);
   }
 
   getDeploymentModelCatalog(): DeploymentModelCatalog {
@@ -1053,13 +1116,30 @@ function normalizeAdminActionReconciliationRequest(
   if (!Number.isSafeInteger(request.actionId) || request.actionId < 0) {
     throw new TypeError("Action identifier is invalid.");
   }
-  if (request.decision !== "settle" && request.decision !== "release" &&
-      request.decision !== "reverse") {
+  if (request.decision !== "reverse") {
     throw new TypeError("Action reconciliation decision is invalid.");
   }
   return {
     workspaceId: request.workspaceId,
     actionId: request.actionId,
+    operationId: normalizeAdminUsageOperationId(request.operationId),
+    decision: request.decision,
+    reason: normalizeAdminUsageReason(request.reason),
+  };
+}
+
+function normalizeAdminUnknownUsageReconciliationRequest(
+    request: AdminUnknownUsageReconciliationRequest): AdminUnknownUsageReconciliationRequest {
+  assertExactRpcObject(
+    request,
+    ["registeredUserRef", "safeRecordRef", "operationId", "decision", "reason"],
+  );
+  if (request.decision !== "settle" && request.decision !== "release") {
+    throw new TypeError("Unknown Usage reconciliation decision is invalid.");
+  }
+  return {
+    registeredUserRef: normalizeRegisteredUserRef(request.registeredUserRef),
+    safeRecordRef: normalizeAdminUsageRecordReference(request.safeRecordRef),
     operationId: normalizeAdminUsageOperationId(request.operationId),
     decision: request.decision,
     reason: normalizeAdminUsageReason(request.reason),
@@ -1148,9 +1228,383 @@ async function assertAdminCapabilityActive(
   }
 }
 
+/** Maximum number of Usage rows encoded into one CSV stream chunk. */
+export const ADMIN_USAGE_CSV_PAGE_SIZE = 64;
+
+/** Maximum encoded byte length held by one Usage CSV stream chunk. */
+export const ADMIN_USAGE_CSV_MAX_CHUNK_BYTES = 256 * 1024;
+
+/** Maximum live report capabilities minted by one administrator Usage capability. */
+export const ADMIN_USAGE_MAX_OPEN_REPORTS = 4;
+
+const ADMIN_USAGE_REPORT_CURSOR_LIMIT = 1_024;
+
+type UsageReportProjection = Pick<DurableObjectStub<UsageProjection>,
+  "assertReportSnapshot" | "readHealth" | "readReportMetrics" | "listReportRows">;
+
+/** Frozen administrator Usage report backed by one Projection generation and watermark. */
+@validateRpc()
+export class AdminUsageReportImpl extends RpcTarget implements AdminUsageReport {
+  private readonly reportId = crypto.randomUUID();
+  private disposed = false;
+  private activeOperations = 0;
+  private activeStreams = new Set<(
+    error: Error,
+    event?: "stream-control-cancelled" | "stream-owner-terminated",
+  ) => void>();
+  private pageCursors = new Map<string, string>();
+
+  constructor(
+      private projection: UsageReportProjection,
+      private query: FrozenUsageReportQuery,
+      private onDispose: () => void = () => undefined,
+      private assertActive: () => Promise<void> = async () => undefined) {
+    super();
+    emitUsageReportIntegrationTestEvent({
+      reportId: this.reportId,
+      event: "target-created",
+      activeOperations: this.activeOperations,
+    });
+  }
+
+  async getOverview(): Promise<AdminUsageReportOverview> {
+    return this.#withOperation(async () => {
+      const [metrics, health] = await Promise.all([
+        this.projection.readReportMetrics(this.query),
+        this.projection.readHealth(),
+      ]);
+      return {
+        metrics,
+        snapshot: this.query.snapshot,
+        health,
+        asOf: new Date().toISOString(),
+      };
+    });
+  }
+
+  async listRows(request: AdminUsageReportPageRequest): Promise<AdminUsageReportPage> {
+    const normalized = normalizeAdminUsageReportPageRequest(request);
+    const internalCursor = normalized.cursor === undefined ? undefined
+      : this.pageCursors.get(normalized.cursor);
+    if (normalized.cursor !== undefined && internalCursor === undefined) {
+      throw new TypeError("Usage report cursor is invalid.");
+    }
+    const page = await this.#withOperation(() => this.projection.listReportRows(
+      this.query,
+      internalCursor,
+      normalized.limit,
+    ));
+    if (page.nextCursor === null) return page;
+    const publicCursor = crypto.randomUUID();
+    this.pageCursors.set(publicCursor, page.nextCursor);
+    while (this.pageCursors.size > ADMIN_USAGE_REPORT_CURSOR_LIMIT) {
+      this.pageCursors.delete(this.pageCursors.keys().next().value!);
+    }
+    return {...page, nextCursor: publicCursor};
+  }
+
+  async exportCsv(): Promise<ReadableStream<Uint8Array>> {
+    if (this.disposed) throw new Error("Usage report is closed.");
+    if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
+    this.activeOperations += 1;
+    this.#emitIntegrationTestEvent("stream-reserved");
+    let cursor: string | undefined;
+    let firstPull = true;
+    let complete = false;
+    let cancelled = false;
+    let released = false;
+    let queryInFlight = 0;
+    let encodedBytes = 0;
+    let ownerError: Error | undefined;
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let terminateFromOwner: ((
+      error: Error,
+      event?: "stream-control-cancelled" | "stream-owner-terminated",
+    ) => void) | undefined;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.activeOperations -= 1;
+      if (terminateFromOwner !== undefined) this.activeStreams.delete(terminateFromOwner);
+      this.#emitIntegrationTestEvent("stream-released");
+    };
+    const cancel = () => {
+      cancelled = true;
+      this.#emitIntegrationTestEvent("stream-cancelled");
+      release();
+    };
+    terminateFromOwner = (error, event = "stream-owner-terminated") => {
+      if (cancelled || released) return;
+      cancelled = true;
+      ownerError = error;
+      this.#emitIntegrationTestEvent(event);
+      controller?.error(error);
+      release();
+    };
+    this.activeStreams.add(terminateFromOwner);
+    let health: AdminUsageProjectionHealth;
+    try {
+      await this.assertActive();
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
+      health = await this.projection.readHealth();
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
+      await this.projection.assertReportSnapshot(this.query);
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
+      await this.assertActive();
+      if (cancelled || this.disposed) {
+        throw ownerError ?? new Error("Usage report is closed.");
+      }
+    } catch (error) {
+      terminateFromOwner(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+    const generatedAt = new Date().toISOString();
+    const encoder = new TextEncoder();
+    return new ReadableStream<Uint8Array>({
+      start: streamController => {
+        controller = streamController;
+      },
+      pull: async streamController => {
+        if (cancelled || complete) return;
+        try {
+          await this.assertActive();
+          if (cancelled) return;
+          let chunk: Uint8Array;
+          if (firstPull) {
+            await this.projection.assertReportSnapshot(this.query);
+            if (cancelled) return;
+            firstPull = false;
+            chunk = encoder.encode(csvPreamble(this.query, generatedAt, health));
+          } else {
+            queryInFlight += 1;
+            this.#emitIntegrationTestEvent("page-query-start", {queryInFlight});
+            let page: AdminUsageReportPage;
+            try {
+              page = await this.projection.listReportRows(
+                this.query,
+                cursor,
+                ADMIN_USAGE_CSV_PAGE_SIZE,
+              );
+            } finally {
+              queryInFlight -= 1;
+            }
+            this.#emitIntegrationTestEvent("page-query-end", {
+              queryInFlight,
+              rowCount: page.rows.length,
+            });
+            if (cancelled) return;
+            chunk = encoder.encode(page.rows.map(csvReportRow).join(""));
+            cursor = page.nextCursor ?? undefined;
+            if (page.nextCursor === null) complete = true;
+          }
+          await this.assertActive();
+          if (cancelled) return;
+          if (chunk.byteLength > ADMIN_USAGE_CSV_MAX_CHUNK_BYTES) {
+            throw new Error("Usage report CSV chunk exceeds its bounded buffer.");
+          }
+          if (chunk.byteLength > 0) {
+            encodedBytes += chunk.byteLength;
+            this.#emitIntegrationTestEvent("chunk-enqueued", {
+              chunkBytes: chunk.byteLength,
+              encodedBytes,
+              queryInFlight,
+            });
+            streamController.enqueue(chunk);
+          }
+          if (complete) {
+            streamController.close();
+            release();
+          }
+        } catch (error) {
+          release();
+          if (!cancelled) streamController.error(error);
+        }
+      },
+      cancel,
+    }, {highWaterMark: 0});
+  }
+
+  async cancelCsvExports(): Promise<void> {
+    for (const terminate of this.activeStreams) {
+      terminate(new Error("Usage report CSV export was cancelled."), "stream-control-cancelled");
+    }
+  }
+
+  [Symbol.dispose](): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const terminate of this.activeStreams) {
+      terminate(new Error("Usage report is closed."));
+    }
+    this.pageCursors.clear();
+    this.onDispose();
+    this.#emitIntegrationTestEvent("target-disposed");
+  }
+
+  #emitIntegrationTestEvent(
+      event: UsageReportIntegrationTestEvent["event"],
+      detail: Omit<UsageReportIntegrationTestEvent,
+        "reportId" | "event" | "activeOperations"> = {}): void {
+    emitUsageReportIntegrationTestEvent({
+      reportId: this.reportId,
+      event,
+      activeOperations: this.activeOperations,
+      ...detail,
+    });
+  }
+
+  async #withOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.disposed) throw new Error("Usage report is closed.");
+    await this.assertActive();
+    if (this.disposed) throw new Error("Usage report is closed.");
+    if (this.activeOperations >= 2) throw new Error("Usage report is busy.");
+    this.activeOperations += 1;
+    try {
+      const result = await operation();
+      await this.assertActive();
+      return result;
+    } finally {
+      this.activeOperations -= 1;
+    }
+  }
+}
+
+function normalizeAdminUsageReportPageRequest(
+    value: AdminUsageReportPageRequest): {cursor?: string; limit: number} {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).some(key => key !== "cursor" && key !== "limit")) {
+    throw new TypeError("Usage report page request is invalid.");
+  }
+  if (value.cursor !== undefined &&
+      (typeof value.cursor !== "string" || value.cursor.length < 1 || value.cursor.length > 1_024)) {
+    throw new TypeError("Usage report cursor is invalid.");
+  }
+  const limit = value.limit ?? ADMIN_USAGE_REPORT_DEFAULT_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > ADMIN_USAGE_REPORT_MAX_LIMIT) {
+    throw new TypeError("Usage report page limit is invalid.");
+  }
+  return {limit, ...(value.cursor === undefined ? {} : {cursor: value.cursor})};
+}
+
+function normalizeAdminUsageRecordDetailRequest(
+    value: AdminUsageRecordDetailRequest): AdminUsageRecordDetailRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      Object.keys(value).toSorted().join("\0") !== "registeredUserRef\0safeRecordRef") {
+    throw new TypeError("Usage Record detail request is invalid.");
+  }
+  const registeredUserRef = normalizeRegisteredUserRef(value.registeredUserRef);
+  return {
+    registeredUserRef,
+    safeRecordRef: normalizeAdminUsageRecordReference(value.safeRecordRef),
+  };
+}
+
+function normalizeAdminUsageRecordReference(value: unknown): string {
+  if (typeof value !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+    throw new TypeError("Usage Record reference is invalid.");
+  }
+  return value;
+}
+
+function csvPreamble(
+    query: FrozenUsageReportQuery,
+    generatedAt: string,
+    health: AdminUsageOverview["health"]): string {
+  const snapshot = query.snapshot;
+  const metadata = [
+    ["schema_version", "admin-usage-v1"],
+    ["generated_at", generatedAt],
+    ["projection_generation", snapshot.projectionGeneration.toString()],
+    ["ingestion_watermark", snapshot.ingestionWatermark.toString()],
+    ["report_time_zone", snapshot.reportTimeZone],
+    ["report_time_zone_version", snapshot.reportTimeZoneVersion.toString()],
+    ["start_at_utc_inclusive", snapshot.startAtUtcInclusive ?? ""],
+    ["end_at_utc_exclusive", snapshot.endAtUtcExclusive ?? ""],
+    ["active_filter", JSON.stringify(snapshot.filter)],
+    ["projection_state", health.state],
+    ["projection_last_ingested_at", health.lastIngestedAt ?? ""],
+    ["projection_latest_applied_source_at", health.latestAppliedSourceAt ?? ""],
+  ];
+  const lines = ["metadata_key,metadata_value\r\n"];
+  for (const row of metadata) lines.push(`${csvCell(row[0]!)},${csvCell(row[1]!)}\r\n`);
+  lines.push("\r\n");
+  lines.push([
+    "row_kind", "row_id", "registered_user_ref", "safe_record_ref", "summary_fact_id",
+    "summary_revision", "metered_kind", "source", "outcome", "pricing_status",
+    "gadget_id", "deployment_model_id", "gatekeeper_id", "stable_method_key",
+    "external_account_id", "occurred_at_utc", "report_local_timestamp",
+    "bucket_start_utc", "report_local_bucket_start", "cache_hit_input_tokens",
+    "cache_miss_input_tokens", "cache_write_input_tokens", "output_tokens",
+    "reasoning_tokens", "metered_use_count", "billable_api_operations", "pre_execution_failures",
+    "unknown_operations", "unpriced_model_uses", "unpriced_api_operations",
+    "provider_cost_usd_subunits", "charged_usage_credit_subunits",
+    "safe_attempt_ref", "reservation_status", "metering_attempts", "held_reservations",
+    "released_reservations", "settled_reservations", "unreserved_attempts",
+  ].join(",") + "\r\n");
+  return lines.join("");
+}
+
+function csvReportRow(row: AdminUsageReportRow): string {
+  const values = [
+    row.rowKind,
+    row.rowId,
+    row.registeredUserRef,
+    row.rowKind === "detail" ? row.safeRecordRef : "",
+    row.rowKind === "aggregate" ? row.summaryFactId : "",
+    row.rowKind === "aggregate" ? row.summaryRevision.toString() : "",
+    row.meteredKind,
+    row.source,
+    row.outcome,
+    row.pricingStatus,
+    row.gadgetId ?? "",
+    row.deploymentModelId ?? "",
+    row.gatekeeperId ?? "",
+    row.stableMethodKey ?? "",
+    row.externalAccountId ?? "",
+    row.rowKind === "detail" ? row.occurredAtUtc : "",
+    row.rowKind === "detail" ? row.reportLocalTimestamp : "",
+    row.rowKind === "aggregate" ? row.bucketStartUtc : "",
+    row.rowKind === "aggregate" ? row.reportLocalBucketStart : "",
+    row.metrics.cacheHitInputTokens.toString(),
+    row.metrics.cacheMissInputTokens.toString(),
+    row.metrics.cacheWriteInputTokens.toString(),
+    row.metrics.outputTokens.toString(),
+    row.metrics.reasoningTokens.toString(),
+    row.metrics.meteredUseCount.toString(),
+    row.metrics.billableApiOperations.toString(),
+    row.metrics.preExecutionFailures.toString(),
+    row.metrics.unknownOperations.toString(),
+    row.metrics.unpricedModelUses.toString(),
+    row.metrics.unpricedApiOperations.toString(),
+    row.metrics.providerCostUsdSubunits.toString(),
+    row.metrics.chargedUsageCreditSubunits.toString(),
+    row.rowKind === "detail" ? row.safeAttemptRef ?? "" : "",
+    row.rowKind === "detail" ? row.reservationStatus : "",
+    row.metrics.meteringAttempts.toString(),
+    row.metrics.heldReservations.toString(),
+    row.metrics.releasedReservations.toString(),
+    row.metrics.settledReservations.toString(),
+    row.metrics.unreservedAttempts.toString(),
+  ];
+  return values.map(csvCell).join(",") + "\r\n";
+}
+
+function csvCell(value: string): string {
+  const safe = /^[=+\-@]/.test(value) ? `'${value}` : value;
+  return /[",\r\n]/.test(safe) ? `"${safe.replaceAll('"', '""')}"` : safe;
+}
 /** Administrator-only Registry and User Usage Account correction capability. */
 @validateRpc()
 export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
+  private activeReports = 0;
+
   constructor(
       private admin: DurableObjectStub<AdminSettings>,
       private users: DurableObjectNamespace<UserDurableObject>,
@@ -1214,6 +1668,50 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       ...(normalized.cursor === undefined ? {} : {cursor: normalized.cursor}),
       ...(normalized.limit === undefined ? {} : {limit: normalized.limit}),
     });
+  }
+
+  async openReport(filter: AdminUsageReportFilter): Promise<RpcStub<AdminUsageReport>> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    if (!this.projection) throw new Error("Usage Projection is unavailable.");
+    if (this.activeReports >= ADMIN_USAGE_MAX_OPEN_REPORTS) {
+      throw new Error("Too many Usage reports are open.");
+    }
+    this.activeReports += 1;
+    try {
+      const projection = this.projection.getByName("");
+      if (!await projection.ensureBootstrap()) {
+        throw new Error("Usage Projection bootstrap is incomplete.");
+      }
+      const [rates, coordinates] = await Promise.all([
+        this.admin.getUsageRates(),
+        projection.getReportCoordinates(),
+      ]);
+      const query = freezeUsageReportQuery(
+        filter,
+        rates.current.reportTimeZone,
+        rates.current.version,
+        coordinates.projectionGeneration,
+        coordinates.ingestionWatermark,
+        coordinates.detailRetentionRevision,
+      );
+      await assertAdminCapabilityActive(this.users, this.adminUserId);
+      // @ts-expect-error Cap'n Web RPC targets become browser-owned stubs at the RPC boundary.
+      return new AdminUsageReportImpl(projection, query, () => {
+        this.activeReports -= 1;
+      }, () => assertAdminCapabilityActive(this.users, this.adminUserId));
+    } catch (error) {
+      this.activeReports -= 1;
+      throw error;
+    }
+  }
+
+  async getRecordDetail(request: AdminUsageRecordDetailRequest): Promise<AdminUsageRecordDetail> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    const normalized = normalizeAdminUsageRecordDetailRequest(request);
+    const user = await this.#resolveUser(normalized.registeredUserRef);
+    const detail = await user.getAdminUsageRecordDetail(normalized.safeRecordRef);
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    return detail;
   }
 
   async grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult> {
@@ -1298,10 +1796,77 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     );
   }
 
+  async reconcileUnknownRecord(
+      request: AdminUnknownUsageReconciliationRequest,
+  ): Promise<AdminUnknownUsageReconciliationResult> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    const normalized = normalizeAdminUnknownUsageReconciliationRequest(request);
+    if (!this.overseers) throw new Error("Action reconciliation is not configured.");
+    const user = await this.#resolveAuthorityUser(normalized.registeredUserRef);
+    const prepared = await user.prepareAdminUnknownUsageReconciliation(
+      normalized.safeRecordRef,
+      normalized.operationId,
+      normalized.decision,
+      normalized.reason,
+      this.adminUserId,
+    );
+    if (prepared.result !== null) return prepared.result;
+    const target = prepared.target;
+    let overseer: DurableObjectStub<import("./overseer.js").OverseerDurableObject>;
+    try {
+      overseer = this.overseers.get(this.overseers.idFromString(target.workspaceId));
+    } catch (error) {
+      throw new Error("Workspace identifier is invalid.", {cause: error});
+    }
+    const result = target.actionId === null
+      ? await overseer.reconcileLegacyUnknownActionUsage(
+        target.billingOperationId,
+        normalized.operationId,
+        normalized.decision,
+        normalized.reason,
+        this.adminUserId,
+        normalized.safeRecordRef,
+      )
+      : await overseer.reconcileActionUsage(
+        target.actionId,
+        normalized.operationId,
+        normalized.decision,
+        normalized.reason,
+        this.adminUserId,
+        normalized.safeRecordRef,
+      );
+    const safeResult: AdminUnknownUsageReconciliationResult = {
+      operationId: result.operationId,
+      decision: normalized.decision,
+      previousState: result.previousState,
+      newState: result.newState,
+      ledgerEntryId: result.ledgerEntryId === null
+        ? null : `${normalized.safeRecordRef}:usage-charge`,
+      actorUserId: result.actorUserId,
+      reason: result.reason,
+      createdAt: result.createdAt,
+    };
+    return user.completeAdminUnknownUsageReconciliation(
+      normalized.safeRecordRef,
+      safeResult,
+    );
+  }
+
   async #resolveUser(
       registeredUserRef: string): Promise<DurableObjectStub<UserDurableObject>> {
     const resolved = await this.admin.resolveRegisteredUsageUser(registeredUserRef);
     if (!resolved) throw new Error("Registered User does not exist.");
+    try {
+      return this.users.get(this.users.idFromString(resolved.userDoId));
+    } catch (error) {
+      throw new Error("Registered User target is invalid.", {cause: error});
+    }
+  }
+
+  async #resolveAuthorityUser(
+      registeredUserRef: string): Promise<DurableObjectStub<UserDurableObject>> {
+    const resolved = await this.admin.resolveRegisteredUsageAuthorityUser(registeredUserRef);
+    if (!resolved) throw new Error("Registered User authority does not exist.");
     try {
       return this.users.get(this.users.idFromString(resolved.userDoId));
     } catch (error) {

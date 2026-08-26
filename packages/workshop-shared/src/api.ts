@@ -1112,6 +1112,341 @@ export type AdminUsageOverview = {
   asOf: string;
 };
 
+/** Default number of rows returned by one administrator Usage report page. */
+export const ADMIN_USAGE_REPORT_DEFAULT_LIMIT = 50;
+
+/** Maximum number of rows returned by one administrator Usage report page. */
+export const ADMIN_USAGE_REPORT_MAX_LIMIT = 200;
+
+/** Maximum number of values accepted for one administrator Usage report filter dimension. */
+export const ADMIN_USAGE_REPORT_FILTER_VALUE_LIMIT = 32;
+
+/** One Gatekeeper-scoped stable business method selected by an administrator report filter. */
+export type AdminUsageReportMethodFilter = {
+  /** Stable Gatekeeper vendor identifier that owns the method. */
+  gatekeeperId: string;
+  /** Stable business-method key that is unique only within that Gatekeeper. */
+  stableMethodKey: string;
+};
+
+/** Frozen administrator Usage report filter. Different dimensions combine with AND. */
+export type AdminUsageReportFilter = {
+  /** Inclusive date in the Deployment report timezone, in strict YYYY-MM-DD form. */
+  startDateInclusive?: string;
+  /** Exclusive date in the Deployment report timezone, in strict YYYY-MM-DD form. */
+  endDateExclusive?: string;
+  /** Opaque registered User references; values within this dimension combine with OR. */
+  registeredUserRefs?: string[];
+  /** Stable Gadget identifiers; values within this dimension combine with OR. */
+  gadgetIds?: string[];
+  /** Stable Deployment Model identifiers; values within this dimension combine with OR. */
+  deploymentModelIds?: string[];
+  /** Stable Gatekeeper vendor identifiers; values within this dimension combine with OR. */
+  gatekeeperIds?: string[];
+  /** Gatekeeper-scoped stable methods; values within this dimension combine with OR. */
+  methods?: AdminUsageReportMethodFilter[];
+  /** Content-free opaque external account/resource dimensions. */
+  externalAccountIds?: string[];
+  /** Causal Metered Use origins. */
+  sources?: UsageSource[];
+  /** Durable terminal Usage outcomes, including the legacy unknown selector. */
+  outcomes?: AdminUsageReportFilterOutcome[];
+  /** Priced and Unpriced selection. */
+  pricingStatuses?: ("priced" | "unpriced")[];
+  /** Model, Gatekeeper, and formal attempt-only Summary selection. */
+  meteredKinds?: ("model" | "gatekeeper" | "attempt")[];
+};
+
+/** Durable outcome exposed by deployment Usage reporting. */
+export type AdminUsageReportOutcome =
+  | "settled"
+  | "failed-before-execution"
+  | "usage-unknown-released"
+  | "usage-unknown-held"
+  | "reconciliation-required"
+  | "reconciled-settled"
+  | "reconciled-released";
+
+/** Report filter outcome, including the legacy unknown selector that expands to both new states. */
+export type AdminUsageReportFilterOutcome = AdminUsageReportOutcome | "usage-unknown";
+
+/** Authoritative Credit Reservation state that explains one reported Metering Attempt. */
+export type AdminUsageReservationStatus = "held" | "released" | "settled" | "none";
+
+/** Immutable snapshot metadata shared by overview, rows, and CSV for one report capability. */
+export type AdminUsageReportSnapshot = {
+  /** Canonical normalized filter frozen when the report opened. */
+  filter: AdminUsageReportFilter;
+  /** Strongly consistent Deployment report timezone frozen when the report opened. */
+  reportTimeZone: string;
+  /** Usage Rate version that supplied the frozen report timezone. */
+  reportTimeZoneVersion: bigint;
+  /** Inclusive UTC boundary derived from the local start date, or null for no lower bound. */
+  startAtUtcInclusive: string | null;
+  /** Exclusive UTC boundary derived from the local end date, or null for no upper bound. */
+  endAtUtcExclusive: string | null;
+  /** Projection generation frozen when the report opened. */
+  projectionGeneration: bigint;
+  /** Applied-ingestion watermark frozen when the report opened. */
+  ingestionWatermark: bigint;
+};
+
+/** Exact metrics carried by one detail or aggregate report row. */
+export type AdminUsageReportRowMetrics = {
+  /** Provider model cost in exact USD rate subunits. */
+  providerCostUsdSubunits: bigint;
+  /** Usage Charges in exact Usage Credit subunits. */
+  chargedUsageCreditSubunits: bigint;
+  /** Model input tokens reported as cache hits. */
+  cacheHitInputTokens: bigint;
+  /** Model input tokens not reported as cache hits. */
+  cacheMissInputTokens: bigint;
+  /** Model input tokens written to a provider cache, when reported. */
+  cacheWriteInputTokens: bigint;
+  /** Total model output tokens, already including reasoning-token detail. */
+  outputTokens: bigint;
+  /** Reasoning-token detail already included in outputTokens. */
+  reasoningTokens: bigint;
+  /** Caller-visible Gatekeeper operations confirmed as executed or accepted. */
+  billableApiOperations: bigint;
+  /** Confirmed Metered Uses represented by this row. */
+  meteredUseCount: bigint;
+  /** Failed-before-execution operations represented by this row. */
+  preExecutionFailures: bigint;
+  /** Unknown-held or released-unknown operations represented by this row. */
+  unknownOperations: bigint;
+  /** Formal Metering Attempts represented by this row. */
+  meteringAttempts: bigint;
+  /** Attempts whose Credit Reservation remains held. */
+  heldReservations: bigint;
+  /** Attempts whose Credit Reservation was released. */
+  releasedReservations: bigint;
+  /** Attempts whose Credit Reservation was settled into a Ledger charge. */
+  settledReservations: bigint;
+  /** Attempts that never owned a Credit Reservation. */
+  unreservedAttempts: bigint;
+  /** Unpriced model uses represented by this row. */
+  unpricedModelUses: bigint;
+  /** Unpriced Gatekeeper operations represented by this row. */
+  unpricedApiOperations: bigint;
+};
+
+/** Exact filtered totals for one frozen administrator Usage report. */
+export type AdminUsageReportMetrics = AdminUsageReportRowMetrics & {
+  /** Distinct Usage Principals with matching confirmed Metered Use. */
+  activeUsers: bigint;
+};
+
+/** Content-free reporting dimensions shared by detail and aggregate rows. */
+export type AdminUsageReportRowDimensions = {
+  /** Opaque registered User reference; this remains the Usage Principal. */
+  registeredUserRef: string;
+  /** Causal origin of the Metered Use. */
+  source: UsageSource;
+  /** Model, Gatekeeper, or formal attempt-only Summary discriminator. */
+  meteredKind: "model" | "gatekeeper" | "attempt";
+  /** Durable terminal Usage outcome. */
+  outcome: AdminUsageReportOutcome;
+  /** Whether the immutable Charge Snapshot had a configured Usage Rate. */
+  pricingStatus: "priced" | "unpriced";
+  /** Stable Deployment Model identifier, or null for Gatekeeper rows. */
+  deploymentModelId: string | null;
+  /** Stable Gatekeeper vendor identifier, or null for model rows. */
+  gatekeeperId: string | null;
+  /** Gatekeeper-scoped stable business method, or null for model rows. */
+  stableMethodKey: string | null;
+  /** Content-free opaque external account/resource dimension. */
+  externalAccountId: string | null;
+  /** Stable Gadget identifier, when applicable. */
+  gadgetId: string | null;
+};
+
+/** One immutable recent Usage event row backed by a User Usage Account record. */
+export type AdminUsageReportDetailRow = AdminUsageReportRowDimensions & {
+  /** Detail-row discriminator. */
+  rowKind: "detail";
+  /** Detail facts remain tied to a Model or Gatekeeper authority family. */
+  meteredKind: "model" | "gatekeeper";
+  /** Opaque Projection row identity used only for stable pagination. */
+  rowId: string;
+  /** Random opaque reference resolved only inside the corresponding User Durable Object. */
+  safeRecordRef: string;
+  /** Content-free opaque reference for the represented Metering Attempt, or null for an audit row. */
+  safeAttemptRef: string | null;
+  /** Authoritative Credit Reservation result for the represented Metering Attempt. */
+  reservationStatus: AdminUsageReservationStatus;
+  /** Canonical UTC event time from the authoritative Usage Record. */
+  occurredAtUtc: string;
+  /** Report-local event time including its numeric UTC offset. */
+  reportLocalTimestamp: string;
+  /** Exact row contribution. */
+  metrics: AdminUsageReportRowMetrics;
+};
+
+/** One content-free 15-minute UTC Summary snapshot row. */
+export type AdminUsageReportAggregateRow = AdminUsageReportRowDimensions & {
+  /** Aggregate-row discriminator. */
+  rowKind: "aggregate";
+  /** Opaque Projection row identity used only for stable pagination. */
+  rowId: string;
+  /** Stable Summary identity across monotonic revisions. */
+  summaryFactId: string;
+  /** Monotonic absolute Summary revision. */
+  summaryRevision: bigint;
+  /** Canonical inclusive start of the 15-minute UTC bucket. */
+  bucketStartUtc: string;
+  /** Report-local bucket start including its numeric UTC offset. */
+  reportLocalBucketStart: string;
+  /** Exact absolute Summary snapshot. */
+  metrics: AdminUsageReportRowMetrics;
+};
+
+/** One deployment Usage report row that never confuses an aggregate with an event. */
+export type AdminUsageReportRow = AdminUsageReportDetailRow | AdminUsageReportAggregateRow;
+
+/** Bounded keyset request against one frozen administrator Usage report. */
+export type AdminUsageReportPageRequest = {
+  /** Opaque cursor returned by the preceding page of this same report capability. */
+  cursor?: string;
+  /** Optional page size from 1 through ADMIN_USAGE_REPORT_MAX_LIMIT. */
+  limit?: number;
+};
+
+/** One stable page from a frozen administrator Usage report. */
+export type AdminUsageReportPage = {
+  /** Rows in descending source-time and stable-row-ID order. */
+  rows: AdminUsageReportRow[];
+  /** Opaque cursor for the next page, or null when the snapshot is complete. */
+  nextCursor: string | null;
+};
+
+/** Filtered exact totals and metadata for one frozen administrator Usage report. */
+export type AdminUsageReportOverview = {
+  /** Exact filtered metrics derived from effective Summary snapshots. */
+  metrics: AdminUsageReportMetrics;
+  /** Frozen metadata shared with every row and CSV byte. */
+  snapshot: AdminUsageReportSnapshot;
+  /** Structured health observed when the overview was read. */
+  health: AdminUsageProjectionHealth;
+  /** Canonical UTC observation time. */
+  asOf: string;
+};
+
+/** Content-free authoritative Reservation linked to an administrator Usage drill-down. */
+export type AdminUsageRecordReservation = {
+  /** Exact reserved Usage Credit amount. */
+  amountSubunits: bigint;
+  /** Durable Reservation state. */
+  state: "reserved" | "settled" | "released";
+  /** Canonical UTC creation time. */
+  createdAt: string;
+  /** Canonical UTC settlement time, or null when it did not settle. */
+  settledAt: string | null;
+  /** Canonical UTC release time, or null when it was not released. */
+  releasedAt: string | null;
+};
+
+/** Content-free authoritative Ledger entry linked to an administrator Usage drill-down. */
+export type AdminUsageRecordLedgerEntry = {
+  /** Opaque immutable Ledger entry identifier. */
+  id: string;
+  /** Ledger entry kind. */
+  kind: "usage-charge" | "credit-reversal";
+  /** Exact signed Usage Credit delta. */
+  deltaSubunits: bigint;
+  /** Canonical UTC creation time. */
+  createdAt: string;
+};
+
+/** Content-free administrator reconciliation audit linked to unknown Gatekeeper Usage. */
+export type AdminUsageRecordReconciliation = {
+  /** Administrator decision applied to the unknown Usage. */
+  decision: "settle" | "release";
+  /** Authenticated administrator identity bound by the service. */
+  actorUserId: string;
+  /** Bounded human explanation retained for audit. */
+  reason: string;
+  /** Canonical UTC decision time. */
+  createdAt: string;
+};
+
+/** Administrator-visible Gatekeeper Usage Record with its content-free account dimension. */
+export type AdminGatekeeperUsageRecord = UserGatekeeperUsageRecord & {
+  /** Content-free opaque external account/resource dimension. */
+  externalAccountId: string;
+};
+
+/** Reconciliation authority retained independently from its older raw Gatekeeper Usage Record. */
+export type AdminGatekeeperReconciliationRecord = {
+  /** Reconciliation-record discriminator. */
+  kind: "gatekeeper-reconciliation";
+  /** Random opaque User-local reference returned by a Projection detail row. */
+  id: string;
+  /** Host-attested causal source copied into the retained authority snapshot. */
+  source: UsageSource;
+  /** Confirmed Gatekeeper Use, or an attempt-only release decision. */
+  meteredKind: "gatekeeper" | "attempt";
+  /** Stable Gatekeeper vendor identifier. */
+  vendorId: string;
+  /** Gatekeeper-scoped stable business method. */
+  billingMethodKey: string;
+  /** Content-free opaque external account/resource dimension. */
+  externalAccountId: string;
+  /** Stable Gadget identifier, or null when no Gadget caused this Use. */
+  gadgetId: string | null;
+  /** Whether the immutable Charge Snapshot had a configured Usage Rate. */
+  pricing: "priced" | "unpriced";
+  /** Formal terminal result of the administrator reconciliation. */
+  outcome: "reconciled-settled" | "reconciled-released";
+  /** Exact Usage Credit charged by the reconciliation decision. */
+  chargeSubunits: bigint;
+  /** Canonical UTC reconciliation time, never the older Usage event time. */
+  createdAt: string;
+};
+
+/** Content-free authoritative administrator view of one Usage detail event. */
+export type AdminUsageRecord =
+  | UserModelUsageRecord
+  | AdminGatekeeperUsageRecord
+  | AdminGatekeeperReconciliationRecord;
+
+/** Serializable authoritative graph for one administrator Usage drill-down. */
+export type AdminUsageRecordDetail = {
+  /** Content-free authoritative Usage or reconciliation record. */
+  record: AdminUsageRecord;
+  /** Immutable pricing evidence used by the authoritative User Usage Account. */
+  chargeSnapshot: ChargeSnapshot;
+  /** Linked Credit Reservation, or null for zero-charge and Unpriced Use. */
+  reservation: AdminUsageRecordReservation | null;
+  /** Linked Usage Charge and later Credit Reversal entries. */
+  ledgerEntries: AdminUsageRecordLedgerEntry[];
+  /** Linked unknown-Usage reconciliation audit, or null before reconciliation. */
+  reconciliation: AdminUsageRecordReconciliation | null;
+};
+
+/** Administrator request for authoritative detail in exactly one registered User account. */
+export type AdminUsageRecordDetailRequest = {
+  /** Opaque target returned by the authoritative User Registry. */
+  registeredUserRef: string;
+  /** Random opaque reference returned only by a Projection detail row. */
+  safeRecordRef: string;
+};
+
+/** Frozen administrator report capability returned by AdminUsageApi.openReport(). */
+export interface AdminUsageReport {
+  /** Read exact filtered totals against this report's frozen snapshot. */
+  getOverview(): Promise<AdminUsageReportOverview>;
+
+  /** Read one bounded keyset page against this report's frozen snapshot. */
+  listRows(request: AdminUsageReportPageRequest): Promise<AdminUsageReportPage>;
+
+  /** Stream RFC 4180 CSV bytes for this same frozen snapshot with Cap'n Web flow control. */
+  exportCsv(): Promise<ReadableStream<Uint8Array>>;
+
+  /** Cancel every active CSV source owned by this report and release its bounded stream slots. */
+  cancelCsvExports(): Promise<void>;
+}
+
 /** Durable status of an idempotent Usage Projection rebuild request. */
 export type ProjectionRebuildStatus = {
   /** Stable caller-supplied rebuild identity. */
@@ -1235,7 +1570,7 @@ export type AdminUsageDeleteUserResult = {
 /** Administrator decision for an Action whose financial state needs explicit coordination. */
 export type AdminActionReconciliationDecision = "settle" | "release" | "reverse";
 
-/** Administrator request to coordinate one durable Action and its linked Usage Account state. */
+/** Administrator request to reverse one durable Action's already-settled Usage Charge. */
 export type AdminActionReconciliationRequest = {
   /** Stable Workshop identifier returned by `Overseer.getMetadata()`. */
   workspaceId: string;
@@ -1243,10 +1578,33 @@ export type AdminActionReconciliationRequest = {
   actionId: number;
   /** Stable client retry identity for this coordination decision. */
   operationId: string;
-  /** Financial decision allowed for the Action's current execution state. */
-  decision: AdminActionReconciliationDecision;
+  /** The only raw Action-scoped decision; unknown coordination requires a selected detail. */
+  decision: "reverse";
   /** Required bounded human explanation retained in the Action audit. */
   reason: string;
+};
+
+/** Detail-scoped request to settle or release one unknown Gatekeeper Usage Record. */
+export type AdminUnknownUsageReconciliationRequest = {
+  /** Opaque target returned by the authoritative User Registry. */
+  registeredUserRef: string;
+  /** Random User-local reference returned by the selected report detail row. */
+  safeRecordRef: string;
+  /** Stable client retry identity for this administrator decision. */
+  operationId: string;
+  /** Financial decision allowed for the selected unknown Usage Record. */
+  decision: "settle" | "release";
+  /** Bounded administrator explanation retained for audit. */
+  reason: string;
+};
+
+/** Auditable unknown-detail result that omits every server-private authority locator. */
+export type AdminUnknownUsageReconciliationResult = Omit<
+  AdminActionReconciliationResult,
+  "workspaceId" | "actionId" | "decision"
+> & {
+  /** Unknown-held decision accepted by the selected authoritative detail. */
+  decision: "settle" | "release";
 };
 
 /** Auditable result of one idempotent administrator Action coordination decision. */
@@ -1294,6 +1652,12 @@ export interface AdminUsageApi {
   /** Return one bounded page of a registered User's content-free Usage Records. */
   listUsageRecords(request: AdminUsageRecordPageRequest): Promise<UserUsageRecordPage>;
 
+  /** Open one report with normalized filters, timezone, generation, and watermark frozen. */
+  openReport(filter: AdminUsageReportFilter): Promise<RpcStub<AdminUsageReport>>;
+
+  /** Read one authoritative Usage graph after resolving the registered User through Registry. */
+  getRecordDetail(request: AdminUsageRecordDetailRequest): Promise<AdminUsageRecordDetail>;
+
   /** Append one exact positive administrator grant to a registered User. */
   grant(request: AdminUsageGrantRequest): Promise<AdminUsageOperationResult>;
 
@@ -1309,10 +1673,15 @@ export interface AdminUsageApi {
   /** Permanently remove one registered User's direct identity and retain pseudonymous history. */
   deleteUsageUser(request: AdminUsageDeleteUserRequest): Promise<AdminUsageDeleteUserResult>;
 
-  /** Coordinate one unknown Action, or reverse its already-settled Usage Charge exactly. */
+  /** Reverse one already-settled Action Usage Charge exactly. */
   reconcileAction(
     request: AdminActionReconciliationRequest,
   ): Promise<AdminActionReconciliationResult>;
+
+  /** Settle or release the selected unknown detail without accepting an Action identifier. */
+  reconcileUnknownRecord(
+    request: AdminUnknownUsageReconciliationRequest,
+  ): Promise<AdminUnknownUsageReconciliationResult>;
 }
 
 /** Top-level API exposed to the user after they have authenticated. */

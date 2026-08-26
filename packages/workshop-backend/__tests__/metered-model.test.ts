@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { AdminSettings } from "../src/admin-settings.js";
 import { getModel } from "../src/ai-models.js";
 import {
@@ -19,13 +19,33 @@ const testEnv = env as unknown as {
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
 };
 
+const REGISTRATION_OUTBOX_KEY = "usageAccount:registrationOutbox:v1";
+const usersWithPendingProjectionMaintenance: DurableObjectStub<UserDurableObject>[] = [];
+
 async function newUser() {
   const identity = `metered-model-${crypto.randomUUID()}`;
   const user = testEnv.TEST_USER.getByName(identity);
   const token = await user.createAccount(identity, identity, new Uint8Array([4, 6, 4, 6]));
   if (token === null) throw new Error("Failed to create metered-model test User.");
+  usersWithPendingProjectionMaintenance.push(user);
   return user;
 }
+
+afterEach(async () => {
+  for (const user of usersWithPendingProjectionMaintenance.splice(0)) {
+    const registered = await runInDurableObject(user, (_instance, state) =>
+      state.storage.kv.get(REGISTRATION_OUTBOX_KEY) !== undefined);
+    if (!registered) continue;
+    for (let batch = 0; batch < 64; batch += 1) {
+      const pending = await runInDurableObject(user, (_instance, state) =>
+        new UsageAccount(state.storage).listPendingProjectionOutbox(1).length > 0);
+      if (!pending) break;
+      await runInDurableObject(user, instance => instance.alarm());
+    }
+    expect(await runInDurableObject(user, (_instance, state) =>
+      new UsageAccount(state.storage).listPendingProjectionOutbox(1).length)).toBe(0);
+  }
+});
 
 function usagePrincipal(user: {id: {toString(): string}}) {
   return {version: 1 as const, kind: "user" as const, userId: user.id.toString()};

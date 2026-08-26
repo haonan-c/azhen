@@ -37,6 +37,7 @@ export default defineConfig({
       '__tests__/usage-retention.test.ts',
       '__tests__/usage-anonymization.test.ts',
       '__tests__/usage-projection.test.ts',
+      '__tests__/usage-report.test.ts',
     ],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
     setupFiles: ['../../test-setup/assert-workerd.ts'],

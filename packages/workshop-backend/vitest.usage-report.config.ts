@@ -1,15 +1,10 @@
-import {defineConfig} from "vitest/config";
 import {cloudflareTest} from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
+import {defineConfig} from "vitest/config";
 
-const EXPECTED_USAGE_ADMIN_ERROR_MESSAGES = new Set([
-  "A User account must exist before its Usage Account can be activated.",
-  "Administrator operation ID conflicts with its stored request.",
-  "Original Credit Ledger Entry has already been reversed.",
-  "A Credit Reversal cannot itself be reversed.",
-  "Insufficient Usage Credit.",
-  "Registry search cursor is invalid.",
-  "Usage Record does not exist.",
+const EXPECTED_USAGE_REPORT_ERROR_MESSAGES = new Set([
+  "Usage report cursor is invalid.",
+  "Usage report snapshot is stale.",
 ]);
 
 export default defineConfig({
@@ -30,12 +25,12 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ["__tests__/usage-account-admin.test.ts"],
+    include: ["__tests__/usage-report.test.ts"],
     setupFiles: ["../../test-setup/assert-workerd.ts"],
-    // Durable Object RPC reports these rejected calls independently from the assertions in this
-    // one negative-test file. Every other unit file keeps Vitest's fail-closed default.
+    // Native Durable Object RPC reports this rejected keyset cursor independently from the
+    // assertion in this one negative-test file. All other errors remain fail-closed.
     onUnhandledError(error) {
-      if (EXPECTED_USAGE_ADMIN_ERROR_MESSAGES.has(error.message)) return false;
+      if (EXPECTED_USAGE_REPORT_ERROR_MESSAGES.has(error.message)) return false;
     },
   },
 });

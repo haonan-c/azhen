@@ -20,8 +20,8 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       cacheWriteInputTokens: 3n,
       outputTokens: 4n,
       reasoningTokens: 1n,
-      meteredUseCount: 5n,
       billableApiOperations: 5n,
+      meteredUseCount: 9n,
       activeUsers: 6n,
       unpricedModelUses: 7n,
       unpricedApiOperations: 8n,
@@ -214,6 +214,48 @@ describe("administrator Usage and Credits overview", () => {
 
     expect(dispose).toHaveBeenCalledOnce();
     expect(usage.getOverview).not.toHaveBeenCalled();
+  });
+
+  it("clears and disposes the previous administrator Usage capability before minting a replacement", async () => {
+    const previousDispose = vi.fn<() => void>();
+    const previousUsage = {
+      getOverview: vi.fn<() => Promise<AdminUsageOverview>>()
+        .mockResolvedValue(overview({registeredUsers: 41n})),
+      [Symbol.dispose]: previousDispose,
+    };
+    const previousAdmin = {
+      getUsageApi: vi.fn<() => Promise<typeof previousUsage>>()
+        .mockResolvedValue(previousUsage),
+    } as unknown as RpcStub<AdminApi>;
+    let rejectReplacement!: (reason: unknown) => void;
+    const replacementPromise = new Promise<never>((_resolve, reject) => {
+      rejectReplacement = reject;
+    });
+    const replacementAdmin = {
+      getUsageApi: vi.fn<() => Promise<never>>()
+        .mockReturnValue(replacementPromise),
+    } as unknown as RpcStub<AdminApi>;
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root!.render(
+      <AdminUsageOverviewPanel adminApi={previousAdmin} />,
+    ));
+    await vi.waitFor(() => expect(container?.textContent).toContain("6 / 41"));
+
+    await act(async () => root!.render(
+      <AdminUsageOverviewPanel adminApi={replacementAdmin} />,
+    ));
+
+    expect(previousDispose).toHaveBeenCalledOnce();
+    expect(container?.querySelector('[role="status"]')?.textContent).toContain("Loading");
+    expect(container?.textContent).not.toContain("6 / 41");
+
+    await act(async () => rejectReplacement(new Error("safe replacement failure")));
+
+    await vi.waitFor(() => expect(container?.textContent).toContain("Could not load"));
+    expect(container?.textContent).not.toContain("6 / 41");
+    expect(previousDispose).toHaveBeenCalledOnce();
   });
 
   it("ignores a late poll response and keeps the newest overview", async () => {

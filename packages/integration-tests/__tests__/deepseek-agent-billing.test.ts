@@ -87,6 +87,26 @@ async function signInWhenAvailable(
   throw connectionFailure ?? new Error("Workshop did not accept a WebSocket connection.");
 }
 
+type ScheduledAlarmDiagnostic = {
+  stage: "await-provider-call";
+  providerCalls: number;
+  schedulerAccountsReady: boolean;
+  hookRegistered: boolean;
+  loaderReloadComplete: boolean;
+  hookEnableComplete: boolean;
+};
+
+function scheduledAlarmTimeout(diagnostic: ScheduledAlarmDiagnostic): Error {
+  return new Error(
+    "Timed out waiting for the scheduled provider call; " +
+    `stage=${diagnostic.stage}; providerCalls=${diagnostic.providerCalls}; ` +
+    `schedulerAccountsReady=${diagnostic.schedulerAccountsReady}; ` +
+    `hookRegistered=${diagnostic.hookRegistered}; ` +
+    `loaderReloadComplete=${diagnostic.loaderReloadComplete}; ` +
+    `hookEnableComplete=${diagnostic.hookEnableComplete}.`,
+  );
+}
+
 function deepSeekSse(): Response {
   const frames = [
     {
@@ -383,6 +403,21 @@ afterAll(async () => {
 });
 
 describe("DeepSeek Agent billing", () => {
+  it("reports bounded scheduled alarm timeout telemetry", () => {
+    expect(scheduledAlarmTimeout({
+      stage: "await-provider-call",
+      providerCalls: 2,
+      schedulerAccountsReady: true,
+      hookRegistered: true,
+      loaderReloadComplete: true,
+      hookEnableComplete: true,
+    }).message).toBe(
+      "Timed out waiting for the scheduled provider call; stage=await-provider-call; " +
+      "providerCalls=2; schedulerAccountsReady=true; hookRegistered=true; " +
+      "loaderReloadComplete=true; hookEnableComplete=true.",
+    );
+  });
+
   it("reserves before the provider request and settles one exact Agent charge", async () => {
     using publicApi = connect(harness.url);
 
@@ -833,15 +868,38 @@ describe("DeepSeek Agent billing", () => {
     using admin = await authenticatedAdmin.getAdminApi();
     if (!admin) throw new Error("Expected the deployment administrator capability.");
     using usageAdmin = await admin.getUsageApi();
+    const registered = await waitFor("the delayed Action User Registry entry", async () =>
+      (await usageAdmin.searchUsers({query: submitterName, limit: 2})).users
+        .find(candidate => candidate.identity === submitterName) ?? null);
+    const opened = await waitFor("the delayed unknown Usage report detail", async () => {
+      let candidate;
+      try {
+        candidate = await usageAdmin.openReport({
+          registeredUserRefs: [registered.registeredUserRef],
+        });
+        const page = await candidate.listRows({limit: 20});
+        const row = page.rows.find(item => item.rowKind === "detail" &&
+          item.meteredKind === "gatekeeper" && item.outcome === "usage-unknown-held");
+        if (row?.rowKind === "detail") return {candidate, row};
+        candidate[Symbol.dispose]();
+        return null;
+      } catch (error) {
+        candidate?.[Symbol.dispose]();
+        if (error instanceof Error &&
+            error.message.includes("Usage Projection bootstrap is incomplete")) return null;
+        throw error;
+      }
+    });
+    using _report = opened.candidate;
     const reconciliationRequest = {
-      workspaceId,
-      actionId: pending.id,
+      registeredUserRef: registered.registeredUserRef,
+      safeRecordRef: opened.row.safeRecordRef,
       operationId: `admin-action-settle:${crypto.randomUUID()}`,
       decision: "settle" as const,
       reason: "Provider confirmed that the delayed Action executed",
     };
-    const reconciliation = await usageAdmin.reconcileAction(reconciliationRequest);
-    expect(await usageAdmin.reconcileAction(reconciliationRequest)).toEqual(reconciliation);
+    const reconciliation = await usageAdmin.reconcileUnknownRecord(reconciliationRequest);
+    expect(await usageAdmin.reconcileUnknownRecord(reconciliationRequest)).toEqual(reconciliation);
     await Promise.race([
       assistanceCall,
       new Promise<never>((_resolve, reject) =>
@@ -882,6 +940,10 @@ describe("DeepSeek Agent billing", () => {
   it("charges a collaborator-configured scheduled alarm to the owner after restart and disconnect", async () => {
     const publicApi = connect(harness.url);
     const [ownerName, builderName] = nextUsernames("scheduleowner", "schedulebuilder");
+    let schedulerAccountsReady = false;
+    let hookRegistered = false;
+    let loaderReloadComplete = false;
+    let hookEnableComplete = false;
     const owner = await signUp(publicApi, ownerName);
     const builder = await signUp(publicApi, builderName);
     await owner.provisionAmbientAccount("scheduler");
@@ -891,6 +953,7 @@ describe("DeepSeek Agent billing", () => {
       (await listConnectedAccounts(builder)).some(account => account.vendorId === "scheduler")
         ? true
         : null);
+    schedulerAccountsReady = true;
     const ownerWorkspace = await owner.newGadget();
     const workspaceId = (await ownerWorkspace.getMetadata()).id;
     expect(await ownerWorkspace.addCollaborator(builderName, "build")).not.toBeNull();
@@ -973,6 +1036,7 @@ describe("DeepSeek Agent billing", () => {
       const hooks = await builderWorkspace.listHooks();
       return chat?.activeAgent === undefined && hooks.length === 1 ? hooks[0]! : null;
     });
+    hookRegistered = true;
     const [hook] = await builderWorkspace.listHooks();
     if (!hook) throw new Error("Expected the registered Scheduler Hook.");
     let scheduleId: string | undefined;
@@ -988,12 +1052,14 @@ describe("DeepSeek Agent billing", () => {
     // equivalent of aborting the active objects; unlike targeted eviction, it also works when a
     // persisted Hook capability still has a live reference to the Overseer.
     await harness.server.update(options => options);
+    loaderReloadComplete = true;
 
     const enablingSession = await signInWhenAvailable(builderName);
     const enablingPublicApi = enablingSession.publicApi;
     const enablingBuilder = enablingSession.user;
     const enablingWorkspace = await enablingBuilder.openGadget(workspaceId);
     await enablingWorkspace.enableHook(hook.id);
+    hookEnableComplete = true;
     enablingWorkspace[Symbol.dispose]();
     enablingBuilder[Symbol.dispose]();
     enablingPublicApi[Symbol.dispose]();
@@ -1001,8 +1067,14 @@ describe("DeepSeek Agent billing", () => {
     await Promise.race([
       scheduledCall,
       new Promise<never>((_resolve, reject) =>
-        setTimeout(() => reject(new Error("Timed out waiting for the scheduled provider call.")),
-          40_000)),
+        setTimeout(() => reject(scheduledAlarmTimeout({
+          stage: "await-provider-call",
+          providerCalls: agentProviderCalls,
+          schedulerAccountsReady,
+          hookRegistered,
+          loaderReloadComplete,
+          hookEnableComplete,
+        })), 40_000)),
     ]);
 
     using reopenedPublicApi = connect(harness.url);

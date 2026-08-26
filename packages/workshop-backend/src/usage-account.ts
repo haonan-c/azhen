@@ -1,7 +1,10 @@
 import {
+  type AdminUnknownUsageReconciliationResult,
+  type AdminUsageRecordDetail,
   type AdminUsageBalanceState,
   type AdminUsageOperationKind,
   type AdminUsageOperationResult,
+  type AdminUsageReservationStatus,
   type ChargeSnapshot,
   type GatekeeperChargeSnapshot,
   type InitialGrantSnapshot,
@@ -103,6 +106,10 @@ const GATEKEEPER_RECONCILIATION_TIME_INDEX_PREFIX =
   "usageAccount:gatekeeperReconciliationTimeIndex:";
 const USAGE_OPERATION_TOMBSTONE_PREFIX = "usageAccount:operationTombstone:";
 const USAGE_USER_DELETION_KEY = "usageAccount:userDeletion:v1";
+const ADMIN_UNKNOWN_RECONCILIATION_PREFIX =
+  "usageAccount:adminUnknownReconciliation:v1:";
+const ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX =
+  "usageAccount:adminUnknownReconciliationByOperation:v1:";
 const RETENTION_RUN_KEY = "usageAccount:retentionRun:v1";
 const RETENTION_NEXT_RUN_AT_KEY = "usageAccount:retentionNextRunAt:v1";
 const RETENTION_FAILURE_RETRY_AT_KEY = "usageAccount:retentionFailureRetryAt:v1";
@@ -140,6 +147,24 @@ export type UsageUserDeletionState = {
   state: "deleting" | "deleted";
 };
 
+/** Server-private authority target frozen before an administrator coordinates unknown Usage. */
+export type AdminUnknownUsageActionTarget = {
+  workspaceId: string;
+  actionId: number | null;
+  billingOperationId: string;
+};
+
+/** Bounded User-authoritative retry state for one detail-scoped unknown Usage decision. */
+export type AdminUnknownUsageReconciliationPreparation = {
+  safeRecordRef: string;
+  operationId: string;
+  decision: "settle" | "release";
+  reason: string;
+  actorUserId: string;
+  target: AdminUnknownUsageActionTarget;
+  result: AdminUnknownUsageReconciliationResult | null;
+};
+
 type UsageRetentionStage = "model" | "gatekeeper" | "reconciliation";
 type UsageDetailExpiryResult = "deleted" | "retained" | "blocked";
 
@@ -162,9 +187,8 @@ type ProjectionFactContribution =
 type DetailProjectionContribution = Omit<
   UsageProjectionDetailFact,
   "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef" |
-    "safeRecordRef"
+    "safeRecordRef" | "safeAttemptRef"
 >;
-
 type TransactionResult<T> = { value: T } | { error: Error };
 
 type UsageAccountTotals = {
@@ -232,6 +256,8 @@ export type ModelUsageRecord = {
   usageStatus: "reported" | "not-reported" | "invalid-report";
   usage: ReportedModelUsage | null;
   chargeSubunits: bigint | null;
+  /** Credit Reservation state frozen when this Metering Attempt became terminal. */
+  reservationStatusAtCompletion?: AdminUsageReservationStatus;
   createdAt: string;
 };
 
@@ -245,6 +271,8 @@ export type GatekeeperUsageAttribution = (
   billingMethodKey: string;
   /** Connected external account the upstream business call consumes quota from. */
   externalAccountId: string;
+  /** Server-private Workspace Action locator, present only for delayed Actions. */
+  actionId?: number;
 };
 
 /**
@@ -286,6 +314,8 @@ export type GatekeeperUsageRecord = {
   ledgerEntryId: string | null;
   outcome: "settled" | "failed-before-execution" | "usage-unknown";
   chargeSubunits: bigint | null;
+  /** Credit Reservation state frozen when this Metering Attempt became terminal. */
+  reservationStatusAtCompletion?: AdminUsageReservationStatus;
   createdAt: string;
 };
 
@@ -1261,6 +1291,25 @@ export class UsageAccount {
         reconciliation.billingOperationId,
       true,
     );
+    const adminSafeRecordRef = this.storage.kv.get<string>(
+      ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+    );
+    if (adminSafeRecordRef !== undefined) {
+      const preparation = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(
+        ADMIN_UNKNOWN_RECONCILIATION_PREFIX + adminSafeRecordRef,
+      );
+      if (preparation === undefined) {
+        throw new Error("Administrator unknown Usage replay index does not reconcile.");
+      }
+      assertAdminUnknownUsageReconciliationPreparation(preparation, adminSafeRecordRef);
+      if (preparation.operationId !== operationId) {
+        throw new Error("Administrator unknown Usage replay index does not reconcile.");
+      }
+      this.storage.kv.delete(ADMIN_UNKNOWN_RECONCILIATION_PREFIX + adminSafeRecordRef);
+      this.storage.kv.delete(
+        ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+      );
+    }
     this.storage.kv.delete(
       GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + reconciliation.billingOperationId,
     );
@@ -1498,6 +1547,308 @@ export class UsageAccount {
   advanceDiscoveredGatekeeperMethodMigrationBatch(): boolean {
     return this.storage.transactionSync(() =>
       this.migrateDiscoveredGatekeeperMethodsBatch());
+  }
+
+  /** Read one content-free authoritative graph through a random User-local record reference. */
+  getAdminUsageRecordDetail(safeRecordRef: string): AdminUsageRecordDetail {
+    if (!isOpaqueUsageReference(safeRecordRef)) {
+      throw new TypeError("Usage Record reference is invalid.");
+    }
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (!locator || operationIdValidationError(locator.operationId) !== undefined) {
+      throw new Error("Usage Record does not exist.");
+    }
+    if (locator.kind === "gatekeeper-reconciliation") {
+      const authority = this.getGatekeeperReconciliationAuthority(safeRecordRef);
+      if (!authority || authority.usagePrincipalRef !==
+          this.getRegistrationOutbox().fact.registeredUserRef) {
+        throw new Error("Usage Record does not exist.");
+      }
+      const reconciliation = this.storage.kv.get<GatekeeperUsageReconciliation>(
+        GATEKEEPER_RECONCILIATION_PREFIX + locator.operationId,
+      );
+      if (!reconciliation) throw new Error("Usage Record does not exist.");
+      assertGatekeeperUsageReconciliation(reconciliation, locator.operationId);
+      const linkedLedger = authority.ledgerEntryId === null ? undefined
+        : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + authority.ledgerEntryId);
+      if (authority.ledgerEntryId !== null &&
+          (!linkedLedger || linkedLedger.kind !== "usage-charge")) {
+        throw new Error("Usage Record Ledger link does not reconcile.");
+      }
+      const reversalId = authority.ledgerEntryId === null ? undefined
+        : this.storage.kv.get<string>(REVERSAL_PREFIX + authority.ledgerEntryId);
+      const reversal = reversalId === undefined ? undefined
+        : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + reversalId);
+      if (reversalId !== undefined && (!reversal || reversal.kind !== "credit-reversal" ||
+          reversal.adminAudit.originalLedgerEntryId !== authority.ledgerEntryId)) {
+        throw new Error("Usage Record Credit Reversal does not reconcile.");
+      }
+      return {
+        record: {
+          kind: "gatekeeper-reconciliation",
+          id: safeRecordRef,
+          source: authority.source,
+          meteredKind: authority.meteredKind,
+          vendorId: authority.vendorId,
+          billingMethodKey: authority.billingMethodKey,
+          externalAccountId: authority.externalAccountId,
+          gadgetId: authority.gadgetId,
+          pricing: authority.pricing,
+          outcome: authority.outcome,
+          chargeSubunits: authority.chargedUsageCreditSubunits,
+          createdAt: authority.reconciledAtUtc,
+        },
+        chargeSnapshot: authority.chargeSnapshot,
+        reservation: null,
+        ledgerEntries: [linkedLedger, reversal].filter(
+          (entry): entry is CreditLedgerEntry => entry !== undefined,
+        ).map(entry => ({
+          id: `${safeRecordRef}:${entry.kind}`,
+          kind: entry.kind as "usage-charge" | "credit-reversal",
+          deltaSubunits: entry.deltaSubunits,
+          createdAt: entry.createdAt,
+        })),
+        reconciliation: {
+          decision: reconciliation.decision,
+          actorUserId: reconciliation.actorUserId,
+          reason: reconciliation.reason,
+          createdAt: reconciliation.createdAt,
+        },
+      };
+    }
+    const sourceIdentity = `${locator.kind}:${locator.operationId}`;
+    const expectedRef = this.storage.kv.get<string>(
+      USAGE_DETAIL_SOURCE_REF_PREFIX + sourceIdentity,
+    );
+    if (expectedRef !== safeRecordRef) {
+      throw new Error("Usage Record reference does not reconcile.");
+    }
+    const rawRecord = locator.kind === "model"
+      ? this.storage.kv.get<ModelUsageRecord>(MODEL_USAGE_RECORD_PREFIX + locator.operationId)
+      : this.storage.kv.get<GatekeeperUsageRecord>(
+        GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
+      );
+    if (!rawRecord) throw new Error("Usage Record does not exist.");
+    if (locator.kind === "model") {
+      assertModelUsageRecord(rawRecord as ModelUsageRecord, locator.operationId);
+    } else {
+      assertGatekeeperUsageRecord(rawRecord as GatekeeperUsageRecord, locator.operationId);
+    }
+
+    const reservation = rawRecord.reservationId === null ? null
+      : this.storage.kv.get<CreditReservation>(RESERVATION_PREFIX + locator.operationId);
+    if (rawRecord.reservationId !== null && !reservation) {
+      throw new Error("Usage Record Reservation does not reconcile.");
+    }
+    if (reservation) this.assertStoredReservationConsistency(reservation, locator.operationId);
+
+    const reconciliationId = locator.kind === "gatekeeper"
+      ? this.storage.kv.get<string>(
+        GATEKEEPER_RECONCILIATION_BY_USAGE_PREFIX + locator.operationId,
+      ) : undefined;
+    const reconciliation = reconciliationId === undefined ? undefined
+      : this.storage.kv.get<GatekeeperUsageReconciliation>(
+        GATEKEEPER_RECONCILIATION_PREFIX + reconciliationId,
+      );
+    if (reconciliationId !== undefined && (!reconciliation ||
+        reconciliation.billingOperationId !== locator.operationId)) {
+      throw new Error("Usage Record reconciliation does not reconcile.");
+    }
+
+    const linkedLedgerId = rawRecord.ledgerEntryId ?? reconciliation?.ledgerEntryId ?? null;
+    const linkedLedger = linkedLedgerId === null ? undefined
+      : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + linkedLedgerId);
+    if (linkedLedgerId !== null && (!linkedLedger || linkedLedger.kind !== "usage-charge")) {
+      throw new Error("Usage Record Ledger link does not reconcile.");
+    }
+    const reversalId = linkedLedgerId === null ? undefined
+      : this.storage.kv.get<string>(REVERSAL_PREFIX + linkedLedgerId);
+    const reversal = reversalId === undefined ? undefined
+      : this.storage.kv.get<CreditLedgerEntry>(LEDGER_PREFIX + reversalId);
+    if (reversalId !== undefined && (!reversal || reversal.kind !== "credit-reversal" ||
+        reversal.adminAudit.originalLedgerEntryId !== linkedLedgerId)) {
+      throw new Error("Usage Record Credit Reversal does not reconcile.");
+    }
+
+    const record = locator.kind === "model"
+      ? userModelUsageRecord(rawRecord as ModelUsageRecord)
+      : {
+        ...userGatekeeperUsageRecord(rawRecord as GatekeeperUsageRecord),
+        externalAccountId: (rawRecord as GatekeeperUsageRecord).attribution.externalAccountId,
+      };
+    return {
+      record: {...record, id: safeRecordRef},
+      chargeSnapshot: rawRecord.chargeSnapshot,
+      reservation: reservation ? {
+        amountSubunits: reservation.amountSubunits,
+        state: reservation.state,
+        createdAt: reservation.createdAt,
+        settledAt: reservation.settledAt ?? null,
+        releasedAt: reservation.releasedAt ?? null,
+      } : null,
+      ledgerEntries: [linkedLedger, reversal].filter(
+        (entry): entry is CreditLedgerEntry => entry !== undefined,
+      ).map(entry => ({
+        id: `${safeRecordRef}:${entry.kind}`,
+        kind: entry.kind as "usage-charge" | "credit-reversal",
+        deltaSubunits: entry.deltaSubunits,
+        createdAt: entry.createdAt,
+      })),
+      reconciliation: reconciliation ? {
+        decision: reconciliation.decision,
+        actorUserId: reconciliation.actorUserId,
+        reason: reconciliation.reason,
+        createdAt: reconciliation.createdAt,
+      } : null,
+    };
+  }
+
+  /** Fail closed unless one random detail reference identifies the specified unknown operation. */
+  assertAdminUnknownUsageDetailReference(
+      safeRecordRef: string,
+      billingOperationId: string): void {
+    if (!isOpaqueUsageReference(safeRecordRef) ||
+        operationIdValidationError(billingOperationId) !== undefined) {
+      throw new Error("Usage Record does not match the Action.");
+    }
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper" || locator.operationId !== billingOperationId) {
+      throw new Error("Usage Record does not match the Action.");
+    }
+    const detail = this.getAdminUsageRecordDetail(safeRecordRef);
+    if (detail.record.kind !== "gatekeeper" || detail.record.outcome !== "usage-unknown") {
+      throw new Error("Usage Record does not match the Action.");
+    }
+  }
+
+  /** Resolve an unknown detail to its server-private Action locator inside this User authority. */
+  getAdminUnknownUsageActionTarget(safeRecordRef: string): AdminUnknownUsageActionTarget {
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator?.kind !== "gatekeeper") {
+      throw new Error("Unknown Usage Record does not exist.");
+    }
+    this.assertAdminUnknownUsageDetailReference(safeRecordRef, locator.operationId);
+    const record = this.storage.kv.get<GatekeeperUsageRecord>(
+      GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
+    );
+    if (!record || typeof record.attribution.workspaceId !== "string" ||
+        (record.attribution.actionId !== undefined &&
+         (!Number.isSafeInteger(record.attribution.actionId) || record.attribution.actionId < 0))) {
+      throw new Error("Unknown Usage Record has no Action authority.");
+    }
+    return {
+      workspaceId: record.attribution.workspaceId,
+      actionId: record.attribution.actionId ?? null,
+      billingOperationId: locator.operationId,
+    };
+  }
+
+  /** Freeze one detail-scoped unknown decision before any cross-Durable-Object mutation. */
+  prepareAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): AdminUnknownUsageReconciliationPreparation {
+    return this.storage.transactionSync(() => {
+      assertAdminUnknownUsageReconciliationInput(
+        safeRecordRef, operationId, decision, reason, actorUserId,
+      );
+      const operationRef = this.storage.kv.get<string>(
+        ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+      );
+      if (operationRef !== undefined && operationRef !== safeRecordRef) {
+        throw new Error(
+          "Administrator unknown Usage operation conflicts with its selected detail.",
+        );
+      }
+      const key = ADMIN_UNKNOWN_RECONCILIATION_PREFIX + safeRecordRef;
+      const existing = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(key);
+      if (existing !== undefined) {
+        assertAdminUnknownUsageReconciliationPreparation(existing, safeRecordRef);
+        if (existing.operationId !== operationId || existing.decision !== decision ||
+            existing.reason !== reason || existing.actorUserId !== actorUserId) {
+          throw new Error(
+            "Administrator unknown Usage detail conflicts with its stored decision.",
+          );
+        }
+        return structuredClone(existing);
+      }
+      const prepared: AdminUnknownUsageReconciliationPreparation = {
+        safeRecordRef,
+        operationId,
+        decision,
+        reason,
+        actorUserId,
+        target: this.getAdminUnknownUsageActionTarget(safeRecordRef),
+        result: null,
+      };
+      this.storage.kv.put(key, prepared);
+      this.storage.kv.put(
+        ADMIN_UNKNOWN_RECONCILIATION_BY_OPERATION_PREFIX + operationId,
+        safeRecordRef,
+      );
+      return structuredClone(prepared);
+    });
+  }
+
+  /** Verify one cross-DO Action call against its retained administrator preparation. */
+  assertPreparedAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      workspaceId: string,
+      actionId: number,
+      billingOperationId: string,
+      operationId: string,
+      decision: "settle" | "release",
+      reason: string,
+      actorUserId: string): void {
+    assertAdminUnknownUsageReconciliationInput(
+      safeRecordRef,
+      operationId,
+      decision,
+      reason,
+      actorUserId,
+    );
+    const prepared = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(
+      ADMIN_UNKNOWN_RECONCILIATION_PREFIX + safeRecordRef,
+    );
+    if (prepared === undefined) {
+      throw new Error("Administrator unknown Usage decision was not prepared.");
+    }
+    assertAdminUnknownUsageReconciliationPreparation(prepared, safeRecordRef);
+    if (prepared.operationId !== operationId || prepared.decision !== decision ||
+        prepared.reason !== reason || prepared.actorUserId !== actorUserId ||
+        prepared.target.workspaceId !== workspaceId ||
+        prepared.target.billingOperationId !== billingOperationId ||
+        (prepared.target.actionId !== null && prepared.target.actionId !== actionId)) {
+      throw new Error("Administrator unknown Usage Action does not match its preparation.");
+    }
+  }
+
+  /** Commit one safe administrator result so a lost response can replay after detail retention. */
+  completeAdminUnknownUsageReconciliation(
+      safeRecordRef: string,
+      result: AdminUnknownUsageReconciliationResult):
+      AdminUnknownUsageReconciliationResult {
+    return this.storage.transactionSync(() => {
+      const key = ADMIN_UNKNOWN_RECONCILIATION_PREFIX + safeRecordRef;
+      const prepared = this.storage.kv.get<AdminUnknownUsageReconciliationPreparation>(key);
+      if (prepared === undefined) {
+        throw new Error("Administrator unknown Usage decision was not prepared.");
+      }
+      assertAdminUnknownUsageReconciliationPreparation(prepared, safeRecordRef);
+      assertAdminUnknownUsageReconciliationResult(result, prepared);
+      if (prepared.result !== null) {
+        assertAdminUnknownUsageReconciliationResult(prepared.result, prepared);
+        if (!adminUnknownUsageResultsEqual(prepared.result, result)) {
+          throw new Error("Administrator unknown Usage result conflicts with its stored result.");
+        }
+        return structuredClone(prepared.result);
+      }
+      const completed = {...prepared, result: structuredClone(result)};
+      this.storage.kv.put(key, completed);
+      return structuredClone(result);
+    });
   }
 
   private migrateGatekeeperUsageTimeIndexBatch(): boolean {
@@ -2035,6 +2386,10 @@ export class UsageAccount {
         usageStatus,
         usage: normalizedUsage,
         chargeSubunits,
+        reservationStatusAtCompletion: this.#projectionReservationStatus(
+          operationId,
+          attempt.reservationId,
+        ),
         createdAt: completedAt,
       };
       const completedAttempt: ModelMeteringAttempt = {
@@ -2104,6 +2459,10 @@ export class UsageAccount {
       usageStatus: "not-reported",
       usage: null,
       chargeSubunits: null,
+      reservationStatusAtCompletion: this.#projectionReservationStatus(
+        operationId,
+        attempt.reservationId,
+      ),
       createdAt: completedAt,
     };
     const completedAttempt: ModelMeteringAttempt = {
@@ -2373,6 +2732,10 @@ export class UsageAccount {
         ledgerEntryId,
         outcome,
         chargeSubunits,
+        reservationStatusAtCompletion: this.#projectionReservationStatus(
+          operationId,
+          attempt.reservationId,
+        ),
         createdAt: completedAt,
       };
       this.storage.kv.put(recordKey, record);
@@ -2394,6 +2757,9 @@ export class UsageAccount {
     const confirmedUsage = record.usageStatus === "reported" && record.usage !== null &&
       (record.outcome === "settled" || record.outcome === "reconciliation-required");
     const usage = confirmedUsage ? record.usage : null;
+    const storedReservationStatus = record.reservationStatusAtCompletion;
+    const reservationStatus = storedReservationStatus ??
+      legacyModelReservationStatus(record);
     this.#appendDetailAndSummary(`model:${record.operationId}`, {
       kind: "model",
       operationId: record.operationId,
@@ -2402,7 +2768,10 @@ export class UsageAccount {
       occurredAt: record.createdAt,
       source: record.attribution.source,
       kind: "model",
-      outcome: record.outcome,
+      outcome: record.outcome === "usage-unknown"
+        ? projectionUnknownOutcome(reservationStatus)
+        : record.outcome,
+      reservationStatus,
       pricing: record.chargeSnapshot.pricing,
       deploymentModelId: record.attribution.deploymentModelId,
       vendorId: null,
@@ -2424,6 +2793,7 @@ export class UsageAccount {
       preExecutionFailures: record.outcome === "failed-before-execution" ? 1n : 0n,
       unknownOperations: record.outcome === "usage-unknown" ||
         record.outcome === "reconciliation-required" ? 1n : 0n,
+      ...reservationAttemptMetrics(reservationStatus),
       activeUserContribution: confirmedUsage ? 1n : 0n,
       unpricedModelUses: confirmedUsage && record.chargeSnapshot.pricing === "unpriced" ? 1n : 0n,
       unpricedApiOperations: 0n,
@@ -2432,6 +2802,9 @@ export class UsageAccount {
 
   #appendGatekeeperProjectionFact(record: GatekeeperUsageRecord): void {
     const confirmedUsage = record.outcome === "settled";
+    const storedReservationStatus = record.reservationStatusAtCompletion;
+    const reservationStatus = storedReservationStatus ??
+      legacyGatekeeperReservationStatus(record);
     this.#appendDetailAndSummary(`gatekeeper:${record.operationId}`, {
       kind: "gatekeeper",
       operationId: record.operationId,
@@ -2440,7 +2813,10 @@ export class UsageAccount {
       occurredAt: record.createdAt,
       source: record.attribution.source,
       kind: "gatekeeper",
-      outcome: record.outcome,
+      outcome: record.outcome === "usage-unknown"
+        ? projectionUnknownOutcome(reservationStatus)
+        : record.outcome,
+      reservationStatus,
       pricing: record.chargeSnapshot.pricing,
       deploymentModelId: null,
       vendorId: record.attribution.vendorId,
@@ -2459,6 +2835,7 @@ export class UsageAccount {
       billableApiOperations: confirmedUsage ? 1n : 0n,
       preExecutionFailures: record.outcome === "failed-before-execution" ? 1n : 0n,
       unknownOperations: record.outcome === "usage-unknown" ? 1n : 0n,
+      ...reservationAttemptMetrics(reservationStatus),
       activeUserContribution: confirmedUsage ? 1n : 0n,
       unpricedModelUses: 0n,
       unpricedApiOperations: confirmedUsage && record.chargeSnapshot.pricing === "unpriced"
@@ -2483,6 +2860,7 @@ export class UsageAccount {
       source: authority.source,
       kind: "gatekeeper",
       outcome: authority.outcome,
+      reservationStatus: "none",
       pricing: authority.pricing,
       deploymentModelId: null,
       vendorId: authority.vendorId,
@@ -2500,6 +2878,7 @@ export class UsageAccount {
       billableApiOperations: authority.billableApiOperations,
       preExecutionFailures: 0n,
       unknownOperations: 0n,
+      ...reservationAttemptMetrics("none", 0n),
       activeUserContribution: authority.meteredUseCount,
       unpricedModelUses: 0n,
       unpricedApiOperations: authority.meteredUseCount > 0n && authority.pricing === "unpriced"
@@ -2928,6 +3307,53 @@ export class UsageAccount {
     });
   }
 
+  /** Resolve one public detail-scoped Ledger reference and append its exact reversal. */
+  adminReverseByReference(
+      operationId: string,
+      originalLedgerEntryRef: string,
+      reason: string,
+      actorUserId: string): AdminUsageOperationResult {
+    const suffix = ":usage-charge";
+    if (typeof originalLedgerEntryRef !== "string" ||
+        !originalLedgerEntryRef.endsWith(suffix)) {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const safeRecordRef = originalLedgerEntryRef.slice(0, -suffix.length);
+    if (!isOpaqueUsageReference(safeRecordRef)) {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const locator = this.resolveUsageDetailReference(safeRecordRef);
+    if (locator === null) throw new Error("Original Credit Ledger Entry does not exist.");
+    let originalLedgerEntryId: string | null;
+    if (locator.kind === "gatekeeper-reconciliation") {
+      originalLedgerEntryId = this.getGatekeeperReconciliationAuthority(safeRecordRef)
+        ?.ledgerEntryId ?? null;
+    } else {
+      const record = locator.kind === "model"
+        ? this.storage.kv.get<ModelUsageRecord>(MODEL_USAGE_RECORD_PREFIX + locator.operationId)
+        : this.storage.kv.get<GatekeeperUsageRecord>(
+          GATEKEEPER_USAGE_RECORD_PREFIX + locator.operationId,
+        );
+      if (record === undefined) throw new Error("Original Credit Ledger Entry does not exist.");
+      if (locator.kind === "model") {
+        assertModelUsageRecord(record as ModelUsageRecord, locator.operationId);
+      }
+      else assertGatekeeperUsageRecord(record as GatekeeperUsageRecord, locator.operationId);
+      originalLedgerEntryId = record.ledgerEntryId;
+    }
+    if (originalLedgerEntryId === null) {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const original = this.storage.kv.get<CreditLedgerEntry>(
+      LEDGER_PREFIX + originalLedgerEntryId,
+    );
+    if (original === undefined || original.kind !== "usage-charge") {
+      throw new Error("Original Credit Ledger Entry does not exist.");
+    }
+    const result = this.adminReverse(operationId, original.id, reason, actorUserId);
+    return {...result, originalLedgerEntryId: originalLedgerEntryRef};
+  }
+
   private applyAdminOperation(
       operationId: string,
       input: StoredAdminUsageOperationInput): AdminUsageOperationResult {
@@ -3267,10 +3693,22 @@ export class UsageAccount {
       this.#appendProjectionFact(`detail-v2:${sourceIdentity}`, {
         ...contribution,
         safeRecordRef: detailReference.safeRecordRef,
+        safeAttemptRef: contribution.meteringAttempts === 0n
+          ? null : detailReference.safeRecordRef,
       });
     }
     this.#appendUsageSummaryContribution(sourceIdentity, contribution);
     this.#scheduleRetentionExpiry(contribution.occurredAt);
+  }
+
+  #projectionReservationStatus(
+      operationId: string,
+      reservationId: string | null): AdminUsageReservationStatus {
+    if (reservationId === null) return "none";
+    const reservation = this.storage.kv.get<CreditReservation>(RESERVATION_PREFIX + operationId);
+    if (!reservation) throw new Error("Credit Reservation does not exist.");
+    this.assertStoredReservationConsistency(reservation, operationId);
+    return reservation.state === "reserved" ? "held" : reservation.state;
   }
 
   #scheduleRetentionExpiry(occurredAt: string): void {
@@ -3365,16 +3803,17 @@ export class UsageAccount {
       if (!isOpaqueUsageReference(indexedSummaryFactId)) {
         throw new Error("Usage Summary dimension index is invalid.");
       }
-      current = this.storage.kv.get<UsageSummaryFact>(
+      const stored = this.storage.kv.get<UsageSummaryFact>(
         USAGE_SUMMARY_PREFIX + indexedSummaryFactId,
       );
-      if (!current || usageSummaryDimensionKey(
-        current.usagePrincipalRef,
-        current.bucketStart,
-        current,
+      if (!stored || usageSummaryDimensionKey(
+        stored.usagePrincipalRef,
+        stored.bucketStart,
+        stored,
       ) !== dimensionKey) {
         throw new Error("Usage Summary dimension index does not reconcile.");
       }
+      current = normalizeUsageSummaryExplainability(stored);
     }
     const summaryFactId = current?.summaryFactId ?? crypto.randomUUID();
     const updated = addUsageSummaryContribution(
@@ -3686,6 +4125,11 @@ function emptyUsageSummaryFact(
     billableApiOperations: 0n,
     preExecutionFailures: 0n,
     unknownOperations: 0n,
+    meteringAttempts: 0n,
+    heldReservations: 0n,
+    releasedReservations: 0n,
+    settledReservations: 0n,
+    unreservedAttempts: 0n,
     activeUserContribution: 0n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -3713,11 +4157,61 @@ function addUsageSummaryContribution(
     preExecutionFailures:
       current.preExecutionFailures + contribution.preExecutionFailures,
     unknownOperations: current.unknownOperations + contribution.unknownOperations,
+    meteringAttempts: current.meteringAttempts + contribution.meteringAttempts,
+    heldReservations: current.heldReservations + contribution.heldReservations,
+    releasedReservations: current.releasedReservations + contribution.releasedReservations,
+    settledReservations: current.settledReservations + contribution.settledReservations,
+    unreservedAttempts: current.unreservedAttempts + contribution.unreservedAttempts,
     activeUserContribution:
       current.activeUserContribution + contribution.activeUserContribution,
     unpricedModelUses: current.unpricedModelUses + contribution.unpricedModelUses,
     unpricedApiOperations: current.unpricedApiOperations + contribution.unpricedApiOperations,
   };
+}
+
+function normalizeUsageSummaryExplainability(current: UsageSummaryFact): UsageSummaryFact {
+  if ("meteringAttempts" in current && typeof current.meteringAttempts === "bigint" &&
+      "heldReservations" in current && typeof current.heldReservations === "bigint" &&
+      "releasedReservations" in current && typeof current.releasedReservations === "bigint" &&
+      "settledReservations" in current && typeof current.settledReservations === "bigint" &&
+      "unreservedAttempts" in current && typeof current.unreservedAttempts === "bigint") {
+    return current;
+  }
+  const outcome = current.outcome as UsageProjectionFact["outcome"] | "usage-unknown";
+  const meteringAttempts = outcome === "reconciled-settled" ||
+      outcome === "reconciled-released"
+    ? 0n
+    : outcome === "settled" ? current.meteredUseCount
+      : outcome === "failed-before-execution" ? current.preExecutionFailures
+        : current.unknownOperations;
+  const reservationStatus = legacySummaryReservationStatus(
+    current.kind,
+    current.pricing,
+    outcome,
+  );
+  return {
+    ...current,
+    meteringAttempts,
+    heldReservations: reservationStatus === "held" ? meteringAttempts : 0n,
+    releasedReservations: reservationStatus === "released" ? meteringAttempts : 0n,
+    settledReservations: reservationStatus === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: reservationStatus === "none" ? meteringAttempts : 0n,
+  };
+}
+
+function legacySummaryReservationStatus(
+    kind: "model" | "gatekeeper",
+    pricing: "priced" | "unpriced",
+    outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
+    AdminUsageReservationStatus {
+  if (pricing === "unpriced" || outcome === "reconciled-settled" ||
+      outcome === "reconciled-released") return "none";
+  if (outcome === "settled") return "settled";
+  if (outcome === "failed-before-execution") return "released";
+  if (outcome === "reconciliation-required") return "held";
+  if (outcome === "usage-unknown-released") return "released";
+  if (outcome === "usage-unknown-held") return "held";
+  return kind === "model" ? "released" : "held";
 }
 
 function projectionPendingKey(sourceSequence: bigint): string {
@@ -3752,7 +4246,8 @@ function legacyProjectionDetailMatches(
     contribution: DetailProjectionContribution): boolean {
   return fact.schemaVersion === 1 && fact.occurredAt === contribution.occurredAt &&
     fact.source === contribution.source && fact.kind === contribution.kind &&
-    fact.outcome === contribution.outcome && fact.pricing === contribution.pricing &&
+    normalizeProjectionOutcome(fact.kind, fact.pricing, fact.outcome) === contribution.outcome &&
+    fact.pricing === contribution.pricing &&
     fact.deploymentModelId === contribution.deploymentModelId &&
     fact.vendorId === contribution.vendorId &&
     fact.billingMethodKey === contribution.billingMethodKey &&
@@ -3773,7 +4268,71 @@ function legacyProjectionDetailMatches(
     (!("preExecutionFailures" in fact) ||
       fact.preExecutionFailures === contribution.preExecutionFailures) &&
     (!("unknownOperations" in fact) ||
-      fact.unknownOperations === contribution.unknownOperations);
+      fact.unknownOperations === contribution.unknownOperations) &&
+    (!("meteringAttempts" in fact) ||
+      fact.meteringAttempts === contribution.meteringAttempts) &&
+    (!("heldReservations" in fact) ||
+      fact.heldReservations === contribution.heldReservations) &&
+    (!("releasedReservations" in fact) ||
+      fact.releasedReservations === contribution.releasedReservations) &&
+    (!("settledReservations" in fact) ||
+      fact.settledReservations === contribution.settledReservations) &&
+    (!("unreservedAttempts" in fact) ||
+      fact.unreservedAttempts === contribution.unreservedAttempts);
+}
+
+function normalizeProjectionOutcome(
+    kind: "model" | "gatekeeper",
+    pricing: "priced" | "unpriced",
+    outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
+    UsageProjectionFact["outcome"] {
+  return outcome === "usage-unknown"
+    ? kind === "gatekeeper" && pricing === "priced"
+      ? "usage-unknown-held" : "usage-unknown-released"
+    : outcome;
+}
+
+function reservationAttemptMetrics(
+    status: AdminUsageReservationStatus,
+    meteringAttempts = 1n): Pick<
+      DetailProjectionContribution,
+      "meteringAttempts" | "heldReservations" | "releasedReservations" |
+        "settledReservations" | "unreservedAttempts"
+    > {
+  return {
+    meteringAttempts,
+    heldReservations: status === "held" ? meteringAttempts : 0n,
+    releasedReservations: status === "released" ? meteringAttempts : 0n,
+    settledReservations: status === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: status === "none" ? meteringAttempts : 0n,
+  };
+}
+
+function projectionUnknownOutcome(
+    reservationStatus: AdminUsageReservationStatus):
+    "usage-unknown-held" | "usage-unknown-released" {
+  return reservationStatus === "held" ? "usage-unknown-held" : "usage-unknown-released";
+}
+
+function legacyModelReservationStatus(
+    record: ModelUsageRecord): AdminUsageReservationStatus {
+  if (record.reservationId === null) return "none";
+  if (record.outcome === "settled") return "settled";
+  if (record.outcome === "reconciliation-required") return "held";
+  return "released";
+}
+
+function legacyGatekeeperReservationStatus(
+    record: GatekeeperUsageRecord): AdminUsageReservationStatus {
+  if (record.reservationId === null) return "none";
+  if (record.outcome === "settled") return "settled";
+  if (record.outcome === "usage-unknown") return "held";
+  return "released";
+}
+
+function isAdminUsageReservationStatus(
+    value: unknown): value is AdminUsageReservationStatus {
+  return value === "held" || value === "released" || value === "settled" || value === "none";
 }
 
 function assertGatekeeperUsageReconciliationAudit(
@@ -3793,6 +4352,77 @@ function assertGatekeeperUsageReconciliationAudit(
       ) !== reconciliation.createdAt) {
     throw new Error("Gatekeeper Usage reconciliation does not reconcile.");
   }
+}
+
+function assertAdminUnknownUsageReconciliationInput(
+    safeRecordRef: string,
+    operationId: string,
+    decision: "settle" | "release",
+    reason: string,
+    actorUserId: string): void {
+  if (!isOpaqueUsageReference(safeRecordRef) || operationIdValidationError(operationId) ||
+      (decision !== "settle" && decision !== "release") ||
+      typeof reason !== "string" || reason.length === 0 || reason.length > 1_000 ||
+      reason.trim() !== reason || reason.includes("\u0000") ||
+      typeof actorUserId !== "string" || actorUserId.length === 0 ||
+      actorUserId.length > 500 || hasAsciiControlCharacter(actorUserId)) {
+    throw new TypeError("Administrator unknown Usage decision is invalid.");
+  }
+}
+
+function assertAdminUnknownUsageReconciliationPreparation(
+    preparation: AdminUnknownUsageReconciliationPreparation,
+    safeRecordRef: string): void {
+  assertAdminUnknownUsageReconciliationInput(
+    safeRecordRef,
+    preparation.operationId,
+    preparation.decision,
+    preparation.reason,
+    preparation.actorUserId,
+  );
+  const target = preparation.target;
+  if (preparation.safeRecordRef !== safeRecordRef ||
+      typeof target.workspaceId !== "string" || !/^[0-9a-f]{64}$/.test(target.workspaceId) ||
+      (target.actionId !== null &&
+       (!Number.isSafeInteger(target.actionId) || target.actionId < 0)) ||
+      operationIdValidationError(target.billingOperationId)) {
+    throw new Error("Administrator unknown Usage decision does not reconcile.");
+  }
+  if (preparation.result !== null) {
+    assertAdminUnknownUsageReconciliationResult(preparation.result, preparation);
+  }
+}
+
+function assertAdminUnknownUsageReconciliationResult(
+    result: AdminUnknownUsageReconciliationResult,
+    preparation: AdminUnknownUsageReconciliationPreparation): void {
+  if (result.operationId !== preparation.operationId ||
+      result.decision !== preparation.decision ||
+      result.actorUserId !== preparation.actorUserId || result.reason !== preparation.reason ||
+      !isAdminUnknownUsageActionState(result.previousState) ||
+      !isAdminUnknownUsageActionState(result.newState) ||
+      (result.ledgerEntryId !== null &&
+       result.ledgerEntryId !== `${preparation.safeRecordRef}:usage-charge`) ||
+      normalizeCanonicalUtcTimestamp(
+        result.createdAt, "Administrator unknown Usage result time",
+      ) !== result.createdAt) {
+    throw new Error("Administrator unknown Usage result does not reconcile.");
+  }
+}
+
+function isAdminUnknownUsageActionState(state: string): boolean {
+  return state === "pending" || state === "applying" || state === "accepted" ||
+    state === "failed-before-execution" || state === "unknown" || state === "rejected" ||
+    state === "reverted";
+}
+
+function adminUnknownUsageResultsEqual(
+    left: AdminUnknownUsageReconciliationResult,
+    right: AdminUnknownUsageReconciliationResult): boolean {
+  return left.operationId === right.operationId && left.decision === right.decision &&
+    left.previousState === right.previousState && left.newState === right.newState &&
+    left.ledgerEntryId === right.ledgerEntryId && left.actorUserId === right.actorUserId &&
+    left.reason === right.reason && left.createdAt === right.createdAt;
 }
 
 function assertGatekeeperUsageReconciliation(
@@ -4463,20 +5093,22 @@ function assertModelMeteringAttempt(
 }
 
 function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: string): void {
+  const baseKeys = [
+    "id",
+    "operationId",
+    "attribution",
+    "chargeSnapshot",
+    "reservationId",
+    "ledgerEntryId",
+    "outcome",
+    "usageStatus",
+    "usage",
+    "chargeSubunits",
+    "createdAt",
+  ];
   if (typeof record !== "object" || record === null || Array.isArray(record) ||
-      !hasExactKeys(record, [
-        "id",
-        "operationId",
-        "attribution",
-        "chargeSnapshot",
-        "reservationId",
-        "ledgerEntryId",
-        "outcome",
-        "usageStatus",
-        "usage",
-        "chargeSubunits",
-        "createdAt",
-      ]) ||
+      (!hasExactKeys(record, baseKeys) &&
+       !hasExactKeys(record, [...baseKeys, "reservationStatusAtCompletion"])) ||
       record.id !== modelUsageRecordId(expectedOperationId) ||
       record.operationId !== expectedOperationId ||
       operationIdValidationError(expectedOperationId) !== undefined ||
@@ -4486,6 +5118,9 @@ function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: s
       (record.usageStatus !== "reported" && record.usageStatus !== "not-reported" &&
        record.usageStatus !== "invalid-report") ||
       (record.usageStatus === "reported") !== (record.usage !== null) ||
+      (record.reservationStatusAtCompletion !== undefined &&
+       (!isAdminUsageReservationStatus(record.reservationStatusAtCompletion) ||
+        record.reservationStatusAtCompletion !== legacyModelReservationStatus(record))) ||
       (record.chargeSubunits !== null &&
        (typeof record.chargeSubunits !== "bigint" || record.chargeSubunits < 0n))) {
     throw new Error("Model Usage Record does not reconcile.");
@@ -4556,13 +5191,16 @@ function normalizeGatekeeperUsageAttribution(
       Object.keys(value).some(key => key !== "vendorId" && key !== "billingMethodKey" &&
         key !== "externalAccountId" && key !== "principal" && key !== "source" &&
         key !== "workspaceId" && key !== "chatId" && key !== "gadgetId" &&
-        key !== "automationId" && key !== "automationRunId") ||
+        key !== "automationId" && key !== "automationRunId" && key !== "actionId") ||
       !isStableUsageDimension(value.vendorId) ||
       !isStableUsageDimension(value.billingMethodKey) ||
-      !isStableUsageDimension(value.externalAccountId)) {
+      !isStableUsageDimension(value.externalAccountId) ||
+      (value.actionId !== undefined &&
+        (value.workspaceId === undefined || !Number.isSafeInteger(value.actionId) ||
+          value.actionId < 0))) {
     throw new TypeError("Gatekeeper Usage attribution is invalid.");
   }
-  const {vendorId, billingMethodKey, externalAccountId, ...attribution} = value;
+  const {vendorId, billingMethodKey, externalAccountId, actionId, ...attribution} = value;
   const normalizedAttribution = attribution.workspaceId === undefined
     ? normalizeDirectUserUsageAttribution(attribution)
     : normalizeUsageAttribution(attribution);
@@ -4571,6 +5209,7 @@ function normalizeGatekeeperUsageAttribution(
     vendorId,
     billingMethodKey,
     externalAccountId,
+    ...(actionId === undefined ? {} : {actionId}),
   };
 }
 
@@ -4592,6 +5231,7 @@ function gatekeeperAttemptInputsEqual(
     attempt.attribution.gadgetId === attribution.gadgetId &&
     attempt.attribution.automationId === attribution.automationId &&
     attempt.attribution.automationRunId === attribution.automationRunId &&
+    attempt.attribution.actionId === attribution.actionId &&
     attempt.attribution.vendorId === attribution.vendorId &&
     attempt.attribution.billingMethodKey === attribution.billingMethodKey &&
     attempt.attribution.externalAccountId === attribution.externalAccountId &&
@@ -4670,24 +5310,29 @@ function assertGatekeeperMeteringAttempt(
 
 function assertGatekeeperUsageRecord(
     record: GatekeeperUsageRecord, expectedOperationId: string): void {
+  const baseKeys = [
+    "id",
+    "operationId",
+    "attribution",
+    "chargeSnapshot",
+    "reservationId",
+    "ledgerEntryId",
+    "outcome",
+    "chargeSubunits",
+    "createdAt",
+  ];
   if (typeof record !== "object" || record === null || Array.isArray(record) ||
-      !hasExactKeys(record, [
-        "id",
-        "operationId",
-        "attribution",
-        "chargeSnapshot",
-        "reservationId",
-        "ledgerEntryId",
-        "outcome",
-        "chargeSubunits",
-        "createdAt",
-      ]) ||
+      (!hasExactKeys(record, baseKeys) &&
+       !hasExactKeys(record, [...baseKeys, "reservationStatusAtCompletion"])) ||
       record.id !== gatekeeperUsageRecordId(expectedOperationId) ||
       record.operationId !== expectedOperationId ||
       operationIdValidationError(expectedOperationId) !== undefined ||
       typeof record.createdAt !== "string" ||
       (record.outcome !== "settled" && record.outcome !== "failed-before-execution" &&
        record.outcome !== "usage-unknown") ||
+      (record.reservationStatusAtCompletion !== undefined &&
+       (!isAdminUsageReservationStatus(record.reservationStatusAtCompletion) ||
+        record.reservationStatusAtCompletion !== legacyGatekeeperReservationStatus(record))) ||
       (record.chargeSubunits !== null &&
        (typeof record.chargeSubunits !== "bigint" || record.chargeSubunits < 0n))) {
     throw new Error("Gatekeeper Usage Record does not reconcile.");
