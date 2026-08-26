@@ -68,7 +68,11 @@ export type UsageReportCursor = {
 
 /** Parameterized SQL fragment shared by report overview, rows, and CSV. */
 export type UsageReportPredicate = {
+  /** Fixed server-owned index required by a predicate with ordered multi-value semantics. */
+  indexName: "usage_projection_report_unknown_time_v3" | null;
+  /** Parameterized SQL WHERE expression. */
   sql: string;
+  /** Bound values for the SQL WHERE expression. */
   params: string[];
 };
 
@@ -232,7 +236,14 @@ export function buildUsageReportPredicate(
   addIn("facts.vendor_id", filter.gatekeeperIds);
   addIn("facts.external_account_id", filter.externalAccountIds);
   addIn("facts.source", filter.sources);
-  addIn("facts.outcome", filter.outcomes);
+  const filtersAllUnknownOutcomes = filter.outcomes?.length === 2 &&
+    filter.outcomes.includes("usage-unknown-held") &&
+    filter.outcomes.includes("usage-unknown-released");
+  if (filtersAllUnknownOutcomes) {
+    clauses.push(`facts.outcome IN ('usage-unknown-held', 'usage-unknown-released')`);
+  } else {
+    addIn("facts.outcome", filter.outcomes);
+  }
   addIn("facts.pricing", filter.pricingStatuses);
   addIn("COALESCE(facts.metered_kind, facts.usage_kind)", filter.meteredKinds);
   if (filter.methods) {
@@ -244,7 +255,12 @@ export function buildUsageReportPredicate(
     clauses.push(`(${sourceTime} < ? OR (${sourceTime} = ? AND facts.fact_id < ?))`);
     params.push(cursor.sourceTime, cursor.sourceTime, cursor.rowId);
   }
-  return {sql: clauses.join(" AND "), params};
+  return {
+    indexName: filtersAllUnknownOutcomes
+      ? "usage_projection_report_unknown_time_v3" : null,
+    sql: clauses.join(" AND "),
+    params,
+  };
 }
 
 /** Encode a cursor bound to exactly one server report capability. */

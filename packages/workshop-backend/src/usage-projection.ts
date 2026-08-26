@@ -596,7 +596,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const predicate = buildUsageReportPredicate(query, "aggregate");
     const activeUsers = this.ctx.storage.sql.exec<{count: string}>(`
       SELECT CAST(COUNT(DISTINCT facts.principal_ref) AS TEXT) AS count
-      FROM usage_projection_facts AS facts
+      FROM usage_projection_facts AS facts${predicate.indexName === null
+        ? "" : ` INDEXED BY ${predicate.indexName}`}
       WHERE ${predicate.sql} AND facts.active_user_contribution <> '0'
     `, ...predicate.params).one().count;
     totals.activeUsers = BigInt(activeUsers);
@@ -622,7 +623,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
              settled_reservations, unreserved_attempts,
              active_user_contribution,
              unpriced_model_uses, unpriced_api_operations, applied, applied_watermark
-      FROM usage_projection_facts AS facts
+      FROM usage_projection_facts AS facts${predicate.indexName === null
+        ? "" : ` INDEXED BY ${predicate.indexName}`}
       WHERE ${predicate.sql}
       ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
       LIMIT ?
@@ -2105,6 +2107,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time_v3
       ON usage_projection_facts(generation, outcome,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
+      CREATE INDEX IF NOT EXISTS usage_projection_report_unknown_time_v3
+      ON usage_projection_facts(
+        generation, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
+      ) WHERE outcome IN ('usage-unknown-held', 'usage-unknown-released');
       CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v3
       ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);

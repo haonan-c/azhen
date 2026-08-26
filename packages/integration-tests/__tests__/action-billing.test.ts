@@ -49,7 +49,7 @@ const RETAINED_REPLAY_TRANSPORT_FAILURES = [
   "Peer closed WebSocket: 3000 test disconnect after Action request",
   "WebSocket connection failed.",
 ] as const;
-const RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT = 3;
+const RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS = 3;
 
 let harness: Harness;
 let interceptor: NetworkInterceptor;
@@ -447,12 +447,61 @@ type RetainedReplayGatekeeperScope = {
   session?: RpcStub<TestSession>;
 };
 
+type RetainedReplayUserScope = Pick<RetainedReplayGatekeeperScope, "publicApi" | "user">;
+
+type RetainedReplayGatekeeperReopenOperations = {
+  openUser: (deadline: number) => PromiseLike<RetainedReplayUserScope>;
+  openWorkspace: (user: RpcStub<AuthenticatedApi>) => PromiseLike<RpcStub<Overseer>>;
+  openGatekeeper: (
+    workspace: RpcStub<Overseer>,
+  ) => PromiseLike<RetainedReplayGatekeeperScope["gatekeeper"]>;
+};
+
+function disposeRetainedReplayUserScope(scope: RetainedReplayUserScope): void {
+  scope.user[Symbol.dispose]();
+  scope.publicApi[Symbol.dispose]();
+}
+
 function disposeRetainedReplayGatekeeperScope(scope: RetainedReplayGatekeeperScope): void {
   scope.session?.[Symbol.dispose]();
   scope.gatekeeper[Symbol.dispose]();
   scope.workspace[Symbol.dispose]();
   scope.user[Symbol.dispose]();
   scope.publicApi[Symbol.dispose]();
+}
+
+async function openRetainedReplayGatekeeperScopeBeforeDeadline(
+    operations: RetainedReplayGatekeeperReopenOperations,
+    deadline: number): Promise<RetainedReplayGatekeeperScope> {
+  let userScope: RetainedReplayUserScope | undefined;
+  let workspace: RpcStub<Overseer> | undefined;
+  let gatekeeper: RetainedReplayGatekeeperScope["gatekeeper"] | undefined;
+  try {
+    userScope = await awaitBeforeDeadline(
+      () => operations.openUser(deadline),
+      deadline,
+      "reopen-user",
+      disposeRetainedReplayUserScope,
+    );
+    workspace = await awaitBeforeDeadline(
+      () => operations.openWorkspace(userScope!.user),
+      deadline,
+      "reopen-workspace",
+      lateWorkspace => lateWorkspace[Symbol.dispose](),
+    );
+    gatekeeper = await awaitBeforeDeadline(
+      () => operations.openGatekeeper(workspace!),
+      deadline,
+      "reopen-gatekeeper",
+      lateGatekeeper => lateGatekeeper[Symbol.dispose](),
+    );
+    return {...userScope, workspace, gatekeeper};
+  } catch (error) {
+    gatekeeper?.[Symbol.dispose]();
+    workspace?.[Symbol.dispose]();
+    if (userScope !== undefined) disposeRetainedReplayUserScope(userScope);
+    throw error;
+  }
 }
 
 function isRetainedReplayTransportFailure(error: unknown): error is Error {
@@ -467,7 +516,7 @@ async function openRetainedReplayGatekeeperSessionWhenAvailable(
     reopen: (deadline: number) => PromiseLike<RetainedReplayGatekeeperScope>,
     deadline = Date.now() + 15_000): Promise<Required<RetainedReplayGatekeeperScope>> {
   let scope = initial;
-  let reconnects = 0;
+  let totalAttempts = 1;
   for (;;) {
     try {
       const session = await awaitBeforeDeadline(
@@ -480,11 +529,12 @@ async function openRetainedReplayGatekeeperSessionWhenAvailable(
     } catch (error) {
       disposeRetainedReplayGatekeeperScope(scope);
       if (!isRetainedReplayTransportFailure(error)) throw error;
+      if (totalAttempts >= RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS) throw error;
       let connectionFailure = error;
       let reopened: RetainedReplayGatekeeperScope | undefined;
       while (reopened === undefined &&
-          reconnects < RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT) {
-        reconnects += 1;
+          totalAttempts < RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS) {
+        totalAttempts += 1;
         try {
           reopened = await awaitBeforeDeadline(
             () => reopen(deadline),
@@ -525,7 +575,7 @@ async function reconcileUnknownRecordWhenAvailable(
       );
     }
     let connectionFailure = error;
-    for (let attempt = 0; attempt < RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT; attempt += 1) {
+    for (let attempt = 1; attempt < RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS; attempt += 1) {
       let scope: UsageAdminScope | undefined;
       try {
         scope = await awaitBeforeDeadline(
@@ -921,20 +971,20 @@ describe("bounded administrator Usage readiness", () => {
       Date.now() + 1_000,
     )).rejects.toThrow("WebSocket connection failed.");
     expect(readinessOperations.open).toHaveBeenCalledTimes(
-      RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT,
+      RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS - 1,
     );
     expect(readinessOperations.signIn).toHaveBeenCalledTimes(
-      RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT,
+      RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS - 1,
     );
     expect(readinessOperations.readBalance).toHaveBeenCalledTimes(
-      RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT,
+      RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS - 1,
     );
     for (const dispose of [...readinessUserDisposes, ...readinessPublicDisposes]) {
       expect(dispose).toHaveBeenCalledOnce();
     }
 
     const transportScopes = Array.from(
-      {length: RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT + 1},
+      {length: RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS},
       () => makeScope("WebSocket connection failed."),
     );
     const reopen = vi.fn(() => Promise.resolve(transportScopes[reopen.mock.calls.length].scope));
@@ -943,12 +993,125 @@ describe("bounded administrator Usage readiness", () => {
       reopen,
       Date.now() + 1_000,
     )).rejects.toThrow("WebSocket connection failed.");
-    expect(reopen).toHaveBeenCalledTimes(RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT);
+    expect(reopen).toHaveBeenCalledTimes(RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS - 1);
     for (const {dispose} of transportScopes) {
       for (const target of Object.values(dispose)) expect(target).toHaveBeenCalledOnce();
     }
     for (const {scope} of transportScopes) {
       expect(scope.gatekeeper.openSession).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("bounds each fresh Gatekeeper reopen step and releases late capabilities", async () => {
+    const deferred = <T,>() => {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>(fulfill => { resolve = fulfill; });
+      return {promise, resolve};
+    };
+    const makeUserScope = () => {
+      const dispose = {publicApi: vi.fn(), user: vi.fn()};
+      const scope: RetainedReplayUserScope = {
+        publicApi: {[Symbol.dispose]: dispose.publicApi} as unknown as ReturnType<typeof connect>,
+        user: {[Symbol.dispose]: dispose.user} as unknown as RpcStub<AuthenticatedApi>,
+      };
+      return {scope, dispose};
+    };
+
+    vi.useFakeTimers();
+    try {
+      const workspaceUser = makeUserScope();
+      const lateWorkspaceDispose = vi.fn();
+      const lateWorkspace = {
+        [Symbol.dispose]: lateWorkspaceDispose,
+      } as unknown as RpcStub<Overseer>;
+      const pendingWorkspace = deferred<RpcStub<Overseer>>();
+      const openWorkspace = vi.fn(() => pendingWorkspace.promise);
+      const openGatekeeperAfterWorkspace = vi.fn();
+      const workspaceAttempt = openRetainedReplayGatekeeperScopeBeforeDeadline({
+        openUser: () => Promise.resolve(workspaceUser.scope),
+        openWorkspace,
+        openGatekeeper: openGatekeeperAfterWorkspace,
+      }, Date.now() + 10);
+      const workspaceRejection = expect(workspaceAttempt).rejects.toThrow(
+        "did not become ready during reopen-workspace",
+      );
+      await vi.advanceTimersByTimeAsync(11);
+      await workspaceRejection;
+      expect(workspaceUser.dispose.user).toHaveBeenCalledOnce();
+      expect(workspaceUser.dispose.publicApi).toHaveBeenCalledOnce();
+      expect(openGatekeeperAfterWorkspace).not.toHaveBeenCalled();
+      pendingWorkspace.resolve(lateWorkspace);
+      await Promise.resolve();
+      expect(lateWorkspaceDispose).toHaveBeenCalledOnce();
+
+      const gatekeeperUser = makeUserScope();
+      const workspaceDispose = vi.fn();
+      const workspace = {
+        [Symbol.dispose]: workspaceDispose,
+      } as unknown as RpcStub<Overseer>;
+      const lateGatekeeperDispose = vi.fn();
+      const lateGatekeeper = {
+        [Symbol.dispose]: lateGatekeeperDispose,
+      } as unknown as RetainedReplayGatekeeperScope["gatekeeper"];
+      const pendingGatekeeper = deferred<RetainedReplayGatekeeperScope["gatekeeper"]>();
+      const openGatekeeper = vi.fn(() => pendingGatekeeper.promise);
+      const gatekeeperAttempt = openRetainedReplayGatekeeperScopeBeforeDeadline({
+        openUser: () => Promise.resolve(gatekeeperUser.scope),
+        openWorkspace: () => Promise.resolve(workspace),
+        openGatekeeper,
+      }, Date.now() + 10);
+      const gatekeeperRejection = expect(gatekeeperAttempt).rejects.toThrow(
+        "did not become ready during reopen-gatekeeper",
+      );
+      await vi.advanceTimersByTimeAsync(11);
+      await gatekeeperRejection;
+      expect(workspaceDispose).toHaveBeenCalledOnce();
+      expect(gatekeeperUser.dispose.user).toHaveBeenCalledOnce();
+      expect(gatekeeperUser.dispose.publicApi).toHaveBeenCalledOnce();
+      pendingGatekeeper.resolve(lateGatekeeper);
+      await Promise.resolve();
+      expect(lateGatekeeperDispose).toHaveBeenCalledOnce();
+      expect(openWorkspace).toHaveBeenCalledOnce();
+      expect(openGatekeeper).toHaveBeenCalledOnce();
+
+      const pendingSession = deferred<RpcStub<TestSession>>();
+      const sessionScopeDisposes = {
+        publicApi: vi.fn(), user: vi.fn(), workspace: vi.fn(), gatekeeper: vi.fn(),
+      };
+      const sessionScope: RetainedReplayGatekeeperScope = {
+        publicApi: {
+          [Symbol.dispose]: sessionScopeDisposes.publicApi,
+        } as unknown as ReturnType<typeof connect>,
+        user: {[Symbol.dispose]: sessionScopeDisposes.user} as unknown as RpcStub<AuthenticatedApi>,
+        workspace: {
+          [Symbol.dispose]: sessionScopeDisposes.workspace,
+        } as unknown as RpcStub<Overseer>,
+        gatekeeper: {
+          [Symbol.dispose]: sessionScopeDisposes.gatekeeper,
+          openSession: () => pendingSession.promise,
+        } as unknown as RetainedReplayGatekeeperScope["gatekeeper"],
+      };
+      const reopenAfterSessionTimeout = vi.fn();
+      const sessionAttempt = openRetainedReplayGatekeeperSessionWhenAvailable(
+        sessionScope, reopenAfterSessionTimeout, Date.now() + 10,
+      );
+      const sessionRejection = expect(sessionAttempt).rejects.toThrow(
+        "did not become ready during open-gatekeeper-session",
+      );
+      await vi.advanceTimersByTimeAsync(11);
+      await sessionRejection;
+      expect(reopenAfterSessionTimeout).not.toHaveBeenCalled();
+      for (const dispose of Object.values(sessionScopeDisposes)) {
+        expect(dispose).toHaveBeenCalledOnce();
+      }
+      const lateSessionDispose = vi.fn();
+      pendingSession.resolve({
+        [Symbol.dispose]: lateSessionDispose,
+      } as unknown as RpcStub<TestSession>);
+      await Promise.resolve();
+      expect(lateSessionDispose).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -1001,6 +1164,9 @@ describe("bounded administrator Usage readiness", () => {
     expect(initial).toHaveBeenCalledOnce();
     expect(inspectAfterInitialTransport).toHaveBeenCalledOnce();
     expect(reopen).toHaveBeenCalledTimes(2);
+    expect(1 + freshScopes.reduce(
+      (total, fresh) => total + fresh.reconcileUnknownRecord.mock.calls.length, 0,
+    )).toBe(RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS);
     for (const fresh of freshScopes) {
       expect(fresh.reconcileUnknownRecord).toHaveBeenCalledOnce();
       expect(fresh.reconcileUnknownRecord).toHaveBeenCalledWith(request);
@@ -1036,7 +1202,7 @@ describe("bounded administrator Usage readiness", () => {
     expect(expiredInitial).not.toHaveBeenCalled();
 
     const alwaysFailedScopes = Array.from(
-      {length: RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT},
+      {length: RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS - 1},
       () => makeScope(() => Promise.reject(new Error("WebSocket connection failed."))),
     );
     const reopenUntilLimit = vi.fn(() => Promise.resolve(
@@ -1048,7 +1214,7 @@ describe("bounded administrator Usage readiness", () => {
       reopenUntilLimit,
       Date.now() + 1_000,
     )).rejects.toThrow("WebSocket connection failed.");
-    expect(reopenUntilLimit).toHaveBeenCalledTimes(RETAINED_REPLAY_GATEKEEPER_RECONNECT_LIMIT);
+    expect(reopenUntilLimit).toHaveBeenCalledTimes(RETAINED_REPLAY_MAX_TOTAL_ATTEMPTS - 1);
     for (const fresh of alwaysFailedScopes) {
       expect(fresh.reconcileUnknownRecord).toHaveBeenCalledWith(request);
       for (const dispose of Object.values(fresh.dispose)) expect(dispose).toHaveBeenCalledOnce();
@@ -2144,34 +2310,18 @@ describe("approved Action billing", () => {
           user: actionUserSession.user,
           workspace: actionWorkspace,
           gatekeeper: actionGatekeeper,
-        }, async deadline => {
-          const reconnected = await openExistingUserAttemptBeforeDeadline(username, {
+        }, deadline => openRetainedReplayGatekeeperScopeBeforeDeadline({
+          openUser: currentDeadline => openExistingUserAttemptBeforeDeadline(username, {
             ...productionExistingUserReadiness,
             open: () => {
               const connection = connectWithSocket(harness.url);
               actionSocket = connection.socket;
               return connection.publicApi;
             },
-          }, deadline);
-          let workspace: RpcStub<Overseer> | undefined;
-          let gatekeeper: RetainedReplayGatekeeperScope["gatekeeper"] | undefined;
-          try {
-            workspace = await reconnected.user.openGadget(workspaceId);
-            gatekeeper = await workspace.getGatekeeperById(gatekeeperId);
-            return {
-              publicApi: reconnected.publicApi,
-              user: reconnected.user,
-              workspace,
-              gatekeeper,
-            };
-          } catch (error) {
-            gatekeeper?.[Symbol.dispose]();
-            workspace?.[Symbol.dispose]();
-            reconnected.user[Symbol.dispose]();
-            reconnected.publicApi[Symbol.dispose]();
-            throw error;
-          }
-        });
+          }, currentDeadline),
+          openWorkspace: user => user.openGadget(workspaceId),
+          openGatekeeper: workspace => workspace.getGatekeeperById(gatekeeperId),
+        }, deadline));
         handedOff = true;
         const opened = await retainedReplayStage(
           "recover-open-gatekeeper-session", () => opening,

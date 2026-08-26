@@ -216,6 +216,10 @@ describe("deployment Usage Projection", () => {
         SELECT tbl_name FROM sqlite_master
         WHERE type = 'index' AND name = 'usage_projection_report_time_v3'
       `).one().tbl_name,
+      unknownIndexTable: state.storage.sql.exec<{tbl_name: string}>(`
+        SELECT tbl_name FROM sqlite_master
+        WHERE type = 'index' AND name = 'usage_projection_report_unknown_time_v3'
+      `).one().tbl_name,
       legacyIndexTable: state.storage.sql.exec<{tbl_name: string}>(`
         SELECT tbl_name FROM sqlite_master
         WHERE type = 'index' AND name = 'usage_projection_report_time'
@@ -224,6 +228,7 @@ describe("deployment Usage Projection", () => {
       currentRows: 0,
       legacyRows: 131,
       currentIndexTable: "usage_projection_facts",
+      unknownIndexTable: "usage_projection_facts",
       legacyIndexTable: "usage_projection_facts_retired_v2",
     });
     await runInDurableObject(restarted, async (_instance, state) => {

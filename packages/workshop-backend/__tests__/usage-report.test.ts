@@ -1126,7 +1126,9 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     const plan = await runInDurableObject(projection, (_instance, state) =>
       state.storage.sql.exec<{detail: string}>(`
         EXPLAIN QUERY PLAN
-        SELECT facts.fact_id FROM usage_projection_facts AS facts
+        SELECT facts.fact_id FROM usage_projection_facts AS facts${
+          predicate.indexName === null ? "" : ` INDEXED BY ${predicate.indexName}`
+        }
         WHERE ${predicate.sql}
         ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
         LIMIT 200
@@ -1205,7 +1207,9 @@ describe("Issue #63 frozen administrator Usage reports", () => {
       const plan = await runInDurableObject(projection, (_instance, state) =>
         state.storage.sql.exec<{detail: string}>(`
           EXPLAIN QUERY PLAN
-          SELECT facts.fact_id FROM usage_projection_facts AS facts
+          SELECT facts.fact_id FROM usage_projection_facts AS facts${
+            predicate.indexName === null ? "" : ` INDEXED BY ${predicate.indexName}`
+          }
           WHERE ${predicate.sql}
           ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
           LIMIT 200
@@ -1225,6 +1229,43 @@ describe("Issue #63 frozen administrator Usage reports", () => {
       expect(overview.metrics.unknownOperations).toBe(BigInt(expectedCount));
       expect(csvRowIds).toEqual(rows.map(row => row.rowId));
     }
+
+    const legacyFilter = {
+      startDateInclusive: "2026-08-24",
+      endDateExclusive: "2026-08-25",
+      outcomes: ["usage-unknown"],
+    } as const;
+    const legacyQuery = freezeUsageReportQuery(
+      legacyFilter, "UTC", 1n, coordinates.projectionGeneration,
+      coordinates.ingestionWatermark,
+    );
+    const legacyPredicate = buildUsageReportPredicate(legacyQuery, "all");
+    const legacyPlan = await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT facts.fact_id FROM usage_projection_facts AS facts${
+          legacyPredicate.indexName === null
+            ? "" : ` INDEXED BY ${legacyPredicate.indexName}`
+        }
+        WHERE ${legacyPredicate.sql}
+        ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+        LIMIT 200
+      `, ...legacyPredicate.params).toArray().map(row => row.detail).join("\n"));
+    expect(legacyPlan).toContain("usage_projection_report_unknown_time_v3");
+    expect(legacyPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+
+    using legacyReport = await usage.openReport(legacyFilter);
+    const legacyOverview = await legacyReport.getOverview();
+    const legacyRows = (await legacyReport.listRows({limit: 10})).rows;
+    const legacyCsv = await new Response(await legacyReport.exportCsv()).text();
+    const legacyCsvRowIds = legacyCsv.split("\r\n")
+      .filter(line => line.startsWith("aggregate,"))
+      .map(line => line.split(",")[1]);
+    expect(legacyRows.map(row => row.outcome).toSorted()).toEqual([
+      "usage-unknown-held", "usage-unknown-released",
+    ]);
+    expect(legacyOverview.metrics.unknownOperations).toBe(2n);
+    expect(legacyCsvRowIds.toSorted()).toEqual(legacyRows.map(row => row.rowId).toSorted());
   });
 
   it("keeps a one-million-row CSV lazy and bounded by one 64-row page", async () => {
