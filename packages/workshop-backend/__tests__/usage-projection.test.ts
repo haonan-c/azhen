@@ -24,13 +24,16 @@ const SUMMARY_BACKFILL_CURSOR_KEY = "usageAccount:summaryBackfillCursor:v1";
 const PROJECTION_PENDING_COUNT_KEY = "usageAccount:projectionPendingCount:v1";
 
 function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjectionDetailFact {
+  const safeRecordRef = crypto.randomUUID();
   return {
     schemaVersion: 1,
     projectionFactId: crypto.randomUUID(),
     sourceSequence: 1n,
     usagePrincipalRef: crypto.randomUUID(),
     rowKind: "detail",
-    safeRecordRef: crypto.randomUUID(),
+    safeRecordRef,
+    safeAttemptRef: safeRecordRef,
+    reservationStatus: "settled",
     occurredAt: "2026-08-24T12:00:00.000Z",
     source: "agent",
     kind: "model",
@@ -52,6 +55,11 @@ function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjecti
     billableApiOperations: 0n,
     preExecutionFailures: 0n,
     unknownOperations: 0n,
+    meteringAttempts: 1n,
+    heldReservations: 0n,
+    releasedReservations: 0n,
+    settledReservations: 1n,
+    unreservedAttempts: 0n,
     activeUserContribution: 1n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -61,7 +69,13 @@ function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjecti
 
 function aggregateFact(
     overrides: Partial<UsageProjectionAggregateFact> = {}): UsageProjectionAggregateFact {
-  const {occurredAt: _occurredAt, safeRecordRef: _safeRecordRef, ...base} = fact();
+  const {
+    occurredAt: _occurredAt,
+    safeRecordRef: _safeRecordRef,
+    safeAttemptRef: _safeAttemptRef,
+    reservationStatus: _reservationStatus,
+    ...base
+  } = fact();
   const kind = overrides.kind ?? base.kind;
   return {
     ...base,
@@ -75,6 +89,46 @@ function aggregateFact(
 }
 
 describe("deployment Usage Projection", () => {
+  it("fails closed and rebuilds instead of scanning legacy facts for explainability", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const input = fact();
+    expect(await projection.ingest([input])).toEqual({
+      acknowledgedFactIds: [input.projectionFactId],
+      rejected: [],
+    });
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts DROP COLUMN metering_attempts
+      `);
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete',
+          rebuild_request_id = 'legacy-completed', rebuild_state = 'completed',
+          rebuild_generation = active_generation,
+          rebuild_started_at = '2026-08-24T00:00:00.000Z',
+          rebuild_completed_at = '2026-08-24T00:01:00.000Z'
+        WHERE singleton = 1
+      `);
+    });
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart explainability migration");
+    })).rejects.toThrow("restart explainability migration");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    expect(await runInDurableObject(restarted, (_instance, state) => ({
+      bootstrap: state.storage.sql.exec<{bootstrap_state: string}>(`
+        SELECT bootstrap_state FROM usage_projection_meta WHERE singleton = 1
+      `).one().bootstrap_state,
+      rebuild: state.storage.sql.exec<{rebuild_state: string | null}>(`
+        SELECT rebuild_state FROM usage_projection_meta WHERE singleton = 1
+      `).one().rebuild_state,
+      storedAttempts: state.storage.sql.exec<{metering_attempts: string}>(`
+        SELECT metering_attempts FROM usage_projection_facts WHERE fact_id = ?
+      `, input.projectionFactId).one().metering_attempts,
+    }))).toEqual({bootstrap: "pending", rebuild: null, storedAttempts: "0"});
+    expect(await restarted.ensureBootstrap()).toBe(false);
+  });
+
   it("forces a clean Summary-backed bootstrap when migrating legacy detail totals", async () => {
     const projectionName = crypto.randomUUID();
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
@@ -176,9 +230,16 @@ describe("deployment Usage Projection", () => {
     const current = fact();
     const {
       safeRecordRef: _safeRecordRef,
+      safeAttemptRef: _safeAttemptRef,
+      reservationStatus: _reservationStatus,
       meteredUseCount: _meteredUseCount,
       preExecutionFailures: _preExecutionFailures,
       unknownOperations: _unknownOperations,
+      meteringAttempts: _meteringAttempts,
+      heldReservations: _heldReservations,
+      releasedReservations: _releasedReservations,
+      settledReservations: _settledReservations,
+      unreservedAttempts: _unreservedAttempts,
       ...legacy
     } = current;
     const canonical = JSON.stringify([
@@ -221,6 +282,11 @@ describe("deployment Usage Projection", () => {
       meteredUseCount: _meteredUseCount,
       preExecutionFailures: _preExecutionFailures,
       unknownOperations: _unknownOperations,
+      meteringAttempts: _meteringAttempts,
+      heldReservations: _heldReservations,
+      releasedReservations: _releasedReservations,
+      settledReservations: _settledReservations,
+      unreservedAttempts: _unreservedAttempts,
       ...legacy
     } = current;
     const canonical = JSON.stringify([
@@ -2575,13 +2641,13 @@ describe("deployment Usage Projection", () => {
     };
     const charge = {
       kind: "gatekeeper" as const,
-      pricing: "unpriced" as const,
+      pricing: "priced" as const,
       usageRateVersion: 1n,
       issuedAt: "2026-08-24T12:00:00.000Z",
       vendorId: "context",
       billingMethodKey: "context.read.v1",
-      chargeSubunits: 0n,
-      configurationGap: true as const,
+      chargeSubunits: 5n,
+      configurationGap: false as const,
     };
     const settledId = `gatekeeper-operation:${crypto.randomUUID()}`;
     await user.beginGatekeeperUsage(settledId, attribution, charge);
@@ -2631,6 +2697,22 @@ describe("deployment Usage Projection", () => {
     const retained = await user.listUsageProjectionFacts(null, 10);
     expect(retained.backfillComplete).toBe(true);
     expect(retained.facts).toHaveLength(6);
+    expect(retained.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        rowKind: "detail",
+        outcome: "usage-unknown-held",
+        reservationStatus: "held",
+        meteringAttempts: 1n,
+        heldReservations: 1n,
+      }),
+      expect.objectContaining({
+        rowKind: "detail",
+        outcome: "reconciled-settled",
+        safeAttemptRef: null,
+        reservationStatus: "none",
+        meteringAttempts: 0n,
+      }),
+    ]));
     const latestAuthoritySummaries = new Map<string, UsageProjectionAggregateFact>();
     for (const fact of retained.facts) {
       if (fact.rowKind !== "aggregate") continue;
@@ -2644,8 +2726,18 @@ describe("deployment Usage Projection", () => {
         meteredUseCount: totals.meteredUseCount + fact.meteredUseCount,
         billableApiOperations: totals.billableApiOperations + fact.billableApiOperations,
         unpricedApiOperations: totals.unpricedApiOperations + fact.unpricedApiOperations,
+        meteringAttempts: totals.meteringAttempts + fact.meteringAttempts,
+        heldReservations: totals.heldReservations + fact.heldReservations,
+        settledReservations: totals.settledReservations + fact.settledReservations,
       }),
-      {meteredUseCount: 0n, billableApiOperations: 0n, unpricedApiOperations: 0n},
+      {
+        meteredUseCount: 0n,
+        billableApiOperations: 0n,
+        unpricedApiOperations: 0n,
+        meteringAttempts: 0n,
+        heldReservations: 0n,
+        settledReservations: 0n,
+      },
     );
     const projectedPrincipalTotals = await runInDurableObject(
       projection,
@@ -2654,6 +2746,9 @@ describe("deployment Usage Projection", () => {
         metered_use_count: string;
         billable_api_operations: string;
         unpriced_api_operations: string;
+        metering_attempts: string;
+        held_reservations: string;
+        settled_reservations: string;
       }>(`
         SELECT CAST(COUNT(*) AS TEXT) AS summary_count,
           CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
@@ -2661,7 +2756,13 @@ describe("deployment Usage Projection", () => {
           CAST(COALESCE(SUM(CAST(billable_api_operations AS INTEGER)), 0) AS TEXT)
             AS billable_api_operations,
           CAST(COALESCE(SUM(CAST(unpriced_api_operations AS INTEGER)), 0) AS TEXT)
-            AS unpriced_api_operations
+            AS unpriced_api_operations,
+          CAST(COALESCE(SUM(CAST(metering_attempts AS INTEGER)), 0) AS TEXT)
+            AS metering_attempts,
+          CAST(COALESCE(SUM(CAST(held_reservations AS INTEGER)), 0) AS TEXT)
+            AS held_reservations,
+          CAST(COALESCE(SUM(CAST(settled_reservations AS INTEGER)), 0) AS TEXT)
+            AS settled_reservations
         FROM usage_projection_summaries
         WHERE generation = (
           SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
@@ -2678,34 +2779,25 @@ describe("deployment Usage Projection", () => {
       metered_use_count: expectedPrincipalTotals.meteredUseCount.toString(),
       billable_api_operations: expectedPrincipalTotals.billableApiOperations.toString(),
       unpriced_api_operations: expectedPrincipalTotals.unpricedApiOperations.toString(),
+      metering_attempts: expectedPrincipalTotals.meteringAttempts.toString(),
+      held_reservations: expectedPrincipalTotals.heldReservations.toString(),
+      settled_reservations: expectedPrincipalTotals.settledReservations.toString(),
     });
   });
 
   it("keeps User legacy backfill alive when the requesting rebuild stops", async () => {
-    const activeProjection = testEnv.TEST_USAGE_PROJECTION.getByName("");
-    for (let step = 0; step < 20 && !await activeProjection.ensureBootstrap(); step += 1) {
-      await runDurableObjectAlarm(activeProjection);
-    }
-    expect(await activeProjection.ensureBootstrap()).toBe(true);
     const identity = `projection-rebuild-backfill-${crypto.randomUUID()}`;
     const userId = testEnv.TEST_USER.idFromName(identity);
     let user = testEnv.TEST_USER.get(userId);
     expect(await user.createAccount(identity, identity, new Uint8Array([31, 32, 33])))
       .not.toBeNull();
     await user.activateUsageAccount();
-    await runInDurableObject(user, async instance => {
-      (instance as unknown as {usageProjection: unknown}).usageProjection = {
-        getByName: () => ({
-          ingest: async (facts: UsageProjectionFact[]) => ({
-            acknowledgedFactIds: facts.map(item => item.projectionFactId),
-            rejected: [],
-          }),
-          expireDetailBefore: async () => true,
-        }),
-      };
+    await runDurableObjectAlarm(user);
+    await runInDurableObject(user, (_instance, state) => {
+      const account = new UsageAccount(state.storage);
       for (let index = 0; index < 33; index += 1) {
         const operationId = `gatekeeper-operation:${crypto.randomUUID()}`;
-        await instance.beginGatekeeperUsage(operationId, {
+        account.beginGatekeeperUsage(operationId, {
           principal: {version: 1, kind: "user", userId: userId.toString()},
           source: "direct-user",
           vendorId: "context",
@@ -2721,8 +2813,8 @@ describe("deployment Usage Projection", () => {
           chargeSubunits: 0n,
           configurationGap: true,
         });
-        await instance.markGatekeeperUsageStarted(operationId);
-        await instance.completeGatekeeperUsage(operationId, "executed");
+        account.markGatekeeperUsageStarted(operationId);
+        account.completeGatekeeperUsage(operationId, "executed");
       }
     });
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
@@ -2806,24 +2898,67 @@ describe("deployment Usage Projection", () => {
       pendingCount: 66n,
     });
     expect(stateBeforeRestart.alarm).not.toBeNull();
-    const unpricedBefore = (await activeProjection.readOverview()).metrics.unpricedApiOperations;
     await expect(runInDurableObject(user, (_instance, state) => {
       state.abort("restart after rebuild backfill outage");
     })).rejects.toThrow("restart after rebuild backfill outage");
     const restarted = testEnv.TEST_USER.get(userId);
-    expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    const stateAfterRestart = await runInDurableObject(restarted, async (_instance, state) => {
-      const alarm = await state.storage.getAlarm();
-      if (alarm !== null) await state.storage.setAlarm(Date.now() + 60_000);
+    const deliveredSummaryFactIds = new Set<string>();
+    const deliveryBatchSizes: number[] = [];
+    let controlsAlarmSchedule = false;
+    let requestedAlarm: number | null = null;
+    const runControlledDelivery = () => runInDurableObject(restarted, async (instance, state) => {
+      if (!controlsAlarmSchedule) {
+        (instance as unknown as {usageProjection: unknown}).usageProjection = {
+          getByName: () => ({
+            ingest: async (facts: UsageProjectionFact[]) => {
+              deliveryBatchSizes.push(facts.length);
+              for (const fact of facts) {
+                if (fact.rowKind === "aggregate") {
+                  deliveredSummaryFactIds.add(fact.projectionFactId);
+                }
+              }
+              return {
+                acknowledgedFactIds: facts.map(fact => fact.projectionFactId),
+                rejected: [],
+              };
+            },
+            expireDetailBefore: async () => true,
+          }),
+        };
+        (instance as unknown as {adminSettings: unknown}).adminSettings = {
+          getByName: () => ({
+            registerUsageUser: async () => undefined,
+            recordUsageProjectionDeliveryHealth: async () => undefined,
+          }),
+        };
+        const storage = state.storage as DurableObjectStorage & {
+          setAlarm(scheduledTime: number | Date): Promise<void>;
+        };
+        const setAlarm = storage.setAlarm.bind(storage);
+        await setAlarm(Date.now() + 60_000);
+        Object.defineProperty(storage, "setAlarm", {
+          configurable: true,
+          value: async (scheduledTime: number | Date) => {
+            requestedAlarm = new Date(scheduledTime).getTime();
+            await setAlarm(Date.now() + 60_000);
+          },
+        });
+        controlsAlarmSchedule = true;
+      }
+      await instance.alarm();
       return {
         projectionStage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
         projectionCursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
         summaryStage: state.storage.kv.get<string>(SUMMARY_BACKFILL_STAGE_KEY),
         summaryCursor: state.storage.kv.get<string>(SUMMARY_BACKFILL_CURSOR_KEY),
         pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
-        alarm,
+        alarm: await state.storage.getAlarm(),
+        requestedAlarm,
+        deliveredSummaryCount: deliveredSummaryFactIds.size,
+        deliveryBatchSizes: [...deliveryBatchSizes],
       };
     });
+    const stateAfterRestart = await runControlledDelivery();
     expect(stateAfterRestart).toMatchObject({
       projectionStage: "complete",
       projectionCursor: undefined,
@@ -2832,29 +2967,25 @@ describe("deployment Usage Projection", () => {
       pendingCount: 34n,
     });
     expect(stateAfterRestart.alarm).not.toBeNull();
-    expect(stateAfterRestart.alarm!).toBeLessThanOrEqual(Date.now() + 1_500);
+    expect(stateAfterRestart.requestedAlarm).not.toBeNull();
+    expect(stateAfterRestart.requestedAlarm!).toBeLessThanOrEqual(Date.now() + 1_500);
     // Backfill writes immutable detail then aggregate facts per record. The first 32-fact delivery
     // after restart therefore applies 16 Summary snapshots and leaves 34 facts pending.
-    expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
-      .toBe(unpricedBefore + 16n);
-    expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    const secondDelivery = await runInDurableObject(restarted, async (_instance, state) => {
-      const pendingCount = state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY);
-      const alarm = await state.storage.getAlarm();
-      if (alarm !== null) await state.storage.setAlarm(Date.now() + 60_000);
-      return {pendingCount, alarm};
-    });
-    expect(secondDelivery.pendingCount).toBe(2n);
-    expect(secondDelivery.alarm).not.toBeNull();
-    // The second 32-fact delivery applies the next 16 aggregate snapshots.
-    expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
-      .toBe(unpricedBefore + 32n);
-    expect(await runDurableObjectAlarm(restarted)).toBe(true);
-    expect(await runInDurableObject(restarted, (_instance, state) =>
-      state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY))).toBe(0n);
-    // The last detail/aggregate pair contributes the 33rd Summary and ends the bounded replay.
-    expect((await activeProjection.readOverview()).metrics.unpricedApiOperations)
-      .toBe(unpricedBefore + 33n);
+    expect(stateAfterRestart.deliveredSummaryCount).toBe(16);
+    expect(stateAfterRestart.deliveryBatchSizes).toEqual([32]);
+    let pendingCount = stateAfterRestart.pendingCount;
+    for (let delivery = 0; delivery < 3 && pendingCount !== 0n; delivery += 1) {
+      pendingCount = await runInDurableObject(restarted, async (instance, state) => {
+        await instance.alarm();
+        return state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY);
+      });
+    }
+    expect(pendingCount).toBe(0n);
+    // A scheduled alarm may race a manual alarm after the first atomic snapshot. Every production
+    // delivery remains bounded, and all 33 detail/aggregate pairs are delivered exactly once.
+    expect(deliveryBatchSizes).toEqual([32, 32, 2]);
+    expect(deliveryBatchSizes.every(size => size <= 32)).toBe(true);
+    expect(deliveredSummaryFactIds.size).toBe(33);
   });
 
   it("automatically bootstraps an empty Projection from dormant User authority", async () => {

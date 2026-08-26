@@ -63,6 +63,11 @@ const EMPTY_METRICS: AdminUsageReportMetrics = {
   meteredUseCount: 0n,
   preExecutionFailures: 0n,
   unknownOperations: 0n,
+  meteringAttempts: 0n,
+  heldReservations: 0n,
+  releasedReservations: 0n,
+  settledReservations: 0n,
+  unreservedAttempts: 0n,
   activeUsers: 0n,
   unpricedModelUses: 0n,
   unpricedApiOperations: 0n,
@@ -73,6 +78,8 @@ const CSV_ROW: AdminUsageReportRow = {
   rowId: "row",
   registeredUserRef: "registered-user",
   safeRecordRef: "record",
+  safeAttemptRef: "attempt",
+  reservationStatus: "settled",
   meteredKind: "model",
   source: "agent",
   outcome: "settled",
@@ -97,6 +104,11 @@ const CSV_ROW: AdminUsageReportRow = {
     meteredUseCount: 1n,
     preExecutionFailures: 0n,
     unknownOperations: 0n,
+    meteringAttempts: 1n,
+    heldReservations: 0n,
+    releasedReservations: 0n,
+    settledReservations: 1n,
+    unreservedAttempts: 0n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
   },
@@ -108,6 +120,17 @@ function aggregate(
   const kind = overrides.kind ?? "model";
   const activeUserContribution = overrides.activeUserContribution ?? 1n;
   const meteredUseCount = overrides.meteredUseCount ?? activeUserContribution;
+  const outcome = overrides.outcome ?? "settled";
+  const preExecutionFailures = overrides.preExecutionFailures ?? 0n;
+  const unknownOperations = overrides.unknownOperations ?? 0n;
+  const meteringAttempts = overrides.meteringAttempts ??
+    (outcome === "reconciled-settled" || outcome === "reconciled-released" ? 0n
+      : outcome === "settled" ? meteredUseCount
+        : outcome === "failed-before-execution" ? preExecutionFailures : unknownOperations);
+  const reservationStatus = overrides.pricing === "unpriced" ? "none"
+    : outcome === "usage-unknown-held" || outcome === "reconciliation-required" ? "held"
+      : outcome === "usage-unknown-released" || outcome === "failed-before-execution"
+        ? "released" : "settled";
   return {
     schemaVersion: 1,
     projectionFactId: crypto.randomUUID(),
@@ -121,7 +144,7 @@ function aggregate(
     kind,
     meteredKind: overrides.meteredKind ??
       (activeUserContribution > 0n ? kind : "attempt"),
-    outcome: "settled",
+    outcome,
     pricing: "priced",
     deploymentModelId: "model-report",
     vendorId: null,
@@ -137,8 +160,13 @@ function aggregate(
     chargedUsageCreditSubunits: 7n,
     meteredUseCount,
     billableApiOperations: 0n,
-    preExecutionFailures: 0n,
-    unknownOperations: 0n,
+    preExecutionFailures,
+    unknownOperations,
+    meteringAttempts,
+    heldReservations: reservationStatus === "held" ? meteringAttempts : 0n,
+    releasedReservations: reservationStatus === "released" ? meteringAttempts : 0n,
+    settledReservations: reservationStatus === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: reservationStatus === "none" ? meteringAttempts : 0n,
     activeUserContribution,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -157,9 +185,25 @@ function detail(
     sourceSequence: 2n,
     rowKind: "detail",
     safeRecordRef: crypto.randomUUID(),
+    safeAttemptRef: crypto.randomUUID(),
+    reservationStatus: "settled",
     occurredAt: "2026-08-24T13:00:00.000Z",
     ...overrides,
   };
+}
+
+function omitExplainabilityFields<T extends UsageProjectionFact>(fact: T): T {
+  const {
+    safeAttemptRef: _safeAttemptRef,
+    reservationStatus: _reservationStatus,
+    meteringAttempts: _meteringAttempts,
+    heldReservations: _heldReservations,
+    releasedReservations: _releasedReservations,
+    settledReservations: _settledReservations,
+    unreservedAttempts: _unreservedAttempts,
+    ...legacy
+  } = fact;
+  return legacy as T;
 }
 
 function adminUsage(): AdminUsageApi {
@@ -623,15 +667,199 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     expect(row[header.indexOf("report_local_timestamp")]).toBe("");
   });
 
+  it("maps legacy unknown facts to released and held report outcomes without hiding reservation semantics",
+      async () => {
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const principal = crypto.randomUUID();
+    const released = detail(principal, {
+      sourceSequence: 1n,
+      kind: "model",
+      outcome: "usage-unknown",
+      deploymentModelId: "legacy-model-unknown",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const held = detail(principal, {
+      sourceSequence: 2n,
+      kind: "gatekeeper",
+      outcome: "usage-unknown",
+      pricing: "priced",
+      deploymentModelId: null,
+      vendorId: "legacy-held-vendor",
+      billingMethodKey: "legacy.held.v1",
+      externalAccountId: "legacy-held-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const legacyReleased = omitExplainabilityFields(released);
+    const legacyHeld = omitExplainabilityFields(held);
+    const releasedAggregate = aggregate(principal, {
+      sourceSequence: 3n,
+      kind: "model",
+      meteredKind: "attempt",
+      outcome: "usage-unknown",
+      deploymentModelId: "legacy-model-unknown",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const heldAggregate = aggregate(principal, {
+      sourceSequence: 4n,
+      kind: "gatekeeper",
+      meteredKind: "attempt",
+      outcome: "usage-unknown",
+      pricing: "priced",
+      deploymentModelId: null,
+      vendorId: "legacy-held-vendor",
+      billingMethodKey: "legacy.held.v1",
+      externalAccountId: "legacy-held-account",
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      meteredUseCount: 0n,
+      billableApiOperations: 0n,
+      unknownOperations: 1n,
+      activeUserContribution: 0n,
+    });
+    const legacyReleasedAggregate = omitExplainabilityFields(releasedAggregate);
+    const legacyHeldAggregate = omitExplainabilityFields(heldAggregate);
+    const outOfOrder = [
+      legacyHeldAggregate, legacyHeld, legacyReleasedAggregate, legacyReleased,
+    ];
+    expect(await projection.ingest(outOfOrder)).toMatchObject({rejected: []});
+    expect(await projection.ingest(outOfOrder)).toMatchObject({rejected: []});
+
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      "issue-63-admin@example.test",
+      undefined,
+      testEnv.TEST_USAGE_PROJECTION,
+    );
+    using releasedReport = await usage.openReport({
+      registeredUserRefs: [principal],
+      outcomes: ["usage-unknown-released"],
+    } as never);
+    using heldReport = await usage.openReport({
+      registeredUserRefs: [principal],
+      outcomes: ["usage-unknown-held"],
+    } as never);
+    using legacyReport = await usage.openReport({
+      registeredUserRefs: [principal],
+      outcomes: ["usage-unknown"],
+    } as never);
+    const releasedRows = (await releasedReport.listRows({limit: 10})).rows;
+    const heldRows = (await heldReport.listRows({limit: 10})).rows;
+    const releasedDetail = releasedRows.find(row => row.rowKind === "detail");
+    const heldDetail = heldRows.find(row => row.rowKind === "detail");
+    expect(releasedDetail).toEqual(
+      expect.objectContaining({
+        rowId: released.projectionFactId,
+        outcome: "usage-unknown-released",
+        safeAttemptRef: released.safeRecordRef,
+        reservationStatus: "released",
+        metrics: expect.objectContaining({
+          meteringAttempts: 1n,
+          releasedReservations: 1n,
+          heldReservations: 0n,
+        }),
+      }),
+    );
+    expect(heldDetail).toEqual(
+      expect.objectContaining({
+        rowId: held.projectionFactId,
+        outcome: "usage-unknown-held",
+        safeAttemptRef: held.safeRecordRef,
+        reservationStatus: "held",
+        metrics: expect.objectContaining({
+          meteringAttempts: 1n,
+          releasedReservations: 0n,
+          heldReservations: 1n,
+        }),
+      }),
+    );
+    const releasedSummary = releasedRows.find(row => row.rowKind === "aggregate");
+    const heldSummary = heldRows.find(row => row.rowKind === "aggregate");
+    expect(releasedSummary).toMatchObject({
+      outcome: "usage-unknown-released",
+      metrics: {meteringAttempts: 1n, releasedReservations: 1n},
+    });
+    expect(heldSummary).toMatchObject({
+      outcome: "usage-unknown-held",
+      metrics: {meteringAttempts: 1n, heldReservations: 1n},
+    });
+    for (const summary of [releasedSummary, heldSummary]) {
+      expect(summary).not.toHaveProperty("safeRecordRef");
+      expect(summary).not.toHaveProperty("safeAttemptRef");
+      expect(summary).not.toHaveProperty("reservationStatus");
+      expect(summary).not.toHaveProperty("occurredAtUtc");
+    }
+    expect((await legacyReport.listRows({limit: 10})).rows).toHaveLength(4);
+    expect((await releasedReport.getOverview()).metrics).toMatchObject({
+      unknownOperations: 1n,
+      meteringAttempts: 1n,
+      heldReservations: 0n,
+      releasedReservations: 1n,
+    });
+    expect((await heldReport.getOverview()).metrics).toMatchObject({
+      unknownOperations: 1n,
+      meteringAttempts: 1n,
+      heldReservations: 1n,
+      releasedReservations: 0n,
+    });
+    const releasedCsv = await new Response(await releasedReport.exportCsv()).text();
+    const heldCsv = await new Response(await heldReport.exportCsv()).text();
+    expect(releasedCsv).toContain("safe_attempt_ref,reservation_status,metering_attempts");
+    expect(releasedCsv).toContain(",usage-unknown-released,");
+    expect(releasedCsv).toContain(`,${released.safeRecordRef},released,`);
+    expect(heldCsv).toContain(",usage-unknown-held,");
+    expect(heldCsv).toContain(`,${held.safeRecordRef},held,`);
+  });
+
   it("uses the legacy Projection fact identity as its safe detail alias", async () => {
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName("");
     const principal = crypto.randomUUID();
     const current = detail(principal, {sourceSequence: 1n});
     const {
       safeRecordRef: _safeRecordRef,
+      safeAttemptRef: _safeAttemptRef,
+      reservationStatus: _reservationStatus,
       meteredUseCount: _meteredUseCount,
       preExecutionFailures: _preExecutionFailures,
       unknownOperations: _unknownOperations,
+      meteringAttempts: _meteringAttempts,
+      heldReservations: _heldReservations,
+      releasedReservations: _releasedReservations,
+      settledReservations: _settledReservations,
+      unreservedAttempts: _unreservedAttempts,
       ...legacy
     } = current;
     await projection.ingest([legacy as UsageProjectionFact]);

@@ -95,7 +95,8 @@ const MODEL_ATTRIBUTION: ModelUsageAttribution = {
   deploymentModelId: "deepseek-summary",
 };
 
-async function withAccount<T>(body: (account: UsageAccount) => T): Promise<T> {
+async function withAccount<T>(
+    body: (account: UsageAccount, storage: DurableObjectStorage) => T): Promise<T> {
   const identity = `summary-${crypto.randomUUID()}`;
   const user = users.get(users.idFromName(identity));
   if (await user.createAccount(identity, identity, new Uint8Array([1])) === null) {
@@ -108,7 +109,7 @@ async function withAccount<T>(body: (account: UsageAccount) => T): Promise<T> {
       displayName: identity,
     }));
     account.getBalance(GRANT);
-    return body(account);
+    return body(account, state.storage);
   });
 }
 
@@ -117,6 +118,43 @@ afterEach(() => {
 });
 
 describe("authoritative 15-minute UTC Usage Summary Facts", () => {
+  it("upgrades an existing Summary snapshot when the next terminal Attempt is appended", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-24T14:01:00.000Z"));
+    await withAccount((account, storage) => {
+      account.beginGatekeeperUsage("summary-legacy-first", ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted("summary-legacy-first");
+      account.completeGatekeeperUsage("summary-legacy-first", "executed");
+      const [summaryKey, summary] = Array.from(storage.kv.list<Record<string, unknown>>({
+        prefix: "usageAccount:summary:",
+      }))[0]!;
+      const legacy = structuredClone(summary);
+      for (const field of [
+        "meteringAttempts",
+        "heldReservations",
+        "releasedReservations",
+        "settledReservations",
+        "unreservedAttempts",
+      ]) delete legacy[field];
+      storage.kv.put(summaryKey, legacy);
+
+      account.beginGatekeeperUsage("summary-legacy-second", ATTRIBUTION, UNPRICED);
+      account.markGatekeeperUsageStarted("summary-legacy-second");
+      account.completeGatekeeperUsage("summary-legacy-second", "executed");
+
+      expect(account.getSnapshot().usageSummaryFacts).toEqual([
+        expect.objectContaining({
+          summaryRevision: 2n,
+          meteringAttempts: 2n,
+          heldReservations: 0n,
+          releasedReservations: 0n,
+          settledReservations: 0n,
+          unreservedAttempts: 2n,
+        }),
+      ]);
+    });
+  });
+
   it("updates one absolute Summary snapshot and aggregate outbox revision in the terminal transaction",
       async () => {
     vi.useFakeTimers();
@@ -285,6 +323,72 @@ describe("authoritative 15-minute UTC Usage Summary Facts", () => {
     });
   });
 
+  it("distinguishes a priced Model Attempt whose missing Usage releases its Reservation",
+      async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-24T17:01:00.000Z"));
+    await withAccount(account => {
+      const operationId = "model-inference:summary-no-report";
+      const attempt = account.beginModelUsage(
+        operationId,
+        MODEL_ATTRIBUTION,
+        PRICED_MODEL,
+        {cacheHitInputTokens: 3n, cacheMissInputTokens: 5n, outputTokens: 7n},
+      );
+      expect(account.getBalance()).toMatchObject({
+        availableSubunits: GRANT.amountSubunits - attempt.reservationAmountSubunits,
+        reservedSubunits: attempt.reservationAmountSubunits,
+      });
+
+      account.markModelUsageStarted(operationId);
+      const record = account.completeModelUsage(operationId, null);
+
+      expect(record).toMatchObject({
+        outcome: "usage-unknown",
+        usageStatus: "not-reported",
+        usage: null,
+        chargeSubunits: null,
+      });
+      const snapshot = account.getSnapshot();
+      expect(snapshot.reservations).toEqual([
+        expect.objectContaining({state: "released"}),
+      ]);
+      expect(snapshot).toMatchObject({
+        availableSubunits: GRANT.amountSubunits,
+        reservedSubunits: 0n,
+      });
+
+      const detail = snapshot.projectionFacts.find(fact => fact.rowKind === "detail");
+      expect(detail).toMatchObject({
+        outcome: "usage-unknown-released",
+        safeAttemptRef: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
+        reservationStatus: "released",
+        meteringAttempts: 1n,
+        heldReservations: 0n,
+        releasedReservations: 1n,
+        settledReservations: 0n,
+        unreservedAttempts: 0n,
+      });
+      expect(JSON.stringify(detail, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value)).not.toContain(operationId);
+      expect(snapshot.usageSummaryFacts).toEqual([
+        expect.objectContaining({
+          outcome: "usage-unknown-released",
+          meteredKind: "attempt",
+          meteringAttempts: 1n,
+          heldReservations: 0n,
+          releasedReservations: 1n,
+          settledReservations: 0n,
+          unreservedAttempts: 0n,
+          meteredUseCount: 0n,
+          unknownOperations: 1n,
+        }),
+      ]);
+    });
+  });
+
   it("keeps confirmed API, pre-execution failure, and unknown counters separate", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-24T18:01:00.000Z"));
@@ -325,7 +429,7 @@ describe("authoritative 15-minute UTC Usage Summary Facts", () => {
           unknownOperations: 0n,
         },
         {
-          outcome: "usage-unknown",
+          outcome: "usage-unknown-released",
           meteredKind: "attempt",
           meteredUseCount: 0n,
           billableApiOperations: 0n,
@@ -359,8 +463,26 @@ describe("authoritative 15-minute UTC Usage Summary Facts", () => {
         meteredKind: fact.meteredKind,
       })).toSorted((a, b) => a.outcome.localeCompare(b.outcome))).toEqual([
         {outcome: "reconciled-settled", meteredKind: "gatekeeper"},
-        {outcome: "usage-unknown", meteredKind: "attempt"},
+        {outcome: "usage-unknown-held", meteredKind: "attempt"},
       ]);
+      expect(snapshot.usageSummaryFacts).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          outcome: "usage-unknown-held",
+          meteringAttempts: 1n,
+          heldReservations: 1n,
+          releasedReservations: 0n,
+          settledReservations: 0n,
+          unreservedAttempts: 0n,
+        }),
+        expect.objectContaining({
+          outcome: "reconciled-settled",
+          meteringAttempts: 0n,
+          heldReservations: 0n,
+          releasedReservations: 0n,
+          settledReservations: 0n,
+          unreservedAttempts: 0n,
+        }),
+      ]));
       expect(snapshot.usageSummaryFacts.reduce((totals, fact) => ({
         charged: totals.charged + fact.chargedUsageCreditSubunits,
         metered: totals.metered + fact.meteredUseCount,
@@ -390,9 +512,33 @@ describe("authoritative 15-minute UTC Usage Summary Facts", () => {
       const details = snapshot.projectionFacts.filter(fact => fact.rowKind === "detail");
       expect(details.map(fact => fact.outcome).toSorted()).toEqual([
         "reconciled-settled",
-        "usage-unknown",
+        "usage-unknown-held",
       ]);
       expect(new Set(details.map(fact => fact.safeRecordRef)).size).toBe(2);
+      expect(details).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          outcome: "usage-unknown-held",
+          safeAttemptRef: expect.stringMatching(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          ),
+          reservationStatus: "held",
+          meteringAttempts: 1n,
+          heldReservations: 1n,
+          releasedReservations: 0n,
+          settledReservations: 0n,
+          unreservedAttempts: 0n,
+        }),
+        expect.objectContaining({
+          outcome: "reconciled-settled",
+          safeAttemptRef: null,
+          reservationStatus: "none",
+          meteringAttempts: 0n,
+          heldReservations: 0n,
+          releasedReservations: 0n,
+          settledReservations: 0n,
+          unreservedAttempts: 0n,
+        }),
+      ]));
     });
   });
 });

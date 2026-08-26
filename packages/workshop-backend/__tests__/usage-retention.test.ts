@@ -268,7 +268,7 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.completeModelUsage("model-inference:held-reconciliation-required", "invalid-report");
       const releasedRefs = account.getSnapshot().projectionFacts
         .filter(fact => fact.rowKind === "detail" && fact.kind === "model" &&
-          fact.outcome === "usage-unknown")
+          fact.outcome === "usage-unknown-released")
         .toSorted((left, right) => left.occurredAt.localeCompare(right.occurredAt));
       expect(releasedRefs).toHaveLength(2);
       acknowledgeAllProjectionFacts(account);
@@ -352,7 +352,7 @@ describe("24 UTC calendar month Usage detail retention", () => {
       account.markGatekeeperUsageStarted(billingOperationId);
       account.completeGatekeeperUsage(billingOperationId, "unknown");
       const unknown = account.getSnapshot().projectionFacts.find(
-        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown",
+        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown-held",
       );
       if (!unknown || unknown.rowKind !== "detail") {
         throw new Error("Expected an unknown Usage detail reference.");
@@ -411,7 +411,7 @@ describe("24 UTC calendar month Usage detail retention", () => {
       const details = account.getSnapshot().projectionFacts.filter(
         fact => fact.rowKind === "detail",
       );
-      const original = details.find(fact => fact.outcome === "usage-unknown");
+      const original = details.find(fact => fact.outcome === "usage-unknown-held");
       const reconciliation = details.find(fact => fact.outcome === "reconciled-settled");
       if (!original || original.rowKind !== "detail" ||
           !reconciliation || reconciliation.rowKind !== "detail") {

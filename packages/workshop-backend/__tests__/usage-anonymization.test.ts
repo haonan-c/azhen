@@ -424,7 +424,7 @@ describe("registered User deletion and pseudonymous financial retention", () => 
       account.markGatekeeperUsageStarted(unknownId);
       account.completeGatekeeperUsage(unknownId, "unknown");
       const unknown = account.getSnapshot().projectionFacts.find(
-        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown",
+        fact => fact.rowKind === "detail" && fact.outcome === "usage-unknown-held",
       );
       if (!unknown || unknown.rowKind !== "detail") {
         throw new Error("Expected the deleted User's unknown Usage detail.");
