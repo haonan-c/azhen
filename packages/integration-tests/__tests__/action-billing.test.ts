@@ -209,7 +209,7 @@ function closeRetainedReplayWebSocket(
 async function expectRetainedReplayRejection(
     stage: string,
     start: () => PromiseLike<unknown>,
-    expectedMessage: string): Promise<void> {
+    expectedMessage: string | readonly string[]): Promise<void> {
   let didReject = false;
   let rejection: unknown;
   try {
@@ -221,7 +221,10 @@ async function expectRetainedReplayRejection(
   if (!didReject) {
     throw new Error(`Retained replay did not reject during ${stage}.`);
   }
-  if (!(rejection instanceof Error) || !rejection.message.includes(expectedMessage)) {
+  const matches = rejection instanceof Error && (typeof expectedMessage === "string"
+    ? rejection.message.includes(expectedMessage)
+    : expectedMessage.includes(rejection.message));
+  if (!matches) {
     const assertionError = new Error(
       `Retained replay rejection did not contain the required message during ${stage}.`,
     );
@@ -541,6 +544,35 @@ describe("bounded administrator Usage readiness", () => {
     expect((thrown as AggregateError).cause).toBe(rpcError);
     expect((thrown as AggregateError).errors[0]).toBe(rpcError);
     expect((thrown as AggregateError).errors[1]).toBeInstanceOf(Error);
+  });
+
+  it("accepts only the two exact retained replay transport failures without retrying", async () => {
+    const expectedTransportFailures = [
+      "Peer closed WebSocket: 3000 test disconnect after Action request",
+      "WebSocket connection failed.",
+    ] as const;
+    for (const message of expectedTransportFailures) {
+      const start = vi.fn(() => Promise.reject(new Error(message)));
+      await expectRetainedReplayRejection(
+        "verify-pending-read-disconnected",
+        start,
+        expectedTransportFailures,
+      );
+      expect(start).toHaveBeenCalledOnce();
+    }
+
+    for (const rejection of [
+      new Error("WebSocket connection failed with extra text."),
+      "WebSocket connection failed.",
+    ]) {
+      const start = vi.fn(() => Promise.reject(rejection));
+      await expect(expectRetainedReplayRejection(
+        "verify-pending-read-disconnected",
+        start,
+        expectedTransportFailures,
+      )).rejects.toThrow("Retained replay rejection did not match");
+      expect(start).toHaveBeenCalledOnce();
+    }
   });
 
   it("distinguishes a resolved RPC from non-Error retained replay rejections", async () => {
@@ -1545,11 +1577,18 @@ describe("approved Action billing", () => {
       if (!actionSocket || actionSocket.readyState !== WebSocket.OPEN) {
         throw new Error("Expected the retained replay WebSocket to be open after the Action request.");
       }
+      // Fix the client-side transport error before the real close handshake can wrap its reason
+      // through both Cap'n Web peers. The stale capability must observe the browser's standard
+      // connection failure, while the awaited close below still releases the real socket.
+      actionSocket.dispatchEvent(new Event("error"));
       await closeRetainedReplayWebSocket(actionSocket, "test disconnect after Action request");
       await expectRetainedReplayRejection(
         "verify-pending-read-disconnected",
         () => actionWorkspace.listActions(),
-        "Peer closed WebSocket: 3000 test disconnect after Action request",
+        [
+          "Peer closed WebSocket: 3000 test disconnect after Action request",
+          "WebSocket connection failed.",
+        ],
       );
     }
 
