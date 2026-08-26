@@ -45,9 +45,18 @@ export function nextUsernames(...prefixes: string[]): string[] {
 
 /** Open an RPC session against the Workshop's /api endpoint. */
 export function connect(baseUrl: URL): RpcStub<PublicApi> {
+  return connectWithSocket(baseUrl).publicApi;
+}
+
+/** Open an RPC session and retain its WebSocket for transport-failure integration tests. */
+export function connectWithSocket(baseUrl: URL): {
+  publicApi: RpcStub<PublicApi>;
+  socket: WebSocket;
+} {
   const wsUrl = new URL("/api", baseUrl);
   wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-  return newWebSocketRpcSession<PublicApi>(wsUrl.toString());
+  const socket = new WebSocket(wsUrl.toString());
+  return {publicApi: newWebSocketRpcSession<PublicApi>(socket), socket};
 }
 
 /**

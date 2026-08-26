@@ -21,8 +21,8 @@ import {
 } from "../src/harness.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
-  connect, listConnectedAccounts, MAX_OBSERVER_PROMPTS, nextUsernames, ObserverConfigRecorder,
-  signIn, signUp, stubFor, waitFor, type ConnectedAccount,
+  connect, connectWithSocket, listConnectedAccounts, MAX_OBSERVER_PROMPTS, nextUsernames,
+  ObserverConfigRecorder, signIn, signUp, stubFor, waitFor, type ConnectedAccount,
 } from "../src/rpc-client.js";
 
 const ACTION_METHOD_KEY = "test.action.apply.v1";
@@ -174,6 +174,32 @@ async function retainedReplayStage<T>(
   } catch (error) {
     throw new Error(`Retained replay failed during ${stage}.`, {cause: error});
   }
+}
+
+function closeRetainedReplayWebSocket(socket: WebSocket, timeoutMs = 5_000): Promise<void> {
+  return new Promise<void>((fulfill, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timeout !== undefined) clearTimeout(timeout);
+      socket.removeEventListener("close", onClose);
+    };
+    const onClose = () => {
+      cleanup();
+      fulfill();
+    };
+    const onTimeout = () => {
+      cleanup();
+      reject(new Error("Timed out closing the retained replay WebSocket."));
+    };
+    socket.addEventListener("close", onClose, {once: true});
+    timeout = setTimeout(onTimeout, timeoutMs);
+    try {
+      socket.close(3_000, "test disconnect after Action request");
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
 }
 
 async function expectRetainedReplayRejection(
@@ -475,6 +501,25 @@ async function controlUnknownUsageReplayCrash(
 }
 
 describe("bounded administrator Usage readiness", () => {
+  it("cleans the retained replay disconnect listener on timeout and close failure", async () => {
+    for (const close of [
+      vi.fn(),
+      vi.fn(() => { throw new Error("close failed"); }),
+    ]) {
+      const target = new EventTarget();
+      const remove = vi.spyOn(target, "removeEventListener");
+      const socket = Object.assign(target, {close}) as unknown as WebSocket;
+      await expect(closeRetainedReplayWebSocket(socket, 0)).rejects.toThrow(
+        close.mock.results[0]?.type === "throw"
+          ? "close failed"
+          : "Timed out closing the retained replay WebSocket.",
+      );
+      expect(remove).toHaveBeenCalledOnce();
+      expect(remove).toHaveBeenCalledWith("close", expect.any(Function));
+      remove.mockRestore();
+    }
+  });
+
   it("preserves the raw retained replay rejection when its assertion fails", async () => {
     const rpcError = new Error("WebSocket connection failed.");
     let thrown: unknown;
@@ -1356,10 +1401,19 @@ describe("approved Action billing", () => {
     let before!: Awaited<ReturnType<AuthenticatedApi["getUsageCreditBalance"]>>;
     let request!: AdminUnknownUsageReconciliationRequest;
     const label = `unknown-retained-replay-${crypto.randomUUID()}`;
+    const providerCallStart = providerCalls.length;
 
     {
+      let initialSocket: WebSocket | undefined;
       const userSession = await retainedReplayStage(
-        "open-new-user", () => openNewUserWhenAvailable(username),
+        "open-new-user", () => openNewUserWhenAvailable(username, {
+          ...productionNewUserReadiness,
+          open: () => {
+            const connection = connectWithSocket(harness.url);
+            initialSocket = connection.socket;
+            return connection.publicApi;
+          },
+        }),
       );
       using _initialPublicApi = userSession.publicApi;
       using initialUser = userSession.user;
@@ -1389,22 +1443,46 @@ describe("approved Action billing", () => {
       await retainedReplayStage(
         "request-billable-action", () => initialSession.requestBillableAction(label),
       );
+      if (!initialSocket || initialSocket.readyState !== WebSocket.OPEN) {
+        throw new Error("Expected the retained replay WebSocket to be open after the Action request.");
+      }
+      await closeRetainedReplayWebSocket(initialSocket);
+      await expectRetainedReplayRejection(
+        "verify-pending-read-disconnected",
+        () => initialWorkspace.listActions(),
+        "Peer closed WebSocket: 3000 test disconnect after Action request",
+      );
+    }
+
+    {
+      const pendingUserSession = await retainedReplayStage(
+        "reconnect-user-for-pending-action", () => openExistingUserWhenAvailable(username),
+      );
+      using _pendingPublicApi = pendingUserSession.publicApi;
+      using pendingUser = pendingUserSession.user;
+      using pendingWorkspace = await retainedReplayStage(
+        "reopen-workspace-for-pending-action", () => pendingUser.openGadget(workspaceId),
+      );
       const actions = await retainedReplayStage(
-        "list-pending-actions", () => initialWorkspace.listActions(),
+        "list-pending-actions-after-reconnect", () => pendingWorkspace.listActions(),
       );
       const action = actions.find(entry =>
         entry.type === "action" && entry.description.title === `Test action ${label}`);
       if (!action) throw new Error("Expected the retained replay Action.");
       actionId = action.id;
       const approval = await retainedReplayStage(
-        "approve-action", () => initialWorkspace.approveAction(actionId),
+        "approve-action-on-reconnected-workspace", () => pendingWorkspace.approveAction(actionId),
       );
       expect(approval).toBe("unknown");
+      expect(providerCalls.slice(providerCallStart).filter(call =>
+        new URL(call.url).pathname === `/effects/${label}`)).toHaveLength(1);
       safeRecordRef = await retainedReplayStage(
         "read-unknown-safe-record-ref",
         () => waitForNextUnknownUsageReference(username, new Set()),
       );
+    }
 
+    {
       const adminSession = await retainedReplayStage(
         "open-initial-admin", () => openUsageAdminWhenAvailable(),
       );
