@@ -916,3 +916,35 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   retry renders the reconciliation and Credit Reversal terminal graph without the stale controls.
 - Browser focused tests passed 21/21. The Frontend build, lint check, and `git diff --check` passed.
   Root test remains prohibited until the final independent read-only review.
+
+### 2026-08-26 — Issue #63 final coordinated branch gate
+
+- The final independent Standards and Spec reviews reported no P0-P2 finding. They confirmed that
+  Cap'n Web promise-pipelined Workspace metadata keeps `newGadget()` single-shot, every committed
+  Action write remains single-shot, pure reads alone use fresh capabilities after transport loss,
+  and all old capabilities are disposed in reverse order.
+- Diagnostic root rounds were not marked PASS. They exposed only test-orchestration seams: Worker
+  Loader readiness, bounded alarm cleanup, legacy tests that bypassed the detail-scoped safe
+  reference, stage-specific WebSocket loss, and two valid Cap'n Web disconnect error spellings.
+  Each correction was written RED→GREEN, remained test-only where production behavior was already
+  correct, and received another independent Standards/Spec review with no P0-P2 finding.
+- The final test-only transport seam accepts only exact peer-close or exact generic connection
+  failure, rejects extra text and non-Error values, and proves the RPC factory is called once. It
+  first fixes the Cap'n Web client transport failure, then awaits the real WebSocket close. Focused
+  passed 2/2, Action billing passed 28/28 in 221.01 seconds, and the complete Integration Tests
+  package passed 128/128 in 846.19 seconds before the final root run.
+- The final clean code fixed point is `8cf2720adcdbe2e705c8070518fc684ed2fef5e2`. Its exclusive root
+  `corepack pnpm test` exited 0 in about 22 minutes 39 seconds. Counts were: root Node 117/117;
+  Browser 1/1; Backend 468/468; Projection 56/56; retention 25/25; administrator Usage 18/18;
+  report 23/23; Metered Model 35/35; Open Gadget 1/1; the four-file RPC group 27 pass and 4 expected
+  skips; Registry 2/2; retention RPC 1/1; DOCX 4/4; production Harness 128/128; Frontend 391/391 plus
+  first-party copy 1/1. Every remaining workspace package exited 0.
+- Root build remained GREEN at 52 tasks. Root lint, the 4/4 release-manifest golden, and
+  `git diff --check` passed. The final corrections changed only Integration Tests and documentation,
+  with no Durable Object, binding, migration, Wrangler, or manifest-shape change. The earlier
+  final-shape `types:generate` and local production-shape dry-run remain valid: Wrangler 4.119.0,
+  19 Workers, 85 modules, 37 asset blobs, and 28 MiB.
+- This evidence is local execution of real production Workshop code paths with controlled test
+  identities and controlled external mocks. It is not production deployment verification. No push,
+  merge, pull request, Issue closure, upload, promotion, deployment, production configuration or
+  charging change, production contact, worktree deletion, or release publication occurred.

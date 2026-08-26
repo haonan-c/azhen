@@ -179,19 +179,19 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | Focused Summary/retention workerd group | PASS, 25/25 |
 | Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
 | Frontend report/file-transfer follow-up tests | PASS, 30/30 |
-| Full Frontend package tests | PASS, 78 files and 381 tests, plus first-party copy 1/1 |
+| Full Frontend package tests | PASS, 78 files and 391 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Real production-Harness second-page legacy/deleted-User coordination | PASS, 1/1; 17 unrelated tests skipped; 15.80 seconds |
 | Real production-Harness retained-detail cross-DO replay | PASS, 1/1; 18 unrelated tests skipped; 16.72 seconds |
 | Backend Worker `capnweb-validate` build | PASS |
-| Full Backend package tests | PRE-REVIEW PASS, 654 tests with 4 expected skips; final rerun pending follow-up review |
-| Root `corepack pnpm build` | PRE-REVIEW PASS, 52 tasks; final rerun pending follow-up review |
-| Root `corepack pnpm lint` | PRE-REVIEW PASS, configured non-blocking warnings only; final rerun pending follow-up review |
+| Full Backend package tests | PASS, 661 tests with 4 expected skips across the root Backend preflight and focused configurations |
+| Root `corepack pnpm build` | PASS, 52 tasks; later test-only corrections also passed the Integration Tests package build |
+| Root `corepack pnpm lint` | PASS, configured non-blocking warnings only |
 | Release-manifest golden | PASS, 4/4 |
 | `corepack pnpm types:generate` | PASS; no Issue #63 generated change |
 | Production-shape release dry-run | PASS, 19 Workers, 85 modules, 37 asset blobs, 28 MiB |
-| Root `corepack pnpm test` | PENDING final coordinated fleet |
-| Standards/specification fixed-point review | PENDING follow-up dual-axis review of correction commits |
+| Root `corepack pnpm test` | PASS at code fixed point `8cf2720adcdbe2e705c8070518fc684ed2fef5e2`; about 22 minutes 39 seconds wall time |
+| Standards/specification fixed-point review | PASS; final two test-only corrections each received independent Standards and Spec reviews with no P0-P2 findings |
 | `git diff --check` | PASS |
 
 The first production-shape dry-run stopped because a gitignored Confluence configurator prerequisite
@@ -261,14 +261,21 @@ batch, coordinated the retained unknown authority after permanent User deletion,
 safe `${safeRecordRef}:usage-charge` alias. A third identical request returned the same stored
 result. Registry identity search stayed empty and the deleted User capability stayed revoked.
 
-## Remaining branch gate
+## Final branch gate
 
-The candidate still requires the next standards/specification follow-up review, final affected/root
-build and lint gates, complete Backend tests, and one coordinated root `corepack pnpm test`. After
-those gates and any TDD corrections, this document must record the final fixed point. No push,
-merge, pull request, Issue closure, deployment, upload, promotion,
-production configuration change, charging change, or worktree deletion is part of this worktree
-step.
+The final code fixed point is `8cf2720adcdbe2e705c8070518fc684ed2fef5e2`. Its coordinated root
+`corepack pnpm test` exited 0. The root command passed 117/117 Node tests, Browser Runtime 1/1,
+Backend 468/468, Projection 56/56, retention 25/25, administrator Usage 18/18, report 23/23,
+Metered Model 35/35, Open Gadget 1/1, the four-file RPC group 27 pass with 4 expected skips,
+Registry 2/2, retention RPC 1/1, DOCX 4/4, and the real production Harness 128/128. The remaining
+workspace package matrix also exited 0; this included Frontend 391/391 plus first-party copy 1/1.
+
+The final corrections after the production-shape dry-run changed only Integration Tests. They did
+not change a Durable Object, binding, migration, Wrangler configuration, release manifest input, or
+production module. The earlier final-shape `types:generate`, 4/4 release-manifest golden, and local
+19-Worker Wrangler dry-run therefore remain the applicable release-shape evidence. There was no
+upload, promotion, deployment, production configuration change, charging change, or production
+contact.
 
 ## Fourth review correction fixed point
 
@@ -292,8 +299,8 @@ The fourth review reported one P1 and two P2 gaps. Each was reproduced before th
 
 The correction gates passed: Frontend focused 29/29, Usage administrator 18/18, Usage report 23/23,
 Summary/retention 25/25, the exact retained-detail Harness 1/1, and affected Backend, Frontend, and
-Integration Tests builds. Root test remains prohibited until the next independent fixed-point
-review.
+Integration Tests builds. At that correction fixed point, root test remained prohibited until the
+next independent review.
 
 The final P2 follow-up makes authority refresh success explicit. `readDetail()` now returns whether
 the current frozen-row detail was applied. If a post-operation refresh rejects, it clears the stale
@@ -302,3 +309,36 @@ not retain a success message. A later successful row read restores the terminal 
 Credit Reversal graph without settle, release, or reverse controls. Both the RPC-success and
 RPC-conflict paths are covered. Browser focused tests passed 21/21; the combined report and file
 transfer set is 30/30. Frontend build, lint, and `git diff --check` passed.
+
+## Final diagnostic history
+
+No failed coordinated root attempt was recorded as PASS. The failed rounds were retained as
+diagnostic evidence and closed through test-only TDD where the production behavior was already
+correct:
+
+- Early rounds exposed Worker Loader readiness gaps, late capability disposal, raw Action-ID test
+  bypasses, a legacy DeepSeek test path that did not use the selected safe detail reference, and
+  test teardown that did not drain bounded User outbox alarms. Focused regressions now fail closed,
+  dispose every late stub, use the detail-scoped RPC, and drain only test-created Users with a hard
+  bound.
+- Retained-decision rounds added stage context around every RPC. Pure reads recover through fresh
+  capabilities; committed or response-lost writes are never retried. The same stable operation ID
+  is used only for the server-authoritative idempotent reconciliation replay. A lost connection
+  while reading a newly-created Workspace ID was removed by issuing `getMetadata()` through the
+  same Cap'n Web promise pipeline before awaiting `newGadget()`; `newGadget()` remains a single call.
+- One package run timed out before a scheduled DeepSeek provider call and observed a duplicate
+  scheduled attempt in the next test. The two focused tests, their adjacent three-test order, and a
+  cross-Harness retry-alarm sequence all passed. After every workerd child exited, the complete
+  Integration Tests package passed 127/127, and the final root run passed the expanded 128/128.
+  No production alarm behavior, 40-second timeout, or exact attempt assertion was changed.
+- The penultimate root run passed 126/127. Its only failure was the stale `listActions()` capability
+  returning exact `WebSocket connection failed.` after the real test socket closed, while the test
+  accepted only the exact peer-close spelling. The final test seam accepts only those two exact
+  Cap'n Web transport errors, rejects extra text and non-Error values, invokes the read factory once,
+  and still closes the real socket. Focused 2/2, Action 28/28, Integration Tests 128/128, both
+  independent reviews, and the final root command then passed.
+
+All final evidence is local execution of production Workshop code paths with controlled identities
+and controlled external mocks. It is not production deployment verification. No push, merge, pull
+request, Issue closure, worktree deletion, upload, promotion, or deployment occurred in this
+branch-verification step.
