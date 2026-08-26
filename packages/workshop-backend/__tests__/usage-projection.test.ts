@@ -2558,12 +2558,17 @@ describe("deployment Usage Projection", () => {
     ).toBe(before.ingestionWatermark + 2n);
     const authoritativeBalanceBefore = await user.getAdminUsageBalanceState();
     for (let step = 0; step < 20; step += 1) {
-      const cleanupGeneration = await runInDurableObject(projection, (_instance, state) =>
-        state.storage.sql.exec<{cleanup_generation: string | null}>(`
+      const cleanupPending = await runInDurableObject(projection, async (instance, state) => {
+        await state.storage.deleteAlarm();
+        const cleanupGeneration = state.storage.sql.exec<{cleanup_generation: string | null}>(`
           SELECT cleanup_generation FROM usage_projection_meta WHERE singleton = 1
-        `).one().cleanup_generation);
-      if (cleanupGeneration === null) break;
-      expect(await runDurableObjectAlarm(projection)).toBe(true);
+        `).one().cleanup_generation;
+        if (cleanupGeneration === null) return false;
+        await instance.alarm();
+        await state.storage.deleteAlarm();
+        return true;
+      });
+      if (!cleanupPending) break;
     }
     expect(await runInDurableObject(projection, (_instance, state) =>
       state.storage.sql.exec<{cleanup_generation: string | null}>(`
@@ -3400,35 +3405,39 @@ describe("deployment Usage Projection", () => {
       state.abort("interrupt generation cleanup");
     })).rejects.toThrow("interrupt generation cleanup");
     const restarted = testEnv.TEST_USAGE_PROJECTION.get(projection.id);
-    const readCleanupState = () => runInDurableObject(restarted, (_instance, state) => {
-      const meta = state.storage.sql.exec<{
-        active_generation: string;
-        cleanup_generation: string | null;
-        cleanup_stage: string | null;
-      }>(`
-        SELECT active_generation, cleanup_generation, cleanup_stage
-        FROM usage_projection_meta WHERE singleton = 1
-      `).one();
-      const cleanupRows = meta.cleanup_generation === null ? 0n : generationTables.reduce(
-        (total, table) => total + BigInt(state.storage.sql.exec<{count: string}>(`
-          SELECT CAST(COUNT(*) AS TEXT) AS count FROM ${table} WHERE generation = ?
-        `, meta.cleanup_generation).one().count),
-        0n,
-      );
-      const activeTotals = state.storage.sql.exec<{count: string}>(`
-        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_projection_totals
-        WHERE generation = ?
-      `, meta.active_generation).one().count;
-      return {...meta, cleanupRows, activeTotals};
-    });
     const finishCleanup = async (): Promise<void> => {
       for (let step = 0; step < 128; step += 1) {
-        const before = await readCleanupState();
+        const {before, after} = await runInDurableObject(restarted, async (instance, state) => {
+          await state.storage.deleteAlarm();
+          const readCleanupState = () => {
+            const meta = state.storage.sql.exec<{
+              active_generation: string;
+              cleanup_generation: string | null;
+              cleanup_stage: string | null;
+            }>(`
+              SELECT active_generation, cleanup_generation, cleanup_stage
+              FROM usage_projection_meta WHERE singleton = 1
+            `).one();
+            const cleanupRows = meta.cleanup_generation === null ? 0n : generationTables.reduce(
+              (total, table) => total + BigInt(state.storage.sql.exec<{count: string}>(`
+                SELECT CAST(COUNT(*) AS TEXT) AS count FROM ${table} WHERE generation = ?
+              `, meta.cleanup_generation).one().count),
+              0n,
+            );
+            const activeTotals = state.storage.sql.exec<{count: string}>(`
+              SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_projection_totals
+              WHERE generation = ?
+            `, meta.active_generation).one().count;
+            return {...meta, cleanupRows, activeTotals};
+          };
+          const before = readCleanupState();
+          if (before.cleanup_generation !== null) await instance.alarm();
+          await state.storage.deleteAlarm();
+          return {before, after: readCleanupState()};
+        });
         expect(before.activeTotals).toBe("1");
         if (before.cleanup_generation === null) return;
         expect(before.cleanup_generation).not.toBe(before.active_generation);
-        await runDurableObjectAlarm(restarted);
-        const after = await readCleanupState();
         expect(after.active_generation).toBe(before.active_generation);
         expect(after.activeTotals).toBe("1");
         const deleted = before.cleanupRows - after.cleanupRows;

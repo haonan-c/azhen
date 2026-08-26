@@ -1,4 +1,4 @@
-import {env, runInDurableObject} from "cloudflare:test";
+import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import type {
   AdminUsageApi,
   AdminUsageProjectionHealth,
@@ -963,6 +963,59 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     expect((await current.listRows({limit: 10})).rows).toEqual([]);
   });
 
+  it("fails old and new reports closed across a pending bootstrap restart", async () => {
+    const projectionName = `issue-63-pending-report-${crypto.randomUUID()}`;
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const projectionNamespace = {
+      getByName: () => testEnv.TEST_USAGE_PROJECTION.getByName(projectionName),
+    } as DurableObjectNamespace<UsageProjection>;
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      "issue-63-admin@example.test",
+      undefined,
+      projectionNamespace,
+    );
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete'
+        WHERE singleton = 1
+      `);
+    });
+    const principal = crypto.randomUUID();
+    await projection.ingest([aggregate(principal)]);
+    using report = await usage.openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'pending'
+        WHERE singleton = 1
+      `);
+    });
+    await expect(report.getOverview()).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(report.listRows({limit: 10})).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(report.exportCsv()).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart during pending report bootstrap");
+    })).rejects.toThrow("restart during pending report bootstrap");
+
+    await expect(usage.openReport({registeredUserRefs: [principal]}))
+      .rejects.toThrow("Usage Projection bootstrap is incomplete.");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    for (let turn = 0; turn < 20 && !await restarted.ensureBootstrap(); turn += 1) {
+      await runDurableObjectAlarm(restarted);
+    }
+    expect(await restarted.ensureBootstrap()).toBe(true);
+    using current = await usage.openReport({registeredUserRefs: [principal]});
+    expect((await current.getOverview()).metrics.meteredUseCount).toBe(0n);
+    expect((await current.listRows({limit: 10})).rows).toEqual([]);
+    expect(await new Response(await current.exportCsv()).text()).toContain(
+      "schema_version,admin-usage-v1\r\n",
+    );
+  });
+
   it("revokes an already-minted report when its administrator deletion starts", async () => {
     const identity = `issue-63-report-admin-${crypto.randomUUID()}@example.test`;
     const user = testEnv.TEST_USER.getByName(identity);
@@ -1071,6 +1124,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     let servedRows = 0;
     let maxRows = 0;
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() { return HEALTHY_PROJECTION },
       async readReportMetrics() { return EMPTY_METRICS },
       async listReportRows(_query: unknown, cursor: string | undefined, limit: number) {
@@ -1112,6 +1166,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
   it("does not prefetch row pages past stream backpressure and stops after cancel", async () => {
     let calls = 0;
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() { return HEALTHY_PROJECTION },
       async readReportMetrics() { return EMPTY_METRICS },
       async listReportRows() {
@@ -1143,6 +1198,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
   it("explicitly cancels an active Cap'n Web CSV source and releases its operation slot",
       async () => {
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() { return HEALTHY_PROJECTION },
       async readReportMetrics() { return EMPTY_METRICS },
       async listReportRows() {
@@ -1170,6 +1226,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     let releaseFirstCheck!: () => void;
     const firstCheckBlocked = new Promise<void>(resolve => { releaseFirstCheck = resolve });
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() { return HEALTHY_PROJECTION },
       async readReportMetrics() { return EMPTY_METRICS },
       async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
@@ -1199,6 +1256,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
 
   it("terminates an active CSV reader when its report capability is disposed", async () => {
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() { return HEALTHY_PROJECTION },
       async readReportMetrics() { return EMPTY_METRICS },
       async listReportRows() {
@@ -1221,6 +1279,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     let releaseHealth!: () => void;
     const healthBlocked = new Promise<void>(resolve => { releaseHealth = resolve });
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() {
         await healthBlocked;
         return HEALTHY_PROJECTION;
@@ -1247,6 +1306,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     let releaseFinalCheck!: () => void;
     const finalCheckBlocked = new Promise<void>(resolve => { releaseFinalCheck = resolve });
     const projection = {
+      async assertReportSnapshot() {},
       async readHealth() { return HEALTHY_PROJECTION },
       async readReportMetrics() { return EMPTY_METRICS },
       async listReportRows() { return {rows: [CSV_ROW], nextCursor: null} },
