@@ -69,7 +69,7 @@ export type UsageReportCursor = {
 /** Parameterized SQL fragment shared by report overview, rows, and CSV. */
 export type UsageReportPredicate = {
   /** Fixed server-owned index required by a predicate with ordered multi-value semantics. */
-  indexName: "usage_projection_report_unknown_time_v3" | null;
+  indexName: "usage_projection_report_unknown_time_v4" | null;
   /** Parameterized SQL WHERE expression. */
   sql: string;
   /** Bound values for the SQL WHERE expression. */
@@ -257,7 +257,7 @@ export function buildUsageReportPredicate(
   }
   return {
     indexName: filtersAllUnknownOutcomes
-      ? "usage_projection_report_unknown_time_v3" : null,
+      ? "usage_projection_report_unknown_time_v4" : null,
     sql: clauses.join(" AND "),
     params,
   };

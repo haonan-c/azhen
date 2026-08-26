@@ -113,7 +113,7 @@ describe("deployment Usage Projection", () => {
       }>(`
         SELECT projection_schema_version, bootstrap_state
         FROM usage_projection_meta WHERE singleton = 1
-      `).one())).toEqual({projection_schema_version: "3", bootstrap_state: "pending"});
+      `).one())).toEqual({projection_schema_version: "4", bootstrap_state: "pending"});
     expect(await restarted.ensureBootstrap()).toBe(false);
   });
 
@@ -124,7 +124,7 @@ describe("deployment Usage Projection", () => {
     expect(await projection.ingest([input])).toMatchObject({rejected: []});
     await runDurableObjectAlarm(projection);
     await runInDurableObject(projection, (_instance, state) => {
-      state.storage.sql.exec("DROP INDEX usage_projection_report_summary_revision_v3");
+      state.storage.sql.exec("DROP INDEX usage_projection_report_summary_revision_v4");
       state.storage.sql.exec("ALTER TABLE usage_projection_facts DROP COLUMN applied_watermark");
       state.storage.sql.exec(`
         UPDATE usage_projection_meta SET projection_schema_version = '0',
@@ -144,10 +144,10 @@ describe("deployment Usage Projection", () => {
         "SELECT COUNT(*) AS count FROM usage_projection_facts",
       ).one().count,
       legacyRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v2",
+        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v3",
       ).one().count,
       legacyHasWatermark: state.storage.sql.exec<{count: number}>(`
-        SELECT COUNT(*) AS count FROM pragma_table_info('usage_projection_facts_retired_v2')
+        SELECT COUNT(*) AS count FROM pragma_table_info('usage_projection_facts_retired_v3')
         WHERE name = 'applied_watermark'
       `).one().count,
     }))).toEqual({
@@ -156,7 +156,8 @@ describe("deployment Usage Projection", () => {
     expect(await restarted.ensureBootstrap()).toBe(false);
   });
 
-  it("indexes an empty shadow table and cleans legacy facts in bounded turns", async () => {
+  it("moves populated v3 tables behind an empty indexed v4 shadow and cleans them boundedly",
+      async () => {
     const projectionName = crypto.randomUUID();
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
     const input = fact();
@@ -167,16 +168,20 @@ describe("deployment Usage Projection", () => {
         SELECT name FROM sqlite_master
         WHERE type = 'index' AND tbl_name IN (
           'usage_projection_facts', 'usage_projection_summaries'
-        ) AND name LIKE '%_v3'
+        ) AND (name LIKE '%_v3' OR name LIKE '%_v4')
       `).toArray();
       for (const {name} of currentIndexes) state.storage.sql.exec(`DROP INDEX ${name}`);
       state.storage.sql.exec(`
-        CREATE INDEX usage_projection_report_time ON usage_projection_facts(
+        CREATE INDEX usage_projection_report_time_v3 ON usage_projection_facts(
           generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
-        )
+        );
+        CREATE INDEX usage_projection_report_unknown_time_v3
+        ON usage_projection_facts(
+          generation, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
+        ) WHERE outcome IN ('usage-unknown-held', 'usage-unknown-released')
       `);
       state.storage.sql.exec(`
-        CREATE UNIQUE INDEX usage_projection_summaries_dimension
+        CREATE UNIQUE INDEX usage_projection_summaries_dimension_v3
         ON usage_projection_summaries(generation, dimension_key)
       `);
       const columns = state.storage.sql.exec<{name: string}>(
@@ -196,7 +201,7 @@ describe("deployment Usage Projection", () => {
         WHERE source.fact_id = ?
       `, input.projectionFactId);
       state.storage.sql.exec(`
-        UPDATE usage_projection_meta SET projection_schema_version = '2',
+        UPDATE usage_projection_meta SET projection_schema_version = '3',
           bootstrap_state = 'complete' WHERE singleton = 1
       `);
     });
@@ -206,58 +211,77 @@ describe("deployment Usage Projection", () => {
 
     const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
     expect(await runInDurableObject(restarted, (_instance, state) => ({
+      schema: state.storage.sql.exec<{
+        projection_schema_version: string; bootstrap_state: string;
+      }>(`
+        SELECT projection_schema_version, bootstrap_state
+        FROM usage_projection_meta WHERE singleton = 1
+      `).one(),
       currentRows: state.storage.sql.exec<{count: number}>(
         "SELECT COUNT(*) AS count FROM usage_projection_facts",
       ).one().count,
       legacyRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v2",
+        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v3",
       ).one().count,
       currentIndexTable: state.storage.sql.exec<{tbl_name: string}>(`
         SELECT tbl_name FROM sqlite_master
-        WHERE type = 'index' AND name = 'usage_projection_report_time_v3'
+        WHERE type = 'index' AND name = 'usage_projection_report_time_v4'
       `).one().tbl_name,
       unknownIndexTable: state.storage.sql.exec<{tbl_name: string}>(`
         SELECT tbl_name FROM sqlite_master
-        WHERE type = 'index' AND name = 'usage_projection_report_unknown_time_v3'
+        WHERE type = 'index' AND name = 'usage_projection_report_unknown_time_v4'
       `).one().tbl_name,
       legacyIndexTable: state.storage.sql.exec<{tbl_name: string}>(`
         SELECT tbl_name FROM sqlite_master
-        WHERE type = 'index' AND name = 'usage_projection_report_time'
+        WHERE type = 'index' AND name = 'usage_projection_report_time_v3'
       `).one().tbl_name,
     }))).toEqual({
+      schema: {projection_schema_version: "4", bootstrap_state: "pending"},
       currentRows: 0,
       legacyRows: 131,
       currentIndexTable: "usage_projection_facts",
       unknownIndexTable: "usage_projection_facts",
-      legacyIndexTable: "usage_projection_facts_retired_v2",
+      legacyIndexTable: "usage_projection_facts_retired_v3",
     });
-    await runInDurableObject(restarted, async (_instance, state) => {
-      await state.storage.deleteAlarm();
+    await expect(runInDurableObject(restarted, (_instance, state) => {
+      state.abort("restart v4 shadow migration");
+    })).rejects.toThrow("restart v4 shadow migration");
+    const reentered = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    expect(await runInDurableObject(reentered, (_instance, state) => ({
+      currentRows: state.storage.sql.exec<{count: number}>(
+        "SELECT COUNT(*) AS count FROM usage_projection_facts",
+      ).one().count,
+      legacyRows: state.storage.sql.exec<{count: number}>(
+        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v3",
+      ).one().count,
+    }))).toEqual({currentRows: 0, legacyRows: 131});
+    await runInDurableObject(reentered, async (_instance, state) => {
+      await state.storage.setAlarm(Date.now());
     });
     let previousLegacyRows = 131;
     for (let turn = 0; turn < 40; turn += 1) {
-      await runDurableObjectAlarm(restarted);
-      const legacyRows = await runInDurableObject(restarted, async (_instance, state) => {
-        await state.storage.deleteAlarm();
+      await runDurableObjectAlarm(reentered);
+      const legacyRows = await runInDurableObject(reentered, (_instance, state) => {
         const present = state.storage.sql.exec<{present: number}>(`
           SELECT COUNT(*) AS present FROM sqlite_master
-          WHERE type = 'table' AND name = 'usage_projection_facts_retired_v2'
+          WHERE type = 'table' AND name = 'usage_projection_facts_retired_v3'
         `).one().present;
         return present === 0 ? 0 : state.storage.sql.exec<{count: number}>(
-          "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v2",
+          "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v3",
         ).one().count;
       });
+      expect(previousLegacyRows - legacyRows).toBeLessThanOrEqual(64);
       expect(legacyRows).toBeLessThan(previousLegacyRows);
       previousLegacyRows = legacyRows;
       if (legacyRows === 0) break;
     }
     expect(previousLegacyRows).toBe(0);
-    expect(await restarted.ensureBootstrap()).toBe(false);
-    for (let turn = 0; turn < 10 && !await restarted.ensureBootstrap(); turn += 1) {
-      await runDurableObjectAlarm(restarted);
+    expect(await reentered.ensureBootstrap()).toBe(false);
+    for (let turn = 0; turn < 10 && !await reentered.ensureBootstrap(); turn += 1) {
+      await runDurableObjectAlarm(reentered);
     }
-    expect(await restarted.ensureBootstrap()).toBe(true);
-    expect((await restarted.readOverview()).metrics.meteredUseCount).toBe(0n);
+    expect(await reentered.ensureBootstrap()).toBe(true);
+    expect((await reentered.readOverview()).metrics.meteredUseCount).toBe(0n);
   });
 
   it("fails closed and rebuilds instead of scanning legacy facts for explainability", async () => {
@@ -297,10 +321,10 @@ describe("deployment Usage Projection", () => {
         "SELECT COUNT(*) AS count FROM usage_projection_facts",
       ).one().count,
       legacyRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v2",
+        "SELECT COUNT(*) AS count FROM usage_projection_facts_retired_v3",
       ).one().count,
       legacyHasAttempts: state.storage.sql.exec<{count: number}>(`
-        SELECT COUNT(*) AS count FROM pragma_table_info('usage_projection_facts_retired_v2')
+        SELECT COUNT(*) AS count FROM pragma_table_info('usage_projection_facts_retired_v3')
         WHERE name = 'metering_attempts'
       `).one().count,
     }))).toEqual({

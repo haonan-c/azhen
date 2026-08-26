@@ -357,9 +357,11 @@ const RESERVATION_STATUSES = new Set<AdminUsageReservationStatus>([
   "held", "released", "settled", "none",
 ]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const CURRENT_PROJECTION_SCHEMA_VERSION = "3";
-const RETIRED_FACTS_TABLE = "usage_projection_facts_retired_v2";
-const RETIRED_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
+const CURRENT_PROJECTION_SCHEMA_VERSION = "4";
+const RETIRED_V2_FACTS_TABLE = "usage_projection_facts_retired_v2";
+const RETIRED_V2_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
+const RETIRED_V3_FACTS_TABLE = "usage_projection_facts_retired_v3";
+const RETIRED_V3_SUMMARIES_TABLE = "usage_projection_summaries_retired_v3";
 
 /** Replaceable SQLite-backed deployment Usage Projection. It never stores authoritative balances. */
 export class UsageProjection extends DurableObject<Cloudflare.Env> {
@@ -1042,18 +1044,22 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   #hasRetiredProjectionTable(): boolean {
     return this.ctx.storage.sql.exec<{present: number}>(`
       SELECT COUNT(*) AS present FROM sqlite_master
-      WHERE type = 'table' AND name IN (?, ?)
-    `, RETIRED_FACTS_TABLE, RETIRED_SUMMARIES_TABLE).one().present > 0;
+      WHERE type = 'table' AND name IN (?, ?, ?, ?)
+    `, RETIRED_V2_FACTS_TABLE, RETIRED_V2_SUMMARIES_TABLE,
+    RETIRED_V3_FACTS_TABLE, RETIRED_V3_SUMMARIES_TABLE).one().present > 0;
   }
 
   async #runRetiredProjectionCleanupStep(): Promise<void> {
     const tables = new Set(this.ctx.storage.sql.exec<{name: string}>(`
       SELECT name FROM sqlite_master
-      WHERE type = 'table' AND name IN (?, ?)
-    `, RETIRED_FACTS_TABLE, RETIRED_SUMMARIES_TABLE).toArray().map(row => row.name));
-    const table = tables.has(RETIRED_FACTS_TABLE)
-      ? RETIRED_FACTS_TABLE : tables.has(RETIRED_SUMMARIES_TABLE)
-        ? RETIRED_SUMMARIES_TABLE : null;
+      WHERE type = 'table' AND name IN (?, ?, ?, ?)
+    `, RETIRED_V2_FACTS_TABLE, RETIRED_V2_SUMMARIES_TABLE,
+    RETIRED_V3_FACTS_TABLE, RETIRED_V3_SUMMARIES_TABLE)
+      .toArray().map(row => row.name));
+    const table = [
+      RETIRED_V2_FACTS_TABLE, RETIRED_V2_SUMMARIES_TABLE,
+      RETIRED_V3_FACTS_TABLE, RETIRED_V3_SUMMARIES_TABLE,
+    ].find(candidate => tables.has(candidate)) ?? null;
     if (table === null) return;
     this.ctx.storage.sql.exec(`
       DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} LIMIT 64)
@@ -2080,41 +2086,41 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
                 summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
                 summary_dimension_key IS NOT NULL AND summary_snapshot_value IS NOT NULL))
       );
-      CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v4
       ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start));
-      CREATE INDEX IF NOT EXISTS usage_projection_report_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_time_v4
       ON usage_projection_facts(
         generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
       );
-      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time_v4
       ON usage_projection_facts(generation, principal_ref,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time_v4
       ON usage_projection_facts(generation, gadget_id,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time_v4
       ON usage_projection_facts(generation, deployment_model_id,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time_v4
       ON usage_projection_facts(generation, vendor_id, billing_method_key,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time_v4
       ON usage_projection_facts(generation, external_account_id,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time_v4
       ON usage_projection_facts(generation, source,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time_v4
       ON usage_projection_facts(generation, outcome,
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_unknown_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_unknown_time_v4
       ON usage_projection_facts(
         generation, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
       ) WHERE outcome IN ('usage-unknown-held', 'usage-unknown-released');
-      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v4
       ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v3
+      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v4
       ON usage_projection_facts(
         generation, summary_fact_id, applied, applied_watermark, summary_revision
       )
@@ -2139,7 +2145,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         unpriced_api_operations TEXT NOT NULL,
         PRIMARY KEY (generation, summary_fact_id)
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension_v3
+      CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension_v4
       ON usage_projection_summaries(generation, dimension_key)
     `);
   }
@@ -2245,9 +2251,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `).one().projection_schema_version;
     const tables = new Set(this.ctx.storage.sql.exec<{name: string}>(`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
-        'usage_projection_facts', 'usage_projection_summaries', ?, ?
+        'usage_projection_facts', 'usage_projection_summaries', ?, ?, ?, ?
       )
-    `, RETIRED_FACTS_TABLE, RETIRED_SUMMARIES_TABLE).toArray().map(row => row.name));
+    `, RETIRED_V2_FACTS_TABLE, RETIRED_V2_SUMMARIES_TABLE,
+    RETIRED_V3_FACTS_TABLE, RETIRED_V3_SUMMARIES_TABLE)
+      .toArray().map(row => row.name));
     const currentFactColumns = new Set(tables.has("usage_projection_facts")
       ? this.ctx.storage.sql.exec<{name: string}>(
           "PRAGMA table_info(usage_projection_facts)",
@@ -2272,14 +2280,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     if (needsShadowMigration) beginSchemaUpgrade();
     if (needsShadowMigration) {
       this.ctx.storage.transactionSync(() => {
-        if (tables.has("usage_projection_facts") && !tables.has(RETIRED_FACTS_TABLE)) {
+        if (tables.has("usage_projection_facts") && !tables.has(RETIRED_V3_FACTS_TABLE)) {
           this.ctx.storage.sql.exec(`
-            ALTER TABLE usage_projection_facts RENAME TO ${RETIRED_FACTS_TABLE}
+            ALTER TABLE usage_projection_facts RENAME TO ${RETIRED_V3_FACTS_TABLE}
           `);
         }
-        if (tables.has("usage_projection_summaries") && !tables.has(RETIRED_SUMMARIES_TABLE)) {
+        if (tables.has("usage_projection_summaries") &&
+            !tables.has(RETIRED_V3_SUMMARIES_TABLE)) {
           this.ctx.storage.sql.exec(`
-            ALTER TABLE usage_projection_summaries RENAME TO ${RETIRED_SUMMARIES_TABLE}
+            ALTER TABLE usage_projection_summaries RENAME TO ${RETIRED_V3_SUMMARIES_TABLE}
           `);
         }
         this.#createCurrentFactsTableAndIndexes();

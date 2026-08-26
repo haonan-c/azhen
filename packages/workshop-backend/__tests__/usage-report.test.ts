@@ -1214,7 +1214,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
           ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
           LIMIT 200
         `, ...predicate.params).toArray().map(row => row.detail).join("\n"));
-      expect(plan).toContain("usage_projection_report_outcome_time_v3");
+      expect(plan).toContain("usage_projection_report_outcome_time_v4");
       expect(plan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
 
       using report = await usage.openReport(filter);
@@ -1251,7 +1251,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
         ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
         LIMIT 200
       `, ...legacyPredicate.params).toArray().map(row => row.detail).join("\n"));
-    expect(legacyPlan).toContain("usage_projection_report_unknown_time_v3");
+    expect(legacyPlan).toContain("usage_projection_report_unknown_time_v4");
     expect(legacyPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
 
     using legacyReport = await usage.openReport(legacyFilter);
