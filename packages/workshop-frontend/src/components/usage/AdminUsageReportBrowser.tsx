@@ -56,7 +56,8 @@ const SOURCES: UsageSource[] = [
   "agent", "gadget", "direct-user", "system-assistance", "hook", "scheduled",
 ];
 const OUTCOMES: AdminUsageReportOutcome[] = [
-  "settled", "failed-before-execution", "usage-unknown", "reconciliation-required",
+  "settled", "failed-before-execution", "usage-unknown-released", "usage-unknown-held",
+  "reconciliation-required",
   "reconciled-settled", "reconciled-released",
 ];
 
@@ -107,7 +108,12 @@ export default function AdminUsageReportBrowser({api}: Props) {
     setDetailError(false);
     void (async () => {
       try {
-        const opened = await api.openReport(filter);
+        const opening = api.openReport(filter);
+        const overviewRequest = opening.getOverview();
+        const pageRequest = opening.listRows({limit: 50});
+        void overviewRequest.catch(() => undefined);
+        void pageRequest.catch(() => undefined);
+        const opened = await opening;
         if (disposed || revision !== requestRevision.current) {
           opened[Symbol.dispose]();
           return;
@@ -115,8 +121,8 @@ export default function AdminUsageReportBrowser({api}: Props) {
         stub = opened;
         setReport({api: opened});
         const [nextOverview, nextPage] = await Promise.all([
-          opened.getOverview(),
-          opened.listRows({limit: 50}),
+          overviewRequest,
+          pageRequest,
         ]);
         if (disposed || revision !== requestRevision.current) return;
         setOverview(nextOverview);
@@ -404,6 +410,7 @@ function ReportTable({page, onDetail}: {
       <th className="p-2">{messages.admin_usage_column_billable_operations()}</th>
       <th className="p-2">{messages.admin_usage_column_pre_execution_failures()}</th>
       <th className="p-2">{messages.admin_usage_column_unknown_operations()}</th>
+      <th className="p-2">{messages.admin_usage_column_attempt_reservations()}</th>
       <th className="p-2">{messages.admin_usage_column_detail()}</th>
     </tr></thead>
     <tbody>{page.rows.map(row => <tr key={row.rowId} className="border-b border-kumo-line last:border-0">
@@ -434,6 +441,13 @@ function ReportTable({page, onDetail}: {
       <td className="p-2">{formatReportInteger(row.metrics.billableApiOperations)}</td>
       <td className="p-2">{formatReportInteger(row.metrics.preExecutionFailures)}</td>
       <td className="p-2">{formatReportInteger(row.metrics.unknownOperations)}</td>
+      <td className="p-2">{[
+        row.metrics.meteringAttempts,
+        row.metrics.heldReservations,
+        row.metrics.releasedReservations,
+        row.metrics.settledReservations,
+        row.metrics.unreservedAttempts,
+      ].map(formatReportInteger).join(" / ")}</td>
       <td className="p-2">{row.rowKind === "detail" && <Button size="sm" variant="secondary"
         onClick={() => void onDetail(row)}>{messages.admin_usage_view_detail()}</Button>}</td>
     </tr>)}</tbody>
@@ -457,7 +471,12 @@ function DetailPanel({detail, error, api, registeredUserRef, onRefresh, onClose}
     {detail && <><dl className="mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
       <dt>{messages.admin_usage_column_kind()}</dt><dd>{detail.record.kind}</dd>
       <dt>{messages.admin_usage_column_source()}</dt><dd>{sourceLabel(detail.record.source)}</dd>
-      <dt>{messages.admin_usage_column_outcome()}</dt><dd>{outcomeLabel(detail.record.outcome)}</dd>
+      <dt>{messages.admin_usage_column_outcome()}</dt><dd>{outcomeLabel(
+        detail.record.outcome === "usage-unknown"
+          ? detail.reservation?.state === "reserved"
+            ? "usage-unknown-held" : "usage-unknown-released"
+          : detail.record.outcome,
+      )}</dd>
       <dt>{messages.admin_usage_detail_created()}</dt><dd>{detail.record.createdAt}</dd>
       <dt>{messages.admin_usage_detail_workspace()}</dt><dd>{
         detail.record.kind === "gatekeeper-reconciliation"
@@ -746,7 +765,8 @@ function outcomeLabel(outcome: AdminUsageReportOutcome): string {
   return ({
     settled: messages.admin_usage_outcome_settled,
     "failed-before-execution": messages.admin_usage_outcome_failed_before_execution,
-    "usage-unknown": messages.admin_usage_outcome_usage_unknown,
+    "usage-unknown-released": messages.admin_usage_outcome_usage_unknown_released,
+    "usage-unknown-held": messages.admin_usage_outcome_usage_unknown_held,
     "reconciliation-required": messages.admin_usage_outcome_reconciliation_required,
     "reconciled-settled": messages.admin_usage_outcome_reconciled_settled,
     "reconciled-released": messages.admin_usage_outcome_reconciled_released,

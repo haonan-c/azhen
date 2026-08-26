@@ -54,6 +54,11 @@ function reportOverview(): AdminUsageReportOverview {
       meteredUseCount: 12n,
       preExecutionFailures: 9n,
       unknownOperations: 10n,
+      meteringAttempts: 12n,
+      heldReservations: 2n,
+      releasedReservations: 3n,
+      settledReservations: 4n,
+      unreservedAttempts: 3n,
       activeUsers: 11n,
       unpricedModelUses: 0n,
       unpricedApiOperations: 0n,
@@ -83,6 +88,8 @@ function row(id: string): AdminUsageReportRow {
     rowId: id,
     registeredUserRef: crypto.randomUUID(),
     safeRecordRef: crypto.randomUUID(),
+    safeAttemptRef: crypto.randomUUID(),
+    reservationStatus: "settled",
     meteredKind: "model",
     source: "agent",
     outcome: "settled",
@@ -106,6 +113,11 @@ function row(id: string): AdminUsageReportRow {
       meteredUseCount: 1n,
       preExecutionFailures: 0n,
       unknownOperations: 0n,
+      meteringAttempts: 1n,
+      heldReservations: 0n,
+      releasedReservations: 0n,
+      settledReservations: 1n,
+      unreservedAttempts: 0n,
       unpricedModelUses: 0n,
       unpricedApiOperations: 0n,
     },
@@ -151,13 +163,38 @@ function report(rows: AdminUsageReportRow[] = []) {
   return {target, dispose, getOverview, listRows, exportCsv, cancelCsvExports};
 }
 
+type ReportOpening = Promise<RpcStub<AdminUsageReport>> & Pick<
+  AdminUsageReport,
+  "getOverview" | "listRows"
+>;
+
+function reportOpening(
+  current: ReturnType<typeof report>,
+  opening: Promise<RpcStub<AdminUsageReport>> = Promise.resolve(current.target),
+): ReportOpening {
+  return Object.assign(opening, {
+    getOverview: current.getOverview,
+    listRows: current.listRows,
+  }) as ReportOpening;
+}
+
+function asReportOpening(opening: Promise<RpcStub<AdminUsageReport>>): ReportOpening {
+  if ("getOverview" in opening && "listRows" in opening) return opening as ReportOpening;
+  return Object.assign(opening, {
+    getOverview: () => opening.then(current => current.getOverview()),
+    listRows: (request: Parameters<AdminUsageReport["listRows"]>[0]) =>
+      opening.then(current => current.listRows(request)),
+  }) as ReportOpening;
+}
+
 function usageApi(
   openReport: AdminUsageApi["openReport"],
   getRecordDetail = vi.fn<AdminUsageApi["getRecordDetail"]>(),
   overrides: Partial<AdminUsageApi> = {},
 ): RpcStub<AdminUsageApi> {
   return Object.assign(vi.fn<() => void>(), {
-    openReport,
+    openReport: (filter: Parameters<AdminUsageApi["openReport"]>[0]) =>
+      asReportOpening(openReport(filter)),
     getRecordDetail,
     ...overrides,
   }) as unknown as RpcStub<AdminUsageApi>;
@@ -194,6 +231,31 @@ describe("administrator frozen Usage report browser", () => {
     await act(async () => root!.render(<AdminUsageReportBrowser api={api} />));
   }
 
+  it("pipelines the overview and first page before the report capability resolves", async () => {
+    const current = report([row("pipelined-model")]);
+    let resolveOpening!: (value: RpcStub<AdminUsageReport>) => void;
+    const opening = reportOpening(current, new Promise(resolve => { resolveOpening = resolve }));
+    const openReport = vi.fn<AdminUsageApi["openReport"]>().mockReturnValue(opening);
+
+    await render(usageApi(openReport));
+
+    await vi.waitFor(() => expect(current.getOverview).toHaveBeenCalledOnce());
+    expect(current.listRows).toHaveBeenCalledWith({limit: 50});
+    expect(container?.textContent).toContain("Loading report");
+
+    await act(async () => resolveOpening(current.target));
+    await vi.waitFor(() => expect(container?.textContent).toContain("pipelined-model"));
+  });
+
+  it("shows a load error when the report opening rejects", async () => {
+    const openReport = vi.fn<AdminUsageApi["openReport"]>()
+      .mockRejectedValue(new Error("opening failed"));
+
+    await render(usageApi(openReport));
+
+    await vi.waitFor(() => expect(container?.textContent).toContain("could not be loaded"));
+  });
+
   it("uses the current report for filters, rows, and CSV and disposes replaced stubs", async () => {
     const first = report();
     const second = report([row("filtered-model")]);
@@ -208,6 +270,8 @@ describe("administrator frozen Usage report browser", () => {
     await vi.waitFor(() => expect(container?.textContent).toContain("No Usage rows"));
     expect(container?.textContent).toContain("Usage report");
     expect(container?.textContent).toContain("Failed before execution");
+    expect(container?.textContent).toContain("Usage unreported; reservation released");
+    expect(container?.textContent).toContain("External outcome unknown; reservation held");
 
     const users = Array.from(container!.querySelectorAll("label"))
       .find(label => label.textContent?.includes("Registered User refs"))
@@ -488,6 +552,7 @@ describe("administrator frozen Usage report browser", () => {
     expect(headings).toContain("Billable API operations");
     expect(headings).toContain("Pre-execution failures");
     expect(headings).toContain("Unknown operations");
+    expect(headings).toContain("Attempts / reservations (held / released / settled / none)");
     const rows = Array.from(container!.querySelectorAll("tbody tr"));
     expect(rows[0]?.textContent).toContain("Priced");
     expect(rows[0]?.textContent).toContain("$2.5");
@@ -664,7 +729,7 @@ describe("administrator frozen Usage report browser", () => {
     const usageRow: AdminUsageReportRow = {
       ...row("unknown-operation"),
       meteredKind: "gatekeeper",
-      outcome: "usage-unknown",
+      outcome: "usage-unknown-held",
       deploymentModelId: null,
       gatekeeperId: "vendor",
       stableMethodKey: "method",
@@ -753,6 +818,7 @@ describe("administrator frozen Usage report browser", () => {
       .find(candidate => candidate.textContent === name);
     await act(async () => button("View detail")?.click());
     await vi.waitFor(() => expect(container?.textContent).toContain("Administrative operations"));
+    expect(container?.textContent).toContain("External outcome unknown; reservation held");
     const input = (label: string) => container!.querySelector<HTMLInputElement>(
       `input[aria-label="${label}"]`,
     );
@@ -801,7 +867,7 @@ describe("administrator frozen Usage report browser", () => {
     const usageRow: AdminUsageReportRow = {
       ...row("unknown-conflict"),
       meteredKind: "gatekeeper",
-      outcome: "usage-unknown",
+      outcome: "usage-unknown-held",
       deploymentModelId: null,
       gatekeeperId: "vendor",
       stableMethodKey: "method",
@@ -915,7 +981,7 @@ describe("administrator frozen Usage report browser", () => {
     const usageRow: AdminUsageReportRow = {
       ...row("changing-unknown-authority"),
       meteredKind: "gatekeeper",
-      outcome: "usage-unknown",
+      outcome: "usage-unknown-held",
       deploymentModelId: null,
       gatekeeperId: "vendor",
       stableMethodKey: "method",
@@ -1061,6 +1127,8 @@ describe("administrator frozen Usage report browser", () => {
     ));
     await vi.waitFor(() => expect(container?.textContent).toContain("用量报表"));
     expect(container?.textContent).toContain("执行前失败");
+    expect(container?.textContent).toContain("用量未报告；预留已释放");
+    expect(container?.textContent).toContain("外部结果未知；预留仍持有");
     expect(container?.textContent).toContain("注册用户引用");
     expect(container?.textContent).toContain("此冻结报表中没有符合条件的用量记录");
   });
