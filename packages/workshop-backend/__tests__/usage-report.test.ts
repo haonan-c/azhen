@@ -1135,6 +1135,98 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     expect(plan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
   });
 
+  it("uses the canonical outcome-and-time index for matching and empty date queries", async () => {
+    const projectionName = crypto.randomUUID();
+    const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+    const usage = new AdminUsageApiImpl(
+      testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+      testEnv.TEST_USER,
+      "issue-63-admin@example.test",
+      undefined,
+      {getByName: () => testEnv.TEST_USAGE_PROJECTION.getByName(projectionName)} as
+        DurableObjectNamespace<UsageProjection>,
+    );
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'complete' WHERE singleton = 1
+      `);
+    });
+    const principal = crypto.randomUUID();
+    expect(await projection.ingest([
+      aggregate(principal, {
+        sourceSequence: 1n,
+        kind: "gatekeeper",
+        outcome: "usage-unknown-held",
+        meteredKind: "attempt",
+        deploymentModelId: null,
+        vendorId: "outcome-query-plan-vendor",
+        billingMethodKey: "outcome.query-plan.v1",
+        externalAccountId: "outcome-query-plan-account",
+        meteredUseCount: 0n,
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        chargedUsageCreditSubunits: 0n,
+        unknownOperations: 1n,
+        activeUserContribution: 0n,
+      }),
+      aggregate(principal, {
+        sourceSequence: 2n,
+        outcome: "usage-unknown-released",
+        meteredKind: "attempt",
+        meteredUseCount: 0n,
+        cacheHitInputTokens: 0n,
+        cacheMissInputTokens: 0n,
+        cacheWriteInputTokens: 0n,
+        outputTokens: 0n,
+        reasoningTokens: 0n,
+        providerCostUsdSubunits: 0n,
+        chargedUsageCreditSubunits: 0n,
+        unknownOperations: 1n,
+        activeUserContribution: 0n,
+      }),
+    ])).toMatchObject({rejected: []});
+    const coordinates = await projection.getReportCoordinates();
+    for (const outcome of [
+      "usage-unknown-held", "usage-unknown-released", "reconciliation-required",
+    ] as const) {
+      const filter = {
+        startDateInclusive: "2026-08-24",
+        endDateExclusive: "2026-08-25",
+        outcomes: [outcome],
+      } as const;
+      const query = freezeUsageReportQuery(
+        filter, "UTC", 1n, coordinates.projectionGeneration, coordinates.ingestionWatermark,
+      );
+      const predicate = buildUsageReportPredicate(query, "all");
+      const plan = await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{detail: string}>(`
+          EXPLAIN QUERY PLAN
+          SELECT facts.fact_id FROM usage_projection_facts AS facts
+          WHERE ${predicate.sql}
+          ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+          LIMIT 200
+        `, ...predicate.params).toArray().map(row => row.detail).join("\n"));
+      expect(plan).toContain("usage_projection_report_outcome_time_v3");
+      expect(plan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+
+      using report = await usage.openReport(filter);
+      const overview = await report.getOverview();
+      const rows = (await report.listRows({limit: 10})).rows;
+      const csv = await new Response(await report.exportCsv()).text();
+      const csvRowIds = csv.split("\r\n")
+        .filter(line => line.startsWith("aggregate,"))
+        .map(line => line.split(",")[1]);
+      const expectedCount = outcome === "reconciliation-required" ? 0 : 1;
+      expect(rows).toHaveLength(expectedCount);
+      expect(overview.metrics.unknownOperations).toBe(BigInt(expectedCount));
+      expect(csvRowIds).toEqual(rows.map(row => row.rowId));
+    }
+  });
+
   it("keeps a one-million-row CSV lazy and bounded by one 64-row page", async () => {
     const totalRows = 1_000_000;
     let calls = 0;
