@@ -1318,70 +1318,146 @@ describe("approved Action billing", () => {
       async () => {
     using publicApi = connect(harness.url);
     const [username] = nextUsernames("actionlegacydeleted");
-    using user = await signUp(publicApi, username);
-    const account = await provisionAccount(user);
-    using workspace = await user.newGadget();
-    const workspaceId = (await workspace.getMetadata()).id;
-    using gatekeeper = await workspace.newGatekeeper(
-      account.id,
-      `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
+    using user = await retainedReplayStage(
+      "legacy-sign-up-user", () => signUp(publicApi, username),
+    );
+    const account = await retainedReplayStage(
+      "legacy-provision-account", () => provisionAccount(user),
+    );
+    using workspace = await retainedReplayStage(
+      "legacy-create-workspace", () => user.newGadget(),
+    );
+    const workspaceId = (await retainedReplayStage(
+      "legacy-read-workspace-id", () => workspace.getMetadata(),
+    )).id;
+    using gatekeeper = await retainedReplayStage(
+      "legacy-create-gatekeeper", () => workspace.newGatekeeper(
+        account.id,
+        `https://gadgets-test.example/things/action-${crypto.randomUUID()}`,
+      ),
     );
     if (!gatekeeper) throw new Error("Expected the test Gatekeeper.");
-    using session = await gatekeeper.openSession() as RpcStub<TestSession>;
+    using session = await retainedReplayStage(
+      "legacy-open-session", () => gatekeeper.openSession(),
+    ) as RpcStub<TestSession>;
 
     for (let index = 0; index < 64; index += 1) {
-      await session.requestBillableAction(`legacy-index-filler-${index}-${crypto.randomUUID()}`);
+      await retainedReplayStage(
+        `legacy-request-filler-${index}`,
+        () => session.requestBillableAction(
+          `legacy-index-filler-${index}-${crypto.randomUUID()}`,
+        ),
+      );
     }
     const targetLabel = `unknown-legacy-second-page-${crypto.randomUUID()}`;
-    await session.requestBillableAction(targetLabel);
-    const target = (await workspace.listActions()).find(entry =>
+    await retainedReplayStage(
+      "legacy-request-target", () => session.requestBillableAction(targetLabel),
+    );
+    const target = (await retainedReplayStage(
+      "legacy-list-target", () => workspace.listActions(),
+    )).find(entry =>
       entry.type === "action" && entry.description.title === `Test action ${targetLabel}`);
     if (!target) throw new Error("Expected the second-page legacy Action.");
     expect(target.id).toBeGreaterThanOrEqual(64);
-    await workspace.approveAction(target.id);
-    const safeRecordRef = await waitForNextUnknownUsageReference(username, new Set());
+    await retainedReplayStage(
+      "legacy-approve-target", () => workspace.approveAction(target.id),
+    );
+    const safeRecordRef = await retainedReplayStage(
+      "legacy-read-safe-record-ref",
+      () => waitForNextUnknownUsageReference(username, new Set()),
+    );
 
-    using adminPublicApi = connect(harness.url);
-    using authenticatedAdmin = await signIn(adminPublicApi, ADMIN_USERNAME);
-    using admin = await authenticatedAdmin.getAdminApi();
-    if (!admin) throw new Error("Expected the deployment administrator capability.");
-    using usage = await admin.getUsageApi();
-    const registered = await waitFor("the legacy User Registry entry", async () =>
-      (await usage.searchUsers({query: username, limit: 2})).users
-        .find(candidate => candidate.identity === username) ?? null);
-    await makeUnknownActionLegacy(username, workspaceId, safeRecordRef);
-    session[Symbol.dispose]();
-    gatekeeper[Symbol.dispose]();
-    workspace[Symbol.dispose]();
-    await usage.deleteUsageUser({
-      registeredUserRef: registered.registeredUserRef,
-      deletionId: `delete-legacy-action-user-${crypto.randomUUID()}`,
-      reason: "Prove deleted identity cannot erase retained unknown financial authority",
-    });
-    expect((await usage.searchUsers({query: username, limit: 2})).users).toEqual([]);
-    await expect(user.getUsageCreditBalance()).rejects.toThrow("deleted");
-    user[Symbol.dispose]();
-    publicApi[Symbol.dispose]();
-    await expect(openExistingUserWhenAvailable(username))
-      .rejects.toThrow(`Login failed for "${username}".`);
+    let request!: AdminUnknownUsageReconciliationRequest;
+    {
+      using adminPublicApi = connect(harness.url);
+      using authenticatedAdmin = await retainedReplayStage(
+        "legacy-sign-in-admin", () => signIn(adminPublicApi, ADMIN_USERNAME),
+      );
+      using admin = await retainedReplayStage(
+        "legacy-open-admin", () => authenticatedAdmin.getAdminApi(),
+      );
+      if (!admin) throw new Error("Expected the deployment administrator capability.");
+      using usage = await retainedReplayStage(
+        "legacy-open-usage-admin", () => admin.getUsageApi(),
+      );
+      const registered = await retainedReplayStage(
+        "legacy-search-registry", () => waitFor("the legacy User Registry entry", async () =>
+          (await usage.searchUsers({query: username, limit: 2})).users
+            .find(candidate => candidate.identity === username) ?? null),
+      );
+      await retainedReplayStage(
+        "legacy-remove-modern-locator",
+        () => makeUnknownActionLegacy(username, workspaceId, safeRecordRef),
+      );
+      session[Symbol.dispose]();
+      gatekeeper[Symbol.dispose]();
+      workspace[Symbol.dispose]();
+      await retainedReplayStage(
+        "legacy-delete-user", () => usage.deleteUsageUser({
+          registeredUserRef: registered.registeredUserRef,
+          deletionId: `delete-legacy-action-user-${crypto.randomUUID()}`,
+          reason: "Prove deleted identity cannot erase retained unknown financial authority",
+        }),
+      );
+      expect((await retainedReplayStage(
+        "legacy-verify-registry-deleted",
+        () => usage.searchUsers({query: username, limit: 2}),
+      )).users).toEqual([]);
+      await expectRetainedReplayRejection(
+        "legacy-verify-user-surface-deleted",
+        () => user.getUsageCreditBalance(),
+        "deleted",
+      );
+      user[Symbol.dispose]();
+      publicApi[Symbol.dispose]();
+      await expectRetainedReplayRejection(
+        "legacy-verify-login-deleted",
+        () => openExistingUserWhenAvailable(username),
+        `Login failed for "${username}".`,
+      );
 
-    const request = {
-      registeredUserRef: registered.registeredUserRef,
-      safeRecordRef,
-      operationId: `legacy-second-page-settle:${crypto.randomUUID()}`,
-      decision: "settle" as const,
-      reason: "Provider confirmed the retained pre-upgrade Action executed",
-    };
-    await expect(usage.reconcileUnknownRecord(request))
-      .rejects.toThrow("Legacy Action authority is being prepared");
-    const settled = await usage.reconcileUnknownRecord(request);
-    const replaySession = await openExistingUserWhenAvailable(ADMIN_USERNAME);
+      request = {
+        registeredUserRef: registered.registeredUserRef,
+        safeRecordRef,
+        operationId: `legacy-second-page-settle:${crypto.randomUUID()}`,
+        decision: "settle",
+        reason: "Provider confirmed the retained pre-upgrade Action executed",
+      };
+      await expectRetainedReplayRejection(
+        "legacy-prepare-authority",
+        () => usage.reconcileUnknownRecord(request),
+        "Legacy Action authority is being prepared",
+      );
+    }
+
+    let settled!: Awaited<ReturnType<AdminUsageApi["reconcileUnknownRecord"]>>;
+    {
+      const settleSession = await retainedReplayStage(
+        "legacy-open-settle-admin", () => openUsageAdminWhenAvailable(),
+      );
+      using _settlePublicApi = settleSession.publicApi;
+      using _settleAuthenticatedAdmin = settleSession.user;
+      using _settleAdmin = settleSession.admin;
+      using settleUsage = settleSession.usage;
+      settled = await retainedReplayStage(
+        "legacy-settle-authority", () => settleUsage.reconcileUnknownRecord(request),
+      );
+    }
+    const replaySession = await retainedReplayStage(
+      "legacy-reconnect-admin", () => openExistingUserWhenAvailable(ADMIN_USERNAME),
+    );
     using _replayPublicApi = replaySession.publicApi;
     using replayAuthenticatedAdmin = replaySession.user;
-    using replayAdmin = await replayAuthenticatedAdmin.getAdminApi();
+    using replayAdmin = await retainedReplayStage(
+      "legacy-reopen-admin", () => replayAuthenticatedAdmin.getAdminApi(),
+    );
     if (!replayAdmin) throw new Error("Expected the deployment administrator capability.");
-    using replayUsage = await replayAdmin.getUsageApi();
-    expect(await replayUsage.reconcileUnknownRecord(request)).toEqual(settled);
+    using replayUsage = await retainedReplayStage(
+      "legacy-reopen-usage-admin", () => replayAdmin.getUsageApi(),
+    );
+    expect(await retainedReplayStage(
+      "legacy-replay-settle", () => replayUsage.reconcileUnknownRecord(request),
+    )).toEqual(settled);
     expect(settled).toMatchObject({
       operationId: request.operationId,
       decision: "settle",
@@ -1390,7 +1466,10 @@ describe("approved Action billing", () => {
       ledgerEntryId: `${safeRecordRef}:usage-charge`,
       actorUserId: ADMIN_USERNAME,
     });
-    expect((await replayUsage.searchUsers({query: username, limit: 2})).users).toEqual([]);
+    expect((await retainedReplayStage(
+      "legacy-verify-final-registry-deleted",
+      () => replayUsage.searchUsers({query: username, limit: 2}),
+    )).users).toEqual([]);
   });
 
   it("replays a committed unknown decision after its raw detail is retained away", async () => {
