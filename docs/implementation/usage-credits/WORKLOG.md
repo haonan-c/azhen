@@ -984,3 +984,35 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   the exclusive root fleet gate for current `6bee6df`, so this checkpoint does not claim a current
   root PASS. No push, merge, pull request, Issue closure, upload, promotion, deployment, production
   configuration change, charging change, production contact, or worktree deletion occurred.
+
+### 2026-08-26 — Issue #63 legacy outcome index and bounded reconnect fixed point
+
+- A later independent review found four remaining gaps at `1b3abfe`: the legacy
+  `usage-unknown` umbrella query did not prove ordered multi-value index access; retained
+  reconciliation allowed the initial dispatch plus three fresh dispatches; Workspace and
+  Gatekeeper reopen calls were not individually bounded by the shared deadline; and the evidence
+  documents still named an older fixed point.
+- The Workerd RED plan selected the general time index instead of a dedicated unknown-outcome
+  index. The correction adds a partial held/released time index to the empty schema-v3 shadow table
+  and uses it only for the exact canonical umbrella predicate. The GREEN plan names
+  `usage_projection_report_unknown_time_v3`, has no temporary order B-tree, and returns the same
+  overview, row, and CSV set. The bounded 131-row shadow-migration case confirms the index belongs
+  to the empty current table while retired rows remain in the bounded cleanup table.
+- The retained reconciliation helper now permits at most three total dispatch attempts, including
+  the initial call, under one 15-second deadline. Fresh User, Workspace, Gatekeeper, and session
+  capabilities are acquired through step-specific deadline guards. Pending Workspace,
+  Gatekeeper, and session tests prove that each late capability is disposed exactly once, partial
+  scopes are reverse-disposed, and no timeout starts another reopen.
+- Focused gates passed: report 26/26, empty-shadow migration 1/1, reconnect 3/3, and Action billing
+  31/31 in 167.80 seconds. The complete Integration Tests package passed 13/13 files and 131/131
+  tests in 800.28 seconds. Backend and Integration builds, root build, root lint, release-manifest
+  golden 4/4, and `git diff --check` also passed.
+- The clean pre-review fixed point `1b3abfe` completed an exclusive root `corepack pnpm test` with
+  exit 0 in 1,340.53 seconds: root Node 117/117, Backend stages all green, Integration 130/130,
+  Frontend 394/394 plus first-party copy 1/1, and all remaining workspace packages green. Because
+  the later review findings superseded that code while the command was running, the result is
+  diagnostic history only. Current code fixed point `dbe40008c659c69fef292684854866ebb91a6710`
+  still requires final two-axis review and a new main-agent-authorized root run.
+- All evidence is local real production code with controlled identities and controlled external
+  mocks. No production deployment, traffic claim, push, merge, pull request, Issue closure,
+  upload, promotion, configuration change, charging enablement, or worktree deletion occurred.
