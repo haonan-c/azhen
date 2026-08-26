@@ -462,7 +462,7 @@ async function waitForNextUnknownUsageReference(
       }>;
     };
     return state.projectionFacts?.find(fact =>
-      fact.rowKind === "detail" && fact.outcome === "usage-unknown" &&
+      fact.rowKind === "detail" && fact.outcome === "usage-unknown-held" &&
       typeof fact.safeRecordRef === "string" && !consumed.has(fact.safeRecordRef))
       ?.safeRecordRef ?? null;
   });
@@ -1937,14 +1937,14 @@ describe("approved Action billing", () => {
         cursor = page.nextCursor ?? undefined;
       } while (cursor !== undefined);
       const row = details.find(item => item.rowKind === "detail" &&
-        item.outcome === "usage-unknown");
+        item.outcome === "usage-unknown-held");
       if (!row || row.rowKind !== "detail" ||
           details.length < 66 + USAGE_REPORT_SEED_ROWS) {
         candidate[Symbol.dispose]();
         return null;
       }
       const nonUnknownRow = details.find(item => item.rowKind === "detail" &&
-        item.outcome !== "usage-unknown");
+        item.outcome !== "usage-unknown-held");
       if (!nonUnknownRow || nonUnknownRow.rowKind !== "detail") {
         candidate[Symbol.dispose]();
         return null;
@@ -1953,6 +1953,17 @@ describe("approved Action billing", () => {
     }, 90_000);
     using report = opened.candidate;
     expect(opened.row.metrics.unknownOperations).toBe(1n);
+    expect(opened.row).toMatchObject({
+      safeAttemptRef: opened.row.safeRecordRef,
+      reservationStatus: "held",
+      metrics: {
+        meteringAttempts: 1n,
+        heldReservations: 1n,
+        releasedReservations: 0n,
+        settledReservations: 0n,
+        unreservedAttempts: 0n,
+      },
+    });
     const encodedRow = JSON.stringify(opened.row, (_key, value) => typeof value === "bigint"
       ? value.toString() : value);
     for (const sentinel of forbiddenSentinels) expect(encodedRow).not.toContain(sentinel);
@@ -2160,7 +2171,9 @@ describe("approved Action billing", () => {
       totalCsvBytes,
     });
     expect(csv).toContain("schema_version,admin-usage-v1\r\n");
+    expect(csv).toContain("safe_attempt_ref,reservation_status,metering_attempts");
     expect(csv).toContain(opened.row.safeRecordRef);
+    expect(csv).toContain(`,${opened.row.safeAttemptRef},held,1,1,0,0,0`);
     expect(csv).toContain(ACTION_CHARGE.toString());
     for (const sentinel of forbiddenSentinels) expect(csv).not.toContain(sentinel);
 

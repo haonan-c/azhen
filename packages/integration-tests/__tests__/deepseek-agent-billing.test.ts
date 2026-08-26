@@ -879,7 +879,7 @@ describe("DeepSeek Agent billing", () => {
         });
         const page = await candidate.listRows({limit: 20});
         const row = page.rows.find(item => item.rowKind === "detail" &&
-          item.meteredKind === "gatekeeper" && item.outcome === "usage-unknown");
+          item.meteredKind === "gatekeeper" && item.outcome === "usage-unknown-held");
         if (row?.rowKind === "detail") return {candidate, row};
         candidate[Symbol.dispose]();
         return null;
