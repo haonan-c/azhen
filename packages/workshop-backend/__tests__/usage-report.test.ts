@@ -987,12 +987,29 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     using report = await usage.openReport({registeredUserRefs: [principal]});
     expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
 
-    await runInDurableObject(projection, (_instance, state) => {
-      state.storage.sql.exec(`
-        UPDATE usage_projection_meta SET bootstrap_state = 'pending'
-        WHERE singleton = 1
-      `);
-    });
+    const beforePreamble = (await report.exportCsv()).getReader();
+    const afterPreamble = (await report.exportCsv()).getReader();
+    expect(new TextDecoder().decode((await afterPreamble.read()).value)).toContain(
+      "schema_version,admin-usage-v1\r\n",
+    );
+    const setBootstrapState = (state: "complete" | "pending") =>
+      runInDurableObject(projection, (_instance, durableState) => {
+        durableState.storage.sql.exec(`
+          UPDATE usage_projection_meta SET bootstrap_state = ? WHERE singleton = 1
+        `, state);
+      });
+    await setBootstrapState("pending");
+    await expect(beforePreamble.read()).rejects.toThrow("Usage report snapshot is stale.");
+    await expect(afterPreamble.read()).rejects.toThrow("Usage report snapshot is stale.");
+    beforePreamble.releaseLock();
+    afterPreamble.releaseLock();
+
+    await setBootstrapState("complete");
+    const replacementBeforePreamble = await report.exportCsv();
+    const replacementAfterPreamble = await report.exportCsv();
+    await replacementBeforePreamble.cancel("prove the first stale stream released its slot");
+    await replacementAfterPreamble.cancel("prove the second stale stream released its slot");
+    await setBootstrapState("pending");
     await expect(report.getOverview()).rejects.toThrow("Usage report snapshot is stale.");
     await expect(report.listRows({limit: 10})).rejects.toThrow("Usage report snapshot is stale.");
     await expect(report.exportCsv()).rejects.toThrow("Usage report snapshot is stale.");
@@ -1003,7 +1020,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     await expect(usage.openReport({registeredUserRefs: [principal]}))
       .rejects.toThrow("Usage Projection bootstrap is incomplete.");
 
-    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName("");
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
     for (let turn = 0; turn < 20 && !await restarted.ensureBootstrap(); turn += 1) {
       await runDurableObjectAlarm(restarted);
     }
