@@ -116,6 +116,7 @@ export type UsageProjectionIngestResult = {
 };
 
 type ProjectionMetaRow = {
+  projection_schema_version: string;
   active_generation: string;
   ingestion_watermark: string;
   report_watermark: string;
@@ -356,6 +357,7 @@ const RESERVATION_STATUSES = new Set<AdminUsageReservationStatus>([
   "held", "released", "settled", "none",
 ]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CURRENT_PROJECTION_SCHEMA_VERSION = "2";
 
 /** Replaceable SQLite-backed deployment Usage Projection. It never stores authoritative balances. */
 export class UsageProjection extends DurableObject<Cloudflare.Env> {
@@ -627,7 +629,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       registeredUserRef: row.principal_ref,
       source: row.source,
       meteredKind,
-      outcome: normalizeStoredOutcome(row.usage_kind, row.outcome),
+      outcome: normalizeStoredOutcome(row.usage_kind, row.pricing, row.outcome),
       pricingStatus: row.pricing,
       deploymentModelId: row.deployment_model_id,
       gatekeeperId: row.vendor_id,
@@ -1979,7 +1981,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
   #meta(): ProjectionMetaRow {
     return this.ctx.storage.sql.exec<ProjectionMetaRow>(`
-      SELECT active_generation, ingestion_watermark, report_watermark, last_ingested_at,
+      SELECT projection_schema_version, active_generation, ingestion_watermark, report_watermark,
+             last_ingested_at,
              detail_retention_revision,
              latest_applied_source_at, failed_ingestion_count, failure_code,
              rebuild_request_id, rebuild_state, rebuild_generation, rebuild_users_processed,
@@ -2004,10 +2007,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   #initializeSchema(): void {
-    let needsExplainabilityRebuild = false;
+    let schemaUpgradeStarted = false;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_meta (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1), active_generation TEXT NOT NULL,
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        projection_schema_version TEXT NOT NULL,
+        active_generation TEXT NOT NULL,
         ingestion_watermark TEXT NOT NULL, report_watermark TEXT NOT NULL,
         detail_retention_revision TEXT NOT NULL,
         last_ingested_at TEXT,
@@ -2027,13 +2032,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const metaColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
       "PRAGMA table_info(usage_projection_meta)",
     ).toArray().map(column => column.name));
-    const needsReportWatermarkMigration = !metaColumns.has("report_watermark");
-    if (needsReportWatermarkMigration) {
-      this.ctx.storage.sql.exec(`
-        ALTER TABLE usage_projection_meta
-        ADD COLUMN report_watermark TEXT NOT NULL DEFAULT '0'
-      `);
+    const needsSchemaMarkerMigration = !metaColumns.has("projection_schema_version");
+    if (needsSchemaMarkerMigration) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(`
+          ALTER TABLE usage_projection_meta
+          ADD COLUMN projection_schema_version TEXT NOT NULL DEFAULT '0'
+        `);
+      });
     }
+    const needsReportWatermarkMigration = !metaColumns.has("report_watermark");
     if (!metaColumns.has("detail_retention_revision")) {
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_meta
@@ -2052,15 +2060,52 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ADD COLUMN rebuild_registry_complete INTEGER NOT NULL DEFAULT 0
       `);
     }
+    const beginSchemaUpgrade = () => {
+      if (schemaUpgradeStarted) return;
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET projection_schema_version = '0',
+            bootstrap_state = 'pending',
+            cleanup_generation = CASE WHEN rebuild_state = 'rebuilding'
+              THEN rebuild_generation ELSE cleanup_generation END,
+            cleanup_stage = CASE WHEN rebuild_state = 'rebuilding'
+              THEN 'facts' ELSE cleanup_stage END,
+            rebuild_request_id = NULL, rebuild_state = NULL, rebuild_generation = NULL,
+            rebuild_registry_revision = NULL, rebuild_registry_cursor = NULL,
+            rebuild_registry_complete = 0, rebuild_current_user_ref = NULL,
+            rebuild_current_user_fact_cursor = NULL, rebuild_current_user_is_last = 0,
+            rebuild_authority_complete = 0, rebuild_started_at = NULL,
+            rebuild_completed_at = NULL, rebuild_failure_code = NULL
+          WHERE singleton = 1
+        `);
+      });
+      schemaUpgradeStarted = true;
+    };
+    if (needsSchemaMarkerMigration) beginSchemaUpgrade();
+    if (needsReportWatermarkMigration) {
+      beginSchemaUpgrade();
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_meta
+        ADD COLUMN report_watermark TEXT NOT NULL DEFAULT '0'
+      `);
+    }
     this.ctx.storage.sql.exec(`
       INSERT OR IGNORE INTO usage_projection_meta (
-        singleton, active_generation, ingestion_watermark, report_watermark,
+        singleton, projection_schema_version, active_generation,
+        ingestion_watermark, report_watermark,
         detail_retention_revision,
         failed_ingestion_count,
         rebuild_users_processed, rebuild_current_user_is_last, rebuild_authority_complete,
         rebuild_registry_complete, maintenance_turn, bootstrap_state
-      ) VALUES (1, '1', '0', '0', '0', '0', '0', 0, 0, 0, 'drain', 'pending')
+      ) VALUES (1, '${CURRENT_PROJECTION_SCHEMA_VERSION}', '1', '0', '0', '0',
+        '0', '0', 0, 0, 0, 'drain', 'pending')
     `);
+    const storedSchemaVersion = this.ctx.storage.sql.exec<{
+      projection_schema_version: string;
+    }>(`
+      SELECT projection_schema_version FROM usage_projection_meta WHERE singleton = 1
+    `).one().projection_schema_version;
+    if (storedSchemaVersion !== CURRENT_PROJECTION_SCHEMA_VERSION) beginSchemaUpgrade();
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_totals (
         generation TEXT PRIMARY KEY, totals_source TEXT NOT NULL,
@@ -2077,38 +2122,28 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       "PRAGMA table_info(usage_projection_totals)",
     ).toArray().map(column => column.name));
     if (!totalColumns.has("totals_source")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_totals
         ADD COLUMN totals_source TEXT NOT NULL DEFAULT 'legacy'
       `);
-      this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_meta SET bootstrap_state = 'pending',
-          cleanup_generation = CASE WHEN rebuild_state = 'rebuilding'
-            THEN rebuild_generation ELSE cleanup_generation END,
-          cleanup_stage = CASE WHEN rebuild_state = 'rebuilding'
-            THEN 'facts' ELSE cleanup_stage END,
-          rebuild_request_id = NULL, rebuild_state = NULL, rebuild_generation = NULL,
-          rebuild_registry_revision = NULL, rebuild_registry_cursor = NULL,
-          rebuild_registry_complete = 0, rebuild_current_user_ref = NULL,
-          rebuild_current_user_fact_cursor = NULL, rebuild_current_user_is_last = 0,
-          rebuild_authority_complete = 0, rebuild_started_at = NULL,
-          rebuild_completed_at = NULL, rebuild_failure_code = NULL
-        WHERE singleton = 1
-      `);
     }
     if (!totalColumns.has("pre_execution_failures")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_totals
         ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
       `);
     }
     if (!totalColumns.has("metered_use_count")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_totals
         ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
       `);
     }
     if (!totalColumns.has("unknown_operations")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_totals
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
@@ -2229,38 +2264,39 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       `);
     }
     if (!factColumns.has("safe_attempt_ref")) {
-      needsExplainabilityRebuild = true;
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts ADD COLUMN safe_attempt_ref TEXT
       `);
     }
     if (!factColumns.has("reservation_status")) {
-      needsExplainabilityRebuild = true;
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts ADD COLUMN reservation_status TEXT
       `);
     }
     if (!factColumns.has("metered_kind")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts ADD COLUMN metered_kind TEXT
       `);
     }
     if (!factColumns.has("pre_execution_failures")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts
         ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
       `);
     }
     if (!factColumns.has("metered_use_count")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts
         ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
       `);
-      this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_facts SET metered_use_count = active_user_contribution
-      `);
     }
     if (!factColumns.has("unknown_operations")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
@@ -2271,7 +2307,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       "settled_reservations", "unreserved_attempts",
     ]) {
       if (!factColumns.has(column)) {
-        needsExplainabilityRebuild = true;
+        beginSchemaUpgrade();
         this.ctx.storage.sql.exec(`
           ALTER TABLE usage_projection_facts
           ADD COLUMN ${column} TEXT NOT NULL DEFAULT '0'
@@ -2279,22 +2315,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       }
     }
     if (!factColumns.has("applied_watermark")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(
         "ALTER TABLE usage_projection_facts ADD COLUMN applied_watermark TEXT",
       );
-    }
-    if (needsReportWatermarkMigration || !factColumns.has("applied_watermark")) {
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec(`
-          UPDATE usage_projection_facts SET applied_watermark = CAST(rowid AS TEXT)
-          WHERE applied = 1 AND applied_watermark IS NULL
-        `);
-        this.ctx.storage.sql.exec(`
-          UPDATE usage_projection_meta SET report_watermark = (
-            SELECT CAST(COALESCE(MAX(rowid), 0) AS TEXT) FROM usage_projection_facts
-          ) WHERE singleton = 1
-        `);
-      });
     }
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v2
@@ -2388,27 +2412,28 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       "PRAGMA table_info(usage_projection_summaries)",
     ).toArray().map(column => column.name));
     if (!summaryColumns.has("metered_kind")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_summaries
         ADD COLUMN metered_kind TEXT NOT NULL DEFAULT 'attempt'
       `);
     }
     if (!summaryColumns.has("pre_execution_failures")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_summaries
         ADD COLUMN pre_execution_failures TEXT NOT NULL DEFAULT '0'
       `);
     }
     if (!summaryColumns.has("metered_use_count")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_summaries
         ADD COLUMN metered_use_count TEXT NOT NULL DEFAULT '0'
       `);
-      this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_summaries SET metered_use_count = active_user_contribution
-      `);
     }
     if (!summaryColumns.has("unknown_operations")) {
+      beginSchemaUpgrade();
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_summaries
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
@@ -2419,26 +2444,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       "settled_reservations", "unreserved_attempts",
     ]) {
       if (!summaryColumns.has(column)) {
-        needsExplainabilityRebuild = true;
+        beginSchemaUpgrade();
         this.ctx.storage.sql.exec(`
           ALTER TABLE usage_projection_summaries
           ADD COLUMN ${column} TEXT NOT NULL DEFAULT '0'
         `);
       }
     }
-    if (needsExplainabilityRebuild) {
+    if (schemaUpgradeStarted) {
       this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_meta SET bootstrap_state = 'pending',
-          cleanup_generation = CASE WHEN rebuild_state = 'rebuilding'
-            THEN rebuild_generation ELSE cleanup_generation END,
-          cleanup_stage = CASE WHEN rebuild_state = 'rebuilding'
-            THEN 'facts' ELSE cleanup_stage END,
-          rebuild_request_id = NULL, rebuild_state = NULL, rebuild_generation = NULL,
-          rebuild_registry_revision = NULL, rebuild_registry_cursor = NULL,
-          rebuild_registry_complete = 0, rebuild_current_user_ref = NULL,
-          rebuild_current_user_fact_cursor = NULL, rebuild_current_user_is_last = 0,
-          rebuild_authority_complete = 0, rebuild_started_at = NULL,
-          rebuild_completed_at = NULL, rebuild_failure_code = NULL
+        UPDATE usage_projection_meta
+        SET projection_schema_version = '${CURRENT_PROJECTION_SCHEMA_VERSION}'
         WHERE singleton = 1
       `);
     }
@@ -2480,7 +2496,8 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   const outcome = raw.outcome === "usage-unknown"
-    ? raw.kind === "model" ? "usage-unknown-released" : "usage-unknown-held"
+    ? raw.kind === "gatekeeper" && raw.pricing === "priced"
+      ? "usage-unknown-held" : "usage-unknown-released"
     : raw.outcome;
   const legacyMeteredUseCount = inputKeys.includes("meteredUseCount")
     ? input.meteredUseCount : input.activeUserContribution;
@@ -2763,10 +2780,12 @@ function legacyProjectionHashOutcome(input: unknown): "usage-unknown" | null {
 
 function normalizeStoredOutcome(
     kind: UsageProjectionFact["kind"],
+    pricing: UsageProjectionFact["pricing"],
     outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
     UsageProjectionFact["outcome"] {
   return outcome === "usage-unknown"
-    ? kind === "model" ? "usage-unknown-released" : "usage-unknown-held"
+    ? kind === "gatekeeper" && pricing === "priced"
+      ? "usage-unknown-held" : "usage-unknown-released"
     : outcome;
 }
 

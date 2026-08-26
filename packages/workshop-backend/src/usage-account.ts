@@ -2769,8 +2769,7 @@ export class UsageAccount {
       source: record.attribution.source,
       kind: "model",
       outcome: record.outcome === "usage-unknown"
-        ? storedReservationStatus === undefined
-          ? "usage-unknown-released" : projectionUnknownOutcome(reservationStatus)
+        ? projectionUnknownOutcome(reservationStatus)
         : record.outcome,
       reservationStatus,
       pricing: record.chargeSnapshot.pricing,
@@ -2815,8 +2814,7 @@ export class UsageAccount {
       source: record.attribution.source,
       kind: "gatekeeper",
       outcome: record.outcome === "usage-unknown"
-        ? storedReservationStatus === undefined
-          ? "usage-unknown-held" : projectionUnknownOutcome(reservationStatus)
+        ? projectionUnknownOutcome(reservationStatus)
         : record.outcome,
       reservationStatus,
       pricing: record.chargeSnapshot.pricing,
@@ -4248,7 +4246,7 @@ function legacyProjectionDetailMatches(
     contribution: DetailProjectionContribution): boolean {
   return fact.schemaVersion === 1 && fact.occurredAt === contribution.occurredAt &&
     fact.source === contribution.source && fact.kind === contribution.kind &&
-    normalizeProjectionOutcome(fact.kind, fact.outcome) === contribution.outcome &&
+    normalizeProjectionOutcome(fact.kind, fact.pricing, fact.outcome) === contribution.outcome &&
     fact.pricing === contribution.pricing &&
     fact.deploymentModelId === contribution.deploymentModelId &&
     fact.vendorId === contribution.vendorId &&
@@ -4285,10 +4283,12 @@ function legacyProjectionDetailMatches(
 
 function normalizeProjectionOutcome(
     kind: "model" | "gatekeeper",
+    pricing: "priced" | "unpriced",
     outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
     UsageProjectionFact["outcome"] {
   return outcome === "usage-unknown"
-    ? kind === "model" ? "usage-unknown-released" : "usage-unknown-held"
+    ? kind === "gatekeeper" && pricing === "priced"
+      ? "usage-unknown-held" : "usage-unknown-released"
     : outcome;
 }
 

@@ -233,10 +233,10 @@ export function buildUsageReportPredicate(
   addIn("facts.external_account_id", filter.externalAccountIds);
   addIn("facts.source", filter.sources);
   addIn(`CASE
-    WHEN facts.outcome = 'usage-unknown' AND facts.usage_kind = 'model'
-      THEN 'usage-unknown-released'
-    WHEN facts.outcome = 'usage-unknown' AND facts.usage_kind = 'gatekeeper'
+    WHEN facts.outcome = 'usage-unknown' AND facts.usage_kind = 'gatekeeper' AND
+      facts.pricing = 'priced'
       THEN 'usage-unknown-held'
+    WHEN facts.outcome = 'usage-unknown' THEN 'usage-unknown-released'
     ELSE facts.outcome END`, filter.outcomes);
   addIn("facts.pricing", filter.pricingStatuses);
   addIn("COALESCE(facts.metered_kind, facts.usage_kind)", filter.meteredKinds);
