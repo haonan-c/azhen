@@ -20,8 +20,9 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
 - `openReport()` first completes the Projection bootstrap gate. It rejects both a direct call and a
   promise-pipelined call while bootstrap is incomplete, so it never freezes pending or partial
   totals as a report snapshot.
-- Projection schema v3 moves pre-upgrade report facts and summaries to retired shadow tables and
-  creates every report index on new empty canonical tables. The constructor does no synchronous
+- Projection schema v4 moves populated v3 report facts and summaries to retired shadow tables and
+  creates every v4 report index on new empty canonical tables. Existing v3 indexes stay attached
+  to the retired tables, so the constructor does no synchronous index drop, rebuild, reindex, or
   index build or data scan over existing report rows. A bounded alarm removes at most 64 retired
   rows per turn while the existing authority rebuild fills the new generation. A schema marker and
   bootstrap marker make every crash point re-entrant and fail closed.
@@ -185,25 +186,25 @@ released_reservations,settled_reservations,unreserved_attempts
 | --- | --- |
 | Shared, Backend, Frontend, and Integration Tests package builds | PASS |
 | Focused Usage administrator workerd | PASS, 18/18; recorded RED 16/18 before safe-reference compatibility fix |
-| Focused Usage report workerd | PASS, 26/26 at code fixed point `dbe4000`; legacy unknown selector uses the ordered partial index without a temporary sort |
-| Focused Summary/retention workerd group | PASS, 28/28 at `6bee6df` |
-| Full focused Projection workerd | Historical PASS, 60/60 at `6bee6df`; current empty-shadow index migration regression PASS, 1/1 at `dbe4000`; seven-sentinel privacy remains included |
+| Focused Usage report workerd | PASS, 26/26 at code fixed point `7679e43`; legacy unknown selector uses the ordered v4 partial index without a temporary sort |
+| Focused Summary/retention workerd group | PASS, 28/28 at `7679e43` |
+| Full focused Projection workerd | PASS, 60/60 at `7679e43`; populated-v3 to empty-v4 shadow migration, crash re-entry, and bounded retired cleanup are included |
 | Frontend report/file-transfer follow-up tests | PASS, 30/30 |
 | Full Frontend package tests | PASS in the superseded root diagnostic run, 78 files and 394 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
 | Real production-Harness second-page legacy/deleted-User coordination | PASS, 1/1; 17 unrelated tests skipped; 15.80 seconds |
 | Real production-Harness retained-detail cross-DO replay | PASS, 1/1; 18 unrelated tests skipped; 16.72 seconds |
-| Full Action billing Harness | PASS, 31/31 at `dbe4000`; 167.80 seconds |
-| Full Integration Tests package | PASS, 13/13 files and 131/131 tests at `dbe4000`; 800.28 seconds |
+| Full Action billing Harness | Historical PASS, 31/31 at `dbe4000`; 167.80 seconds; this v4-only correction does not change Action code |
+| Full Integration Tests package | PASS, 13/13 files and 131/131 tests at `7679e43`; 790.72 seconds |
 | Backend Worker `capnweb-validate` build | PASS |
-| Full Backend package tests | PASS, 661 tests with 4 expected skips across the root Backend preflight and focused configurations |
-| Root `corepack pnpm build` | PASS, 52 tasks; later test-only corrections also passed the Integration Tests package build |
+| Full Backend package tests | Historical PASS at superseded fixed point `1b3abfe`; the current `7679e43` full Backend/root test gate is pending and is not claimed as PASS |
+| Root `corepack pnpm build` | PASS at `7679e43`, 52 tasks; Backend and Integration package builds also passed |
 | Root `corepack pnpm lint` | PASS, configured non-blocking warnings only |
 | Release-manifest golden | PASS, 4/4 |
 | `corepack pnpm types:generate` | PASS at `6bee6df`; no Issue #63 generated change; unrelated UGC Ads drift precisely restored |
 | Production-shape release dry-run | PASS at `6bee6df`, 19 Workers, 85 modules, 37 asset blobs, 29,168 KiB |
-| Root `corepack pnpm test` | Superseded diagnostic PASS at `1b3abfe174ed9d74062f69204371b95d50a9837e`: exit 0 in 1,340.53 seconds; current `dbe4000` final root gate remains pending |
-| Standards/specification fixed-point review | Pending for `dbe4000`; the prior review findings are reproduced and corrected, but this document does not pre-claim review PASS |
+| Root `corepack pnpm test` | Superseded diagnostic PASS at `1b3abfe174ed9d74062f69204371b95d50a9837e`: exit 0 in 1,340.53 seconds; current `7679e43` final root gate remains pending |
+| Standards/specification fixed-point review | Pending for `7679e43`; this document does not pre-claim review PASS |
 | `git diff --check` | PASS |
 
 The first production-shape dry-run stopped because a gitignored Confluence configurator prerequisite
@@ -383,13 +384,14 @@ branch-verification step.
 
 ## Legacy outcome index and bounded reconnect fixed point
 
-The current code fixed point is `dbe40008c659c69fef292684854866ebb91a6710`. It closes the last
+The earlier code fixed point was `dbe40008c659c69fef292684854866ebb91a6710`. It closed the prior
 independent review findings without changing a public Usage API, a binding, or a Wrangler manifest.
 
 - The compatibility selector `outcomes: ["usage-unknown"]` still freezes as the two canonical
   held and released outcomes. Its exact production predicate now selects the server-owned
-  `usage_projection_report_unknown_time_v3` partial ordered index. The index is created with the
-  other v3 indexes on the empty shadow table; it is not synchronously built over retired rows.
+  `usage_projection_report_unknown_time_v3` partial ordered index. That historical index was
+  created with the other v3 indexes on an empty shadow table; it was not synchronously built over
+  retired rows.
   Real Workerd `EXPLAIN QUERY PLAN` requires that index and rejects `USE TEMP B-TREE FOR ORDER BY`.
   The same test proves overview, rows, and CSV return the same held/released set.
 - Retained reconciliation has one 15-second absolute deadline and at most three total mutation
@@ -407,7 +409,27 @@ Integration Tests 13/13 files and 131/131 tests in 800.28 seconds; Backend and I
 root build and lint; release-manifest golden 4/4; and `git diff --check`. The prior clean code fixed
 point `1b3abfe` also completed one exclusive root test run with exit 0 in 1,340.53 seconds, but the
 review arrived before that run completed. That result is retained only as diagnostic history and is
-not extended to `dbe4000`. Final root test and the final two-axis review remain pending.
+not extended to `dbe4000`. A later v4 correction supersedes this fixed point.
+
+## Schema v4 empty-shadow fixed point
+
+The current code fixed point is `7679e4391d3b856785801d3345338df9e04d7ee8`.
+
+- A populated schema-v3 Projection is renamed to retired-v3 facts and Summary tables inside one
+  schema transaction. Its existing v3 indexes stay attached to those tables. New v4 tables are
+  empty when every `_v4` index is created, so the constructor performs no synchronous DROP,
+  REINDEX, or CREATE INDEX scan over populated report rows.
+- The Workerd RED case left 131 facts in the current v3 table. GREEN observes schema version 4,
+  `bootstrap_state = pending`, zero canonical rows, all 131 retired rows, old/new index ownership,
+  and the same state after an actor restart. Each production cleanup turn removes at most 64 rows;
+  the bounded authority rebuild completes before reports can read the v4 generation.
+- Current focused evidence is Projection 60/60, report 26/26, retention 28/28, administrator Usage
+  18/18, and Integration 13/13 files with 131/131 tests in 790.72 seconds. Backend, Integration,
+  and root builds passed. Root lint, release-manifest golden 4/4, and `git diff --check` passed.
+- This is an internal SQLite schema behavior change only. It adds no Durable Object class, binding,
+  Wrangler migration, or release-manifest shape. The earlier final-shape `types:generate` and local
+  production-shape dry-run remain the applicable artifact-shape evidence. The full current Backend
+  package and root test are still pending; no current PASS is claimed for either.
 
 This evidence uses local real production code paths, controlled identities, and controlled external
 mocks. It does not claim production deployment or production traffic. No upload, promotion,

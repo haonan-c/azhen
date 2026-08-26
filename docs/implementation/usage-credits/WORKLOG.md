@@ -1016,3 +1016,24 @@ tests must retain the runtime assertion. Mock provider tests are not production 
 - All evidence is local real production code with controlled identities and controlled external
   mocks. No production deployment, traffic claim, push, merge, pull request, Issue closure,
   upload, promotion, configuration change, charging enablement, or worktree deletion occurred.
+
+### 2026-08-26 — Issue #63 schema v4 empty-shadow index correction
+
+- An independent Standards review found that adding the legacy unknown-outcome index to an already
+  populated schema-v3 Projection could synchronously scan and sort report rows in the Durable
+  Object constructor. The RED Workerd case kept 131 rows and v3 indexes on the canonical table.
+- The GREEN schema-v4 transaction renames populated v3 facts and summaries to retired-v3 tables,
+  leaves their v3 indexes attached, and creates every v4 index only on new empty canonical tables.
+  It performs no synchronous DROP, REINDEX, or populated CREATE INDEX. Actor restart re-enters the
+  same state without mixing generations or losing retired rows.
+- Retired-v2 and retired-v3 tables share the existing maintenance path. One alarm turn deletes at
+  most 64 rows from one retired table. Bootstrap stays pending until a bounded authority rebuild
+  completes, so old or partially rebuilt report data remains fail closed.
+- Current focused gates passed: Projection 60/60, report 26/26, retention 28/28, administrator
+  Usage 18/18, and complete Integration 13/13 files with 131/131 tests in 790.72 seconds. Backend,
+  Integration, and root builds passed. Root lint, release-manifest golden 4/4, and
+  `git diff --check` passed.
+- Code fixed point is `7679e4391d3b856785801d3345338df9e04d7ee8`. The earlier full Backend and
+  root results are historical diagnostic evidence only; the current full Backend/root test and
+  final Standards/Spec reviews remain pending. No binding, Wrangler migration, generated type, or
+  release-manifest shape changed, and no remote or production mutation occurred.
