@@ -4,6 +4,7 @@ import {
   type AdminUsageBalanceState,
   type AdminUsageOperationKind,
   type AdminUsageOperationResult,
+  type AdminUsageReservationStatus,
   type ChargeSnapshot,
   type GatekeeperChargeSnapshot,
   type InitialGrantSnapshot,
@@ -186,7 +187,7 @@ type ProjectionFactContribution =
 type DetailProjectionContribution = Omit<
   UsageProjectionDetailFact,
   "schemaVersion" | "projectionFactId" | "sourceSequence" | "usagePrincipalRef" |
-    "safeRecordRef"
+    "safeRecordRef" | "safeAttemptRef"
 >;
 type TransactionResult<T> = { value: T } | { error: Error };
 
@@ -255,6 +256,8 @@ export type ModelUsageRecord = {
   usageStatus: "reported" | "not-reported" | "invalid-report";
   usage: ReportedModelUsage | null;
   chargeSubunits: bigint | null;
+  /** Credit Reservation state frozen when this Metering Attempt became terminal. */
+  reservationStatusAtCompletion?: AdminUsageReservationStatus;
   createdAt: string;
 };
 
@@ -311,6 +314,8 @@ export type GatekeeperUsageRecord = {
   ledgerEntryId: string | null;
   outcome: "settled" | "failed-before-execution" | "usage-unknown";
   chargeSubunits: bigint | null;
+  /** Credit Reservation state frozen when this Metering Attempt became terminal. */
+  reservationStatusAtCompletion?: AdminUsageReservationStatus;
   createdAt: string;
 };
 
@@ -2381,6 +2386,10 @@ export class UsageAccount {
         usageStatus,
         usage: normalizedUsage,
         chargeSubunits,
+        reservationStatusAtCompletion: this.#projectionReservationStatus(
+          operationId,
+          attempt.reservationId,
+        ),
         createdAt: completedAt,
       };
       const completedAttempt: ModelMeteringAttempt = {
@@ -2450,6 +2459,10 @@ export class UsageAccount {
       usageStatus: "not-reported",
       usage: null,
       chargeSubunits: null,
+      reservationStatusAtCompletion: this.#projectionReservationStatus(
+        operationId,
+        attempt.reservationId,
+      ),
       createdAt: completedAt,
     };
     const completedAttempt: ModelMeteringAttempt = {
@@ -2719,6 +2732,10 @@ export class UsageAccount {
         ledgerEntryId,
         outcome,
         chargeSubunits,
+        reservationStatusAtCompletion: this.#projectionReservationStatus(
+          operationId,
+          attempt.reservationId,
+        ),
         createdAt: completedAt,
       };
       this.storage.kv.put(recordKey, record);
@@ -2740,6 +2757,9 @@ export class UsageAccount {
     const confirmedUsage = record.usageStatus === "reported" && record.usage !== null &&
       (record.outcome === "settled" || record.outcome === "reconciliation-required");
     const usage = confirmedUsage ? record.usage : null;
+    const storedReservationStatus = record.reservationStatusAtCompletion;
+    const reservationStatus = storedReservationStatus ??
+      legacyModelReservationStatus(record);
     this.#appendDetailAndSummary(`model:${record.operationId}`, {
       kind: "model",
       operationId: record.operationId,
@@ -2748,7 +2768,11 @@ export class UsageAccount {
       occurredAt: record.createdAt,
       source: record.attribution.source,
       kind: "model",
-      outcome: record.outcome,
+      outcome: record.outcome === "usage-unknown"
+        ? storedReservationStatus === undefined
+          ? "usage-unknown-released" : projectionUnknownOutcome(reservationStatus)
+        : record.outcome,
+      reservationStatus,
       pricing: record.chargeSnapshot.pricing,
       deploymentModelId: record.attribution.deploymentModelId,
       vendorId: null,
@@ -2770,6 +2794,7 @@ export class UsageAccount {
       preExecutionFailures: record.outcome === "failed-before-execution" ? 1n : 0n,
       unknownOperations: record.outcome === "usage-unknown" ||
         record.outcome === "reconciliation-required" ? 1n : 0n,
+      ...reservationAttemptMetrics(reservationStatus),
       activeUserContribution: confirmedUsage ? 1n : 0n,
       unpricedModelUses: confirmedUsage && record.chargeSnapshot.pricing === "unpriced" ? 1n : 0n,
       unpricedApiOperations: 0n,
@@ -2778,6 +2803,9 @@ export class UsageAccount {
 
   #appendGatekeeperProjectionFact(record: GatekeeperUsageRecord): void {
     const confirmedUsage = record.outcome === "settled";
+    const storedReservationStatus = record.reservationStatusAtCompletion;
+    const reservationStatus = storedReservationStatus ??
+      legacyGatekeeperReservationStatus(record);
     this.#appendDetailAndSummary(`gatekeeper:${record.operationId}`, {
       kind: "gatekeeper",
       operationId: record.operationId,
@@ -2786,7 +2814,11 @@ export class UsageAccount {
       occurredAt: record.createdAt,
       source: record.attribution.source,
       kind: "gatekeeper",
-      outcome: record.outcome,
+      outcome: record.outcome === "usage-unknown"
+        ? storedReservationStatus === undefined
+          ? "usage-unknown-held" : projectionUnknownOutcome(reservationStatus)
+        : record.outcome,
+      reservationStatus,
       pricing: record.chargeSnapshot.pricing,
       deploymentModelId: null,
       vendorId: record.attribution.vendorId,
@@ -2805,6 +2837,7 @@ export class UsageAccount {
       billableApiOperations: confirmedUsage ? 1n : 0n,
       preExecutionFailures: record.outcome === "failed-before-execution" ? 1n : 0n,
       unknownOperations: record.outcome === "usage-unknown" ? 1n : 0n,
+      ...reservationAttemptMetrics(reservationStatus),
       activeUserContribution: confirmedUsage ? 1n : 0n,
       unpricedModelUses: 0n,
       unpricedApiOperations: confirmedUsage && record.chargeSnapshot.pricing === "unpriced"
@@ -2829,6 +2862,7 @@ export class UsageAccount {
       source: authority.source,
       kind: "gatekeeper",
       outcome: authority.outcome,
+      reservationStatus: "none",
       pricing: authority.pricing,
       deploymentModelId: null,
       vendorId: authority.vendorId,
@@ -2846,6 +2880,7 @@ export class UsageAccount {
       billableApiOperations: authority.billableApiOperations,
       preExecutionFailures: 0n,
       unknownOperations: 0n,
+      ...reservationAttemptMetrics("none", 0n),
       activeUserContribution: authority.meteredUseCount,
       unpricedModelUses: 0n,
       unpricedApiOperations: authority.meteredUseCount > 0n && authority.pricing === "unpriced"
@@ -3660,10 +3695,22 @@ export class UsageAccount {
       this.#appendProjectionFact(`detail-v2:${sourceIdentity}`, {
         ...contribution,
         safeRecordRef: detailReference.safeRecordRef,
+        safeAttemptRef: contribution.meteringAttempts === 0n
+          ? null : detailReference.safeRecordRef,
       });
     }
     this.#appendUsageSummaryContribution(sourceIdentity, contribution);
     this.#scheduleRetentionExpiry(contribution.occurredAt);
+  }
+
+  #projectionReservationStatus(
+      operationId: string,
+      reservationId: string | null): AdminUsageReservationStatus {
+    if (reservationId === null) return "none";
+    const reservation = this.storage.kv.get<CreditReservation>(RESERVATION_PREFIX + operationId);
+    if (!reservation) throw new Error("Credit Reservation does not exist.");
+    this.assertStoredReservationConsistency(reservation, operationId);
+    return reservation.state === "reserved" ? "held" : reservation.state;
   }
 
   #scheduleRetentionExpiry(occurredAt: string): void {
@@ -3758,16 +3805,17 @@ export class UsageAccount {
       if (!isOpaqueUsageReference(indexedSummaryFactId)) {
         throw new Error("Usage Summary dimension index is invalid.");
       }
-      current = this.storage.kv.get<UsageSummaryFact>(
+      const stored = this.storage.kv.get<UsageSummaryFact>(
         USAGE_SUMMARY_PREFIX + indexedSummaryFactId,
       );
-      if (!current || usageSummaryDimensionKey(
-        current.usagePrincipalRef,
-        current.bucketStart,
-        current,
+      if (!stored || usageSummaryDimensionKey(
+        stored.usagePrincipalRef,
+        stored.bucketStart,
+        stored,
       ) !== dimensionKey) {
         throw new Error("Usage Summary dimension index does not reconcile.");
       }
+      current = normalizeUsageSummaryExplainability(stored);
     }
     const summaryFactId = current?.summaryFactId ?? crypto.randomUUID();
     const updated = addUsageSummaryContribution(
@@ -4079,6 +4127,11 @@ function emptyUsageSummaryFact(
     billableApiOperations: 0n,
     preExecutionFailures: 0n,
     unknownOperations: 0n,
+    meteringAttempts: 0n,
+    heldReservations: 0n,
+    releasedReservations: 0n,
+    settledReservations: 0n,
+    unreservedAttempts: 0n,
     activeUserContribution: 0n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -4106,11 +4159,61 @@ function addUsageSummaryContribution(
     preExecutionFailures:
       current.preExecutionFailures + contribution.preExecutionFailures,
     unknownOperations: current.unknownOperations + contribution.unknownOperations,
+    meteringAttempts: current.meteringAttempts + contribution.meteringAttempts,
+    heldReservations: current.heldReservations + contribution.heldReservations,
+    releasedReservations: current.releasedReservations + contribution.releasedReservations,
+    settledReservations: current.settledReservations + contribution.settledReservations,
+    unreservedAttempts: current.unreservedAttempts + contribution.unreservedAttempts,
     activeUserContribution:
       current.activeUserContribution + contribution.activeUserContribution,
     unpricedModelUses: current.unpricedModelUses + contribution.unpricedModelUses,
     unpricedApiOperations: current.unpricedApiOperations + contribution.unpricedApiOperations,
   };
+}
+
+function normalizeUsageSummaryExplainability(current: UsageSummaryFact): UsageSummaryFact {
+  if ("meteringAttempts" in current && typeof current.meteringAttempts === "bigint" &&
+      "heldReservations" in current && typeof current.heldReservations === "bigint" &&
+      "releasedReservations" in current && typeof current.releasedReservations === "bigint" &&
+      "settledReservations" in current && typeof current.settledReservations === "bigint" &&
+      "unreservedAttempts" in current && typeof current.unreservedAttempts === "bigint") {
+    return current;
+  }
+  const outcome = current.outcome as UsageProjectionFact["outcome"] | "usage-unknown";
+  const meteringAttempts = outcome === "reconciled-settled" ||
+      outcome === "reconciled-released"
+    ? 0n
+    : outcome === "settled" ? current.meteredUseCount
+      : outcome === "failed-before-execution" ? current.preExecutionFailures
+        : current.unknownOperations;
+  const reservationStatus = legacySummaryReservationStatus(
+    current.kind,
+    current.pricing,
+    outcome,
+  );
+  return {
+    ...current,
+    meteringAttempts,
+    heldReservations: reservationStatus === "held" ? meteringAttempts : 0n,
+    releasedReservations: reservationStatus === "released" ? meteringAttempts : 0n,
+    settledReservations: reservationStatus === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: reservationStatus === "none" ? meteringAttempts : 0n,
+  };
+}
+
+function legacySummaryReservationStatus(
+    kind: "model" | "gatekeeper",
+    pricing: "priced" | "unpriced",
+    outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
+    AdminUsageReservationStatus {
+  if (pricing === "unpriced" || outcome === "reconciled-settled" ||
+      outcome === "reconciled-released") return "none";
+  if (outcome === "settled") return "settled";
+  if (outcome === "failed-before-execution") return "released";
+  if (outcome === "reconciliation-required") return "held";
+  if (outcome === "usage-unknown-released") return "released";
+  if (outcome === "usage-unknown-held") return "held";
+  return kind === "model" ? "released" : "held";
 }
 
 function projectionPendingKey(sourceSequence: bigint): string {
@@ -4145,7 +4248,8 @@ function legacyProjectionDetailMatches(
     contribution: DetailProjectionContribution): boolean {
   return fact.schemaVersion === 1 && fact.occurredAt === contribution.occurredAt &&
     fact.source === contribution.source && fact.kind === contribution.kind &&
-    fact.outcome === contribution.outcome && fact.pricing === contribution.pricing &&
+    normalizeProjectionOutcome(fact.kind, fact.outcome) === contribution.outcome &&
+    fact.pricing === contribution.pricing &&
     fact.deploymentModelId === contribution.deploymentModelId &&
     fact.vendorId === contribution.vendorId &&
     fact.billingMethodKey === contribution.billingMethodKey &&
@@ -4166,7 +4270,69 @@ function legacyProjectionDetailMatches(
     (!("preExecutionFailures" in fact) ||
       fact.preExecutionFailures === contribution.preExecutionFailures) &&
     (!("unknownOperations" in fact) ||
-      fact.unknownOperations === contribution.unknownOperations);
+      fact.unknownOperations === contribution.unknownOperations) &&
+    (!("meteringAttempts" in fact) ||
+      fact.meteringAttempts === contribution.meteringAttempts) &&
+    (!("heldReservations" in fact) ||
+      fact.heldReservations === contribution.heldReservations) &&
+    (!("releasedReservations" in fact) ||
+      fact.releasedReservations === contribution.releasedReservations) &&
+    (!("settledReservations" in fact) ||
+      fact.settledReservations === contribution.settledReservations) &&
+    (!("unreservedAttempts" in fact) ||
+      fact.unreservedAttempts === contribution.unreservedAttempts);
+}
+
+function normalizeProjectionOutcome(
+    kind: "model" | "gatekeeper",
+    outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
+    UsageProjectionFact["outcome"] {
+  return outcome === "usage-unknown"
+    ? kind === "model" ? "usage-unknown-released" : "usage-unknown-held"
+    : outcome;
+}
+
+function reservationAttemptMetrics(
+    status: AdminUsageReservationStatus,
+    meteringAttempts = 1n): Pick<
+      DetailProjectionContribution,
+      "meteringAttempts" | "heldReservations" | "releasedReservations" |
+        "settledReservations" | "unreservedAttempts"
+    > {
+  return {
+    meteringAttempts,
+    heldReservations: status === "held" ? meteringAttempts : 0n,
+    releasedReservations: status === "released" ? meteringAttempts : 0n,
+    settledReservations: status === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: status === "none" ? meteringAttempts : 0n,
+  };
+}
+
+function projectionUnknownOutcome(
+    reservationStatus: AdminUsageReservationStatus):
+    "usage-unknown-held" | "usage-unknown-released" {
+  return reservationStatus === "held" ? "usage-unknown-held" : "usage-unknown-released";
+}
+
+function legacyModelReservationStatus(
+    record: ModelUsageRecord): AdminUsageReservationStatus {
+  if (record.reservationId === null) return "none";
+  if (record.outcome === "settled") return "settled";
+  if (record.outcome === "reconciliation-required") return "held";
+  return "released";
+}
+
+function legacyGatekeeperReservationStatus(
+    record: GatekeeperUsageRecord): AdminUsageReservationStatus {
+  if (record.reservationId === null) return "none";
+  if (record.outcome === "settled") return "settled";
+  if (record.outcome === "usage-unknown") return "held";
+  return "released";
+}
+
+function isAdminUsageReservationStatus(
+    value: unknown): value is AdminUsageReservationStatus {
+  return value === "held" || value === "released" || value === "settled" || value === "none";
 }
 
 function assertGatekeeperUsageReconciliationAudit(
@@ -4927,20 +5093,22 @@ function assertModelMeteringAttempt(
 }
 
 function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: string): void {
+  const baseKeys = [
+    "id",
+    "operationId",
+    "attribution",
+    "chargeSnapshot",
+    "reservationId",
+    "ledgerEntryId",
+    "outcome",
+    "usageStatus",
+    "usage",
+    "chargeSubunits",
+    "createdAt",
+  ];
   if (typeof record !== "object" || record === null || Array.isArray(record) ||
-      !hasExactKeys(record, [
-        "id",
-        "operationId",
-        "attribution",
-        "chargeSnapshot",
-        "reservationId",
-        "ledgerEntryId",
-        "outcome",
-        "usageStatus",
-        "usage",
-        "chargeSubunits",
-        "createdAt",
-      ]) ||
+      (!hasExactKeys(record, baseKeys) &&
+       !hasExactKeys(record, [...baseKeys, "reservationStatusAtCompletion"])) ||
       record.id !== modelUsageRecordId(expectedOperationId) ||
       record.operationId !== expectedOperationId ||
       operationIdValidationError(expectedOperationId) !== undefined ||
@@ -4950,6 +5118,9 @@ function assertModelUsageRecord(record: ModelUsageRecord, expectedOperationId: s
       (record.usageStatus !== "reported" && record.usageStatus !== "not-reported" &&
        record.usageStatus !== "invalid-report") ||
       (record.usageStatus === "reported") !== (record.usage !== null) ||
+      (record.reservationStatusAtCompletion !== undefined &&
+       (!isAdminUsageReservationStatus(record.reservationStatusAtCompletion) ||
+        record.reservationStatusAtCompletion !== legacyModelReservationStatus(record))) ||
       (record.chargeSubunits !== null &&
        (typeof record.chargeSubunits !== "bigint" || record.chargeSubunits < 0n))) {
     throw new Error("Model Usage Record does not reconcile.");
@@ -5139,24 +5310,29 @@ function assertGatekeeperMeteringAttempt(
 
 function assertGatekeeperUsageRecord(
     record: GatekeeperUsageRecord, expectedOperationId: string): void {
+  const baseKeys = [
+    "id",
+    "operationId",
+    "attribution",
+    "chargeSnapshot",
+    "reservationId",
+    "ledgerEntryId",
+    "outcome",
+    "chargeSubunits",
+    "createdAt",
+  ];
   if (typeof record !== "object" || record === null || Array.isArray(record) ||
-      !hasExactKeys(record, [
-        "id",
-        "operationId",
-        "attribution",
-        "chargeSnapshot",
-        "reservationId",
-        "ledgerEntryId",
-        "outcome",
-        "chargeSubunits",
-        "createdAt",
-      ]) ||
+      (!hasExactKeys(record, baseKeys) &&
+       !hasExactKeys(record, [...baseKeys, "reservationStatusAtCompletion"])) ||
       record.id !== gatekeeperUsageRecordId(expectedOperationId) ||
       record.operationId !== expectedOperationId ||
       operationIdValidationError(expectedOperationId) !== undefined ||
       typeof record.createdAt !== "string" ||
       (record.outcome !== "settled" && record.outcome !== "failed-before-execution" &&
        record.outcome !== "usage-unknown") ||
+      (record.reservationStatusAtCompletion !== undefined &&
+       (!isAdminUsageReservationStatus(record.reservationStatusAtCompletion) ||
+        record.reservationStatusAtCompletion !== legacyGatekeeperReservationStatus(record))) ||
       (record.chargeSubunits !== null &&
        (typeof record.chargeSubunits !== "bigint" || record.chargeSubunits < 0n))) {
     throw new Error("Gatekeeper Usage Record does not reconcile.");

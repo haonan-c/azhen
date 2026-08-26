@@ -1149,8 +1149,8 @@ export type AdminUsageReportFilter = {
   externalAccountIds?: string[];
   /** Causal Metered Use origins. */
   sources?: UsageSource[];
-  /** Durable terminal Usage outcomes. */
-  outcomes?: AdminUsageReportOutcome[];
+  /** Durable terminal Usage outcomes, including the legacy unknown selector. */
+  outcomes?: AdminUsageReportFilterOutcome[];
   /** Priced and Unpriced selection. */
   pricingStatuses?: ("priced" | "unpriced")[];
   /** Model, Gatekeeper, and formal attempt-only Summary selection. */
@@ -1161,10 +1161,17 @@ export type AdminUsageReportFilter = {
 export type AdminUsageReportOutcome =
   | "settled"
   | "failed-before-execution"
-  | "usage-unknown"
+  | "usage-unknown-released"
+  | "usage-unknown-held"
   | "reconciliation-required"
   | "reconciled-settled"
   | "reconciled-released";
+
+/** Report filter outcome, including the legacy unknown selector that expands to both new states. */
+export type AdminUsageReportFilterOutcome = AdminUsageReportOutcome | "usage-unknown";
+
+/** Authoritative Credit Reservation state that explains one reported Metering Attempt. */
+export type AdminUsageReservationStatus = "held" | "released" | "settled" | "none";
 
 /** Immutable snapshot metadata shared by overview, rows, and CSV for one report capability. */
 export type AdminUsageReportSnapshot = {
@@ -1208,6 +1215,16 @@ export type AdminUsageReportRowMetrics = {
   preExecutionFailures: bigint;
   /** Unknown-held or released-unknown operations represented by this row. */
   unknownOperations: bigint;
+  /** Formal Metering Attempts represented by this row. */
+  meteringAttempts: bigint;
+  /** Attempts whose Credit Reservation remains held. */
+  heldReservations: bigint;
+  /** Attempts whose Credit Reservation was released. */
+  releasedReservations: bigint;
+  /** Attempts whose Credit Reservation was settled into a Ledger charge. */
+  settledReservations: bigint;
+  /** Attempts that never owned a Credit Reservation. */
+  unreservedAttempts: bigint;
   /** Unpriced model uses represented by this row. */
   unpricedModelUses: bigint;
   /** Unpriced Gatekeeper operations represented by this row. */
@@ -1254,6 +1271,10 @@ export type AdminUsageReportDetailRow = AdminUsageReportRowDimensions & {
   rowId: string;
   /** Random opaque reference resolved only inside the corresponding User Durable Object. */
   safeRecordRef: string;
+  /** Content-free opaque reference for the represented Metering Attempt, or null for an audit row. */
+  safeAttemptRef: string | null;
+  /** Authoritative Credit Reservation result for the represented Metering Attempt. */
+  reservationStatus: AdminUsageReservationStatus;
   /** Canonical UTC event time from the authoritative Usage Record. */
   occurredAtUtc: string;
   /** Report-local event time including its numeric UTC offset. */

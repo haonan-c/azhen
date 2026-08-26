@@ -1,5 +1,6 @@
 import {DurableObject} from "cloudflare:workers";
 import type {
+  AdminUsageReservationStatus,
   AdminUsageReportMetrics,
   AdminUsageReportPage,
   AdminUsageReportRow,
@@ -38,7 +39,8 @@ type UsageProjectionFactContribution = {
   usagePrincipalRef: string;
   source: UsageSource;
   kind: "model" | "gatekeeper";
-  outcome: "settled" | "failed-before-execution" | "usage-unknown" |
+  outcome: "settled" | "failed-before-execution" | "usage-unknown-released" |
+    "usage-unknown-held" |
     "reconciliation-required" | "reconciled-settled" | "reconciled-released";
   pricing: "priced" | "unpriced";
   deploymentModelId: string | null;
@@ -57,6 +59,11 @@ type UsageProjectionFactContribution = {
   billableApiOperations: bigint;
   preExecutionFailures: bigint;
   unknownOperations: bigint;
+  meteringAttempts: bigint;
+  heldReservations: bigint;
+  releasedReservations: bigint;
+  settledReservations: bigint;
+  unreservedAttempts: bigint;
   activeUserContribution: bigint;
   unpricedModelUses: bigint;
   unpricedApiOperations: bigint;
@@ -67,6 +74,10 @@ export type UsageProjectionDetailFact = UsageProjectionFactContribution & {
   rowKind: "detail";
   /** Random opaque reference resolved only inside the authoritative User Durable Object. */
   safeRecordRef: string;
+  /** Content-free opaque reference for the represented Metering Attempt, or null for an audit. */
+  safeAttemptRef: string | null;
+  /** Authoritative Credit Reservation result for the represented Metering Attempt. */
+  reservationStatus: AdminUsageReservationStatus;
   /** Canonical UTC event time owned by the authoritative Usage Record. */
   occurredAt: string;
   bucketStart?: never;
@@ -192,6 +203,8 @@ type StoredFactRow = {
   source_sequence: string;
   occurred_at: string | null;
   safe_record_ref: string | null;
+  safe_attempt_ref: string | null;
+  reservation_status: AdminUsageReservationStatus | null;
   bucket_start: string | null;
   summary_fact_id: string | null;
   summary_revision: string | null;
@@ -219,6 +232,11 @@ type StoredFactRow = {
   billable_api_operations: string;
   pre_execution_failures: string;
   unknown_operations: string;
+  metering_attempts: string;
+  held_reservations: string;
+  released_reservations: string;
+  settled_reservations: string;
+  unreserved_attempts: string;
   active_user_contribution: string;
   unpriced_model_uses: string;
   unpriced_api_operations: string;
@@ -243,6 +261,11 @@ type StoredSummaryRow = {
   billable_api_operations: string;
   pre_execution_failures: string;
   unknown_operations: string;
+  metering_attempts: string;
+  held_reservations: string;
+  released_reservations: string;
+  settled_reservations: string;
+  unreserved_attempts: string;
   active_user_contribution: string;
   unpriced_model_uses: string;
   unpriced_api_operations: string;
@@ -260,6 +283,11 @@ type ProjectionMetricSnapshot = {
   billableApiOperations: bigint;
   preExecutionFailures: bigint;
   unknownOperations: bigint;
+  meteringAttempts: bigint;
+  heldReservations: bigint;
+  releasedReservations: bigint;
+  settledReservations: bigint;
+  unreservedAttempts: bigint;
   activeUserContribution: bigint;
   unpricedModelUses: bigint;
   unpricedApiOperations: bigint;
@@ -273,12 +301,24 @@ const FACT_BASE_KEYS = [
   "providerCostUsdSubunits", "chargedUsageCreditSubunits", "meteredUseCount",
   "billableApiOperations",
   "preExecutionFailures", "unknownOperations", "activeUserContribution", "unpricedModelUses",
-  "unpricedApiOperations",
+  "unpricedApiOperations", "meteringAttempts", "heldReservations", "releasedReservations",
+  "settledReservations", "unreservedAttempts",
 ] as const;
-const PRE_METER_FACT_BASE_KEYS = FACT_BASE_KEYS.filter(key => key !== "meteredUseCount");
-const LEGACY_FACT_BASE_KEYS = FACT_BASE_KEYS.filter(key =>
+const PRE_EXPLAINABILITY_FACT_BASE_KEYS = FACT_BASE_KEYS.filter(key =>
+  key !== "meteringAttempts" && key !== "heldReservations" &&
+  key !== "releasedReservations" && key !== "settledReservations" &&
+  key !== "unreservedAttempts");
+const PRE_METER_FACT_BASE_KEYS = PRE_EXPLAINABILITY_FACT_BASE_KEYS.filter(
+  key => key !== "meteredUseCount",
+);
+const LEGACY_FACT_BASE_KEYS = PRE_EXPLAINABILITY_FACT_BASE_KEYS.filter(key =>
   key !== "meteredUseCount" && key !== "preExecutionFailures" && key !== "unknownOperations");
-const DETAIL_FACT_KEYS = new Set<string>([...FACT_BASE_KEYS, "safeRecordRef", "occurredAt"]);
+const DETAIL_FACT_KEYS = new Set<string>([
+  ...FACT_BASE_KEYS, "safeRecordRef", "safeAttemptRef", "reservationStatus", "occurredAt",
+]);
+const PRE_EXPLAINABILITY_DETAIL_FACT_KEYS = new Set<string>([
+  ...PRE_EXPLAINABILITY_FACT_BASE_KEYS, "safeRecordRef", "occurredAt",
+]);
 const PRE_METER_DETAIL_FACT_KEYS = new Set<string>([
   ...PRE_METER_FACT_BASE_KEYS, "safeRecordRef", "occurredAt",
 ]);
@@ -290,6 +330,10 @@ const LEGACY_PRE_COUNTER_DETAIL_FACT_KEYS = new Set<string>([
 ]);
 const AGGREGATE_FACT_KEYS = new Set<string>([
   ...FACT_BASE_KEYS, "meteredKind", "bucketStart", "summaryFactId", "summaryRevision",
+]);
+const PRE_EXPLAINABILITY_AGGREGATE_FACT_KEYS = new Set<string>([
+  ...PRE_EXPLAINABILITY_FACT_BASE_KEYS,
+  "meteredKind", "bucketStart", "summaryFactId", "summaryRevision",
 ]);
 const PRE_METER_AGGREGATE_FACT_KEYS = new Set<string>([
   ...PRE_METER_FACT_BASE_KEYS, "meteredKind", "bucketStart", "summaryFactId", "summaryRevision",
@@ -304,8 +348,12 @@ const SOURCES = new Set<UsageSource>([
   "agent", "gadget", "direct-user", "system-assistance", "hook", "scheduled",
 ]);
 const OUTCOMES = new Set<UsageProjectionFact["outcome"]>([
-  "settled", "failed-before-execution", "usage-unknown", "reconciliation-required",
+  "settled", "failed-before-execution", "usage-unknown-released", "usage-unknown-held",
+  "reconciliation-required",
   "reconciled-settled", "reconciled-released",
+]);
+const RESERVATION_STATUSES = new Set<AdminUsageReservationStatus>([
+  "held", "released", "settled", "none",
 ]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -380,7 +428,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         rejected.push({projectionFactId, code});
         continue;
       }
-      const hash = await hashProjectionFact(fact, projectionFactHashVersion(input));
+      const hash = await hashProjectionFact(
+        fact,
+        projectionFactHashVersion(input),
+        legacyProjectionHashOutcome(input),
+      );
       const meta = this.#meta();
       const result = this.#ingestOne(fact, hash, meta.active_generation, true);
       if (result.rejection !== null) {
@@ -496,6 +548,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       meteredUseCount: 0n,
       preExecutionFailures: 0n,
       unknownOperations: 0n,
+      meteringAttempts: 0n,
+      heldReservations: 0n,
+      releasedReservations: 0n,
+      settledReservations: 0n,
+      unreservedAttempts: 0n,
       unpricedModelUses: 0n,
       unpricedApiOperations: 0n,
       activeUsers: 0n,
@@ -515,6 +572,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         totals.meteredUseCount += BigInt(row.metered_use_count);
         totals.preExecutionFailures += BigInt(row.pre_execution_failures);
         totals.unknownOperations += BigInt(row.unknown_operations);
+        totals.meteringAttempts += BigInt(row.metering_attempts);
+        totals.heldReservations += BigInt(row.held_reservations);
+        totals.releasedReservations += BigInt(row.released_reservations);
+        totals.settledReservations += BigInt(row.settled_reservations);
+        totals.unreservedAttempts += BigInt(row.unreserved_attempts);
         totals.unpricedModelUses += BigInt(row.unpriced_model_uses);
         totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
       }
@@ -540,12 +602,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const predicate = buildUsageReportPredicate(query, rowKind, cursor);
     return this.ctx.storage.sql.exec<StoredFactRow>(`
       SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
+             safe_attempt_ref, reservation_status,
              bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
              summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
              deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
              cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
              reasoning_tokens, provider_cost, charged_credits, metered_use_count,
              billable_api_operations, pre_execution_failures, unknown_operations,
+             metering_attempts, held_reservations, released_reservations,
+             settled_reservations, unreserved_attempts,
              active_user_contribution,
              unpriced_model_uses, unpriced_api_operations, applied, applied_watermark
       FROM usage_projection_facts AS facts
@@ -562,7 +627,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       registeredUserRef: row.principal_ref,
       source: row.source,
       meteredKind,
-      outcome: row.outcome,
+      outcome: normalizeStoredOutcome(row.usage_kind, row.outcome),
       pricingStatus: row.pricing,
       deploymentModelId: row.deployment_model_id,
       gatekeeperId: row.vendor_id,
@@ -582,6 +647,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       meteredUseCount: BigInt(row.metered_use_count),
       preExecutionFailures: BigInt(row.pre_execution_failures),
       unknownOperations: BigInt(row.unknown_operations),
+      meteringAttempts: BigInt(row.metering_attempts),
+      heldReservations: BigInt(row.held_reservations),
+      releasedReservations: BigInt(row.released_reservations),
+      settledReservations: BigInt(row.settled_reservations),
+      unreservedAttempts: BigInt(row.unreserved_attempts),
       unpricedModelUses: BigInt(row.unpriced_model_uses),
       unpricedApiOperations: BigInt(row.unpriced_api_operations),
     };
@@ -595,6 +665,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         rowKind: "detail",
         rowId: row.fact_id,
         safeRecordRef: row.safe_record_ref ?? row.fact_id,
+        safeAttemptRef: row.safe_attempt_ref,
+        reservationStatus: row.reservation_status ?? "none",
         occurredAtUtc: row.occurred_at,
         reportLocalTimestamp: reportLocalTimestamp(
           row.occurred_at, query.snapshot.reportTimeZone,
@@ -1041,7 +1113,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
             if (!marker.stored) return;
             continue;
           }
-          const hash = await hashProjectionFact(fact, projectionFactHashVersion(input));
+          const hash = await hashProjectionFact(
+            fact,
+            projectionFactHashVersion(input),
+            legacyProjectionHashOutcome(input),
+          );
           const result = this.#ingestOne(fact, hash, meta.rebuild_generation, false, true);
           if (result.rejection !== null && !result.sequenceRejectionAccepted) return;
         }
@@ -1483,19 +1559,23 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_facts (
           generation, fact_id, fact_hash, principal_ref, source_sequence, occurred_at,
-          safe_record_ref, bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
+          safe_record_ref, safe_attempt_ref, reservation_status, bucket_start, summary_fact_id,
+          summary_revision, summary_dimension_key,
           summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
           deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
           cache_hit_input, cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
           provider_cost, charged_credits, metered_use_count, billable_api_operations,
-          pre_execution_failures, unknown_operations, active_user_contribution, unpriced_model_uses,
-          unpriced_api_operations, applied
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+          pre_execution_failures, unknown_operations, metering_attempts, held_reservations,
+          released_reservations, settled_reservations, unreserved_attempts,
+          active_user_contribution, unpriced_model_uses, unpriced_api_operations, applied
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
       `,
       generation, fact.projectionFactId, hash, fact.usagePrincipalRef,
       fact.sourceSequence.toString(), fact.rowKind === "detail" ? fact.occurredAt : null,
       fact.rowKind === "detail" && typeof fact.safeRecordRef === "string"
         ? fact.safeRecordRef : null,
+      fact.rowKind === "detail" ? fact.safeAttemptRef : null,
+      fact.rowKind === "detail" ? fact.reservationStatus : null,
       fact.rowKind === "aggregate" ? fact.bucketStart : null,
       fact.rowKind === "aggregate" ? fact.summaryFactId : null,
       fact.rowKind === "aggregate" ? fact.summaryRevision.toString() : null,
@@ -1509,6 +1589,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       fact.providerCostUsdSubunits.toString(), fact.chargedUsageCreditSubunits.toString(),
       fact.meteredUseCount.toString(), fact.billableApiOperations.toString(),
       fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
+      fact.meteringAttempts.toString(), fact.heldReservations.toString(),
+      fact.releasedReservations.toString(), fact.settledReservations.toString(),
+      fact.unreservedAttempts.toString(),
       fact.activeUserContribution.toString(),
       fact.unpricedModelUses.toString(), fact.unpricedApiOperations.toString());
       if (updateActiveMeta) {
@@ -1598,6 +1681,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       const nextSequence = (highWater + 1n).toString();
       const next = this.ctx.storage.sql.exec<StoredFactRow>(`
         SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
+               safe_attempt_ref, reservation_status,
                bucket_start,
                summary_fact_id, summary_revision, summary_dimension_key,
                summary_snapshot_value, source, row_kind, metered_kind,
@@ -1605,7 +1689,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
                external_account_id, gadget_id, cache_hit_input, cache_miss_input,
                cache_write_input, output_tokens, reasoning_tokens, provider_cost, charged_credits,
                metered_use_count, billable_api_operations, pre_execution_failures,
-               unknown_operations, active_user_contribution, unpriced_model_uses,
+               unknown_operations, metering_attempts, held_reservations, released_reservations,
+               settled_reservations, unreserved_attempts,
+               active_user_contribution, unpriced_model_uses,
                unpriced_api_operations, applied
         FROM usage_projection_facts
         WHERE generation = ? AND principal_ref = ? AND source_sequence = ?
@@ -1775,7 +1861,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
              cache_hit_input,
              cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
              provider_cost, charged_credits, metered_use_count, billable_api_operations,
-             pre_execution_failures, unknown_operations, active_user_contribution, unpriced_model_uses,
+             pre_execution_failures, unknown_operations, metering_attempts, held_reservations,
+             released_reservations, settled_reservations, unreserved_attempts,
+             active_user_contribution, unpriced_model_uses,
              unpriced_api_operations
       FROM usage_projection_summaries WHERE generation = ? AND summary_fact_id = ?
     `, generation, fact.summary_fact_id).toArray()[0];
@@ -1812,9 +1900,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         generation, summary_fact_id, summary_revision, dimension_key, snapshot_value, metered_kind,
         cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
         reasoning_tokens, provider_cost, charged_credits, metered_use_count,
-        billable_api_operations, pre_execution_failures, unknown_operations, active_user_contribution,
-        unpriced_model_uses, unpriced_api_operations
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        billable_api_operations, pre_execution_failures, unknown_operations, metering_attempts,
+        held_reservations, released_reservations, settled_reservations, unreserved_attempts,
+        active_user_contribution, unpriced_model_uses, unpriced_api_operations
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (generation, summary_fact_id) DO UPDATE SET
         summary_revision = excluded.summary_revision,
         dimension_key = excluded.dimension_key,
@@ -1831,6 +1920,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         billable_api_operations = excluded.billable_api_operations,
         pre_execution_failures = excluded.pre_execution_failures,
         unknown_operations = excluded.unknown_operations,
+        metering_attempts = excluded.metering_attempts,
+        held_reservations = excluded.held_reservations,
+        released_reservations = excluded.released_reservations,
+        settled_reservations = excluded.settled_reservations,
+        unreserved_attempts = excluded.unreserved_attempts,
         active_user_contribution = excluded.active_user_contribution,
         unpriced_model_uses = excluded.unpriced_model_uses,
         unpriced_api_operations = excluded.unpriced_api_operations
@@ -1841,7 +1935,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     metrics.providerCost.toString(), metrics.chargedCredits.toString(),
     metrics.meteredUseCount.toString(), metrics.billableApiOperations.toString(),
     metrics.preExecutionFailures.toString(),
-    metrics.unknownOperations.toString(), metrics.activeUserContribution.toString(),
+    metrics.unknownOperations.toString(), metrics.meteringAttempts.toString(),
+    metrics.heldReservations.toString(), metrics.releasedReservations.toString(),
+    metrics.settledReservations.toString(), metrics.unreservedAttempts.toString(),
+    metrics.activeUserContribution.toString(),
     metrics.unpricedModelUses.toString(), metrics.unpricedApiOperations.toString());
   }
 
@@ -1907,6 +2004,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   #initializeSchema(): void {
+    let needsExplainabilityRebuild = false;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_meta (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1), active_generation TEXT NOT NULL,
@@ -2091,7 +2189,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       CREATE TABLE IF NOT EXISTS usage_projection_facts (
         generation TEXT NOT NULL, fact_id TEXT NOT NULL, fact_hash TEXT NOT NULL,
         principal_ref TEXT NOT NULL, source_sequence TEXT NOT NULL, occurred_at TEXT,
-        safe_record_ref TEXT, bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
+        safe_record_ref TEXT, safe_attempt_ref TEXT, reservation_status TEXT,
+        bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
         summary_dimension_key TEXT, summary_snapshot_value TEXT,
         source TEXT NOT NULL, row_kind TEXT NOT NULL, metered_kind TEXT, usage_kind TEXT NOT NULL,
         outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT, vendor_id TEXT,
@@ -2102,6 +2201,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
         billable_api_operations TEXT NOT NULL,
         pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
+        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
+        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
+        unreserved_attempts TEXT NOT NULL,
         active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
         unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
         applied_watermark TEXT,
@@ -2111,6 +2213,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
                 summary_fact_id IS NULL AND summary_revision IS NULL AND
                 summary_dimension_key IS NULL AND summary_snapshot_value IS NULL) OR
                (row_kind = 'aggregate' AND occurred_at IS NULL AND safe_record_ref IS NULL AND
+                safe_attempt_ref IS NULL AND reservation_status IS NULL AND
                 metered_kind IS NOT NULL AND
                 bucket_start IS NOT NULL AND
                 summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
@@ -2123,6 +2226,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     if (!factColumns.has("safe_record_ref")) {
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_facts ADD COLUMN safe_record_ref TEXT
+      `);
+    }
+    if (!factColumns.has("safe_attempt_ref")) {
+      needsExplainabilityRebuild = true;
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts ADD COLUMN safe_attempt_ref TEXT
+      `);
+    }
+    if (!factColumns.has("reservation_status")) {
+      needsExplainabilityRebuild = true;
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_facts ADD COLUMN reservation_status TEXT
       `);
     }
     if (!factColumns.has("metered_kind")) {
@@ -2150,6 +2265,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ALTER TABLE usage_projection_facts
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
       `);
+    }
+    for (const column of [
+      "metering_attempts", "held_reservations", "released_reservations",
+      "settled_reservations", "unreserved_attempts",
+    ]) {
+      if (!factColumns.has(column)) {
+        needsExplainabilityRebuild = true;
+        this.ctx.storage.sql.exec(`
+          ALTER TABLE usage_projection_facts
+          ADD COLUMN ${column} TEXT NOT NULL DEFAULT '0'
+        `);
+      }
     }
     if (!factColumns.has("applied_watermark")) {
       this.ctx.storage.sql.exec(
@@ -2249,6 +2376,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
         billable_api_operations TEXT NOT NULL,
         pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
+        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
+        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
+        unreserved_attempts TEXT NOT NULL,
         active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
         unpriced_api_operations TEXT NOT NULL,
         PRIMARY KEY (generation, summary_fact_id)
@@ -2284,6 +2414,34 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ADD COLUMN unknown_operations TEXT NOT NULL DEFAULT '0'
       `);
     }
+    for (const column of [
+      "metering_attempts", "held_reservations", "released_reservations",
+      "settled_reservations", "unreserved_attempts",
+    ]) {
+      if (!summaryColumns.has(column)) {
+        needsExplainabilityRebuild = true;
+        this.ctx.storage.sql.exec(`
+          ALTER TABLE usage_projection_summaries
+          ADD COLUMN ${column} TEXT NOT NULL DEFAULT '0'
+        `);
+      }
+    }
+    if (needsExplainabilityRebuild) {
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_meta SET bootstrap_state = 'pending',
+          cleanup_generation = CASE WHEN rebuild_state = 'rebuilding'
+            THEN rebuild_generation ELSE cleanup_generation END,
+          cleanup_stage = CASE WHEN rebuild_state = 'rebuilding'
+            THEN 'facts' ELSE cleanup_stage END,
+          rebuild_request_id = NULL, rebuild_state = NULL, rebuild_generation = NULL,
+          rebuild_registry_revision = NULL, rebuild_registry_cursor = NULL,
+          rebuild_registry_complete = 0, rebuild_current_user_ref = NULL,
+          rebuild_current_user_fact_cursor = NULL, rebuild_current_user_is_last = 0,
+          rebuild_authority_complete = 0, rebuild_started_at = NULL,
+          rebuild_completed_at = NULL, rebuild_failure_code = NULL
+        WHERE singleton = 1
+      `);
+    }
     this.ctx.storage.sql.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS usage_projection_summaries_dimension
       ON usage_projection_summaries(generation, dimension_key)
@@ -2305,34 +2463,75 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   const input = value as UsageProjectionFact;
+  const envelope = value as Record<string, unknown>;
+  const raw = value as {kind?: unknown; outcome?: unknown; pricing?: unknown};
   const inputKeys = Object.keys(value);
   const allowedKeys = input.rowKind === "detail"
-    ? [DETAIL_FACT_KEYS, PRE_METER_DETAIL_FACT_KEYS, PRE_COUNTER_DETAIL_FACT_KEYS,
+    ? [DETAIL_FACT_KEYS, PRE_EXPLAINABILITY_DETAIL_FACT_KEYS,
+        PRE_METER_DETAIL_FACT_KEYS, PRE_COUNTER_DETAIL_FACT_KEYS,
         LEGACY_PRE_COUNTER_DETAIL_FACT_KEYS]
     : input.rowKind === "aggregate"
-      ? [AGGREGATE_FACT_KEYS, PRE_METER_AGGREGATE_FACT_KEYS,
+      ? [AGGREGATE_FACT_KEYS, PRE_EXPLAINABILITY_AGGREGATE_FACT_KEYS,
+          PRE_METER_AGGREGATE_FACT_KEYS,
           PRE_COUNTER_AGGREGATE_FACT_KEYS, LEGACY_PRE_COUNTER_AGGREGATE_FACT_KEYS] : [];
   const hasExpectedKeys = allowedKeys.some(expectedKeys =>
     inputKeys.length === expectedKeys.size && inputKeys.every(key => expectedKeys.has(key)));
   if (!hasExpectedKeys) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
+  const outcome = raw.outcome === "usage-unknown"
+    ? raw.kind === "model" ? "usage-unknown-released" : "usage-unknown-held"
+    : raw.outcome;
+  const legacyMeteredUseCount = inputKeys.includes("meteredUseCount")
+    ? input.meteredUseCount : input.activeUserContribution;
+  const legacyPreExecutionFailures = inputKeys.includes("preExecutionFailures")
+    ? input.preExecutionFailures : outcome === "failed-before-execution" ? 1n : 0n;
+  const legacyUnknownOperations = inputKeys.includes("unknownOperations")
+    ? input.unknownOperations
+    : outcome === "usage-unknown-released" || outcome === "usage-unknown-held" ||
+        outcome === "reconciliation-required" ? 1n : 0n;
+  const legacyAttemptCount = input.rowKind === "detail"
+    ? outcome === "reconciled-settled" || outcome === "reconciled-released" ? 0n : 1n
+    : outcome === "reconciled-settled" || outcome === "reconciled-released" ? 0n
+      : outcome === "settled" ? legacyMeteredUseCount
+        : outcome === "failed-before-execution" ? legacyPreExecutionFailures
+          : legacyUnknownOperations;
+  const reservationStatus = input.rowKind === "detail" &&
+      inputKeys.includes("reservationStatus")
+    ? input.reservationStatus
+    : legacyReservationStatus(raw.pricing, outcome);
+  const meteringAttempts = inputKeys.includes("meteringAttempts")
+    ? input.meteringAttempts : legacyAttemptCount;
   const fact = {
     ...input,
+    outcome,
     ...(input.rowKind === "aggregate" ? {
       meteredKind: inputKeys.includes("meteredKind")
         ? input.meteredKind
         : input.activeUserContribution > 0n ? input.kind : "attempt",
-    } : {}),
+    } : {
+      safeAttemptRef: inputKeys.includes("safeAttemptRef")
+        ? input.safeAttemptRef
+        : outcome === "reconciled-settled" || outcome === "reconciled-released"
+          ? null : typeof envelope.safeRecordRef === "string"
+            ? envelope.safeRecordRef : input.projectionFactId,
+      reservationStatus,
+    }),
     meteredUseCount: inputKeys.includes("meteredUseCount")
-      ? input.meteredUseCount : input.activeUserContribution,
+      ? input.meteredUseCount : legacyMeteredUseCount,
     preExecutionFailures: inputKeys.includes("preExecutionFailures")
-      ? input.preExecutionFailures
-      : input.outcome === "failed-before-execution" ? 1n : 0n,
+      ? input.preExecutionFailures : legacyPreExecutionFailures,
     unknownOperations: inputKeys.includes("unknownOperations")
-      ? input.unknownOperations
-      : input.outcome === "usage-unknown" || input.outcome === "reconciliation-required"
-        ? 1n : 0n,
+      ? input.unknownOperations : legacyUnknownOperations,
+    meteringAttempts,
+    heldReservations: inputKeys.includes("heldReservations")
+      ? input.heldReservations : reservationStatus === "held" ? meteringAttempts : 0n,
+    releasedReservations: inputKeys.includes("releasedReservations")
+      ? input.releasedReservations : reservationStatus === "released" ? meteringAttempts : 0n,
+    settledReservations: inputKeys.includes("settledReservations")
+      ? input.settledReservations : reservationStatus === "settled" ? meteringAttempts : 0n,
+    unreservedAttempts: inputKeys.includes("unreservedAttempts")
+      ? input.unreservedAttempts : reservationStatus === "none" ? meteringAttempts : 0n,
   } as UsageProjectionFact;
   if (fact.schemaVersion !== 1 || !UUID_PATTERN.test(fact.projectionFactId) ||
       typeof fact.sourceSequence !== "bigint" || fact.sourceSequence < 1n ||
@@ -2347,8 +2546,10 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
        fact.meteredKind !== "attempt"))) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
-  if (fact.rowKind === "detail" && "safeRecordRef" in fact &&
-      !UUID_PATTERN.test(fact.safeRecordRef)) {
+  if (fact.rowKind === "detail" && ("safeRecordRef" in fact &&
+      !UUID_PATTERN.test(fact.safeRecordRef) ||
+      fact.safeAttemptRef !== null && !UUID_PATTERN.test(fact.safeAttemptRef) ||
+      !RESERVATION_STATUSES.has(fact.reservationStatus))) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
   const sourceTime = fact.rowKind === "detail"
@@ -2371,6 +2572,8 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
     fact.providerCostUsdSubunits, fact.chargedUsageCreditSubunits,
     fact.meteredUseCount, fact.billableApiOperations,
     fact.preExecutionFailures, fact.unknownOperations,
+    fact.meteringAttempts, fact.heldReservations, fact.releasedReservations,
+    fact.settledReservations, fact.unreservedAttempts,
     fact.activeUserContribution, fact.unpricedModelUses, fact.unpricedApiOperations];
   if (exactFields.some(item => typeof item !== "bigint" || item < 0n) ||
       fact.meteredUseCount !== fact.activeUserContribution ||
@@ -2381,6 +2584,17 @@ function normalizeProjectionFactEnvelope(value: unknown): UsageProjectionFact {
   return fact.rowKind === "detail"
     ? {...fact, occurredAt: sourceTime}
     : {...fact, bucketStart: sourceTime};
+}
+
+function legacyReservationStatus(
+    pricing: unknown,
+    outcome: unknown): AdminUsageReservationStatus {
+  if (pricing === "unpriced") return "none";
+  if (outcome === "usage-unknown-held" || outcome === "reconciliation-required") return "held";
+  if (outcome === "usage-unknown-released" || outcome === "failed-before-execution" ||
+      outcome === "reconciled-released") return "released";
+  if (outcome === "settled" || outcome === "reconciled-settled") return "settled";
+  return "none";
 }
 
 function normalizeProjectionBucketStart(value: unknown): string {
@@ -2417,8 +2631,11 @@ function assertProjectionContributionInvariants(fact: UsageProjectionFact): void
   if (fact.rowKind === "detail") {
     const expectedApiOperations = fact.kind === "gatekeeper" && confirmed ? 1n : 0n;
     const expectedPreExecutionFailures = fact.outcome === "failed-before-execution" ? 1n : 0n;
-    const expectedUnknownOperations = fact.outcome === "usage-unknown" ||
-      fact.outcome === "reconciliation-required" ? 1n : 0n;
+    const expectedUnknownOperations = fact.outcome === "usage-unknown-released" ||
+      fact.outcome === "usage-unknown-held" || fact.outcome === "reconciliation-required"
+      ? 1n : 0n;
+    const expectedAttempts = fact.outcome === "reconciled-settled" ||
+      fact.outcome === "reconciled-released" ? 0n : 1n;
     const expectedUnpricedModel = fact.kind === "model" && confirmed &&
       fact.pricing === "unpriced" ? 1n : 0n;
     const expectedUnpricedApi = fact.kind === "gatekeeper" && confirmed &&
@@ -2428,6 +2645,8 @@ function assertProjectionContributionInvariants(fact: UsageProjectionFact): void
         fact.billableApiOperations !== expectedApiOperations ||
         fact.preExecutionFailures !== expectedPreExecutionFailures ||
         fact.unknownOperations !== expectedUnknownOperations ||
+        fact.meteringAttempts !== expectedAttempts ||
+        (expectedAttempts === 0n) !== (fact.safeAttemptRef === null) ||
         fact.unpricedModelUses !== expectedUnpricedModel ||
         fact.unpricedApiOperations !== expectedUnpricedApi) {
       throw new TypeError("Usage Projection fact is invalid.");
@@ -2449,8 +2668,11 @@ function assertProjectionContributionInvariants(fact: UsageProjectionFact): void
        fact.unpricedApiOperations !== fact.billableApiOperations)) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
-  if ((fact.outcome === "failed-before-execution") !== (fact.preExecutionFailures > 0n) ||
-      ((fact.outcome === "usage-unknown" || fact.outcome === "reconciliation-required") !==
+  if (fact.heldReservations + fact.releasedReservations + fact.settledReservations +
+      fact.unreservedAttempts !== fact.meteringAttempts ||
+      (fact.outcome === "failed-before-execution") !== (fact.preExecutionFailures > 0n) ||
+      ((fact.outcome === "usage-unknown-released" || fact.outcome === "usage-unknown-held" ||
+        fact.outcome === "reconciliation-required") !==
        (fact.unknownOperations > 0n))) {
     throw new TypeError("Usage Projection fact is invalid.");
   }
@@ -2480,10 +2702,11 @@ function isSafeRequestId(value: unknown): value is string {
     });
 }
 
-type ProjectionFactHashVersion = "legacy" | "pre-meter" | "current";
+type ProjectionFactHashVersion = "legacy" | "pre-meter" | "current" | "explainable";
 
 function projectionFactHashVersion(input: UsageProjectionFact): ProjectionFactHashVersion {
   const keys = new Set(Object.keys(input));
+  if (keys.has("meteringAttempts")) return "explainable";
   if (keys.has("meteredUseCount")) return "current";
   return keys.has("safeRecordRef") || keys.has("preExecutionFailures") ||
       keys.has("unknownOperations")
@@ -2492,7 +2715,8 @@ function projectionFactHashVersion(input: UsageProjectionFact): ProjectionFactHa
 
 async function hashProjectionFact(
     fact: UsageProjectionFact,
-    version: ProjectionFactHashVersion): Promise<string> {
+    version: ProjectionFactHashVersion,
+    legacyOutcome: "usage-unknown" | null): Promise<string> {
   const canonical = JSON.stringify([
     fact.schemaVersion, fact.projectionFactId, fact.sourceSequence.toString(),
     fact.usagePrincipalRef, fact.rowKind, projectionFactSourceTime(fact),
@@ -2500,26 +2724,50 @@ async function hashProjectionFact(
       fact.rowKind === "detail" && typeof fact.safeRecordRef === "string"
         ? fact.safeRecordRef : null,
     ]),
+    ...(version === "explainable" && fact.rowKind === "detail" ? [
+      fact.safeAttemptRef, fact.reservationStatus,
+    ] : []),
     fact.rowKind === "aggregate" ? fact.summaryFactId : null,
     fact.rowKind === "aggregate" ? fact.summaryRevision.toString() : null,
     ...(version !== "legacy" && fact.rowKind === "aggregate" ? [fact.meteredKind] : []),
-    fact.source, fact.kind, fact.outcome,
+    fact.source, fact.kind, legacyOutcome ?? fact.outcome,
     fact.pricing, fact.deploymentModelId, fact.vendorId, fact.billingMethodKey,
     fact.externalAccountId, fact.gadgetId, fact.cacheHitInputTokens.toString(),
     fact.cacheMissInputTokens.toString(), fact.cacheWriteInputTokens.toString(),
     fact.outputTokens.toString(), fact.reasoningTokens.toString(),
     fact.providerCostUsdSubunits.toString(), fact.chargedUsageCreditSubunits.toString(),
-    ...(version === "current" ? [fact.meteredUseCount.toString()] : []),
+    ...(version === "current" || version === "explainable"
+      ? [fact.meteredUseCount.toString()] : []),
     fact.billableApiOperations.toString(),
     ...(version === "legacy" ? [] : [
       fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
     ]),
+    ...(version === "explainable" ? [
+      fact.meteringAttempts.toString(), fact.heldReservations.toString(),
+      fact.releasedReservations.toString(), fact.settledReservations.toString(),
+      fact.unreservedAttempts.toString(),
+    ] : []),
     fact.activeUserContribution.toString(),
     fact.unpricedModelUses.toString(), fact.unpricedApiOperations.toString(),
   ]);
   return new Uint8Array(await crypto.subtle.digest(
     "SHA-256", new TextEncoder().encode(canonical),
   )).toHex();
+}
+
+function legacyProjectionHashOutcome(input: unknown): "usage-unknown" | null {
+  return typeof input === "object" && input !== null && Reflect.get(input, "outcome") ===
+    "usage-unknown"
+    ? "usage-unknown" : null;
+}
+
+function normalizeStoredOutcome(
+    kind: UsageProjectionFact["kind"],
+    outcome: UsageProjectionFact["outcome"] | "usage-unknown"):
+    UsageProjectionFact["outcome"] {
+  return outcome === "usage-unknown"
+    ? kind === "model" ? "usage-unknown-released" : "usage-unknown-held"
+    : outcome;
 }
 
 function projectionFactSourceTime(fact: UsageProjectionFact): string {
@@ -2548,6 +2796,9 @@ function aggregateSnapshotValue(fact: UsageProjectionAggregateFact): string {
     fact.chargedUsageCreditSubunits.toString(), fact.meteredUseCount.toString(),
     fact.billableApiOperations.toString(),
     fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
+    fact.meteringAttempts.toString(), fact.heldReservations.toString(),
+    fact.releasedReservations.toString(), fact.settledReservations.toString(),
+    fact.unreservedAttempts.toString(),
     fact.activeUserContribution.toString(), fact.unpricedModelUses.toString(),
     fact.unpricedApiOperations.toString(),
   ]);
@@ -2566,6 +2817,11 @@ function storedFactMetricSnapshot(fact: StoredFactRow): ProjectionMetricSnapshot
     billableApiOperations: BigInt(fact.billable_api_operations),
     preExecutionFailures: BigInt(fact.pre_execution_failures),
     unknownOperations: BigInt(fact.unknown_operations),
+    meteringAttempts: BigInt(fact.metering_attempts),
+    heldReservations: BigInt(fact.held_reservations),
+    releasedReservations: BigInt(fact.released_reservations),
+    settledReservations: BigInt(fact.settled_reservations),
+    unreservedAttempts: BigInt(fact.unreserved_attempts),
     activeUserContribution: BigInt(fact.active_user_contribution),
     unpricedModelUses: BigInt(fact.unpriced_model_uses),
     unpricedApiOperations: BigInt(fact.unpriced_api_operations),
@@ -2585,6 +2841,11 @@ function storedSummaryMetricSnapshot(summary: StoredSummaryRow): ProjectionMetri
     billableApiOperations: BigInt(summary.billable_api_operations),
     preExecutionFailures: BigInt(summary.pre_execution_failures),
     unknownOperations: BigInt(summary.unknown_operations),
+    meteringAttempts: BigInt(summary.metering_attempts),
+    heldReservations: BigInt(summary.held_reservations),
+    releasedReservations: BigInt(summary.released_reservations),
+    settledReservations: BigInt(summary.settled_reservations),
+    unreservedAttempts: BigInt(summary.unreserved_attempts),
     activeUserContribution: BigInt(summary.active_user_contribution),
     unpricedModelUses: BigInt(summary.unpriced_model_uses),
     unpricedApiOperations: BigInt(summary.unpriced_api_operations),
@@ -2604,6 +2865,11 @@ function emptyMetricSnapshot(): ProjectionMetricSnapshot {
     billableApiOperations: 0n,
     preExecutionFailures: 0n,
     unknownOperations: 0n,
+    meteringAttempts: 0n,
+    heldReservations: 0n,
+    releasedReservations: 0n,
+    settledReservations: 0n,
+    unreservedAttempts: 0n,
     activeUserContribution: 0n,
     unpricedModelUses: 0n,
     unpricedApiOperations: 0n,
@@ -2625,6 +2891,11 @@ function subtractMetricSnapshots(
     billableApiOperations: next.billableApiOperations - previous.billableApiOperations,
     preExecutionFailures: next.preExecutionFailures - previous.preExecutionFailures,
     unknownOperations: next.unknownOperations - previous.unknownOperations,
+    meteringAttempts: next.meteringAttempts - previous.meteringAttempts,
+    heldReservations: next.heldReservations - previous.heldReservations,
+    releasedReservations: next.releasedReservations - previous.releasedReservations,
+    settledReservations: next.settledReservations - previous.settledReservations,
+    unreservedAttempts: next.unreservedAttempts - previous.unreservedAttempts,
     activeUserContribution: next.activeUserContribution - previous.activeUserContribution,
     unpricedModelUses: next.unpricedModelUses - previous.unpricedModelUses,
     unpricedApiOperations: next.unpricedApiOperations - previous.unpricedApiOperations,

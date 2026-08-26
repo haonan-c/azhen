@@ -1539,6 +1539,8 @@ function csvPreamble(
     "reasoning_tokens", "metered_use_count", "billable_api_operations", "pre_execution_failures",
     "unknown_operations", "unpriced_model_uses", "unpriced_api_operations",
     "provider_cost_usd_subunits", "charged_usage_credit_subunits",
+    "safe_attempt_ref", "reservation_status", "metering_attempts", "held_reservations",
+    "released_reservations", "settled_reservations", "unreserved_attempts",
   ].join(",") + "\r\n");
   return lines.join("");
 }
@@ -1577,6 +1579,13 @@ function csvReportRow(row: AdminUsageReportRow): string {
     row.metrics.unpricedApiOperations.toString(),
     row.metrics.providerCostUsdSubunits.toString(),
     row.metrics.chargedUsageCreditSubunits.toString(),
+    row.rowKind === "detail" ? row.safeAttemptRef ?? "" : "",
+    row.rowKind === "detail" ? row.reservationStatus : "",
+    row.metrics.meteringAttempts.toString(),
+    row.metrics.heldReservations.toString(),
+    row.metrics.releasedReservations.toString(),
+    row.metrics.settledReservations.toString(),
+    row.metrics.unreservedAttempts.toString(),
   ];
   return values.map(csvCell).join(",") + "\r\n";
 }

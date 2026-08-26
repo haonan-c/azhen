@@ -2,6 +2,7 @@ import {Temporal} from "temporal-polyfill/implementation";
 import {
   ADMIN_USAGE_REPORT_FILTER_VALUE_LIMIT,
   type AdminUsageReportFilter,
+  type AdminUsageReportFilterOutcome,
   type AdminUsageReportMethodFilter,
   type AdminUsageReportSnapshot,
   type UsageSource,
@@ -14,7 +15,8 @@ const SOURCES = new Set<UsageSource>([
   "agent", "gadget", "direct-user", "system-assistance", "hook", "scheduled",
 ]);
 const OUTCOMES = new Set([
-  "settled", "failed-before-execution", "usage-unknown", "reconciliation-required",
+  "settled", "failed-before-execution", "usage-unknown-released", "usage-unknown-held",
+  "reconciliation-required",
   "reconciled-settled", "reconciled-released",
 ]);
 
@@ -37,6 +39,15 @@ function normalizeReportDimensions(
   }
   const result = [...new Set(input)].toSorted();
   return result.length === 0 ? undefined : result;
+}
+
+function normalizeOutcomeDimensions(input: unknown): AdminUsageReportFilterOutcome[] | undefined {
+  if (Array.isArray(input)) {
+    input = input.flatMap(item => item === "usage-unknown"
+      ? ["usage-unknown-released", "usage-unknown-held"] : [item]);
+  }
+  return normalizeReportDimensions(input, item => OUTCOMES.has(item)) as
+    AdminUsageReportFilterOutcome[] | undefined;
 }
 
 /** Server-owned report query frozen behind one AdminUsageReport capability. */
@@ -152,8 +163,7 @@ export function normalizeAdminUsageReportFilter(
     ),
     sources: normalizeReportDimensions(value.sources, item => SOURCES.has(item as UsageSource)) as
       UsageSource[] | undefined,
-    outcomes: normalizeReportDimensions(value.outcomes, item => OUTCOMES.has(item)) as
-      AdminUsageReportFilter["outcomes"],
+    outcomes: normalizeOutcomeDimensions(value.outcomes),
     pricingStatuses: normalizeReportDimensions(
       value.pricingStatuses, item => item === "priced" || item === "unpriced",
     ) as AdminUsageReportFilter["pricingStatuses"],
@@ -222,7 +232,12 @@ export function buildUsageReportPredicate(
   addIn("facts.vendor_id", filter.gatekeeperIds);
   addIn("facts.external_account_id", filter.externalAccountIds);
   addIn("facts.source", filter.sources);
-  addIn("facts.outcome", filter.outcomes);
+  addIn(`CASE
+    WHEN facts.outcome = 'usage-unknown' AND facts.usage_kind = 'model'
+      THEN 'usage-unknown-released'
+    WHEN facts.outcome = 'usage-unknown' AND facts.usage_kind = 'gatekeeper'
+      THEN 'usage-unknown-held'
+    ELSE facts.outcome END`, filter.outcomes);
   addIn("facts.pricing", filter.pricingStatuses);
   addIn("COALESCE(facts.metered_kind, facts.usage_kind)", filter.meteredKinds);
   if (filter.methods) {
