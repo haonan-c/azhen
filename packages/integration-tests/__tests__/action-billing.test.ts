@@ -202,13 +202,15 @@ async function expectRetainedReplayRejection(
     stage: string,
     start: () => PromiseLike<unknown>,
     expectedMessage: string): Promise<void> {
+  let didReject = false;
   let rejection: unknown;
   try {
     await start();
   } catch (error) {
+    didReject = true;
     rejection = error;
   }
-  if (rejection === undefined) {
+  if (!didReject) {
     throw new Error(`Retained replay did not reject during ${stage}.`);
   }
   if (!(rejection instanceof Error) || !rejection.message.includes(expectedMessage)) {
@@ -466,6 +468,31 @@ describe("bounded administrator Usage readiness", () => {
     expect((thrown as AggregateError).cause).toBe(rpcError);
     expect((thrown as AggregateError).errors[0]).toBe(rpcError);
     expect((thrown as AggregateError).errors[1]).toBeInstanceOf(Error);
+  });
+
+  it("distinguishes a resolved RPC from non-Error retained replay rejections", async () => {
+    await expect(expectRetainedReplayRejection(
+      "resolved-rpc",
+      () => Promise.resolve(undefined),
+      "Usage Record does not exist.",
+    )).rejects.toThrow("did not reject during resolved-rpc");
+
+    for (const rejection of ["connection closed", undefined]) {
+      let thrown: unknown;
+      try {
+        await expectRetainedReplayRejection(
+          "non-error-rejection",
+          () => Promise.reject(rejection),
+          "Usage Record does not exist.",
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(AggregateError);
+      expect((thrown as AggregateError).cause).toBe(rejection);
+      expect((thrown as AggregateError).errors[0]).toBe(rejection);
+      expect((thrown as AggregateError).errors[1]).toBeInstanceOf(Error);
+    }
   });
 
   it("does not start an RPC after its absolute deadline", async () => {
