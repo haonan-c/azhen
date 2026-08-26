@@ -45,7 +45,7 @@ export async function saveStreamToFile(
     }>
   }).showSaveFilePicker
   if (picker) {
-    const handle = await picker({suggestedName: filename})
+    const handle = await picker.call(window, {suggestedName: filename})
     const writable = await handle.createWritable()
     let stream: ReadableStream<Uint8Array>
     try {

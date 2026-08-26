@@ -56,6 +56,26 @@ describe('export file transfers', () => {
     expect(click).not.toHaveBeenCalled()
   })
 
+  it('invokes the Chromium file picker with its Window receiver', async () => {
+    let receiver: unknown
+    const writable = new WritableStream<Uint8Array>()
+    const picker = vi.fn<(this: Window) => Promise<{
+      createWritable: () => Promise<WritableStream<Uint8Array>>
+    }>>(function(this: Window) {
+      receiver = this
+      return Promise.resolve({
+        createWritable: async () => writable,
+      })
+    })
+    Object.assign(window, {showSaveFilePicker: picker})
+
+    await saveStreamToFile(async () => new ReadableStream({
+      start(controller) { controller.close() },
+    }), 'usage.csv')
+
+    expect(receiver).toBe(window)
+  })
+
   it('does not create a stream when the selected file cannot become writable', async () => {
     const failure = new DOMException('Cannot write file', 'NotAllowedError')
     const createWritable = vi.fn<() => Promise<WritableStream<Uint8Array>>>()
