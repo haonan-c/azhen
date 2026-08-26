@@ -1,6 +1,6 @@
 # Usage Credits delivery work log
 
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 ## Objective
 
@@ -948,3 +948,39 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   identities and controlled external mocks. It is not production deployment verification. No push,
   merge, pull request, Issue closure, upload, promotion, deployment, production configuration or
   charging change, production contact, worktree deletion, or release publication occurred.
+
+### 2026-08-26 — Issue #63 schema v3 and stale-report fixed point
+
+- An independent Spec review found that synchronous `CREATE INDEX` during a Projection constructor
+  upgrade could scan existing report rows. The RED migration case seeded 131 legacy facts. The
+  GREEN schema v3 transaction renames legacy facts and summaries to retired shadow tables, creates
+  indexed canonical tables while they are empty, and leaves the existing bounded authority rebuild
+  to fill the new generation. Retired cleanup remains hard-limited to 64 rows per alarm turn.
+- A second Spec review found that a report minted before the shadow swap could keep the same
+  generation, watermark, and retention coordinates and read empty or partial canonical tables.
+  The Projection now requires current schema v3 and `bootstrap_state = complete` in addition to the
+  frozen coordinates. Overview, keyset rows, CSV stream mint, CSV preamble, and every CSV data page
+  fail closed while bootstrap is pending.
+- The real workerd regression keeps one randomly named Projection across pending state, actor abort,
+  reopen, and bounded authority rebuild. One CSV reader becomes stale before its preamble and a
+  second becomes stale after its preamble. Both terminate, and two concurrent replacement streams
+  then open and cancel, proving both server operation slots were released. Pending reopen fails;
+  openReport, rows, and CSV recover only after bootstrap completes.
+- The first follow-up reviews found that the test mistakenly drove the default Projection after
+  restart and did not cover both CSV phases. The RED-to-GREEN correction bound every step to the
+  same random Projection and added both stream races. Final Standards and Spec reviews at
+  `6bee6dfd3b21f5c49a781f8b375eae75b316e53b` reported no P0-P2 findings.
+- Focused gates passed: Usage report 25/25, Projection 60/60, and retention 28/28. Backend and root
+  builds passed. Root lint passed with configured non-blocking warnings, release manifest passed
+  4/4, and `git diff --check` passed. Two initial Projection runs exposed automatic/manual alarm
+  overlap in tests; exact isolated cases and the deterministic actor-turn cleanup regression then
+  passed without changing production `LIMIT 64`.
+- Final-shape `types:generate` exited 0 and produced no Issue #63 generated change. Its unrelated UGC
+  Ads workerd metadata drift was precisely restored. The local Wrangler 4.119.0 release dry-run at
+  `6bee6df` produced 19 Workers, 85 modules, 37 asset blobs, and 29,168 KiB under
+  `/tmp/azhen-issue63-shadow.nEpDiP/release-out`; manifest SHA-256 is
+  `747ead6205ed99468b9894c823a48effa0dcbeeef0bedc8529addcb519de3e06`.
+- The root `corepack pnpm test` PASS remains historical at `8cf2720`; the main agent has not opened
+  the exclusive root fleet gate for current `6bee6df`, so this checkpoint does not claim a current
+  root PASS. No push, merge, pull request, Issue closure, upload, promotion, deployment, production
+  configuration change, charging change, production contact, or worktree deletion occurred.

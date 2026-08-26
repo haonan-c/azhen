@@ -20,12 +20,20 @@ The candidate is in the isolated `issue-63` worktree on `codex/issue-63`. It was
 - `openReport()` first completes the Projection bootstrap gate. It rejects both a direct call and a
   promise-pipelined call while bootstrap is incomplete, so it never freezes pending or partial
   totals as a report snapshot.
+- Projection schema v3 moves pre-upgrade report facts and summaries to retired shadow tables and
+  creates every report index on new empty canonical tables. The constructor does no synchronous
+  index build or data scan over existing report rows. A bounded alarm removes at most 64 retired
+  rows per turn while the existing authority rebuild fills the new generation. A schema marker and
+  bootstrap marker make every crash point re-entrant and fail closed.
 - The resulting `AdminUsageReport` freezes the canonical filter, strongly consistent Deployment
   report timezone and its Usage Rate version, UTC half-open date bounds, Projection generation,
   applied-ingestion watermark, and a server-private detail-retention revision.
   `getOverview()`, keyset `listRows()`, and `exportCsv()` use this one query. A generation change or
   physical retention deletion fails the report closed as a stale snapshot instead of silently
-  changing its rows.
+  changing its rows. The same check requires the current schema version and a complete bootstrap.
+  It runs before overview/rows, before CSV stream mint, before the CSV preamble, and on every row
+  page. Reports minted before a migration and reports opened during a restart cannot expose empty
+  or partially rebuilt data.
 - Report dates are strict `YYYY-MM-DD` local dates. Temporal timezone conversion, not fixed 24-hour
   arithmetic, produces UTC boundaries. Returned local timestamps include their numeric UTC offset.
   Tests cover UTC, New York spring-forward and fall-back, Kathmandu's 45-minute offset, and Lord
@@ -137,7 +145,9 @@ stable_method_key,external_account_id,occurred_at_utc,report_local_timestamp,
 bucket_start_utc,report_local_bucket_start,cache_hit_input_tokens,cache_miss_input_tokens,
 cache_write_input_tokens,output_tokens,reasoning_tokens,metered_use_count,
 billable_api_operations,pre_execution_failures,unknown_operations,unpriced_model_uses,
-unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
+unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits,
+safe_attempt_ref,reservation_status,metering_attempts,held_reservations,
+released_reservations,settled_reservations,unreserved_attempts
 ```
 
 ## Administrator UI coverage
@@ -175,9 +185,9 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | --- | --- |
 | Shared, Backend, Frontend, and Integration Tests package builds | PASS |
 | Focused Usage administrator workerd | PASS, 18/18; recorded RED 16/18 before safe-reference compatibility fix |
-| Focused Usage report workerd | PASS, 23/23 |
-| Focused Summary/retention workerd group | PASS, 25/25 |
-| Focused Projection seven-sentinel privacy test | PASS, 1/1; 55 unrelated tests skipped |
+| Focused Usage report workerd | PASS, 25/25 at `6bee6df` |
+| Focused Summary/retention workerd group | PASS, 28/28 at `6bee6df` |
+| Full focused Projection workerd | PASS, 60/60 at `6bee6df`; seven-sentinel privacy remains included |
 | Frontend report/file-transfer follow-up tests | PASS, 30/30 |
 | Full Frontend package tests | PASS, 78 files and 391 tests, plus first-party copy 1/1 |
 | Real production-Harness Cap'n Web report stream/cancel/privacy tracer | PASS, 1/1; 16 unrelated tests skipped |
@@ -188,10 +198,10 @@ unpriced_api_operations,provider_cost_usd_subunits,charged_usage_credit_subunits
 | Root `corepack pnpm build` | PASS, 52 tasks; later test-only corrections also passed the Integration Tests package build |
 | Root `corepack pnpm lint` | PASS, configured non-blocking warnings only |
 | Release-manifest golden | PASS, 4/4 |
-| `corepack pnpm types:generate` | PASS; no Issue #63 generated change |
-| Production-shape release dry-run | PASS, 19 Workers, 85 modules, 37 asset blobs, 28 MiB |
-| Root `corepack pnpm test` | PASS at code fixed point `8cf2720adcdbe2e705c8070518fc684ed2fef5e2`; about 22 minutes 39 seconds wall time |
-| Standards/specification fixed-point review | PASS; final two test-only corrections each received independent Standards and Spec reviews with no P0-P2 findings |
+| `corepack pnpm types:generate` | PASS at `6bee6df`; no Issue #63 generated change; unrelated UGC Ads drift precisely restored |
+| Production-shape release dry-run | PASS at `6bee6df`, 19 Workers, 85 modules, 37 asset blobs, 29,168 KiB |
+| Root `corepack pnpm test` | Historical PASS at `8cf2720adcdbe2e705c8070518fc684ed2fef5e2`; not yet rerun at current `6bee6df` because the main-agent root gate remains closed |
+| Standards/specification fixed-point review | PASS at `6bee6df`; both axes report no P0-P2 findings |
 | `git diff --check` | PASS |
 
 The first production-shape dry-run stopped because a gitignored Confluence configurator prerequisite
@@ -204,11 +214,20 @@ There was no upload, promotion, or deployment.
 `types:generate` also exposed one unrelated UGC Ads workerd metadata drift. It was reviewed and
 precisely restored. The final Issue #63 diff contains no UGC Ads file.
 
-One first Backend-package run observed the existing #65 cleanup assertion exceed its 64-row batch
-bound because an overdue automatic alarm raced the test's manual alarm. Production SQL still uses
-the required hard `LIMIT 64`. The exact isolated case passed, then the full Projection suite passed
-56/56 twice, and the final complete Backend package passed with the same assertion unchanged. No
-production batch bound or assertion was weakened.
+The final-shape release rerun used commit `6bee6dfd3b21f5c49a781f8b375eae75b316e53b`,
+Wrangler `4.119.0`, and release ID `issue-63-shadow-local`. It produced 19 Workers, 85 modules,
+37 unique asset blobs, and 29,168 KiB under
+`/tmp/azhen-issue63-shadow.nEpDiP/release-out`. The release manifest SHA-256 is
+`747ead6205ed99468b9894c823a48effa0dcbeeef0bedc8529addcb519de3e06`. This was a local
+production-shape dry-run only. It did not upload, promote, deploy, or change production settings.
+
+Two current focused Projection runs exposed one test-orchestration race between an automatic alarm
+and a manual alarm. One run observed a completed cleanup before the manual trigger and another
+measured 94 rows across two overlapping production turns. Production SQL still uses the required
+hard `LIMIT 64`. The tests now execute before-state, exactly one real production `alarm()`, and
+after-state under one Durable Object actor turn, while cancelling only the test-scheduled automatic
+alarm. Both exact cases passed, including two consecutive bounded-cleanup repetitions, and the full
+Projection suite then passed 60/60. No production batch bound or assertion was weakened.
 
 ## Review-correction fixed point
 
@@ -276,6 +295,23 @@ production module. The earlier final-shape `types:generate`, 4/4 release-manifes
 19-Worker Wrangler dry-run therefore remain the applicable release-shape evidence. There was no
 upload, promotion, deployment, production configuration change, charging change, or production
 contact.
+
+## Post-root schema and stale-capability fixed point
+
+The current code fixed point is `6bee6dfd3b21f5c49a781f8b375eae75b316e53b`. It supersedes the
+historical root-tested fixed point with the schema v3 shadow migration and one additional
+fail-closed report-snapshot gate. A pre-migration report and a report opened during pending
+bootstrap cannot read overview, rows, a CSV preamble, or a later CSV page. The real workerd
+regression uses one randomly named Projection across abort/restart and authority rebuild. Two
+concurrent CSV readers fail at the preamble and data-page boundaries; two replacement streams then
+open and cancel successfully, proving both operation slots were released.
+
+The first follow-up review found that the test initially drove the default Projection after restart
+instead of its randomly named Projection, and that it did not cover both CSV stream phases. Those
+findings were corrected through RED-to-GREEN tests. The final Standards and Spec follow-up reviews
+reported no P0-P2 findings. Root `corepack pnpm test` remains intentionally pending until the main
+agent opens that exclusive fleet gate. This document does not extend the historical root PASS to
+the current fixed point.
 
 ## Fourth review correction fixed point
 
