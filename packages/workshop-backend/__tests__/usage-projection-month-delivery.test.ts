@@ -110,8 +110,9 @@ async function monthRowCount(projectionName: string, month: string, factId: stri
 
 function outbox(projection: DurableObjectStub<UsageProjection>) {
   return runInDurableObject(projection, (_instance, state) =>
-    state.storage.sql.exec<{fact_id: string; month: string; applied_watermark: string}>(`
-      SELECT fact_id, month, applied_watermark FROM usage_projection_month_outbox
+    state.storage.sql.exec<
+      {generation: string; fact_id: string; month: string; applied_watermark: string}>(`
+      SELECT generation, fact_id, month, applied_watermark FROM usage_projection_month_outbox
       ORDER BY length(applied_watermark), applied_watermark
     `).toArray());
 }
@@ -371,6 +372,46 @@ describe("Usage Projection month delivery", () => {
 
     using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
     expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+  });
+
+  it("switches the reported generation only after its own rows are delivered", async () => {
+    const name = `delivery-rebuild-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const requestId = `rebuild-${crypto.randomUUID()}`;
+    expect((await projection.requestRebuild(requestId)).state).toBe("rebuilding");
+
+    // A live ingest during a rebuild applies to the active and to the rebuild generation, and one
+    // delivery step moves a single month. Spreading the batch over six months therefore leaves the
+    // rebuild generation queued when the rebuild reaches its switchover.
+    const months = ["03", "04", "05", "06", "07", "08"];
+    const facts = months.map((month, index) => detail(principal, {
+      sourceSequence: BigInt(index + 1),
+      occurredAt: `2026-${month}-12T12:00:00.000Z`,
+    }));
+    expect((await projection.ingest(facts)).rejected).toEqual([]);
+    const rebuildGeneration = await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{rebuild_generation: string | null}>(`
+        SELECT rebuild_generation FROM usage_projection_meta WHERE singleton = 1
+      `).one().rebuild_generation);
+    expect((await outbox(projection))
+      .filter(row => row.generation === rebuildGeneration).length).toBeGreaterThan(0);
+
+    await runDurableObjectAlarm(projection);
+    expect((await projection.requestRebuild(requestId)).state).toBe("rebuilding");
+
+    for (let step = 0; step < 32; step += 1) {
+      if ((await projection.requestRebuild(requestId)).state === "completed") break;
+      await runDurableObjectAlarm(projection);
+    }
+    expect((await projection.requestRebuild(requestId)).state).toBe("completed");
+    expect(await outbox(projection)).toEqual([]);
+
+    // The rebuild assigns its watermarks in rebuild order, so a report taken across the switchover
+    // must still name every row in source-time order rather than a watermark-truncated subset.
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 32})).rows.map(row => row.rowId))
+      .toEqual([...facts].reverse().map(fact => fact.projectionFactId));
   });
 
   it("keeps the root object's per-record cost far below a reportable row", async () => {

@@ -1534,6 +1534,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (meta.rebuild_state !== "rebuilding" || meta.rebuild_generation !== generation) {
         return;
       }
+      // A report reads its rows from the month objects but bounds them by a watermark, and a
+      // rebuild assigns its watermarks in rebuild order rather than source-time order. Switching
+      // to a generation whose rows are still queued would therefore report a source-time
+      // scattered subset against complete totals, so the switchover waits for delivery.
+      const undelivered = this.ctx.storage.sql.exec<{present: string}>(`
+        SELECT CAST(EXISTS(
+          SELECT 1 FROM usage_projection_month_outbox WHERE generation = ? LIMIT 1
+        ) AS TEXT) AS present
+      `, generation).one().present === "1";
+      if (undelivered) return;
       const pending = this.ctx.storage.sql.exec<{count: string}>(`
         SELECT CAST(COUNT(*) AS TEXT) AS count FROM (
           SELECT fact_id FROM usage_projection_facts WHERE generation = ? AND applied = 0
