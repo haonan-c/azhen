@@ -154,6 +154,33 @@ describe("Usage Projection retained fact identity", () => {
     ]);
   });
 
+  it("clears a stale rebuild generation's retained identities before a new rebuild", async () => {
+    const projection = await ready(`identity-stale-${crypto.randomUUID()}`);
+    const principal = crypto.randomUUID();
+    expect((await projection.ingest([detail(principal)])).rejected).toEqual([]);
+
+    // An interrupted rebuild can leave the next generation's rows behind without that generation
+    // ever entering cleanup. The clear that starts a rebuild removes its Usage Principal rows, and
+    // a principal's high water is the only justification for pruning an identity, so an identity
+    // left here can never age out on its own.
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        INSERT INTO usage_projection_expired_sequences (
+          generation, fact_id, principal_ref, source_sequence, fact_hash, retired_at
+        ) VALUES ('2', 'stale-rebuild-fact', ?, '1', 'stale-hash', '2020-01-01T00:00:00.000Z')
+      `, principal);
+    });
+    await ageIdentities(projection);
+    await maintain(projection);
+    expect((await identities(projection)).map(row => row.fact_id))
+      .toContain("stale-rebuild-fact");
+
+    expect((await projection.requestRebuild(`rebuild-${crypto.randomUUID()}`)).state)
+      .toBe("rebuilding");
+    expect((await identities(projection)).map(row => row.fact_id))
+      .not.toContain("stale-rebuild-fact");
+  });
+
   it("holds the root object flat as records accumulate", async () => {
     const measure = async (records: number) => {
       const projection = await ready(`identity-size-${crypto.randomUUID()}`);

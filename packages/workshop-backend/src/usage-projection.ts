@@ -1198,6 +1198,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_rebuild_users WHERE generation = ?
         `, generation);
+        // A rebuild that never completed leaves retained identities and queued deliveries behind.
+        // This clear removes the Usage Principal rows whose high water is the only justification
+        // for pruning an identity, so the identities have to go with them or nothing ever can.
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_expired_sequences WHERE generation = ?
+        `, generation);
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_month_outbox WHERE generation = ?
+        `, generation);
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_totals (
             generation, totals_source, provider_cost, charged_credits,
