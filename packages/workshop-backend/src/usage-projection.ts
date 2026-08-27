@@ -358,6 +358,15 @@ const RESERVATION_STATUSES = new Set<AdminUsageReservationStatus>([
 ]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CURRENT_PROJECTION_SCHEMA_VERSION = "4";
+
+/**
+ * Applied facts that must separate a Summary revision from the revision it replaced before
+ * compaction may remove the replaced row. A frozen report can only lose a row it still names when
+ * it was opened before the newer revision was applied, so this lag keeps every report opened
+ * within roughly the last hour of the profile's sustained load untouched. The shared
+ * detail-retention revision still fails an older report instead of changing its rows.
+ */
+const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
 const RETIRED_V2_FACTS_TABLE = "usage_projection_facts_retired_v2";
 const RETIRED_V2_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
 const RETIRED_V3_FACTS_TABLE = "usage_projection_facts_retired_v3";
@@ -824,6 +833,67 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     });
   }
 
+  /**
+   * Delete at most one bounded page of Summary revisions that a newer applied revision replaced.
+   * Effective revisions, revisions that are not applied yet, and Usage Summary snapshots are kept,
+   * so report totals stay exact. A delayed replay of a removed revision is absorbed by its
+   * retained Summary snapshot and contributes no metric. Frozen reports that could still name a
+   * removed revision are failed through the shared detail-retention revision.
+   */
+  compactSupersededAggregates(
+      limit = 64, watermarkLag = SUPERSEDED_AGGREGATE_WATERMARK_LAG): boolean {
+    // Each batch deletes what it finds, so the candidate set only shrinks and no ordering is
+    // needed to make progress. Leaving it unordered lets the Summary-revision index stop at LIMIT
+    // instead of sorting every superseded row first.
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64 ||
+        !Number.isInteger(watermarkLag) || watermarkLag < 0) {
+      throw new TypeError("Usage Projection aggregate compaction request is invalid.");
+    }
+    return this.ctx.storage.transactionSync(() => {
+      const floor = BigInt(this.#meta().report_watermark) - BigInt(watermarkLag);
+      if (floor < 1n) return true;
+      const floorText = floor.toString();
+      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+        SELECT facts.generation, facts.fact_id
+        FROM usage_projection_facts AS facts
+        WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
+          AND facts.applied_watermark IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM usage_projection_facts AS newer
+            WHERE newer.generation = facts.generation
+              AND newer.row_kind = 'aggregate'
+              AND newer.summary_fact_id = facts.summary_fact_id
+              AND newer.applied = 1
+              AND newer.applied_watermark IS NOT NULL
+              AND (length(newer.applied_watermark) < length(?) OR
+                (length(newer.applied_watermark) = length(?)
+                  AND newer.applied_watermark <= ?))
+              AND (length(newer.summary_revision) > length(facts.summary_revision) OR
+                (length(newer.summary_revision) = length(facts.summary_revision)
+                  AND (newer.summary_revision > facts.summary_revision OR
+                    (newer.summary_revision = facts.summary_revision AND
+                      (length(newer.applied_watermark) < length(facts.applied_watermark) OR
+                        (length(newer.applied_watermark) = length(facts.applied_watermark) AND
+                          newer.applied_watermark < facts.applied_watermark))))))
+          )
+        LIMIT ?
+      `, floorText, floorText, floorText, limit + 1).toArray();
+      const removed = rows.slice(0, limit);
+      for (const row of removed) {
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+      }
+      const meta = this.#meta();
+      if (removed.some(row => row.generation === meta.active_generation)) {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
+      }
+      return rows.length <= limit;
+    });
+  }
+
   /** Start or resume the first bounded authority scan and report whether its totals are verified. */
   async ensureBootstrap(): Promise<boolean> {
     let meta = this.#meta();
@@ -970,7 +1040,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       this.#setMaintenanceTurn("drain");
     }
     await this.#runRetiredProjectionCleanupStep();
-    await this.#scheduleRemainingMaintenance();
+    await this.#scheduleRemainingMaintenance(this.compactSupersededAggregates());
   }
 
   #hasApplyDrain(): boolean {
@@ -1032,11 +1102,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, turn);
   }
 
-  async #scheduleRemainingMaintenance(): Promise<void> {
+  async #scheduleRemainingMaintenance(compactionComplete: boolean): Promise<void> {
     const meta = this.#meta();
     const hasDrain = this.#hasApplyDrain();
-    if (hasDrain || meta.rebuild_state === "rebuilding" || meta.cleanup_generation !== null ||
-        this.#hasRetiredProjectionTable()) {
+    if (hasDrain || !compactionComplete || meta.rebuild_state === "rebuilding" ||
+        meta.cleanup_generation !== null || this.#hasRetiredProjectionTable()) {
       await this.ctx.storage.setAlarm(Date.now() + (hasDrain ? 1_000 : 0));
     }
   }
