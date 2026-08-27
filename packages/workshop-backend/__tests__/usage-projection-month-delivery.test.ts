@@ -1,5 +1,7 @@
 import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import {describe, expect, it} from "vitest";
+import {AdminUsageApiImpl, type AdminSettings} from "../src/admin-settings.js";
+import type {UserDurableObject} from "../src/user.js";
 import type {UsageProjectionMonth} from "../src/usage-projection-month.js";
 import type {
   UsageProjection,
@@ -8,9 +10,22 @@ import type {
 } from "../src/usage-projection.js";
 
 const testEnv = env as unknown as {
+  TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
+  TEST_USER: DurableObjectNamespace<UserDurableObject>;
   TEST_USAGE_PROJECTION: DurableObjectNamespace<UsageProjection>;
   TEST_USAGE_PROJECTION_MONTH: DurableObjectNamespace<UsageProjectionMonth>;
 };
+
+function adminUsage(name: string) {
+  return new AdminUsageApiImpl(
+    testEnv.TEST_ADMIN_SETTINGS.getByName(""),
+    testEnv.TEST_USER,
+    "issue-73-admin@example.test",
+    undefined,
+    {getByName: () => testEnv.TEST_USAGE_PROJECTION.getByName(name)} as
+      DurableObjectNamespace<UsageProjection>,
+  );
+}
 
 function aggregate(
     principal: string,
@@ -160,5 +175,52 @@ describe("Usage Projection month delivery", () => {
     await runDurableObjectAlarm(projection);
     expect(await outbox(projection)).toEqual([]);
     expect((await projection.getReportCoordinates()).ingestionWatermark).toBe(watermark);
+  });
+
+  it("pages one report across the month boundary in source-time order", async () => {
+    const name = `delivery-paging-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const times = [
+      "2026-09-02T00:00:00.000Z",
+      "2026-09-01T00:00:00.000Z",
+      "2026-08-31T00:00:00.000Z",
+      "2026-08-30T00:00:00.000Z",
+    ];
+    for (const [index, occurredAt] of times.entries()) {
+      expect((await projection.ingest([
+        detail(principal, {sourceSequence: BigInt(index + 1), occurredAt}),
+      ])).rejected).toEqual([]);
+    }
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    const first = await report.listRows({limit: 3});
+    expect(first.rows.map(row => row.occurredAtUtc)).toEqual(times.slice(0, 3));
+    expect(first.nextCursor).not.toBeNull();
+
+    const second = await report.listRows({limit: 3, cursor: first.nextCursor!});
+    expect(second.rows.map(row => row.occurredAtUtc)).toEqual(times.slice(3));
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("reports exact filtered totals and one distinct active User across months", async () => {
+    const name = `delivery-totals-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    for (const [index, bucketStart] of [
+      "2026-09-01T00:00:00.000Z",
+      "2026-08-01T00:00:00.000Z",
+    ].entries()) {
+      expect((await projection.ingest([aggregate(principal, {
+        sourceSequence: BigInt(index + 1),
+        bucketStart,
+        providerCostUsdSubunits: 10n,
+      })])).rejected).toEqual([]);
+    }
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    const metrics = (await report.getOverview()).metrics;
+    expect(metrics.providerCostUsdSubunits).toBe(20n);
+    expect(metrics.activeUsers).toBe(1n);
   });
 });

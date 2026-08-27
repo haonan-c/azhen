@@ -1,4 +1,10 @@
+import {buildUsageReportPredicate} from "./usage-report-query.js";
 import type {
+  FrozenUsageReportQuery,
+  UsageReportCursor,
+} from "./usage-report-query.js";
+import type {
+  StoredFactRow,
   UsageProjectionAggregateFact,
   UsageProjectionFact,
 } from "./usage-projection.js";
@@ -164,3 +170,38 @@ export const USAGE_PROJECTION_FACT_COLUMNS = [
   "unreserved_attempts", "active_user_contribution", "unpriced_model_uses",
   "unpriced_api_operations", "applied", "applied_watermark",
 ] as const;
+
+/**
+ * Read one bounded keyset page of reportable rows in descending source-time order.
+ *
+ * The deployment root object and every UTC month object hold the same row shape and answer the
+ * same normalized predicate, so the report read has one definition. Months own disjoint time
+ * ranges, so a caller walks them from newest to oldest instead of merging them.
+ */
+export function readUsageProjectionReportRows(
+    sql: SqlStorage,
+    query: FrozenUsageReportQuery,
+    cursor: UsageReportCursor | undefined,
+    limit: number,
+    rowKind: "all" | "aggregate"): StoredFactRow[] {
+  const predicate = buildUsageReportPredicate(query, rowKind, cursor);
+  return sql.exec<StoredFactRow>(`
+      SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
+             safe_attempt_ref, reservation_status,
+             bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
+             summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
+             deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
+             cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
+             reasoning_tokens, provider_cost, charged_credits, metered_use_count,
+             billable_api_operations, pre_execution_failures, unknown_operations,
+             metering_attempts, held_reservations, released_reservations,
+             settled_reservations, unreserved_attempts,
+             active_user_contribution,
+             unpriced_model_uses, unpriced_api_operations, applied, applied_watermark
+      FROM usage_projection_facts AS facts${predicate.indexName === null
+        ? "" : ` INDEXED BY ${predicate.indexName}`}
+      WHERE ${predicate.sql}
+      ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
+      LIMIT ?
+    `, ...predicate.params, limit).toArray();
+}

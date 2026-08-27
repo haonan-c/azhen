@@ -3,7 +3,11 @@ import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import {
   USAGE_PROJECTION_FACT_COLUMNS,
   createUsageProjectionFactsTable,
+  readUsageProjectionReportRows,
 } from "./usage-projection-facts-schema.js";
+import type {StoredFactRow} from "./usage-projection.js";
+import {buildUsageReportPredicate} from "./usage-report-query.js";
+import type {FrozenUsageReportQuery, UsageReportCursor} from "./usage-report-query.js";
 
 /**
  * One reportable Usage Projection row, keyed by the column names both objects store.
@@ -84,6 +88,132 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
         stored.push(factId);
       }
       return stored;
+    });
+  }
+
+  /**
+   * Read one bounded keyset page of this month's reportable rows.
+   *
+   * The root object walks months from newest to oldest and maps rows to their public shape, so a
+   * month object neither knows the report contract nor sees a cursor it did not receive.
+   */
+  listStoredRows(
+      query: FrozenUsageReportQuery,
+      cursor: UsageReportCursor | undefined,
+      limit: number,
+      rowKind: "all" | "aggregate"): StoredFactRow[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 257) {
+      throw new TypeError("Usage Projection month page limit is invalid.");
+    }
+    return readUsageProjectionReportRows(this.ctx.storage.sql, query, cursor, limit, rowKind);
+  }
+
+  /**
+   * Count the Usage Principals that contributed activity to this month under one report filter.
+   *
+   * Distinct counts cannot be summed across months, so this returns the month's own references and
+   * the root object unions them. The result is bounded by the deployment's registered Users.
+   */
+  listActivePrincipals(query: FrozenUsageReportQuery, limit: number): string[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
+      throw new TypeError("Usage Projection month principal limit is invalid.");
+    }
+    const predicate = buildUsageReportPredicate(query, "aggregate");
+    const rows = this.ctx.storage.sql.exec<{principal_ref: string}>(`
+      SELECT DISTINCT facts.principal_ref
+      FROM usage_projection_facts AS facts${predicate.indexName === null
+        ? "" : ` INDEXED BY ${predicate.indexName}`}
+      WHERE ${predicate.sql} AND facts.active_user_contribution <> '0'
+      LIMIT ?
+    `, ...predicate.params, limit + 1).toArray();
+    if (rows.length > limit) {
+      throw new Error("Usage Projection month has more active Usage Principals than registered.");
+    }
+    return rows.map(row => row.principal_ref);
+  }
+
+  /**
+   * Remove this month's detail rows for one Usage Principal before a retention cutoff.
+   *
+   * Usage Summary Fact revisions are kept, so a historical report still reports the same totals
+   * after the event detail behind them expires. Returns whether this month is now complete.
+   */
+  expireDetailBefore(usagePrincipalRef: string, cutoffUtc: string, limit = 64): boolean {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
+      throw new TypeError("Usage Projection month retention request is invalid.");
+    }
+    const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection month detail cutoff");
+    return this.ctx.storage.transactionSync(() => {
+      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+        SELECT generation, fact_id FROM usage_projection_facts
+        WHERE principal_ref = ? AND row_kind = 'detail' AND occurred_at < ?
+        LIMIT ?
+      `, usagePrincipalRef, cutoff, limit + 1).toArray();
+      for (const row of rows.slice(0, limit)) {
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+      }
+      return rows.length <= limit;
+    });
+  }
+
+  /**
+   * Remove this month's Summary revisions that a newer applied revision replaced.
+   *
+   * A Usage Summary Fact belongs to one bucket and therefore one month, so its whole revision
+   * history is here and the effective revision can be chosen without consulting another object.
+   */
+  compactSupersededAggregates(limit = 64): boolean {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
+      throw new TypeError("Usage Projection month compaction request is invalid.");
+    }
+    return this.ctx.storage.transactionSync(() => {
+      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+        SELECT facts.generation, facts.fact_id
+        FROM usage_projection_facts AS facts
+        WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
+          AND facts.applied_watermark IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM usage_projection_facts AS newer
+            WHERE newer.generation = facts.generation
+              AND newer.row_kind = 'aggregate'
+              AND newer.summary_fact_id = facts.summary_fact_id
+              AND newer.applied = 1 AND newer.applied_watermark IS NOT NULL
+              AND (length(newer.summary_revision) > length(facts.summary_revision) OR
+                (length(newer.summary_revision) = length(facts.summary_revision)
+                  AND (newer.summary_revision > facts.summary_revision OR
+                    (newer.summary_revision = facts.summary_revision AND
+                      (length(newer.applied_watermark) < length(facts.applied_watermark) OR
+                        (length(newer.applied_watermark) = length(facts.applied_watermark) AND
+                          newer.applied_watermark < facts.applied_watermark))))))
+          )
+        LIMIT ?
+      `, limit + 1).toArray();
+      for (const row of rows.slice(0, limit)) {
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+      }
+      return rows.length <= limit;
+    });
+  }
+
+  /** Remove every row of one retired projection generation, one bounded page at a time. */
+  removeGeneration(generation: string, limit = 64): boolean {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
+      throw new TypeError("Usage Projection month cleanup request is invalid.");
+    }
+    return this.ctx.storage.transactionSync(() => {
+      const rows = this.ctx.storage.sql.exec<{fact_id: string}>(`
+        SELECT fact_id FROM usage_projection_facts WHERE generation = ? LIMIT ?
+      `, generation, limit + 1).toArray();
+      for (const row of rows.slice(0, limit)) {
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, generation, row.fact_id);
+      }
+      return rows.length <= limit;
     });
   }
 

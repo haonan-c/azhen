@@ -24,7 +24,6 @@ import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import type {AdminSettings} from "./admin-settings.js";
 import type {UserDurableObject} from "./user.js";
 import {
-  buildUsageReportPredicate,
   decodeUsageReportCursor,
   encodeUsageReportCursor,
   reportLocalTimestamp,
@@ -207,7 +206,8 @@ type ProjectionTotalsRow = {
   started_at: string | null;
 };
 
-type StoredFactRow = {
+/** One stored reportable Usage Projection row as the report read path selects it. */
+export type StoredFactRow = {
   fact_id: string;
   fact_hash: string;
   principal_ref: string;
@@ -377,6 +377,15 @@ const CURRENT_PROJECTION_SCHEMA_VERSION = "4";
  * detail-retention revision still fails an older report instead of changing its rows.
  */
 const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
+
+/**
+ * Most distinct Usage Principals one month object may report for a filtered active-User count.
+ *
+ * Distinct counts cannot be summed across months, so the root object unions each month's own
+ * references. No month can hold more contributing Principals than the deployment has registered
+ * Users, so exceeding this bound is a failure rather than a truncated count.
+ */
+const ACTIVE_PRINCIPAL_PAGE_MAX = 10_000;
 const RETIRED_V2_FACTS_TABLE = "usage_projection_facts_retired_v2";
 const RETIRED_V2_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
 const RETIRED_V3_FACTS_TABLE = "usage_projection_facts_retired_v3";
@@ -586,6 +595,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       const month = this.months.getByName(pending.month);
       const stored = new Set(await month.storeRows(rows));
       for (const row of rows) {
+        if (typeof row.generation !== "string") continue;
+        this.ctx.storage.sql.exec(`
+          INSERT OR IGNORE INTO usage_projection_months (generation, month) VALUES (?, ?)
+        `, row.generation, pending.month);
+      }
+      for (const row of rows) {
         if (typeof row.fact_id === "string" && !stored.has(row.fact_id)) continue;
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_month_outbox WHERE generation = ? AND fact_id = ?
@@ -608,17 +623,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Read one stable keyset page through the shared normalized report predicate. */
-  listReportRows(
+  async listReportRows(
       query: FrozenUsageReportQuery,
       cursorValue: string | undefined,
-      limit: number): AdminUsageReportPage {
+      limit: number): Promise<AdminUsageReportPage> {
     this.#assertCurrentReportSnapshot(query);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
       throw new TypeError("Usage report page limit is invalid.");
     }
     const cursor = cursorValue === undefined
       ? undefined : decodeUsageReportCursor(query, cursorValue);
-    const stored = this.#readStoredReportRows(query, cursor, limit + 1, "all");
+    const stored = await this.#readReportRowsAcrossMonths(query, cursor, limit + 1, "all");
     const visible = stored.slice(0, limit);
     const rows = visible.map(row => this.#publicReportRow(query, row));
     const last = visible.at(-1);
@@ -633,7 +648,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Read exact filtered Summary totals without materializing an unbounded row collection. */
-  readReportMetrics(query: FrozenUsageReportQuery): AdminUsageReportMetrics {
+  async readReportMetrics(query: FrozenUsageReportQuery): Promise<AdminUsageReportMetrics> {
     this.#assertCurrentReportSnapshot(query);
     const totals: AdminUsageReportMetrics = {
       providerCostUsdSubunits: 0n,
@@ -658,7 +673,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
     let cursor: UsageReportCursor | undefined;
     while (true) {
-      const page = this.#readStoredReportRows(query, cursor, 256, "aggregate");
+      const page = await this.#readReportRowsAcrossMonths(query, cursor, 256, "aggregate");
       for (const row of page) {
         totals.providerCostUsdSubunits += BigInt(row.provider_cost);
         totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
@@ -683,42 +698,49 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (page.length < 256 || !last) break;
       cursor = {sourceTime: storedFactSourceTime(last), rowId: last.fact_id};
     }
-    const predicate = buildUsageReportPredicate(query, "aggregate");
-    const activeUsers = this.ctx.storage.sql.exec<{count: string}>(`
-      SELECT CAST(COUNT(DISTINCT facts.principal_ref) AS TEXT) AS count
-      FROM usage_projection_facts AS facts${predicate.indexName === null
-        ? "" : ` INDEXED BY ${predicate.indexName}`}
-      WHERE ${predicate.sql} AND facts.active_user_contribution <> '0'
-    `, ...predicate.params).one().count;
-    totals.activeUsers = BigInt(activeUsers);
+    const active = new Set<string>();
+    for (const month of this.#reportMonths(query, undefined)) {
+      for (const principal of await this.months.getByName(month)
+          .listActivePrincipals(query, ACTIVE_PRINCIPAL_PAGE_MAX)) {
+        active.add(principal);
+      }
+    }
+    totals.activeUsers = BigInt(active.size);
     return totals;
   }
 
-  #readStoredReportRows(
+  /**
+   * Name the UTC months a report may still read, newest first.
+   *
+   * Month objects own disjoint source-time ranges and the report orders by source time, so a page
+   * walks months in order instead of merging them. A cursor already names the month it stopped in,
+   * so months newer than the cursor cannot hold a row the page has not returned.
+   */
+  #reportMonths(query: FrozenUsageReportQuery, cursor: UsageReportCursor | undefined): string[] {
+    const months = this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month DESC
+    `, query.snapshot.projectionGeneration.toString()).toArray().map(row => row.month);
+    if (cursor === undefined) return months;
+    const from = usageProjectionMonthKey(cursor.sourceTime);
+    return months.filter(month => month <= from);
+  }
+
+  /** Read one bounded keyset page by walking month objects from newest to oldest. */
+  async #readReportRowsAcrossMonths(
       query: FrozenUsageReportQuery,
       cursor: UsageReportCursor | undefined,
       limit: number,
-      rowKind: "all" | "aggregate"): StoredFactRow[] {
-    const predicate = buildUsageReportPredicate(query, rowKind, cursor);
-    return this.ctx.storage.sql.exec<StoredFactRow>(`
-      SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
-             safe_attempt_ref, reservation_status,
-             bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
-             summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
-             deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
-             cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
-             reasoning_tokens, provider_cost, charged_credits, metered_use_count,
-             billable_api_operations, pre_execution_failures, unknown_operations,
-             metering_attempts, held_reservations, released_reservations,
-             settled_reservations, unreserved_attempts,
-             active_user_contribution,
-             unpriced_model_uses, unpriced_api_operations, applied, applied_watermark
-      FROM usage_projection_facts AS facts${predicate.indexName === null
-        ? "" : ` INDEXED BY ${predicate.indexName}`}
-      WHERE ${predicate.sql}
-      ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
-      LIMIT ?
-    `, ...predicate.params, limit).toArray();
+      rowKind: "all" | "aggregate"): Promise<StoredFactRow[]> {
+    const rows: StoredFactRow[] = [];
+    let pageCursor = cursor;
+    for (const month of this.#reportMonths(query, cursor)) {
+      if (rows.length >= limit) break;
+      rows.push(...await this.months.getByName(month)
+        .listStoredRows(query, pageCursor, limit - rows.length, rowKind));
+      // A cursor only positions the month it was produced in; older months start at their newest.
+      pageCursor = undefined;
+    }
+    return rows;
   }
 
   #publicReportRow(query: FrozenUsageReportQuery, row: StoredFactRow): AdminUsageReportRow {
@@ -854,7 +876,46 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * Summary-backed totals are not changed, and a delayed replay of a removed fact is acknowledged
    * without restoring its event timestamp or dimensions.
    */
-  expireDetailBefore(
+  async expireDetailBefore(
+      usagePrincipalRef: string,
+      cutoffUtc: string,
+      limit = 64): Promise<boolean> {
+    const rootComplete = this.#expireRootDetailBefore(usagePrincipalRef, cutoffUtc, limit);
+    let monthsComplete = true;
+    const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection detail cutoff");
+    // Months newer than the cutoff hold nothing to expire, so only older ones are visited.
+    for (const month of this.#monthsBefore(cutoff)) {
+      if (!await this.months.getByName(month)
+        .expireDetailBefore(usagePrincipalRef, cutoff, limit)) monthsComplete = false;
+    }
+    return rootComplete && monthsComplete;
+  }
+
+  /** Name every stored month whose range can still hold detail older than one cutoff. */
+  #monthsBefore(cutoffUtc: string): string[] {
+    const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
+    return this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT DISTINCT month FROM usage_projection_months WHERE month <= ? ORDER BY month
+    `, cutoffMonth).toArray().map(row => row.month);
+  }
+
+  /**
+   * Compact superseded Summary revisions in every month object.
+   *
+   * A Usage Summary Fact never spans two months, so each month decides its own effective revision
+   * and no cross-object coordination is needed. Returns whether every month is complete.
+   */
+  async #compactMonthsStep(): Promise<boolean> {
+    let complete = true;
+    for (const row of this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT DISTINCT month FROM usage_projection_months ORDER BY month DESC
+    `).toArray()) {
+      if (!await this.months.getByName(row.month).compactSupersededAggregates()) complete = false;
+    }
+    return complete;
+  }
+
+  #expireRootDetailBefore(
       usagePrincipalRef: string,
       cutoffUtc: string,
       limit = 64): boolean {
@@ -1120,8 +1181,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     }
     await this.#runRetiredProjectionCleanupStep();
     const deliveryComplete = await this.#deliverMonthOutboxStep();
+    const monthCompactionComplete = await this.#compactMonthsStep();
     await this.#scheduleRemainingMaintenance(
-      this.compactSupersededAggregates() && deliveryComplete,
+      this.compactSupersededAggregates() && deliveryComplete && monthCompactionComplete,
     );
   }
 
@@ -2486,6 +2548,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       );
       CREATE INDEX IF NOT EXISTS usage_projection_month_outbox_order
       ON usage_projection_month_outbox(month, length(applied_watermark), applied_watermark)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_months (
+        generation TEXT NOT NULL, month TEXT NOT NULL,
+        PRIMARY KEY (generation, month)
+      )
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_rejections (
