@@ -154,6 +154,33 @@ describe("Usage Projection retained fact identity", () => {
     ]);
   });
 
+  it("keeps replay and conflict answers the same across a rebuild", async () => {
+    const projection = await ready(`identity-rebuild-${crypto.randomUUID()}`);
+    const principal = crypto.randomUUID();
+    const requestId = `rebuild-${crypto.randomUUID()}`;
+    expect((await projection.requestRebuild(requestId)).state).toBe("rebuilding");
+    // A live ingest during a rebuild applies to both generations, so both retain this identity.
+    const fact = detail(principal);
+    expect((await projection.ingest([fact])).rejected).toEqual([]);
+
+    for (let step = 0; step < 32; step += 1) {
+      if ((await projection.requestRebuild(requestId)).state === "completed") break;
+      await maintain(projection);
+    }
+    expect((await projection.requestRebuild(requestId)).state).toBe("completed");
+
+    // The rebuilt generation carries the identity, so a replay is still the same fact and a
+    // different fact on the same sequence is still a conflict.
+    expect(await projection.ingest([fact])).toEqual({
+      acknowledgedFactIds: [fact.projectionFactId],
+      rejected: [],
+    });
+    const reuse = detail(principal, {outputTokens: 99n});
+    expect((await projection.ingest([reuse])).rejected).toEqual([
+      {projectionFactId: reuse.projectionFactId, code: "source-sequence-conflict"},
+    ]);
+  });
+
   it("clears a stale rebuild generation's retained identities before a new rebuild", async () => {
     const projection = await ready(`identity-stale-${crypto.randomUUID()}`);
     const principal = crypto.randomUUID();
