@@ -372,4 +372,36 @@ describe("Usage Projection month delivery", () => {
     using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
     expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
   });
+
+  it("keeps the root object's per-record cost far below a reportable row", async () => {
+    const name = `delivery-size-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const records = 800;
+    const principal = crypto.randomUUID();
+    const rootId = testEnv.TEST_USAGE_PROJECTION.idFromName(name).toString();
+    const empty = await runInDurableObject(
+      projection, (_instance, state) => state.storage.sql.databaseSize);
+    for (let index = 0; index < records; index += 1) {
+      expect((await projection.ingest([detail(principal, {
+        sourceSequence: BigInt(index + 1),
+        occurredAt: `2026-08-${String((index % 28) + 1).padStart(2, "0")}T12:00:00.000Z`,
+      })])).rejected).toEqual([]);
+    }
+
+    const rootBytes = await runInDurableObject(
+      projection, (_instance, state) => state.storage.sql.databaseSize);
+    const monthBytes = await runInDurableObject(
+      testEnv.TEST_USAGE_PROJECTION_MONTH.getByName(`2026-08:${rootId}`),
+      (_instance, state) => state.storage.sql.databaseSize);
+    const result = {
+      records,
+      rootVariableBytes: rootBytes - empty,
+      rootBytesPerRecord: (rootBytes - empty) / records,
+      monthBytesPerRecord: monthBytes / records,
+    };
+    console.warn(`USAGE_PROJECTION_SHARD_SIZE=${JSON.stringify(result)}`);
+    // The month object carries the reportable row and its report indexes; the root keeps only the
+    // retained identity, so its share must be a small fraction of the row it no longer stores.
+    expect(result.rootBytesPerRecord).toBeLessThan(result.monthBytesPerRecord / 3);
+  }, 120_000);
 });
