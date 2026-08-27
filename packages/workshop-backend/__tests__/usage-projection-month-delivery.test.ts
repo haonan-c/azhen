@@ -99,9 +99,10 @@ async function ready(name: string) {
   return projection;
 }
 
-function monthRowCount(month: string, factId: string) {
+async function monthRowCount(projectionName: string, month: string, factId: string) {
+  const rootId = testEnv.TEST_USAGE_PROJECTION.idFromName(projectionName).toString();
   return runInDurableObject(
-    testEnv.TEST_USAGE_PROJECTION_MONTH.getByName(month),
+    testEnv.TEST_USAGE_PROJECTION_MONTH.getByName(`${month}:${rootId}`),
     (_instance, state) => state.storage.sql.exec<{count: number}>(`
       SELECT COUNT(*) AS count FROM usage_projection_facts WHERE fact_id = ?
     `, factId).one().count);
@@ -117,7 +118,8 @@ function outbox(projection: DurableObjectStub<UsageProjection>) {
 
 describe("Usage Projection month delivery", () => {
   it("delivers each applied row to the UTC month its source time names", async () => {
-    const projection = await ready(`delivery-${crypto.randomUUID()}`);
+    const name = `delivery-${crypto.randomUUID()}`;
+    const projection = await ready(name);
     const principal = crypto.randomUUID();
     const august = detail(principal, {sourceSequence: 1n});
     const september = detail(principal, {
@@ -127,9 +129,9 @@ describe("Usage Projection month delivery", () => {
     expect((await projection.ingest([august])).rejected).toEqual([]);
     expect((await projection.ingest([september])).rejected).toEqual([]);
 
-    expect(await monthRowCount("2026-08", august.projectionFactId)).toBe(1);
-    expect(await monthRowCount("2026-09", september.projectionFactId)).toBe(1);
-    expect(await monthRowCount("2026-09", august.projectionFactId)).toBe(0);
+    expect(await monthRowCount(name, "2026-08", august.projectionFactId)).toBe(1);
+    expect(await monthRowCount(name, "2026-09", september.projectionFactId)).toBe(1);
+    expect(await monthRowCount(name, "2026-09", august.projectionFactId)).toBe(0);
     expect(await outbox(projection)).toEqual([]);
   });
 

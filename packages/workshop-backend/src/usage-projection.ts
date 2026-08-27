@@ -396,6 +396,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   private admin: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
   private months: DurableObjectNamespace<UsageProjectionMonth>;
+  private alarmRunning = false;
   private ingestPreparations = 0;
   private rebuildPreparations = 0;
 
@@ -592,7 +593,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       else rows.push(row);
     }
     if (rows.length > 0) {
-      const month = this.months.getByName(pending.month);
+      const month = this.#monthStub(pending.month);
       const stored = new Set(await month.storeRows(rows));
       for (const row of rows) {
         if (typeof row.generation !== "string") continue;
@@ -700,7 +701,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     }
     const active = new Set<string>();
     for (const month of this.#reportMonths(query, undefined)) {
-      for (const principal of await this.months.getByName(month)
+      for (const principal of await this.#monthStub(month)
           .listActivePrincipals(query, ACTIVE_PRINCIPAL_PAGE_MAX)) {
         active.add(principal);
       }
@@ -735,7 +736,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     let pageCursor = cursor;
     for (const month of this.#reportMonths(query, cursor)) {
       if (rows.length >= limit) break;
-      rows.push(...await this.months.getByName(month)
+      rows.push(...await this.#monthStub(month)
         .listStoredRows(query, pageCursor, limit - rows.length, rowKind));
       // A cursor only positions the month it was produced in; older months start at their newest.
       pageCursor = undefined;
@@ -885,10 +886,20 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection detail cutoff");
     // Months newer than the cutoff hold nothing to expire, so only older ones are visited.
     for (const month of this.#monthsBefore(cutoff)) {
-      if (!await this.months.getByName(month)
+      if (!await this.#monthStub(month)
         .expireDetailBefore(usagePrincipalRef, cutoff, limit)) monthsComplete = false;
     }
     return rootComplete && monthsComplete;
+  }
+
+  /**
+   * Address the month object that belongs to this projection.
+   *
+   * The month is the name's prefix so the object can check what it owns, and this projection's own
+   * identity is the suffix so two projections never share a month object.
+   */
+  #monthStub(month: string): DurableObjectStub<UsageProjectionMonth> {
+    return this.months.getByName(`${month}:${this.ctx.id.toString()}`);
   }
 
   /** Name every stored month whose range can still hold detail older than one cutoff. */
@@ -910,7 +921,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     for (const row of this.ctx.storage.sql.exec<{month: string}>(`
       SELECT DISTINCT month FROM usage_projection_months ORDER BY month DESC
     `).toArray()) {
-      if (!await this.months.getByName(row.month).compactSupersededAggregates()) complete = false;
+      if (!await this.#monthStub(row.month).compactSupersededAggregates()) complete = false;
     }
     return complete;
   }
@@ -1161,10 +1172,21 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
   /** Resume one bounded rebuild step after an isolate restart. */
   async alarm(): Promise<void> {
-    if (this.ingestPreparations > 0 || this.rebuildPreparations > 0) {
+    // Delivering to a month object awaits another Durable Object, which opens a window a second
+    // alarm could enter and run a second bounded lifecycle step in the same turn.
+    if (this.alarmRunning || this.ingestPreparations > 0 || this.rebuildPreparations > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 1_000);
       return;
     }
+    this.alarmRunning = true;
+    try {
+      await this.#runMaintenanceTurn();
+    } finally {
+      this.alarmRunning = false;
+    }
+  }
+
+  async #runMaintenanceTurn(): Promise<void> {
     const meta = this.#meta();
     const hasDrain = this.#hasApplyDrain();
     const hasLifecycle = meta.rebuild_state === "rebuilding" || meta.cleanup_generation !== null;
