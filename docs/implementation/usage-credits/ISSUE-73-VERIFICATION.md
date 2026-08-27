@@ -56,6 +56,32 @@ Every month shard clears both thresholds outright. The root clears the 10 GB vet
 clear the 7 GB review threshold, and its identity table keeps growing. #74 bounds that table; with
 it the root is the lifetime Usage Summary Facts alone, about 3.2 GB at 24 months.
 
+## Review outcome
+
+A two-axis review (Standards and Spec) of `origin/dev...codex/issue-74` found three real defects.
+All three are fixed and each has a test that fails without its fix.
+
+| Defect | Fix |
+| --- | --- |
+| `#finishRebuild` switched `active_generation` while the rebuild generation's rows were still queued. A report bounds rows by the visible watermark, and a rebuild assigns watermarks in rebuild order, so the report returned a source-time scattered subset against complete totals. | `f906d8e` |
+| The clear that starts a rebuild removed that generation's Usage Principal rows but not its retained identities, and a principal's high water is the only justification the prune has. An interrupted rebuild left identities that could never age out. | `ee8daa8` |
+| Detail retention and aggregate compaction fanned one bounded page out over every month, so one turn did up to 24 cross-object calls and 24 pages of deletions. Both also selected across every generation. | `e1adc02` |
+
+One reported finding was rejected: `readHealth` returns `deliveryPendingEventCount: 0n` on
+`origin/dev` as well. The field counts the User outbox backlog, which `AdminUsageApiImpl` fills in
+after scanning the User Durable Objects, so the Projection object cannot know it.
+
+### Acceptance tests this Issue named
+
+| Case | Where |
+| --- | --- |
+| cross-shard paging | `usage-projection-month-delivery.test.ts`, and over Cap'n Web in `__integration__/usage-projection-rpc.test.ts` |
+| cancel | `usage-projection-month-delivery.test.ts` |
+| rebuild | `usage-projection-month-delivery.test.ts` |
+| retention cutoff equality | `usage-projection-month-delivery.test.ts` |
+| late-arriving detail | `usage-projection-month-delivery.test.ts` |
+| anonymization tombstones | `usage-anonymization.test.ts` |
+
 ## Boundary
 
 These are local workerd and SQLite measurements on the production code path, extrapolated

@@ -63,6 +63,25 @@ Lifetime Usage Summary Facts still grow for the deployment lifetime, about 1.6 G
 target. They clear the review threshold for the 24-month judgement the Oracle makes and cross it
 around year four. That is a separate decision and needs its own Issue.
 
+## Review outcome
+
+A two-axis review found that the clear which starts a rebuild removed that generation's Usage
+Principal rows but left its retained identities behind. A principal's high water is the only
+justification the prune has for dropping an identity, so an interrupted rebuild left identities
+that could never age out, which is the unbounded growth this Issue exists to remove. `ee8daa8`
+clears them with the generation; loosening the prune's join would instead have dropped identities
+with no high-water proof, which is what makes a replayed fact distinguishable from a different
+fact reusing its sequence.
+
+### Cases this Issue named
+
+| Case | Where |
+| --- | --- |
+| replay inside the window | `usage-projection-identity-retention.test.ts` |
+| replay outside the window | `usage-projection-identity-retention.test.ts` |
+| a different fact reusing a sequence inside the window | `usage-projection-identity-retention.test.ts` |
+| rebuild interaction | `usage-projection-identity-retention.test.ts` |
+
 ## Boundary
 
 Local workerd and SQLite on the production code path, extrapolated conservatively. Not a hosted
