@@ -315,10 +315,13 @@ describe("Usage Projection month delivery", () => {
     expect((await reader.read()).done).toBe(false);
     await reader.cancel("stop the export before it walks the older month");
 
-    // Cancelling a walk that had more months to visit must release the export slot, so the same
-    // report can still stream every month from the start.
-    const csv = await new Response(await report.exportCsv()).text();
+    // Cancelling a walk that had more months to visit must release its export slot. A report
+    // allows two at once, so taking both proves the cancelled one was returned rather than leaked.
+    const replacement = await report.exportCsv();
+    const alongside = await report.exportCsv();
+    const csv = await new Response(replacement).text();
     for (const fact of facts) expect(csv).toContain(fact.projectionFactId);
+    await alongside.cancel("release the second export slot");
   });
 
   it("expires detail across months at the exact retention cutoff", async () => {

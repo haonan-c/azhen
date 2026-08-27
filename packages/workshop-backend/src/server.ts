@@ -129,10 +129,10 @@ export { LanguageModelGatekeeper };
 // Re-export entrypoint types from admin-settings.ts.
 export { AdminSettings };
 
-// Re-export the replaceable deployment Usage Projection Durable Object.
+// Re-export the replaceable Projection Root Object.
 export { UsageProjection };
 
-// Re-export the per-UTC-month Usage Projection Durable Object.
+// Re-export the Projection Month Object.
 export { UsageProjectionMonth };
 
 // Re-export entrypoint types from user.ts.

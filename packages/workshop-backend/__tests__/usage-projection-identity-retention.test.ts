@@ -169,8 +169,8 @@ describe("Usage Projection retained fact identity", () => {
     }
     expect((await projection.requestRebuild(requestId)).state).toBe("completed");
 
-    // The rebuilt generation carries the identity, so a replay is still the same fact and a
-    // different fact on the same sequence is still a conflict.
+    // Inside the window the rebuilt generation still carries the identity, so a replay is the
+    // same fact and a different fact on the same sequence is still a conflict.
     expect(await projection.ingest([fact])).toEqual({
       acknowledgedFactIds: [fact.projectionFactId],
       rejected: [],
@@ -179,6 +179,19 @@ describe("Usage Projection retained fact identity", () => {
     expect((await projection.ingest([reuse])).rejected).toEqual([
       {projectionFactId: reuse.projectionFactId, code: "source-sequence-conflict"},
     ]);
+
+    // Outside the window the rebuilt generation's own Usage Principal high water is the fallback,
+    // so the replay is still acknowledged rather than reopening a gap.
+    await ageIdentities(projection);
+    for (let step = 0; step < 32; step += 1) {
+      if ((await identities(projection)).length === 0) break;
+      await maintain(projection);
+    }
+    expect(await identities(projection)).toEqual([]);
+    expect(await projection.ingest([fact])).toEqual({
+      acknowledgedFactIds: [fact.projectionFactId],
+      rejected: [],
+    });
   });
 
   it("clears a stale rebuild generation's retained identities before a new rebuild", async () => {

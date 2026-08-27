@@ -11,9 +11,7 @@ import type {
   UsageSource,
 } from "@gadgets/workshop-shared/api";
 import {
-  USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX,
   USAGE_PROJECTION_FACT_COLUMNS,
-  USAGE_PROJECTION_REPORT_PAGE_MAX,
   createUsageProjectionFactsTable,
   usageProjectionFactRowValues,
 } from "./usage-projection-facts-schema.js";
@@ -26,6 +24,8 @@ import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import type {AdminSettings} from "./admin-settings.js";
 import type {UserDurableObject} from "./user.js";
 import {
+  USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX,
+  USAGE_PROJECTION_REPORT_PAGE_MAX,
   decodeUsageReportCursor,
   encodeUsageReportCursor,
   reportLocalTimestamp,
@@ -380,13 +380,6 @@ const CURRENT_PROJECTION_SCHEMA_VERSION = "4";
  */
 const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
 
-/**
- * Most distinct Usage Principals one month object may report for a filtered active-User count.
- *
- * Distinct counts cannot be summed across months, so the root object unions each month's own
- * references. No month can hold more contributing Principals than the deployment has registered
- * Users, so exceeding this bound is a failure rather than a truncated count.
- */
 
 /**
  * How long a retired fact's identity is kept so a delayed redelivery is still recognized.
@@ -980,7 +973,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     // Months newer than the cutoff hold nothing to expire, so only older ones are visited, and a
     // month that still has work ends the turn. One turn therefore removes one bounded page, which
     // is the shape retention had before the rows moved into month objects.
-    for (const month of this.#monthsBefore(cutoff, this.#meta().active_generation)) {
+    for (const month of this.#monthsBefore(cutoff)) {
       const result = await this.#monthStub(month)
         .expireDetailBefore(usagePrincipalRef, cutoff, limit);
       monthsRemoved += result.removed;
@@ -1003,7 +996,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     return this.months.getByName(`${month}:${this.ctx.id.toString()}`);
   }
 
-  /** Name every stored month whose range can still hold detail older than one cutoff. */
   /**
    * Signal that rows a frozen report could still name are gone.
    *
@@ -1017,12 +1009,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, (BigInt(meta.detail_retention_revision) + 1n).toString());
   }
 
-  #monthsBefore(cutoffUtc: string, generation: string): string[] {
+  /**
+   * Name every stored month whose range can still hold detail older than one cutoff.
+   *
+   * Every generation is named, not only the reported one. A rebuild reads the retained authority
+   * again and can restore detail the reported generation already expired, so filtering here would
+   * leave that detail past its cutoff until a retention pass after the switchover.
+   */
+  #monthsBefore(cutoffUtc: string): string[] {
     const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
     return this.ctx.storage.sql.exec<{month: string}>(`
-      SELECT month FROM usage_projection_months
-      WHERE generation = ? AND month <= ? ORDER BY month
-    `, generation, cutoffMonth).toArray().map(row => row.month);
+      SELECT DISTINCT month FROM usage_projection_months WHERE month <= ? ORDER BY month
+    `, cutoffMonth).toArray().map(row => row.month);
   }
 
   /**

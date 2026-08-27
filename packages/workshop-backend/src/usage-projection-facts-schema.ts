@@ -10,22 +10,6 @@ import type {
 } from "./usage-projection.js";
 
 /**
- * Largest keyset page the Admin report reads at once.
- *
- * The root object bounds a caller's page here and a month object accepts one more, because a
- * keyset read fetches one extra row to learn whether another page follows.
- */
-export const USAGE_PROJECTION_REPORT_PAGE_MAX = 256;
-
-/**
- * Largest number of Usage Principal references one month returns for a distinct active-User count.
- *
- * Distinct counts cannot be summed across months, so the root unions each month's own references.
- * The result is bounded by the deployment's registered Users.
- */
-export const USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX = 10_000;
-
-/**
  * Create the current reportable Usage Projection fact table and its report indexes.
  *
  * The deployment root object and every UTC month object store the same reportable row shape, so
