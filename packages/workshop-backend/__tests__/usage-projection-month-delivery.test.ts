@@ -268,4 +268,108 @@ describe("Usage Projection month delivery", () => {
       {projectionFactId: poison.projectionFactId, code: "source-sequence-conflict"},
     ]);
   });
+
+  it("streams one CSV across the month boundary in source-time order", async () => {
+    const name = `delivery-csv-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const times = [
+      "2026-09-02T00:00:00.000Z",
+      "2026-09-01T00:00:00.000Z",
+      "2026-08-31T00:00:00.000Z",
+    ];
+    const facts = times.map((occurredAt, index) =>
+      detail(principal, {sourceSequence: BigInt(index + 1), occurredAt}));
+    for (const fact of facts) {
+      expect((await projection.ingest([fact])).rejected).toEqual([]);
+    }
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    const csv = await new Response(await report.exportCsv()).text();
+    for (const fact of facts) expect(csv).toContain(fact.projectionFactId);
+    const positions = facts.map(fact => csv.indexOf(fact.projectionFactId));
+    expect(positions).toEqual(positions.toSorted((left, right) => left - right));
+    expect(csv.split("\r\n").filter(line => line.includes("2026-0")).length)
+      .toBeGreaterThanOrEqual(3);
+  });
+
+  it("removes a retired generation from its month objects and forgets the month", async () => {
+    const name = `delivery-retire-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const fact = detail(principal);
+    expect((await projection.ingest([fact])).rejected).toEqual([]);
+    expect(await monthRowCount(name, "2026-08", fact.projectionFactId)).toBe(1);
+
+    const requestId = `retire-${crypto.randomUUID()}`;
+    await projection.requestRebuild(requestId);
+    await expect.poll(async () => (await projection.requestRebuild(requestId)).state)
+      .toBe("completed");
+    for (let step = 0; step < 512; step += 1) {
+      const pending = await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{cleanup_generation: string | null}>(`
+          SELECT cleanup_generation FROM usage_projection_meta WHERE singleton = 1
+        `).one().cleanup_generation);
+      if (pending === null) break;
+      await runDurableObjectAlarm(projection);
+    }
+
+    expect(await monthRowCount(name, "2026-08", fact.projectionFactId)).toBe(0);
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_months
+        WHERE generation <> (
+          SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
+        )
+      `).one().count)).toBe(0);
+    expect(await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_month_outbox
+      `).one().count)).toBe(0);
+  });
+
+  it("moves rows an earlier deployment left in the root into their month objects", async () => {
+    const name = `delivery-migrate-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const fact = detail(principal);
+    expect((await projection.ingest([fact])).rejected).toEqual([]);
+
+    // Recreate what a deployment that predates sharding holds: the applied row in the root, no
+    // month object, and no record that the month exists.
+    const [delivered] = await runInDurableObject(
+      testEnv.TEST_USAGE_PROJECTION_MONTH
+        .getByName(`2026-08:${testEnv.TEST_USAGE_PROJECTION.idFromName(name).toString()}`),
+      (_instance, state) => state.storage.sql.exec<Record<string, string | null>>(`
+        SELECT * FROM usage_projection_facts
+      `).toArray());
+    expect(delivered).toBeDefined();
+    const columns = Object.keys(delivered!);
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(
+        `INSERT OR REPLACE INTO usage_projection_facts (${columns.join(", ")})
+         VALUES (${columns.map(() => "?").join(", ")})`,
+        ...columns.map(column => delivered![column]!),
+      );
+      state.storage.sql.exec("DELETE FROM usage_projection_months");
+      state.storage.sql.exec(
+        "DELETE FROM usage_projection_expired_sequences WHERE fact_id = ?",
+        fact.projectionFactId,
+      );
+    });
+    await runInDurableObject(
+      testEnv.TEST_USAGE_PROJECTION_MONTH
+        .getByName(`2026-08:${testEnv.TEST_USAGE_PROJECTION.idFromName(name).toString()}`),
+      (_instance, state) => state.storage.sql.exec("DELETE FROM usage_projection_facts"));
+
+    for (let step = 0; step < 64; step += 1) {
+      if (await outbox(projection).then(rows => rows.length) === 0 &&
+          await monthRowCount(name, "2026-08", fact.projectionFactId) === 1) break;
+      await runDurableObjectAlarm(projection);
+    }
+    expect(await monthRowCount(name, "2026-08", fact.projectionFactId)).toBe(1);
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+  });
 });

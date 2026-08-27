@@ -150,7 +150,7 @@ type ProjectionMetaRow = {
   rebuild_failure_code: ProjectionRebuildStatus["failureCode"];
   cleanup_generation: string | null;
   cleanup_stage:
-    "facts" | "expired-sequences" | "rejections" | "drains" | "principals" |
+    "months" | "facts" | "expired-sequences" | "rejections" | "drains" | "principals" |
     "active-users" | "summaries" | "rebuild-users" | "totals" | null;
   maintenance_turn: "drain" | "lifecycle";
   bootstrap_state: "pending" | "complete";
@@ -570,7 +570,45 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * removed, so a failed call is retried by the maintenance alarm without losing or duplicating a
    * row. Returns whether the outbox is now empty.
    */
+  /**
+   * Enqueue applied rows that predate month routing so delivery can move them.
+   *
+   * A deployment upgraded from a single-object Projection holds applied rows the outbox never saw.
+   * Routing them through the same outbox means migration has no path of its own: delivery moves
+   * each row to its month object and retires the root's copy exactly as it does for a new fact.
+   */
+  #routeUnroutedAppliedRows(): void {
+    const rows = this.ctx.storage.sql.exec<{
+      generation: string;
+      fact_id: string;
+      occurred_at: string | null;
+      bucket_start: string | null;
+      applied_watermark: string;
+    }>(`
+      SELECT facts.generation, facts.fact_id, facts.occurred_at, facts.bucket_start,
+             facts.applied_watermark
+      FROM usage_projection_facts AS facts
+      WHERE facts.applied = 1 AND facts.applied_watermark IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_projection_month_outbox AS outbox
+          WHERE outbox.generation = facts.generation AND outbox.fact_id = facts.fact_id
+        )
+      LIMIT 64
+    `).toArray();
+    for (const row of rows) {
+      const sourceTime = row.occurred_at ?? row.bucket_start;
+      if (sourceTime === null) continue;
+      this.ctx.storage.sql.exec(`
+        INSERT OR REPLACE INTO usage_projection_month_outbox (
+          generation, fact_id, month, applied_watermark
+        ) VALUES (?, ?, ?, ?)
+      `, row.generation, row.fact_id, usageProjectionMonthKey(sourceTime),
+      row.applied_watermark);
+    }
+  }
+
   async #deliverMonthOutboxStep(): Promise<boolean> {
+    this.#routeUnroutedAppliedRows();
     const pending = this.ctx.storage.sql.exec<{month: string}>(`
       SELECT month FROM usage_projection_month_outbox
       ORDER BY length(applied_watermark), applied_watermark LIMIT 1
@@ -1226,7 +1264,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_meta SET rebuild_state = 'failed',
             rebuild_failure_code = 'projection-write-failed', rebuild_completed_at = ?,
-            cleanup_generation = rebuild_generation, cleanup_stage = 'facts'
+            cleanup_generation = rebuild_generation, cleanup_stage = 'months'
           WHERE singleton = 1
         `, new Date().toISOString());
         rebuildFailed = true;
@@ -1469,7 +1507,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_meta SET rebuild_state = 'failed',
             rebuild_failure_code = 'projection-write-failed', rebuild_completed_at = ?,
-            cleanup_generation = rebuild_generation, cleanup_stage = 'facts'
+            cleanup_generation = rebuild_generation, cleanup_stage = 'months'
           WHERE singleton = 1
         `, new Date().toISOString());
         return;
@@ -1485,7 +1523,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         UPDATE usage_projection_meta SET active_generation = ?, ingestion_watermark = ?,
           latest_applied_source_at = ?, last_ingested_at = ?, failed_ingestion_count = '0',
           failure_code = NULL, rebuild_state = 'completed', rebuild_completed_at = ?,
-          rebuild_failure_code = NULL, cleanup_generation = ?, cleanup_stage = 'facts',
+          rebuild_failure_code = NULL, cleanup_generation = ?, cleanup_stage = 'months',
           bootstrap_state = 'complete'
         WHERE singleton = 1
       `, generation, applied.count, applied.latest,
@@ -1498,7 +1536,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       UPDATE usage_projection_meta SET rebuild_state = 'failed', rebuild_failure_code = ?,
         rebuild_completed_at = ?, cleanup_generation = rebuild_generation,
-        cleanup_stage = 'facts' WHERE singleton = 1
+        cleanup_stage = 'months' WHERE singleton = 1
     `, code, new Date().toISOString());
     this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now()));
   }
@@ -1510,6 +1548,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       throw new Error("Usage Projection refused to clean its active generation.");
     }
     const generation = meta.cleanup_generation;
+    if (meta.cleanup_stage === "months") {
+      if (await this.#cleanRetiredGenerationMonths(generation)) {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET cleanup_stage = 'facts' WHERE singleton = 1
+        `);
+      }
+      await this.ctx.storage.setAlarm(Date.now());
+      return;
+    }
     const table = meta.cleanup_stage === "facts" ? "usage_projection_facts"
       : meta.cleanup_stage === "expired-sequences" ? "usage_projection_expired_sequences"
         : meta.cleanup_stage === "rejections" ? "usage_projection_rejections"
@@ -1544,6 +1591,34 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       WHERE singleton = 1
     `, next, next === null ? null : generation);
     if (next !== null) await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  /**
+   * Remove one retired generation from the month objects that hold its reportable rows.
+   *
+   * Its outbox entries go first because a row that will be deleted never needs delivering. A month
+   * is forgotten once it reports itself complete, so the router only names months that still hold
+   * rows. Returns whether the generation is gone from every month.
+   */
+  async #cleanRetiredGenerationMonths(generation: string): Promise<boolean> {
+    this.ctx.storage.sql.exec(`
+      DELETE FROM usage_projection_month_outbox WHERE generation = ?
+    `, generation);
+    const months = this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month LIMIT 8
+    `, generation).toArray();
+    if (months.length === 0) return true;
+    for (const {month} of months) {
+      if (!await this.#monthStub(month).removeGeneration(generation)) continue;
+      this.ctx.storage.sql.exec(`
+        DELETE FROM usage_projection_months WHERE generation = ? AND month = ?
+      `, generation, month);
+    }
+    return this.ctx.storage.sql.exec<{present: string}>(`
+      SELECT CAST(EXISTS(
+        SELECT 1 FROM usage_projection_months WHERE generation = ? LIMIT 1
+      ) AS TEXT) AS present
+    `, generation).one().present === "0";
   }
 
   #rebuildStatus(meta: ProjectionMetaRow): ProjectionRebuildStatus {
