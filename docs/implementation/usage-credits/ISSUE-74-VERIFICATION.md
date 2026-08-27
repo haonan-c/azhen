@@ -42,7 +42,10 @@ The root object's variable size after ingesting and pruning:
 | 300 | 4,096 |
 | 900 | 4,096 |
 
-**Growth 1.0.** The root's own size no longer depends on how many records passed through it.
+**Growth 1.0, at the floor.** Both runs land on SQLite's single 4,096-byte page, so this is not a
+resolved ratio: the measurement has no resolution below one page. What it shows is that tripling
+the records through the root leaves its own size at the minimum allocation. The test asserts the
+ratio stays under 1.5, which is the claim it can actually support.
 
 ## Projection at the Acceptance Oracle target
 

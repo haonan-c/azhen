@@ -66,5 +66,11 @@ conservatively. They are not a hosted deployment measurement, and they are not a
 
 `keeps User legacy backfill alive when the requesting rebuild stops` in
 `usage-projection.test.ts` failed once in four full-chain runs and passed in three standalone runs
-of its own config. Its assertion is on the User Durable Object's own backfill batching. It is not
-diagnosed and should not be treated as resolved by a passing re-run.
+of its own config. Its assertion is on the User Durable Object's own backfill batching.
+
+`cbac8b8` makes the measurement atomic: it clears the derived projection state and measures the
+next batch inside one transaction, because delivery maintenance runs unawaited and any await
+between the two lets a legitimate maintenance turn advance the backfill being measured. That is a
+proven race in the test, not a proven cause of the one failure. Seventeen targeted attempts did
+not reproduce the original failure, so the fix is a hardening and the flake is not confirmed
+resolved.
