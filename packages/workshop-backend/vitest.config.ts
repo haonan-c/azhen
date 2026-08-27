@@ -17,6 +17,7 @@ export default defineConfig({
         compatibilityDate: '2026-02-02',
         compatibilityFlags: ['experimental', 'nodejs_compat'],
         durableObjects: {
+          TEST_USAGE_PROJECTION_MONTH: {className: "UsageProjectionMonth", useSQLite: true},
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_ADMIN_SETTINGS: { className: 'AdminSettings', useSQLite: true },
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },
@@ -39,6 +40,7 @@ export default defineConfig({
       '__tests__/usage-projection.test.ts',
       '__tests__/usage-projection-compaction.test.ts',
       '__tests__/usage-projection-month.test.ts',
+      '__tests__/usage-projection-month-delivery.test.ts',
       '__tests__/usage-report.test.ts',
     ],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.

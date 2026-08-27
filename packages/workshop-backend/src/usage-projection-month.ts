@@ -3,21 +3,17 @@ import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import {
   USAGE_PROJECTION_FACT_COLUMNS,
   createUsageProjectionFactsTable,
-  usageProjectionFactRowValues,
 } from "./usage-projection-facts-schema.js";
-import type {UsageProjectionFact} from "./usage-projection.js";
 
-/** One reportable Usage Projection row with the apply coordinates its root object assigned. */
-export type UsageProjectionMonthRow = {
-  /** Projection generation that applied the fact. */
-  generation: string;
-  /** Report visibility watermark the root object stamped when it applied the fact. */
-  appliedWatermark: bigint;
-  /** Content hash the root object recorded for the fact. */
-  factHash: string;
-  /** The applied fact itself. */
-  fact: UsageProjectionFact;
-};
+/**
+ * One reportable Usage Projection row, keyed by the column names both objects store.
+ *
+ * The deployment root object forwards exactly what it holds, so delivery neither reshapes a row
+ * nor needs to rebuild the fact it came from.
+ */
+export type UsageProjectionStoredRow = Record<
+  (typeof USAGE_PROJECTION_FACT_COLUMNS)[number], string | number | null
+>;
 
 const MONTH_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
 
@@ -31,9 +27,13 @@ export function usageProjectionMonthKey(sourceTimeUtc: string): string {
   return normalizeCanonicalUtcTimestamp(sourceTimeUtc, "projection month source time").slice(0, 7);
 }
 
-/** Read the canonical UTC source time that owns one fact. */
-export function usageProjectionFactSourceTime(fact: UsageProjectionFact): string {
-  return fact.rowKind === "detail" ? fact.occurredAt : fact.bucketStart;
+/** Read the canonical UTC source time that owns one stored reportable row. */
+export function usageProjectionStoredRowSourceTime(row: UsageProjectionStoredRow): string {
+  const sourceTime = row.occurred_at ?? row.bucket_start;
+  if (typeof sourceTime !== "string") {
+    throw new TypeError("Usage Projection row has no source time.");
+  }
+  return sourceTime;
 }
 
 /**
@@ -54,15 +54,17 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
   /**
    * Store one bounded page of applied rows and report which rows this object now holds.
    *
-   * Delivery is idempotent, so a redelivered row is acknowledged without changing what is stored.
+   * Delivery is idempotent on the fact identity, so a redelivered row is acknowledged without
+   * changing what is stored. Month ownership is checked before any row is written, so a misrouted
+   * delivery leaves no partial state behind.
    */
-  storeRows(rows: UsageProjectionMonthRow[]): string[] {
+  storeRows(rows: UsageProjectionStoredRow[]): string[] {
     if (!Array.isArray(rows) || rows.length > 64) {
       throw new TypeError("Usage Projection month delivery is invalid.");
     }
     const owned = this.#monthKey();
     for (const row of rows) {
-      if (usageProjectionMonthKey(usageProjectionFactSourceTime(row.fact)) !== owned) {
+      if (usageProjectionMonthKey(usageProjectionStoredRowSourceTime(row)) !== owned) {
         throw new TypeError("Usage Projection month object received a row it does not own.");
       }
     }
@@ -71,14 +73,15 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       const stored: string[] = [];
       for (const row of rows) {
         this.ctx.storage.sql.exec(`
-          INSERT OR IGNORE INTO usage_projection_facts (${
+          INSERT OR REPLACE INTO usage_projection_facts (${
             USAGE_PROJECTION_FACT_COLUMNS.join(", ")})
           VALUES (${placeholders})
-        `, ...usageProjectionFactRowValues(
-          row.generation, row.factHash, row.fact,
-          {applied: 1, appliedWatermark: row.appliedWatermark},
-        ));
-        stored.push(row.fact.projectionFactId);
+        `, ...USAGE_PROJECTION_FACT_COLUMNS.map(column => row[column]));
+        const factId = row.fact_id;
+        if (typeof factId !== "string") {
+          throw new TypeError("Usage Projection row has no fact identity.");
+        }
+        stored.push(factId);
       }
       return stored;
     });
