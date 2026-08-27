@@ -27,6 +27,8 @@ export default defineConfig({
   ],
   test: {
     include: ["__tests__/usage-projection-identity-retention.test.ts"],
+    // This suite reports a measured size breakdown, so its output must reach the run log.
+    disableConsoleIntercept: true,
     fileParallelism: false,
     setupFiles: ["../../test-setup/assert-workerd.ts"],
     // No rejection is expected here; every error stays fail-closed.

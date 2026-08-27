@@ -153,4 +153,32 @@ describe("Usage Projection retained fact identity", () => {
       {projectionFactId: poison.projectionFactId, code: "source-sequence-conflict"},
     ]);
   });
+
+  it("holds the root object flat as records accumulate", async () => {
+    const measure = async (records: number) => {
+      const projection = await ready(`identity-size-${crypto.randomUUID()}`);
+      const principal = crypto.randomUUID();
+      const empty = await runInDurableObject(
+        projection, (_instance, state) => state.storage.sql.databaseSize);
+      for (let index = 0; index < records; index += 1) {
+        expect((await projection.ingest([detail(principal, {
+          sourceSequence: BigInt(index + 1),
+        })])).rejected).toEqual([]);
+      }
+      // Age every identity so the whole run is outside the replay window, then drain the prune.
+      await ageIdentities(projection);
+      for (let step = 0; step < 64; step += 1) {
+        await maintain(projection);
+        if ((await identities(projection)).length === 0) break;
+      }
+      return await runInDurableObject(
+        projection, (_instance, state) => state.storage.sql.databaseSize) - empty;
+    };
+    const small = await measure(300);
+    const large = await measure(900);
+    const result = {small, large, growth: large / Math.max(small, 1)};
+    console.warn(`USAGE_PROJECTION_IDENTITY_SIZE=${JSON.stringify(result)}`);
+    // Pruned identities leave the root's own size independent of how many records passed through.
+    expect(result.growth).toBeLessThan(1.5);
+  }, 180_000);
 });
