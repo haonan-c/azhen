@@ -974,12 +974,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     let monthsComplete = true;
     let monthsRemoved = 0;
     const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection detail cutoff");
-    // Months newer than the cutoff hold nothing to expire, so only older ones are visited.
-    for (const month of this.#monthsBefore(cutoff)) {
+    // Months newer than the cutoff hold nothing to expire, so only older ones are visited, and a
+    // month that still has work ends the turn. One turn therefore removes one bounded page, which
+    // is the shape retention had before the rows moved into month objects.
+    for (const month of this.#monthsBefore(cutoff, this.#meta().active_generation)) {
       const result = await this.#monthStub(month)
         .expireDetailBefore(usagePrincipalRef, cutoff, limit);
-      if (!result.complete) monthsComplete = false;
       monthsRemoved += result.removed;
+      if (!result.complete) {
+        monthsComplete = false;
+        break;
+      }
     }
     // Rows a report could still name are gone, so reports frozen before this must fail rather
     // than silently return fewer rows. This is the same signal detail retention has always used.
@@ -1003,11 +1008,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Name every stored month whose range can still hold detail older than one cutoff. */
-  #monthsBefore(cutoffUtc: string): string[] {
+  #monthsBefore(cutoffUtc: string, generation: string): string[] {
     const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
     return this.ctx.storage.sql.exec<{month: string}>(`
-      SELECT DISTINCT month FROM usage_projection_months WHERE month <= ? ORDER BY month
-    `, cutoffMonth).toArray().map(row => row.month);
+      SELECT month FROM usage_projection_months
+      WHERE generation = ? AND month <= ? ORDER BY month
+    `, generation, cutoffMonth).toArray().map(row => row.month);
   }
 
   /**
@@ -1022,12 +1028,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     if (floor < 1n) return true;
     let complete = true;
     let removed = 0;
+    // A month that still has work ends the turn, so one turn compacts one bounded page.
     for (const row of this.ctx.storage.sql.exec<{month: string}>(`
-      SELECT DISTINCT month FROM usage_projection_months ORDER BY month DESC
-    `).toArray()) {
+      SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month DESC
+    `, meta.active_generation).toArray()) {
       const result = await this.#monthStub(row.month).compactSupersededAggregates(floor);
-      if (!result.complete) complete = false;
       removed += result.removed;
+      if (!result.complete) {
+        complete = false;
+        break;
+      }
     }
     // A report frozen at an older watermark could still name a revision that was removed, so it
     // must fail rather than silently lose a row. Detail retention uses the same signal.
