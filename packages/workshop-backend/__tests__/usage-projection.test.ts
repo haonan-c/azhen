@@ -3069,26 +3069,28 @@ describe("deployment Usage Projection", () => {
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
     const registered = (await settings.searchRegisteredUsageUsers({query: identity, limit: 1}))
       .users[0]!;
-    await runInDurableObject(user, async (_instance, state) => {
-      for (const prefix of [
-        "usageAccount:projection",
-        "usageAccount:summary",
-        "usageAccount:detail",
-      ]) {
-        for (const [key] of Array.from(state.storage.kv.list({prefix}))) {
-          state.storage.kv.delete(key);
+    await runInDurableObject(user, (_instance, state) => state.storage.deleteAlarm());
+    // Clearing the derived projection state and measuring the next batch have to be one
+    // transaction. Delivery maintenance runs unawaited through `ctx.waitUntil`, so any await
+    // between the two lets a legitimate maintenance turn advance the backfill this measures.
+    const partialBackfill = await runInDurableObject(user, (_instance, state) =>
+      state.storage.transactionSync(() => {
+        for (const prefix of [
+          "usageAccount:projection",
+          "usageAccount:summary",
+          "usageAccount:detail",
+        ]) {
+          for (const [key] of Array.from(state.storage.kv.list({prefix}))) {
+            state.storage.kv.delete(key);
+          }
         }
-      }
-      await state.storage.deleteAlarm();
-    });
-    const partialBackfill = await runInDurableObject(user, (_instance, state) => {
-      expect(new UsageAccount(state.storage).backfillProjectionFactsBatch(32)).toBe(false);
-      return {
-        stage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
-        cursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
-        pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
-      };
-    });
+        expect(new UsageAccount(state.storage).backfillProjectionFactsBatch(32)).toBe(false);
+        return {
+          stage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+          cursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+          pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+        };
+      }));
     expect(partialBackfill).toMatchObject({stage: "gatekeeper", pendingCount: 64n});
     expect(partialBackfill.cursor).toBeDefined();
     await expect(runInDurableObject(user, (_instance, state) => {
