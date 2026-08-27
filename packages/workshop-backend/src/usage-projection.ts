@@ -386,6 +386,16 @@ const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
  * Users, so exceeding this bound is a failure rather than a truncated count.
  */
 const ACTIVE_PRINCIPAL_PAGE_MAX = 10_000;
+
+/**
+ * How long a retired fact's identity is kept so a delayed redelivery is still recognized.
+ *
+ * A User outbox retries until the Projection acknowledges, so a replay arrives within seconds, not
+ * days. Beyond this window `usage_projection_principals.high_water` still proves the sequence was
+ * processed and the replay is acknowledged from that alone, which bounds the identity table to
+ * about one day of ingest instead of the whole retention period.
+ */
+const RETAINED_IDENTITY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const RETIRED_V2_FACTS_TABLE = "usage_projection_facts_retired_v2";
 const RETIRED_V2_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
 const RETIRED_V3_FACTS_TABLE = "usage_projection_facts_retired_v3";
@@ -607,6 +617,35 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  /**
+   * Drop one bounded page of retained fact identities that no replay can still need.
+   *
+   * A row is only removed once it is outside the replay window *and* its Usage Principal has
+   * applied past its sequence, because apply steps over a retired sequence through this same row.
+   * Returns whether nothing prunable is left.
+   */
+  #pruneRetainedIdentitiesStep(): boolean {
+    const cutoff = new Date(Date.now() - RETAINED_IDENTITY_WINDOW_MS).toISOString();
+    const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+      SELECT identities.generation, identities.fact_id
+      FROM usage_projection_expired_sequences AS identities
+      JOIN usage_projection_principals AS principals
+        ON principals.generation = identities.generation
+        AND principals.principal_ref = identities.principal_ref
+      WHERE identities.retired_at < ?
+        AND (length(identities.source_sequence) < length(principals.high_water) OR
+          (length(identities.source_sequence) = length(principals.high_water)
+            AND identities.source_sequence <= principals.high_water))
+      LIMIT ?
+    `, cutoff, 65).toArray();
+    for (const row of rows.slice(0, 64)) {
+      this.ctx.storage.sql.exec(`
+        DELETE FROM usage_projection_expired_sequences WHERE generation = ? AND fact_id = ?
+      `, row.generation, row.fact_id);
+    }
+    return rows.length <= 64;
+  }
+
   async #deliverMonthOutboxStep(): Promise<boolean> {
     this.#routeUnroutedAppliedRows();
     const pending = this.ctx.storage.sql.exec<{month: string}>(`
@@ -646,9 +685,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         // fact that reuses its sequence is still reported as a conflict.
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_expired_sequences (
-            generation, fact_id, principal_ref, source_sequence, fact_hash
-          ) VALUES (?, ?, ?, ?, ?)
-        `, row.generation, row.fact_id, row.principal_ref, row.source_sequence, row.fact_hash);
+            generation, fact_id, principal_ref, source_sequence, fact_hash, retired_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `, row.generation, row.fact_id, row.principal_ref, row.source_sequence, row.fact_hash,
+        new Date().toISOString());
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
         `, row.generation, row.fact_id);
@@ -1033,9 +1073,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       for (const row of removed) {
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_expired_sequences (
-            generation, fact_id, principal_ref, source_sequence
-          ) VALUES (?, ?, ?, ?)
-        `, row.generation, row.fact_id, usagePrincipalRef, row.source_sequence);
+            generation, fact_id, principal_ref, source_sequence, retired_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `, row.generation, row.fact_id, usagePrincipalRef, row.source_sequence,
+        new Date().toISOString());
         const table = row.storage_kind === "fact"
           ? "usage_projection_facts" : "usage_projection_rejections";
         this.ctx.storage.sql.exec(`
@@ -1217,7 +1258,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     await this.#runRetiredProjectionCleanupStep();
     const deliveryComplete = await this.#deliverMonthOutboxStep();
     const monthCompactionComplete = await this.#compactMonthsStep();
-    await this.#scheduleRemainingMaintenance(deliveryComplete && monthCompactionComplete);
+    const identityPruneComplete = this.#pruneRetainedIdentitiesStep();
+    await this.#scheduleRemainingMaintenance(
+      deliveryComplete && monthCompactionComplete && identityPruneComplete,
+    );
   }
 
   #hasApplyDrain(): boolean {
@@ -1908,6 +1952,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
             sequenceRejectionAccepted: false,
           });
         }
+      }
+      // Nothing here names this fact, and its Usage Principal has already applied past its
+      // sequence, so it is a redelivery whose retained identity was pruned. Acknowledging it is
+      // what `high_water` already proves; storing it would leave a row apply can never reach.
+      const appliedThrough = this.ctx.storage.sql.exec<{high_water: string}>(`
+        SELECT high_water FROM usage_projection_principals
+        WHERE generation = ? AND principal_ref = ?
+      `, generation, fact.usagePrincipalRef).toArray()[0];
+      if (appliedThrough !== undefined &&
+          fact.sourceSequence <= BigInt(appliedThrough.high_water)) {
+        return complete({rejection: null, applied: true, sequenceRejectionAccepted: false});
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_facts (${USAGE_PROJECTION_FACT_COLUMNS.join(", ")})
@@ -2629,11 +2684,21 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `);
     // A row whose reportable copy now lives in a month object keeps its content hash here, so a
     // redelivery of the same fact identity with a different payload is still a conflict.
-    if (!new Set(this.ctx.storage.sql.exec<{name: string}>(
+    const identityColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
       "PRAGMA table_info(usage_projection_expired_sequences)",
-    ).toArray().map(column => column.name)).has("fact_hash")) {
+    ).toArray().map(column => column.name));
+    if (!identityColumns.has("fact_hash")) {
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_expired_sequences ADD COLUMN fact_hash TEXT
+      `);
+    }
+    // Rows that predate this column were written only by detail retention, so each is at least a
+    // full retention window old and no live delivery can still replay it. The empty default sorts
+    // before every canonical timestamp, which makes them prunable on the first maintenance turn.
+    if (!identityColumns.has("retired_at")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_expired_sequences
+        ADD COLUMN retired_at TEXT NOT NULL DEFAULT ''
       `);
     }
     this.ctx.storage.sql.exec(`

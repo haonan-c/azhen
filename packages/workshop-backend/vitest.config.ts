@@ -41,6 +41,7 @@ export default defineConfig({
       '__tests__/usage-projection-compaction.test.ts',
       '__tests__/usage-projection-month.test.ts',
       '__tests__/usage-projection-month-delivery.test.ts',
+      '__tests__/usage-projection-identity-retention.test.ts',
       '__tests__/usage-report.test.ts',
     ],
     // Asserts the pool actually started, rather than trusting a green run to mean workerd.
