@@ -131,6 +131,9 @@ export { AdminSettings };
 // Re-export the replaceable deployment Usage Projection Durable Object.
 export { UsageProjection };
 
+import { UsageProjectionMonth } from "./usage-projection-month.js";
+export { UsageProjectionMonth };
+
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl };
 

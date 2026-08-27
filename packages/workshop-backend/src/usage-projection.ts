@@ -10,6 +10,11 @@ import type {
   ProjectionRebuildStatus,
   UsageSource,
 } from "@gadgets/workshop-shared/api";
+import {
+  aggregateDimensionKey,
+  aggregateSnapshotValue,
+  createUsageProjectionFactsTable,
+} from "./usage-projection-facts-schema.js";
 import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import type {AdminSettings} from "./admin-settings.js";
 import type {UserDurableObject} from "./user.js";
@@ -2122,79 +2127,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   #createCurrentFactsTableAndIndexes(): void {
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS usage_projection_facts (
-        generation TEXT NOT NULL, fact_id TEXT NOT NULL, fact_hash TEXT NOT NULL,
-        principal_ref TEXT NOT NULL, source_sequence TEXT NOT NULL, occurred_at TEXT,
-        safe_record_ref TEXT, safe_attempt_ref TEXT, reservation_status TEXT,
-        bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
-        summary_dimension_key TEXT, summary_snapshot_value TEXT,
-        source TEXT NOT NULL, row_kind TEXT NOT NULL, metered_kind TEXT, usage_kind TEXT NOT NULL,
-        outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT, vendor_id TEXT,
-        billing_method_key TEXT, external_account_id TEXT, gadget_id TEXT,
-        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
-        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
-        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
-        billable_api_operations TEXT NOT NULL,
-        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
-        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
-        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
-        unreserved_attempts TEXT NOT NULL,
-        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
-        unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
-        applied_watermark TEXT,
-        PRIMARY KEY (generation, fact_id), UNIQUE (generation, principal_ref, source_sequence),
-        CHECK ((row_kind = 'detail' AND occurred_at IS NOT NULL AND bucket_start IS NULL AND
-                metered_kind IS NULL AND
-                summary_fact_id IS NULL AND summary_revision IS NULL AND
-                summary_dimension_key IS NULL AND summary_snapshot_value IS NULL) OR
-               (row_kind = 'aggregate' AND occurred_at IS NULL AND safe_record_ref IS NULL AND
-                safe_attempt_ref IS NULL AND reservation_status IS NULL AND
-                metered_kind IS NOT NULL AND
-                bucket_start IS NOT NULL AND
-                summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
-                summary_dimension_key IS NOT NULL AND summary_snapshot_value IS NOT NULL))
-      );
-      CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v4
-      ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start));
-      CREATE INDEX IF NOT EXISTS usage_projection_report_time_v4
-      ON usage_projection_facts(
-        generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
-      );
-      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time_v4
-      ON usage_projection_facts(generation, principal_ref,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time_v4
-      ON usage_projection_facts(generation, gadget_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time_v4
-      ON usage_projection_facts(generation, deployment_model_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time_v4
-      ON usage_projection_facts(generation, vendor_id, billing_method_key,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time_v4
-      ON usage_projection_facts(generation, external_account_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time_v4
-      ON usage_projection_facts(generation, source,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time_v4
-      ON usage_projection_facts(generation, outcome,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_unknown_time_v4
-      ON usage_projection_facts(
-        generation, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
-      ) WHERE outcome IN ('usage-unknown-held', 'usage-unknown-released');
-      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v4
-      ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v4
-      ON usage_projection_facts(
-        generation, summary_fact_id, applied, applied_watermark, summary_revision
-      )
-    `);
+    createUsageProjectionFactsTable(this.ctx.storage.sql);
   }
 
   #createCurrentSummariesTableAndIndex(): void {
@@ -2858,30 +2791,6 @@ function storedFactSourceTime(fact: StoredFactRow): string {
   const sourceTime = fact.row_kind === "detail" ? fact.occurred_at : fact.bucket_start;
   if (sourceTime === null) throw new Error("Usage Projection fact source time is missing.");
   return sourceTime;
-}
-
-function aggregateDimensionKey(fact: UsageProjectionAggregateFact): string {
-  return JSON.stringify([
-    fact.schemaVersion, fact.usagePrincipalRef, fact.bucketStart,
-    fact.source, fact.kind, fact.meteredKind, fact.outcome, fact.pricing, fact.deploymentModelId,
-    fact.vendorId, fact.billingMethodKey, fact.externalAccountId, fact.gadgetId,
-  ]);
-}
-
-function aggregateSnapshotValue(fact: UsageProjectionAggregateFact): string {
-  return JSON.stringify([
-    fact.cacheHitInputTokens.toString(), fact.cacheMissInputTokens.toString(),
-    fact.cacheWriteInputTokens.toString(), fact.outputTokens.toString(),
-    fact.reasoningTokens.toString(), fact.providerCostUsdSubunits.toString(),
-    fact.chargedUsageCreditSubunits.toString(), fact.meteredUseCount.toString(),
-    fact.billableApiOperations.toString(),
-    fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
-    fact.meteringAttempts.toString(), fact.heldReservations.toString(),
-    fact.releasedReservations.toString(), fact.settledReservations.toString(),
-    fact.unreservedAttempts.toString(),
-    fact.activeUserContribution.toString(), fact.unpricedModelUses.toString(),
-    fact.unpricedApiOperations.toString(),
-  ]);
 }
 
 function storedFactMetricSnapshot(fact: StoredFactRow): ProjectionMetricSnapshot {
