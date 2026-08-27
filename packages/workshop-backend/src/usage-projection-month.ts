@@ -136,9 +136,13 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
    * Remove this month's detail rows for one Usage Principal before a retention cutoff.
    *
    * Usage Summary Fact revisions are kept, so a historical report still reports the same totals
-   * after the event detail behind them expires. Returns whether this month is now complete.
+   * after the event detail behind them expires. Reports whether this month is now complete and how
+   * many rows it removed, so the root object can fail reports frozen before the removal.
    */
-  expireDetailBefore(usagePrincipalRef: string, cutoffUtc: string, limit = 64): boolean {
+  expireDetailBefore(
+      usagePrincipalRef: string,
+      cutoffUtc: string,
+      limit = 64): {complete: boolean; removed: number} {
     if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
       throw new TypeError("Usage Projection month retention request is invalid.");
     }
@@ -149,12 +153,13 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
         WHERE principal_ref = ? AND row_kind = 'detail' AND occurred_at < ?
         LIMIT ?
       `, usagePrincipalRef, cutoff, limit + 1).toArray();
-      for (const row of rows.slice(0, limit)) {
+      const removed = rows.slice(0, limit);
+      for (const row of removed) {
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
         `, row.generation, row.fact_id);
       }
-      return rows.length <= limit;
+      return {complete: rows.length <= limit, removed: removed.length};
     });
   }
 
@@ -163,11 +168,19 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
    *
    * A Usage Summary Fact belongs to one bucket and therefore one month, so its whole revision
    * history is here and the effective revision can be chosen without consulting another object.
+   * Only revisions replaced at or below `watermarkFloor` are removed, so a report opened inside
+   * the root object's lag window keeps every row it can still name. Reports the floor and how many
+   * rows it removed, so the root object can fail reports frozen before the removal.
    */
-  compactSupersededAggregates(limit = 64): boolean {
-    if (!Number.isInteger(limit) || limit < 1 || limit > 64) {
+  compactSupersededAggregates(
+      watermarkFloor: bigint,
+      limit = 64): {complete: boolean; removed: number} {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64 ||
+        typeof watermarkFloor !== "bigint") {
       throw new TypeError("Usage Projection month compaction request is invalid.");
     }
+    if (watermarkFloor < 1n) return {complete: true, removed: 0};
+    const floor = watermarkFloor.toString();
     return this.ctx.storage.transactionSync(() => {
       const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
         SELECT facts.generation, facts.fact_id
@@ -180,6 +193,9 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
               AND newer.row_kind = 'aggregate'
               AND newer.summary_fact_id = facts.summary_fact_id
               AND newer.applied = 1 AND newer.applied_watermark IS NOT NULL
+              AND (length(newer.applied_watermark) < length(?) OR
+                (length(newer.applied_watermark) = length(?)
+                  AND newer.applied_watermark <= ?))
               AND (length(newer.summary_revision) > length(facts.summary_revision) OR
                 (length(newer.summary_revision) = length(facts.summary_revision)
                   AND (newer.summary_revision > facts.summary_revision OR
@@ -189,13 +205,14 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
                           newer.applied_watermark < facts.applied_watermark))))))
           )
         LIMIT ?
-      `, limit + 1).toArray();
-      for (const row of rows.slice(0, limit)) {
+      `, floor, floor, floor, limit + 1).toArray();
+      const removed = rows.slice(0, limit);
+      for (const row of removed) {
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
         `, row.generation, row.fact_id);
       }
-      return rows.length <= limit;
+      return {complete: rows.length <= limit, removed: removed.length};
     });
   }
 

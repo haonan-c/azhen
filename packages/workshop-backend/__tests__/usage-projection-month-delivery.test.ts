@@ -225,4 +225,47 @@ describe("Usage Projection month delivery", () => {
     expect(metrics.providerCostUsdSubunits).toBe(20n);
     expect(metrics.activeUsers).toBe(1n);
   });
+
+  it("keeps no applied row in the root object once its month object holds it", async () => {
+    const name = `delivery-root-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const fact = detail(principal);
+    expect((await projection.ingest([fact])).rejected).toEqual([]);
+
+    const root = await runInDurableObject(projection, (_instance, state) => ({
+      facts: state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_facts WHERE applied = 1
+      `).one().count,
+      expired: state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_expired_sequences WHERE fact_id = ?
+      `, fact.projectionFactId).one().count,
+    }));
+    expect(root).toEqual({facts: 0, expired: 1});
+    expect(await monthRowCount(name, "2026-08", fact.projectionFactId)).toBe(1);
+
+    // A redelivery after a lost acknowledgement stays idempotent.
+    expect(await projection.ingest([fact])).toEqual({
+      acknowledgedFactIds: [fact.projectionFactId],
+      rejected: [],
+    });
+    expect(await monthRowCount(name, "2026-08", fact.projectionFactId)).toBe(1);
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows).toHaveLength(1);
+    expect((await projection.readHealth()).failedIngestionCount).toBe(0n);
+  });
+
+  it("still rejects a different fact that reuses a delivered sequence", async () => {
+    const name = `delivery-conflict-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const first = detail(principal, {sourceSequence: 1n});
+    expect((await projection.ingest([first])).rejected).toEqual([]);
+
+    const poison = detail(principal, {sourceSequence: 1n, outputTokens: 99n});
+    expect((await projection.ingest([poison])).rejected).toEqual([
+      {projectionFactId: poison.projectionFactId, code: "source-sequence-conflict"},
+    ]);
+  });
 });

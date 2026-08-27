@@ -602,7 +602,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         `, row.generation, pending.month);
       }
       for (const row of rows) {
-        if (typeof row.fact_id === "string" && !stored.has(row.fact_id)) continue;
+        if (typeof row.fact_id !== "string" || !stored.has(row.fact_id)) continue;
+        // The month object is now the only store for this row. Its identity stays here so a
+        // redelivered fact is still recognized as the same one and acknowledged, and a different
+        // fact that reuses its sequence is still reported as a conflict.
+        this.ctx.storage.sql.exec(`
+          INSERT OR REPLACE INTO usage_projection_expired_sequences (
+            generation, fact_id, principal_ref, source_sequence, fact_hash
+          ) VALUES (?, ?, ?, ?, ?)
+        `, row.generation, row.fact_id, row.principal_ref, row.source_sequence, row.fact_hash);
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_month_outbox WHERE generation = ? AND fact_id = ?
         `, row.generation, row.fact_id);
@@ -883,11 +894,22 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       limit = 64): Promise<boolean> {
     const rootComplete = this.#expireRootDetailBefore(usagePrincipalRef, cutoffUtc, limit);
     let monthsComplete = true;
+    let monthsRemoved = 0;
     const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection detail cutoff");
     // Months newer than the cutoff hold nothing to expire, so only older ones are visited.
     for (const month of this.#monthsBefore(cutoff)) {
-      if (!await this.#monthStub(month)
-        .expireDetailBefore(usagePrincipalRef, cutoff, limit)) monthsComplete = false;
+      const result = await this.#monthStub(month)
+        .expireDetailBefore(usagePrincipalRef, cutoff, limit);
+      if (!result.complete) monthsComplete = false;
+      monthsRemoved += result.removed;
+    }
+    // Rows a report could still name are gone, so reports frozen before this must fail rather
+    // than silently return fewer rows. This is the same signal detail retention has always used.
+    if (monthsRemoved > 0) {
+      const meta = this.#meta();
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+      `, (BigInt(meta.detail_retention_revision) + 1n).toString());
     }
     return rootComplete && monthsComplete;
   }
@@ -917,11 +939,25 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * and no cross-object coordination is needed. Returns whether every month is complete.
    */
   async #compactMonthsStep(): Promise<boolean> {
+    const meta = this.#meta();
+    const floor = BigInt(meta.report_watermark) - BigInt(SUPERSEDED_AGGREGATE_WATERMARK_LAG);
+    if (floor < 1n) return true;
     let complete = true;
+    let removed = 0;
     for (const row of this.ctx.storage.sql.exec<{month: string}>(`
       SELECT DISTINCT month FROM usage_projection_months ORDER BY month DESC
     `).toArray()) {
-      if (!await this.#monthStub(row.month).compactSupersededAggregates()) complete = false;
+      const result = await this.#monthStub(row.month).compactSupersededAggregates(floor);
+      if (!result.complete) complete = false;
+      removed += result.removed;
+    }
+    // A report frozen at an older watermark could still name a revision that was removed, so it
+    // must fail rather than silently lose a row. Detail retention uses the same signal.
+    if (removed > 0) {
+      const current = this.#meta();
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+      `, (BigInt(current.detail_retention_revision) + 1n).toString());
     }
     return complete;
   }
@@ -980,67 +1016,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ON CONFLICT(principal_ref) DO UPDATE SET cutoff_utc =
           CASE WHEN cutoff_utc < excluded.cutoff_utc THEN excluded.cutoff_utc ELSE cutoff_utc END
       `, usagePrincipalRef, cutoff);
-      return rows.length <= limit;
-    });
-  }
-
-  /**
-   * Delete at most one bounded page of Summary revisions that a newer applied revision replaced.
-   * Effective revisions, revisions that are not applied yet, and Usage Summary snapshots are kept,
-   * so report totals stay exact. A delayed replay of a removed revision is absorbed by its
-   * retained Summary snapshot and contributes no metric. Frozen reports that could still name a
-   * removed revision are failed through the shared detail-retention revision.
-   */
-  compactSupersededAggregates(
-      limit = 64, watermarkLag = SUPERSEDED_AGGREGATE_WATERMARK_LAG): boolean {
-    // Each batch deletes what it finds, so the candidate set only shrinks and no ordering is
-    // needed to make progress. Leaving it unordered lets the Summary-revision index stop at LIMIT
-    // instead of sorting every superseded row first.
-    if (!Number.isInteger(limit) || limit < 1 || limit > 64 ||
-        !Number.isInteger(watermarkLag) || watermarkLag < 0) {
-      throw new TypeError("Usage Projection aggregate compaction request is invalid.");
-    }
-    return this.ctx.storage.transactionSync(() => {
-      const floor = BigInt(this.#meta().report_watermark) - BigInt(watermarkLag);
-      if (floor < 1n) return true;
-      const floorText = floor.toString();
-      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
-        SELECT facts.generation, facts.fact_id
-        FROM usage_projection_facts AS facts
-        WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
-          AND facts.applied_watermark IS NOT NULL
-          AND EXISTS (
-            SELECT 1 FROM usage_projection_facts AS newer
-            WHERE newer.generation = facts.generation
-              AND newer.row_kind = 'aggregate'
-              AND newer.summary_fact_id = facts.summary_fact_id
-              AND newer.applied = 1
-              AND newer.applied_watermark IS NOT NULL
-              AND (length(newer.applied_watermark) < length(?) OR
-                (length(newer.applied_watermark) = length(?)
-                  AND newer.applied_watermark <= ?))
-              AND (length(newer.summary_revision) > length(facts.summary_revision) OR
-                (length(newer.summary_revision) = length(facts.summary_revision)
-                  AND (newer.summary_revision > facts.summary_revision OR
-                    (newer.summary_revision = facts.summary_revision AND
-                      (length(newer.applied_watermark) < length(facts.applied_watermark) OR
-                        (length(newer.applied_watermark) = length(facts.applied_watermark) AND
-                          newer.applied_watermark < facts.applied_watermark))))))
-          )
-        LIMIT ?
-      `, floorText, floorText, floorText, limit + 1).toArray();
-      const removed = rows.slice(0, limit);
-      for (const row of removed) {
-        this.ctx.storage.sql.exec(`
-          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
-        `, row.generation, row.fact_id);
-      }
-      const meta = this.#meta();
-      if (removed.some(row => row.generation === meta.active_generation)) {
-        this.ctx.storage.sql.exec(`
-          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
-        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
-      }
       return rows.length <= limit;
     });
   }
@@ -1204,9 +1179,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     await this.#runRetiredProjectionCleanupStep();
     const deliveryComplete = await this.#deliverMonthOutboxStep();
     const monthCompactionComplete = await this.#compactMonthsStep();
-    await this.#scheduleRemainingMaintenance(
-      this.compactSupersededAggregates() && deliveryComplete && monthCompactionComplete,
-    );
+    await this.#scheduleRemainingMaintenance(deliveryComplete && monthCompactionComplete);
   }
 
   #hasApplyDrain(): boolean {
@@ -1630,7 +1603,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (expiredById) {
         const sameSequence = expiredById.principal_ref === fact.usagePrincipalRef &&
           expiredById.source_sequence === fact.sourceSequence.toString();
-        return complete({code: sameSequence ? "invalid-fact" : "fact-id-conflict", stored: true});
+        // The retired sequence already advances through its expired-sequence marker. A new
+        // sequence has no marker yet, so one is stored for it here.
+        const samePrincipalNewSequence =
+          expiredById.principal_ref === fact.usagePrincipalRef && !sameSequence;
+        const stored = sameSequence || samePrincipalNewSequence &&
+          this.#ingestSequenceRejection(
+            fact, generation, "fact-id-conflict", updateActiveMeta,
+          );
+        return complete({code: sameSequence ? "invalid-fact" : "fact-id-conflict", stored});
       }
       const existingMarkerById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
         SELECT fact_id, principal_ref, source_sequence, source_time, code, applied
@@ -1739,20 +1720,34 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       const expiredById = this.ctx.storage.sql.exec<{
         principal_ref: string;
         source_sequence: string;
+        fact_hash: string | null;
       }>(`
-        SELECT principal_ref, source_sequence FROM usage_projection_expired_sequences
+        SELECT principal_ref, source_sequence, fact_hash
+        FROM usage_projection_expired_sequences
         WHERE generation = ? AND fact_id = ?
       `, generation, fact.projectionFactId).toArray()[0];
       if (expiredById) {
+        // A retained hash proves the replay carries the same payload. Rows expired before the
+        // hash was retained have none, and stay judged by identity alone.
         if (expiredById.principal_ref === fact.usagePrincipalRef &&
-            expiredById.source_sequence === fact.sourceSequence.toString()) {
+            expiredById.source_sequence === fact.sourceSequence.toString() &&
+            (expiredById.fact_hash === null || expiredById.fact_hash === hash)) {
           return complete({rejection: null, applied: true, sequenceRejectionAccepted: false});
         }
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
+        // The row moved to its month object, but a reused identity at a new sequence must still
+        // leave a marker here or the Usage Principal's sequence stalls at the gap.
+        const samePrincipalNewSequence =
+          expiredById.principal_ref === fact.usagePrincipalRef &&
+          expiredById.source_sequence !== fact.sourceSequence.toString();
+        const sequenceRejectionAccepted = samePrincipalNewSequence &&
+          this.#ingestSequenceRejection(
+            fact, generation, "fact-id-conflict", updateActiveMeta,
+          );
         return complete({
           rejection: "fact-id-conflict",
           applied: false,
-          sequenceRejectionAccepted: false,
+          sequenceRejectionAccepted,
         });
       }
       const existingRejectionById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
@@ -2557,6 +2552,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         UNIQUE (generation, principal_ref, source_sequence)
       )
     `);
+    // A row whose reportable copy now lives in a month object keeps its content hash here, so a
+    // redelivery of the same fact identity with a different payload is still a conflict.
+    if (!new Set(this.ctx.storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_projection_expired_sequences)",
+    ).toArray().map(column => column.name)).has("fact_hash")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_expired_sequences ADD COLUMN fact_hash TEXT
+      `);
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_detail_watermarks (
         principal_ref TEXT PRIMARY KEY, cutoff_utc TEXT NOT NULL

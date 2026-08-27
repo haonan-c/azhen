@@ -1,9 +1,10 @@
-import {env, runInDurableObject} from "cloudflare:test";
+import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import {describe, expect, it} from "vitest";
 import {
   AdminUsageApiImpl,
   type AdminSettings,
 } from "../src/admin-settings.js";
+import type {UsageProjectionMonth} from "../src/usage-projection-month.js";
 import type {
   UsageProjection,
   UsageProjectionAggregateFact,
@@ -14,7 +15,16 @@ const testEnv = env as unknown as {
   TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
   TEST_USAGE_PROJECTION: DurableObjectNamespace<UsageProjection>;
+  TEST_USAGE_PROJECTION_MONTH: DurableObjectNamespace<UsageProjectionMonth>;
 };
+
+// Reportable rows live in the UTC month object that owns their bucket, and compaction runs there.
+const BUCKET_MONTH = "2026-08";
+
+function monthOf(projection: DurableObjectStub<UsageProjection>) {
+  return testEnv.TEST_USAGE_PROJECTION_MONTH
+    .getByName(`${BUCKET_MONTH}:${projection.id.toString()}`);
+}
 
 function aggregate(
     principal: string,
@@ -100,7 +110,7 @@ async function ready(projection: DurableObjectStub<UsageProjection>): Promise<vo
 }
 
 function aggregateRows(projection: DurableObjectStub<UsageProjection>, summaryFactId: string) {
-  return runInDurableObject(projection, (_instance, state) =>
+  return runInDurableObject(monthOf(projection), (_instance, state) =>
     state.storage.sql.exec<{summary_revision: string; fact_id: string}>(`
       SELECT summary_revision, fact_id FROM usage_projection_facts
       WHERE row_kind = 'aggregate' AND summary_fact_id = ?
@@ -132,7 +142,8 @@ describe("Usage Projection superseded aggregate compaction", () => {
     const totalsBefore = (await before.getOverview()).metrics;
     expect(totalsBefore.providerCostUsdSubunits).toBe(50n);
 
-    expect(await projection.compactSupersededAggregates(64, 0)).toBe(true);
+    expect((await monthOf(projection).compactSupersededAggregates(1n << 62n, 64)).complete)
+      .toBe(true);
 
     const remaining = await aggregateRows(projection, summaryFactId);
     expect(remaining).toHaveLength(1);
@@ -162,7 +173,15 @@ describe("Usage Projection superseded aggregate compaction", () => {
       summaryRevision: 2n,
       providerCostUsdSubunits: 25n,
     })]);
-    expect(await projection.compactSupersededAggregates(64, 0)).toBe(true);
+    // Compaction only reaches revisions replaced outside the report lag, so the watermark is moved
+    // past it to exercise the removal the frozen report must not survive silently.
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET report_watermark = '1000000' WHERE singleton = 1
+      `);
+    });
+    await runDurableObjectAlarm(projection);
+    expect(await aggregateRows(projection, summaryFactId)).toHaveLength(1);
 
     await expect(frozen.listRows({limit: 10}))
       .rejects.toThrow("Usage report snapshot is stale.");
@@ -183,10 +202,13 @@ describe("Usage Projection superseded aggregate compaction", () => {
         summaryRevision: revision,
       })]);
     }
-    expect(await projection.compactSupersededAggregates(2, 0)).toBe(false);
+    expect((await monthOf(projection).compactSupersededAggregates(1n << 62n, 2)).complete)
+      .toBe(false);
     expect(await aggregateRows(projection, summaryFactId)).toHaveLength(4);
-    expect(await projection.compactSupersededAggregates(2, 0)).toBe(false);
-    expect(await projection.compactSupersededAggregates(2, 0)).toBe(true);
+    expect((await monthOf(projection).compactSupersededAggregates(1n << 62n, 2)).complete)
+      .toBe(false);
+    expect((await monthOf(projection).compactSupersededAggregates(1n << 62n, 2)).complete)
+      .toBe(true);
     expect(await aggregateRows(projection, summaryFactId)).toHaveLength(1);
   });
 
@@ -203,13 +225,14 @@ describe("Usage Projection superseded aggregate compaction", () => {
       sourceSequence: 2n,
       summaryRevision: 2n,
     })]);
-    await runInDurableObject(projection, (_instance, state) => {
+    await runInDurableObject(monthOf(projection), (_instance, state) => {
       state.storage.sql.exec(`
         UPDATE usage_projection_facts SET applied = 0, applied_watermark = NULL
         WHERE row_kind = 'aggregate' AND summary_fact_id = ? AND summary_revision = '2'
       `, summaryFactId);
     });
-    expect(await projection.compactSupersededAggregates(64, 0)).toBe(true);
+    expect((await monthOf(projection).compactSupersededAggregates(1n << 62n, 64)).complete)
+      .toBe(true);
     expect(await aggregateRows(projection, summaryFactId)).toHaveLength(2);
   });
 
@@ -227,10 +250,12 @@ describe("Usage Projection superseded aggregate compaction", () => {
       summaryRevision: 2n,
     })]);
 
-    expect(await projection.compactSupersededAggregates(64, 1_000)).toBe(true);
+    expect((await monthOf(projection).compactSupersededAggregates(0n, 64)).complete)
+      .toBe(true);
     expect(await aggregateRows(projection, summaryFactId)).toHaveLength(2);
 
-    expect(await projection.compactSupersededAggregates(64, 0)).toBe(true);
+    expect((await monthOf(projection).compactSupersededAggregates(1n << 62n, 64)).complete)
+      .toBe(true);
     expect(await aggregateRows(projection, summaryFactId)).toHaveLength(1);
   });
 });
