@@ -1,7 +1,9 @@
 import {DurableObject} from "cloudflare:workers";
 import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import {
+  USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX,
   USAGE_PROJECTION_FACT_COLUMNS,
+  USAGE_PROJECTION_REPORT_PAGE_MAX,
   createUsageProjectionFactsTable,
   readUsageProjectionReportRows,
 } from "./usage-projection-facts-schema.js";
@@ -102,7 +104,8 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       cursor: UsageReportCursor | undefined,
       limit: number,
       rowKind: "all" | "aggregate"): StoredFactRow[] {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 257) {
+    if (!Number.isSafeInteger(limit) || limit < 1 ||
+        limit > USAGE_PROJECTION_REPORT_PAGE_MAX + 1) {
       throw new TypeError("Usage Projection month page limit is invalid.");
     }
     return readUsageProjectionReportRows(this.ctx.storage.sql, query, cursor, limit, rowKind);
@@ -115,7 +118,8 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
    * the root object unions them. The result is bounded by the deployment's registered Users.
    */
   listActivePrincipals(query: FrozenUsageReportQuery, limit: number): string[] {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
+    if (!Number.isSafeInteger(limit) || limit < 1 ||
+        limit > USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX) {
       throw new TypeError("Usage Projection month principal limit is invalid.");
     }
     const predicate = buildUsageReportPredicate(query, "aggregate");

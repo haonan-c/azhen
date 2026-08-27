@@ -2,6 +2,7 @@ import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import {describe, expect, it, vi} from "vitest";
 import {AdminUsageApiImpl, type AdminSettings} from "../src/admin-settings.js";
 import {UsageAccount} from "../src/usage-account.js";
+import type {ProjectionRebuildStatus} from "@gadgets/workshop-shared/api";
 import type {
   UsageProjection,
   UsageProjectionAggregateFact,
@@ -109,6 +110,23 @@ async function restoreRootFact(projection: DurableObjectStub<UsageProjection>): 
       ...columns.map(column => row[column]!),
     );
   });
+}
+
+/**
+ * Drive maintenance turns until a rebuild reports its final state.
+ *
+ * A rebuild switches generation only once its own rows have reached their month objects, so it
+ * takes as many turns as delivery needs rather than a fixed number.
+ */
+async function settleRebuild(
+    projection: DurableObjectStub<UsageProjection>,
+    requestId: string): Promise<ProjectionRebuildStatus> {
+  let status = await projection.requestRebuild(requestId);
+  for (let step = 0; step < 32 && status.state === "rebuilding"; step += 1) {
+    await runDurableObjectAlarm(projection);
+    status = await projection.requestRebuild(requestId);
+  }
+  return status;
 }
 
 function aggregateFact(
@@ -1638,9 +1656,8 @@ describe("deployment Usage Projection", () => {
     });
     const requestId = `poison-rebuild-${crypto.randomUUID()}`;
     await projection.requestRebuild(requestId);
-    await runDurableObjectAlarm(projection);
 
-    expect(await projection.requestRebuild(requestId)).toMatchObject({state: "completed"});
+    expect(await settleRebuild(projection, requestId)).toMatchObject({state: "completed"});
     expect((await projection.readOverview()).metrics?.cacheHitInputTokens).toBe(23n);
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
@@ -1687,8 +1704,7 @@ describe("deployment Usage Projection", () => {
 
     const requestId = `fact-id-authority-${crypto.randomUUID()}`;
     await projection.requestRebuild(requestId);
-    await runDurableObjectAlarm(projection);
-    expect(await projection.requestRebuild(requestId)).toMatchObject({state: "completed"});
+    expect(await settleRebuild(projection, requestId)).toMatchObject({state: "completed"});
     expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(10n);
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });

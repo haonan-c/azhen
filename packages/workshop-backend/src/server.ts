@@ -27,6 +27,7 @@ import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { wrapDoStubForTelemetry } from "./do-telemetry";
 import { UsageProjection } from "./usage-projection.js";
+import { UsageProjectionMonth } from "./usage-projection-month.js";
 import { publicBillingMethodInventory } from "./generated/public-billing-methods.js";
 import {
   isPublicPublishedApiMethod,
@@ -131,7 +132,7 @@ export { AdminSettings };
 // Re-export the replaceable deployment Usage Projection Durable Object.
 export { UsageProjection };
 
-import { UsageProjectionMonth } from "./usage-projection-month.js";
+// Re-export the per-UTC-month Usage Projection Durable Object.
 export { UsageProjectionMonth };
 
 // Re-export entrypoint types from user.ts.

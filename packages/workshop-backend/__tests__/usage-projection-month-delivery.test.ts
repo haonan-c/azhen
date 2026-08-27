@@ -294,6 +294,72 @@ describe("Usage Projection month delivery", () => {
       .toBeGreaterThanOrEqual(3);
   });
 
+  it("cancels a CSV export that spans months and leaves the report usable", async () => {
+    const name = `delivery-cancel-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const times = [
+      "2026-09-02T00:00:00.000Z",
+      "2026-09-01T00:00:00.000Z",
+      "2026-08-31T00:00:00.000Z",
+      "2026-08-30T00:00:00.000Z",
+    ];
+    const facts = times.map((occurredAt, index) =>
+      detail(principal, {sourceSequence: BigInt(index + 1), occurredAt}));
+    for (const fact of facts) {
+      expect((await projection.ingest([fact])).rejected).toEqual([]);
+    }
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    const reader = (await report.exportCsv()).getReader();
+    expect((await reader.read()).done).toBe(false);
+    await reader.cancel("stop the export before it walks the older month");
+
+    // Cancelling a walk that had more months to visit must release the export slot, so the same
+    // report can still stream every month from the start.
+    const csv = await new Response(await report.exportCsv()).text();
+    for (const fact of facts) expect(csv).toContain(fact.projectionFactId);
+  });
+
+  it("expires detail across months at the exact retention cutoff", async () => {
+    const name = `delivery-retention-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const principal = crypto.randomUUID();
+    const kept = detail(principal, {
+      sourceSequence: 1n,
+      occurredAt: "2026-09-01T00:00:00.000Z",
+    });
+    const expired = detail(principal, {
+      sourceSequence: 2n,
+      occurredAt: "2026-08-31T23:59:59.999Z",
+    });
+    const summary = aggregate(principal, {
+      sourceSequence: 3n,
+      bucketStart: "2026-08-01T00:00:00.000Z",
+      gadgetId: "gadget-retention",
+    });
+    for (const fact of [kept, expired, summary]) {
+      expect((await projection.ingest([fact])).rejected).toEqual([]);
+    }
+    const before = await projection.getReportCoordinates();
+    using frozen = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    expect((await frozen.listRows({limit: 10})).rows).toHaveLength(3);
+
+    // The cutoff is exclusive, so the row that sits exactly on it survives and only the older
+    // month loses detail. A Usage Summary Fact is not detail and is kept in either month.
+    for (let step = 0; step < 8; step += 1) {
+      if (await projection.expireDetailBefore(principal, "2026-09-01T00:00:00.000Z")) break;
+    }
+    expect((await projection.getReportCoordinates()).detailRetentionRevision)
+      .toBeGreaterThan(before.detailRetentionRevision);
+
+    using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
+    expect((await report.listRows({limit: 10})).rows.map(row => row.rowId).toSorted())
+      .toEqual([kept.projectionFactId, summary.projectionFactId].toSorted());
+    // The shared staleness signal still fails a report frozen before the cutoff.
+    await expect(frozen.listRows({limit: 10})).rejects.toThrow("stale");
+  });
+
   it("removes a retired generation from its month objects and forgets the month", async () => {
     const name = `delivery-retire-${crypto.randomUUID()}`;
     const projection = await ready(name);
@@ -411,7 +477,7 @@ describe("Usage Projection month delivery", () => {
     // must still name every row in source-time order rather than a watermark-truncated subset.
     using report = await adminUsage(name).openReport({registeredUserRefs: [principal]});
     expect((await report.listRows({limit: 32})).rows.map(row => row.rowId))
-      .toEqual([...facts].reverse().map(fact => fact.projectionFactId));
+      .toEqual(facts.toReversed().map(fact => fact.projectionFactId));
   });
 
   it("keeps the root object's per-record cost far below a reportable row", async () => {

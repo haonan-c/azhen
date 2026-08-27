@@ -11,7 +11,9 @@ import type {
   UsageSource,
 } from "@gadgets/workshop-shared/api";
 import {
+  USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX,
   USAGE_PROJECTION_FACT_COLUMNS,
+  USAGE_PROJECTION_REPORT_PAGE_MAX,
   createUsageProjectionFactsTable,
   usageProjectionFactRowValues,
 } from "./usage-projection-facts-schema.js";
@@ -385,7 +387,6 @@ const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
  * references. No month can hold more contributing Principals than the deployment has registered
  * Users, so exceeding this bound is a failure rather than a truncated count.
  */
-const ACTIVE_PRINCIPAL_PAGE_MAX = 10_000;
 
 /**
  * How long a retired fact's identity is kept so a delayed redelivery is still recognized.
@@ -573,14 +574,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Deliver one bounded page of applied rows to the UTC month object that owns them.
-   *
-   * A Durable Object transaction cannot span a call to another object, so apply commits the metric
-   * fold and leaves the row in this outbox. Delivery is idempotent and only acknowledged rows are
-   * removed, so a failed call is retried by the maintenance alarm without losing or duplicating a
-   * row. Returns whether the outbox is now empty.
-   */
-  /**
    * Enqueue applied rows that predate month routing so delivery can move them.
    *
    * A deployment upgraded from a single-object Projection holds applied rows the outbox never saw.
@@ -646,6 +639,14 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     return rows.length <= 64;
   }
 
+  /**
+   * Deliver one bounded page of applied rows to the UTC month object that owns them.
+   *
+   * A Durable Object transaction cannot span a call to another object, so apply commits the metric
+   * fold and leaves the row in this outbox. Delivery is idempotent and only acknowledged rows are
+   * removed, so a failed call is retried by the maintenance alarm without losing or duplicating a
+   * row. Returns whether the outbox is now empty.
+   */
   async #deliverMonthOutboxStep(): Promise<boolean> {
     this.#routeUnroutedAppliedRows();
     const pending = this.ctx.storage.sql.exec<{month: string}>(`
@@ -718,7 +719,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       cursorValue: string | undefined,
       limit: number): Promise<AdminUsageReportPage> {
     this.#assertCurrentReportSnapshot(query);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+    if (!Number.isSafeInteger(limit) || limit < 1 ||
+        limit > USAGE_PROJECTION_REPORT_PAGE_MAX) {
       throw new TypeError("Usage report page limit is invalid.");
     }
     const cursor = cursorValue === undefined
@@ -763,7 +765,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
     let cursor: UsageReportCursor | undefined;
     while (true) {
-      const page = await this.#readReportRowsAcrossMonths(query, cursor, 256, "aggregate");
+      const page = await this.#readReportRowsAcrossMonths(
+        query, cursor, USAGE_PROJECTION_REPORT_PAGE_MAX, "aggregate");
       for (const row of page) {
         totals.providerCostUsdSubunits += BigInt(row.provider_cost);
         totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
@@ -785,13 +788,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
       }
       const last = page.at(-1);
-      if (page.length < 256 || !last) break;
+      if (page.length < USAGE_PROJECTION_REPORT_PAGE_MAX || !last) break;
       cursor = {sourceTime: storedFactSourceTime(last), rowId: last.fact_id};
     }
     const active = new Set<string>();
     for (const month of this.#reportMonths(query, undefined)) {
       for (const principal of await this.#monthStub(month)
-          .listActivePrincipals(query, ACTIVE_PRINCIPAL_PAGE_MAX)) {
+          .listActivePrincipals(query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX)) {
         active.add(principal);
       }
     }
@@ -986,14 +989,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         break;
       }
     }
-    // Rows a report could still name are gone, so reports frozen before this must fail rather
-    // than silently return fewer rows. This is the same signal detail retention has always used.
-    if (monthsRemoved > 0) {
-      const meta = this.#meta();
-      this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
-      `, (BigInt(meta.detail_retention_revision) + 1n).toString());
-    }
+    if (monthsRemoved > 0) this.#bumpDetailRetentionRevision();
     return rootComplete && monthsComplete;
   }
 
@@ -1008,6 +1004,19 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Name every stored month whose range can still hold detail older than one cutoff. */
+  /**
+   * Signal that rows a frozen report could still name are gone.
+   *
+   * A report freezes this revision when it opens, so bumping it fails the report rather than
+   * letting it silently return fewer rows. Detail retention and aggregate compaction share it.
+   */
+  #bumpDetailRetentionRevision(): void {
+    const meta = this.#meta();
+    this.ctx.storage.sql.exec(`
+      UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+    `, (BigInt(meta.detail_retention_revision) + 1n).toString());
+  }
+
   #monthsBefore(cutoffUtc: string, generation: string): string[] {
     const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
     return this.ctx.storage.sql.exec<{month: string}>(`
@@ -1039,14 +1048,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         break;
       }
     }
-    // A report frozen at an older watermark could still name a revision that was removed, so it
-    // must fail rather than silently lose a row. Detail retention uses the same signal.
-    if (removed > 0) {
-      const current = this.#meta();
-      this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
-      `, (BigInt(current.detail_retention_revision) + 1n).toString());
-    }
+    if (removed > 0) this.#bumpDetailRetentionRevision();
     return complete;
   }
 
@@ -1095,9 +1097,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       }
       const meta = this.#meta();
       if (removed.some(row => row.generation === meta.active_generation)) {
-        this.ctx.storage.sql.exec(`
-          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
-        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
+        this.#bumpDetailRetentionRevision();
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_detail_watermarks (principal_ref, cutoff_utc)

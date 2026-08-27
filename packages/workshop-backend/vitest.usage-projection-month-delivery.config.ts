@@ -2,8 +2,10 @@ import {cloudflareTest} from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
 import {defineConfig} from "vitest/config";
 
+// Retention deliberately invalidates a report frozen before its cutoff, and the RPC layer
+// surfaces that rejection outside the awaiting test.
 const EXPECTED_DELIVERY_ERROR_MESSAGES = new Set([
-
+  "Usage report snapshot is stale.",
 ]);
 
 export default defineConfig({
@@ -31,7 +33,6 @@ export default defineConfig({
     disableConsoleIntercept: true,
     fileParallelism: false,
     setupFiles: ["../../test-setup/assert-workerd.ts"],
-    // No rejection is expected here; every error stays fail-closed.
     // All other errors remain fail-closed.
     onUnhandledError(error) {
       if (EXPECTED_DELIVERY_ERROR_MESSAGES.has(error.message)) return false;
