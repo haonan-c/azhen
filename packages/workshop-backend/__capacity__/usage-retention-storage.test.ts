@@ -1,5 +1,6 @@
 import {runInDurableObject} from "cloudflare:test";
 import {exports} from "cloudflare:workers";
+import {projectionMonthStub, projectionMonths, readAcrossProjection} from "./projection-rows.js";
 import type {
   InitialGrantSnapshot,
   UnpricedGatekeeperChargeSnapshot,
@@ -9,7 +10,7 @@ import {
   UsageAccount,
   type GatekeeperUsageAttribution,
 } from "../src/usage-account.js";
-import type {UsageProjectionFact} from "../src/usage-projection.js";
+import type {UsageProjection, UsageProjectionFact} from "../src/usage-projection.js";
 
 const GRANT: InitialGrantSnapshot = {
   kind: "initial-grant",
@@ -28,6 +29,30 @@ const UNPRICED: UnpricedGatekeeperChargeSnapshot = {
   chargeSubunits: 0n,
   configurationGap: true,
 };
+
+/**
+ * Read the projection's detail row count and storage across every store that holds its rows.
+ *
+ * Delivery retires the root object's copy of a row once its UTC month object holds it, so a count
+ * or a size taken from the root alone describes only the part still waiting for delivery.
+ */
+async function projectionStorage(projection: DurableObjectStub<UsageProjection>) {
+  const counts = await readAcrossProjection<{count: number}>(projection, `
+    SELECT COUNT(*) AS count FROM usage_projection_facts WHERE row_kind = 'detail'
+  `);
+  let monthDatabaseSize = 0;
+  for (const month of await projectionMonths(projection)) {
+    monthDatabaseSize += await runInDurableObject(
+      projectionMonthStub(projection, month),
+      (_instance, state) => state.storage.sql.databaseSize,
+    );
+  }
+  return {
+    pages: await runInDurableObject(projection, (_instance, state) => sqlitePages(state)),
+    monthDatabaseSize,
+    detailRows: counts.reduce((total, row) => total + row.count, 0),
+  };
+}
 
 function sqlitePages(state: DurableObjectState) {
   let pragmaFailure: string | null = null;
@@ -108,12 +133,7 @@ test("production retention keeps Summary totals and exposes reusable SQLite page
 
   const projection = exports.UsageProjection.getByName(`retention-storage-${identity}`);
   await ingestAll(projection, prepared.facts);
-  const projectionBefore = await runInDurableObject(projection, (_instance, state) => ({
-    pages: sqlitePages(state),
-    detailRows: state.storage.sql.exec<{count: number}>(`
-      SELECT COUNT(*) AS count FROM usage_projection_facts WHERE row_kind = 'detail'
-    `).one().count,
-  }));
+  const projectionBefore = await projectionStorage(projection);
   expect(projectionBefore.detailRows).toBe(201);
   const projectionMeteredUsesBefore = (await projection.readOverview()).metrics.meteredUseCount;
 
@@ -151,12 +171,7 @@ test("production retention keeps Summary totals and exposes reusable SQLite page
   )) {
     // Production cleanup is deliberately bounded to 64 rows per transaction.
   }
-  const projectionAfter = await runInDurableObject(projection, (_instance, state) => ({
-    pages: sqlitePages(state),
-    detailRows: state.storage.sql.exec<{count: number}>(`
-      SELECT COUNT(*) AS count FROM usage_projection_facts WHERE row_kind = 'detail'
-    `).one().count,
-  }));
+  const projectionAfter = await projectionStorage(projection);
   expect(projectionAfter.detailRows).toBe(1);
   const projectionMeteredUsesAfter = (await projection.readOverview()).metrics.meteredUseCount;
   expect(projectionMeteredUsesAfter).toBe(projectionMeteredUsesBefore);

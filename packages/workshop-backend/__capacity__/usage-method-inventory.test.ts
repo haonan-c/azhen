@@ -5,6 +5,7 @@ import type {GatekeeperChargeSnapshot} from "@gadgets/workshop-shared/api";
 import {publicBillingMethodInventory} from "../src/generated/public-billing-methods.js";
 import type {GatekeeperUsageAttribution} from "../src/usage-account.js";
 import type {UsageProjection, UsageProjectionFact} from "../src/usage-projection.js";
+import {readAcrossProjection} from "./projection-rows.js";
 
 test("delivers every generated public billing method through User authority and Projection", async () => {
   expect(publicBillingMethodInventory).toHaveLength(355);
@@ -66,16 +67,17 @@ test("delivers every generated public billing method through User authority and 
     const ingest = await projection.ingest(facts.slice(offset, offset + 64));
     expect(ingest.rejected).toEqual([]);
   }
-  const actual = await runInDurableObject(
-    projection, (_instance: UsageProjection, state) => state.storage.sql.exec<{
-      vendor_id: string;
-      billing_method_key: string;
-    }>(`
-      SELECT DISTINCT vendor_id, billing_method_key
-      FROM usage_projection_facts
-      WHERE row_kind = 'detail' AND applied = 1
-      ORDER BY vendor_id, billing_method_key
-    `).toArray().map(method => `${method.vendor_id}\u0000${method.billing_method_key}`),
-  );
+  // Delivered rows live in their UTC month object, so the covered methods are the union over
+  // every store this projection writes to.
+  const methods = await readAcrossProjection<{
+    vendor_id: string;
+    billing_method_key: string;
+  }>(projection, `
+    SELECT DISTINCT vendor_id, billing_method_key
+    FROM usage_projection_facts
+    WHERE row_kind = 'detail' AND applied = 1
+  `);
+  const actual = [...new Set(methods.map(
+    method => `${method.vendor_id}\u0000${method.billing_method_key}`))].toSorted();
   expect(actual).toEqual(expected);
 });
