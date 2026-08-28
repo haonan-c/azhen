@@ -903,9 +903,17 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
       stub: exports.UserDurableObject.get(id),
     };
   });
+  const accountClockStartedAt = performance.now();
+  let accountsCreated = 0;
   await inBatches(stubs, 50, async ({identity, displayName, stub}) => {
     expect(await stub.createAccount(identity, displayName, new Uint8Array([1]))).not.toBeNull();
     await stub.activateUsageAccount();
+    accountsCreated += 1;
+    if (accountsCreated % 2_000 === 0) {
+      console.warn(`USAGE_CAPACITY_ACCOUNTS created=${accountsCreated} of ${
+        stubs.length} elapsedSeconds=${
+        ((performance.now() - accountClockStartedAt) / 1_000).toFixed(1)}`);
+    }
   });
 
   const warmAssignments = roundRobinAssignments(
@@ -921,9 +929,37 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
   for (const user of [...warmAssignments, ...measured]) scheduledCounts[user]! += 1;
 
   const projection = exports.UsageProjection.getByName("");
-  for (let step = 0; step < 1_000 && !await projection.ensureBootstrap(); step += 1) {
+  // Bootstrap rebuilds every registered User, and at this scale the harness moves only two or
+  // three Users an alarm because each one is a Durable Object round trip inside the same isolate.
+  // A fixed step budget would therefore be a number chosen for the smoke profile. What has to hold
+  // is progress: a rebuild that stops advancing fails here instead of burning a budget and then
+  // reporting a stale bootstrap.
+  const bootstrapClockStartedAt = performance.now();
+  let rebuiltUsers = 0n;
+  let reportedUsers = 0n;
+  let alarmsWithoutProgress = 0;
+  while (!await projection.ensureBootstrap()) {
     await runDurableObjectAlarm(projection);
+    const status = await projection.requestRebuild("bootstrap-v1");
+    if (status.usersProcessed > rebuiltUsers) {
+      rebuiltUsers = status.usersProcessed;
+      alarmsWithoutProgress = 0;
+      if (rebuiltUsers - reportedUsers >= 1_000n) {
+        reportedUsers = rebuiltUsers;
+        console.warn(`USAGE_CAPACITY_BOOTSTRAP users=${rebuiltUsers} elapsedSeconds=${
+          ((performance.now() - bootstrapClockStartedAt) / 1_000).toFixed(1)}`);
+      }
+      continue;
+    }
+    alarmsWithoutProgress += 1;
+    if (alarmsWithoutProgress > 500) {
+      throw new Error(
+        `Usage Projection bootstrap stopped advancing at ${rebuiltUsers} Users.`,
+      );
+    }
   }
+  console.warn(`USAGE_CAPACITY_BOOTSTRAP_DONE users=${rebuiltUsers} elapsedSeconds=${
+    ((performance.now() - bootstrapClockStartedAt) / 1_000).toFixed(1)}`);
   expect(await projection.ensureBootstrap()).toBe(true);
   using publicApi = await connectCapacityRpc();
   const adminToken = await publicApi.login(stubs[0]!.identity, new Uint8Array([1]));
@@ -949,8 +985,24 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
       return Array.from({length: count}, () => userIndex);
     });
     const preseedWindowMs = 29 * 24 * 60 * 60 * 1_000;
+    // Seeding is bound by what one workerd process can put through the per-record path, not by
+    // how many records are in flight: widening this batch from 13 to 130 moved the measured rate
+    // from 22.0 to 22.3 records a second. It stays at the original 13.
     const preseedBatchSize = 13;
+    // The profile spends most of its wall time here: it seeds every record that the warm and
+    // measured windows do not, one small batch at a time. Without a progress line the run is
+    // silent for hours and there is no way to tell a slow machine from a stalled one. `Date` is
+    // faked in this block, so elapsed time comes from `performance.now()`.
+    const preseedClockStartedAt = performance.now();
+    let preseedReported = 0;
     for (let offset = 0; offset < preseedAssignments.length; offset += preseedBatchSize) {
+      if (offset - preseedReported >= 20_000) {
+        preseedReported = offset;
+        const elapsedSeconds = (performance.now() - preseedClockStartedAt) / 1_000;
+        console.warn(`USAGE_CAPACITY_PRESEED seeded=${offset} of ${
+          preseedAssignments.length} elapsedSeconds=${elapsedSeconds.toFixed(1)} recordsPerSecond=${
+          (offset / Math.max(elapsedSeconds, 0.001)).toFixed(1)}`);
+      }
       const users = preseedAssignments.slice(offset, offset + preseedBatchSize);
       const timestamp = preseedStartedAt + Math.floor(
         offset / Math.max(1, preseedAssignments.length - 1) * preseedWindowMs,
@@ -968,6 +1020,8 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
     }
 
     const preseedExpected = preseedAssignments.length;
+    console.warn(`USAGE_CAPACITY_PRESEED_DONE seeded=${preseedExpected} elapsedSeconds=${
+      ((performance.now() - preseedClockStartedAt) / 1_000).toFixed(1)}`);
     await expect.poll(async () => (await projection.readOverview()).metrics.meteredUseCount, {
       timeout: 60_000,
       interval: 100,

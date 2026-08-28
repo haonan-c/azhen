@@ -4,9 +4,10 @@ Date: 2026-08-26
 
 Baseline: `366c92618d583d74666a08600d8bab9655fbed6b`
 
-Status: **IN PROGRESS — no formal full `usage-capacity-v1` run is currently active. The
-Projection storage gate is blocked; see
-[`ISSUE-66-CAPACITY-DECISION.md`](ISSUE-66-CAPACITY-DECISION.md).**
+Status: **IN PROGRESS — the Projection storage gate is unblocked by #73 and #74, and the capacity
+model now projects per Durable Object. No formal full `usage-capacity-v1` run has completed: the
+profile needs about 12.4 hours to seed its records on this machine, which is longer than its own
+timeout. See "Why the formal full run does not complete here".**
 
 ## Verification boundary
 
@@ -150,6 +151,50 @@ a local comparison. It is not proof of hosted isolate memory compliance.
 | Cap'n Web report cancel and owner termination | stream, control, and report capabilities release | PASS |
 | late React RPC success/error/unmount | wrapped stub state; stale result ignored; stub disposed | PASS |
 | content and secret sentinel | no prompt, body, header, token, content, identity, or authoritative balance in Projection/log | PASS |
+
+## Why the formal full run does not complete here
+
+Three blockers stopped the full profile. Two are fixed; the third is a property of the profile and
+this machine, and it is recorded rather than worked around.
+
+**1. The harness died after twelve minutes.** `@cloudflare/vitest-pool-workers` 0.20.3 re-wrapped
+each Durable Object class prototype in a new `Proxy` on *every* construction, so a property lookup
+cost one stack frame per past construction. A standalone model of `createProxyPrototypeClass`
+overflows after 2,073 constructions; the profile constructs 10,000 and died inside a Durable Object
+constructor with `RangeError: Maximum call stack size exceeded`, reported as
+`broken.constructorFailed` and looking exactly like a defect in this repository.
+`patches/@cloudflare__vitest-pool-workers@0.20.3.patch` wraps once, and
+`scripts/vitest-pool-workers-patch.test.js` guards it. Account setup went from dying at twelve
+minutes to creating 10,000 accounts in 110 seconds.
+
+**2. Bootstrap ran out of a step budget, not of progress.** The test drove at most 1,000 alarms and
+then asserted the bootstrap was complete. Instrumented, the rebuild advanced steadily and simply
+needed more: 2,296 Users after 1,000 alarms. The loop now asserts progress instead of a step count
+and fails immediately, naming the User it stopped at, if a rebuild stops advancing. Bootstrap
+completes in 99 seconds.
+
+**3. Seeding the profile's records takes longer than the run's own timeout.** The profile holds
+1,000,000 Usage Records. The warm and measured windows offer 20,400 of them; the remaining 979,600
+are seeded through the same per-record User path. Measured on this machine:
+
+| Preseed batch size | Records a second | Projected preseed |
+| ---: | ---: | ---: |
+| 13 | 22.0 | 12.37 hours |
+| 130 | 22.3 | 12.20 hours |
+
+The run's own `testTimeout` is 12 hours, so the profile cannot finish. Widening the batch by ten
+times moved the rate by 1.4%, which places the limit in what one workerd process puts through the
+per-record path rather than in how many records are in flight. The profile's own
+`offeredRecordsPerSecond` is 20, so seeding 979,600 records through that path is close to replaying
+a month of traffic at its real rate. The batch stays at its original 13.
+
+This is a property of the harness design, not of the sharding this branch verifies. Making the full
+profile runnable needs preseed to stop going through the per-record User pipeline, or needs the
+profile to accept a run measured in half a day. Both are decisions for #66, not for #73.
+
+What the three fixes do establish: the profile now reaches steady-state seeding with every earlier
+stage passing, and both formal Cap'n Web steps pass on this branch (20 passed, 4 skipped, then 31
+passed).
 
 ## Full-run evaluation
 
