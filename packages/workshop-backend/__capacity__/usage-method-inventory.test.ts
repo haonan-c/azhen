@@ -1,10 +1,10 @@
-import {runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
+import {runDurableObjectAlarm} from "cloudflare:test";
 import {exports} from "cloudflare:workers";
 import {expect, test} from "vitest";
 import type {GatekeeperChargeSnapshot} from "@gadgets/workshop-shared/api";
 import {publicBillingMethodInventory} from "../src/generated/public-billing-methods.js";
 import type {GatekeeperUsageAttribution} from "../src/usage-account.js";
-import type {UsageProjection, UsageProjectionFact} from "../src/usage-projection.js";
+import type {UsageProjectionFact} from "../src/usage-projection.js";
 import {readAcrossProjection} from "./projection-rows.js";
 
 test("delivers every generated public billing method through User authority and Projection", async () => {

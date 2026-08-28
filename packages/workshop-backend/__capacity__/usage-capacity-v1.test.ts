@@ -18,6 +18,7 @@ import {
 } from "../src/usage-account.js";
 import type {UsageProjection, UsageProjectionFact} from "../src/usage-projection.js";
 import type {UserDurableObject} from "../src/user.js";
+import {projectionMonthStub, projectionMonths, readAcrossProjection} from "./projection-rows.js";
 
 type CapacityMode = "full" | "smoke";
 
@@ -233,20 +234,27 @@ async function measureCapacityTelemetry(
     await projection.readCapacityReview(registeredUsers);
     samplesMs.push(performance.now() - started);
   }
-  const queryPlan = await runInDurableObject(projection, (_instance, state) => {
-    const generation = state.storage.sql.exec<{active_generation: string}>(`
+  const generation = await runInDurableObject(projection, (_instance, state) =>
+    state.storage.sql.exec<{active_generation: string}>(`
       SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-    `).one().active_generation;
-    return state.storage.sql.exec<{detail: string}>(`
-      EXPLAIN QUERY PLAN
-      SELECT CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
-      FROM usage_projection_facts
-      WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
-        AND COALESCE(occurred_at, bucket_start) >= ?
-        AND COALESCE(occurred_at, bucket_start) < ?
-    `, generation, "2026-07-27T00:00:00.000Z", "2026-08-27T00:00:00.000Z")
-        .toArray().map(row => row.detail);
-  });
+    `).one().active_generation);
+  // The capacity windows are read from the month objects, so the index that has to serve them is
+  // the one in a month object's copy of the reportable fact table.
+  const [plannedMonth] = await projectionMonths(projection);
+  if (plannedMonth === undefined) {
+    throw new Error("Capacity query plan needs one delivered UTC month.");
+  }
+  const queryPlan = await runInDurableObject(
+    projectionMonthStub(projection, plannedMonth), (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
+        FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND COALESCE(occurred_at, bucket_start) >= ?
+          AND COALESCE(occurred_at, bucket_start) < ?
+      `, generation, "2026-07-27T00:00:00.000Z", "2026-08-27T00:00:00.000Z")
+          .toArray().map(row => row.detail));
   expect(queryPlan.some(detail =>
     detail.includes("usage_projection_facts_pending_v4"))).toBe(true);
   return {
@@ -263,33 +271,29 @@ async function readProjectionDetailDigest(
   dimensionGroups: number;
   coveredMethods: number;
 }> {
-  const rows = await runInDurableObject(projection, (_instance, state) => {
-    const generation = state.storage.sql.exec<{active_generation: string}>(`
+  const generation = await runInDurableObject(projection, (_instance, state) =>
+    state.storage.sql.exec<{active_generation: string}>(`
       SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-    `).one().active_generation;
-    return state.storage.sql.exec<{
-      source: string;
-      kind: string;
-      outcome: string;
-      pricing: string;
-      deployment_model_id: string | null;
-      vendor_id: string | null;
-      billing_method_key: string | null;
-      external_account_id: string | null;
-      gadget_id: string | null;
-      records: number;
-    }>(`
-      SELECT source, usage_kind AS kind, outcome, pricing, deployment_model_id, vendor_id,
-             billing_method_key, external_account_id, gadget_id, COUNT(*) AS records
-      FROM usage_projection_facts
-      WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
-        AND CAST(metered_use_count AS INTEGER) > 0
-      GROUP BY source, usage_kind, outcome, pricing, deployment_model_id, vendor_id,
-               billing_method_key, external_account_id, gadget_id
-      ORDER BY source, usage_kind, outcome, pricing, deployment_model_id, vendor_id,
-               billing_method_key, external_account_id, gadget_id
-    `, generation).toArray();
-  });
+    `).one().active_generation);
+  const slices = await readAcrossProjection<DimensionGroup>(projection, `
+    SELECT source, usage_kind AS kind, outcome, pricing, deployment_model_id, vendor_id,
+           billing_method_key, external_account_id, gadget_id, COUNT(*) AS records
+    FROM usage_projection_facts
+    WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+      AND CAST(metered_use_count AS INTEGER) > 0
+    GROUP BY source, usage_kind, outcome, pricing, deployment_model_id, vendor_id,
+             billing_method_key, external_account_id, gadget_id
+  `, generation);
+  // One dimension group can appear in more than one store, so the groups are added and then put
+  // back into the order the single-object query returned, which is what the digest is taken over.
+  const groups = new Map<string, DimensionGroup>();
+  for (const slice of slices) {
+    const key = DIMENSION_COLUMNS.map(column => slice[column] ?? "\u0000").join("\u0001");
+    const merged = groups.get(key);
+    if (merged === undefined) groups.set(key, {...slice});
+    else merged.records += slice.records;
+  }
+  const rows = [...groups.values()].toSorted(compareDimensionGroups);
   const methods = new Set(rows.filter(row => row.vendor_id !== null &&
     row.billing_method_key !== null).map(row => `${row.vendor_id}\u0000${row.billing_method_key}`));
   return {
@@ -297,6 +301,81 @@ async function readProjectionDetailDigest(
     dimensionGroups: rows.length,
     coveredMethods: methods.size,
   };
+}
+
+// Mirrors `RETAINED_IDENTITY_WINDOW_MS` in `usage-projection.ts`, which #74 fixed at one day.
+const RETAINED_IDENTITY_WINDOW_HOURS = 24;
+
+const DIMENSION_COLUMNS = [
+  "source", "kind", "outcome", "pricing", "deployment_model_id", "vendor_id",
+  "billing_method_key", "external_account_id", "gadget_id",
+] as const;
+
+type DimensionGroup = {
+  source: string;
+  kind: string;
+  outcome: string;
+  pricing: string;
+  deployment_model_id: string | null;
+  vendor_id: string | null;
+  billing_method_key: string | null;
+  external_account_id: string | null;
+  gadget_id: string | null;
+  records: number;
+};
+
+/** Order dimension groups the way SQLite ordered them, which puts a null before any text. */
+function compareDimensionGroups(left: DimensionGroup, right: DimensionGroup): number {
+  for (const column of DIMENSION_COLUMNS) {
+    const leftValue = left[column];
+    const rightValue = right[column];
+    if (leftValue === rightValue) continue;
+    if (leftValue === null) return -1;
+    if (rightValue === null) return 1;
+    return leftValue < rightValue ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Measure what the deployment root object still holds, by table.
+ *
+ * Sharding leaves the root with retained fact identity, lifetime Usage Summary Facts, and
+ * per-User bookkeeping. Those three grow by different rules, so a projection that multiplies the
+ * root's whole variable size by twenty-four months is wrong in both directions: the identity table
+ * is bounded to one replay window by #74, and the Summary Facts really do accumulate.
+ */
+async function measureRootComposition(
+    projection: DurableObjectStub<UsageProjection>): Promise<{
+  identityRows: number;
+  identityLogicalBytes: number;
+  bookkeepingLogicalBytes: number;
+}> {
+  return runInDurableObject(projection, (_instance, state) => {
+    const identity = state.storage.sql.exec<{rows: number; logical_bytes: number}>(`
+      SELECT COUNT(*) AS rows, COALESCE(SUM(
+        length(generation) + length(fact_id) + length(principal_ref) +
+        length(source_sequence) + length(fact_hash) + length(retired_at)
+      ), 0) AS logical_bytes
+      FROM usage_projection_expired_sequences
+    `).one();
+    const principals = state.storage.sql.exec<{logical_bytes: number}>(`
+      SELECT COALESCE(SUM(length(generation) + length(principal_ref) + length(high_water)), 0)
+        AS logical_bytes
+      FROM usage_projection_principals
+    `).one().logical_bytes;
+    const activeUsers = state.storage.sql.exec<{logical_bytes: number}>(`
+      SELECT COALESCE(SUM(
+        length(generation) + length(principal_ref) + length(contribution_count)
+      ), 0) AS logical_bytes
+      FROM usage_projection_active_users
+    `).one().logical_bytes;
+    return {
+      identityRows: identity.rows,
+      identityLogicalBytes: identity.logical_bytes,
+      bookkeepingLogicalBytes: principals + activeUsers,
+    };
+  });
 }
 
 async function measureProjectionStorageBreakdown(
@@ -309,39 +388,47 @@ async function measureProjectionStorageBreakdown(
   summaryLogicalBytes: number;
   factIndexNames: string[];
 }> {
-  return runInDurableObject(projection, (_instance, state) => {
-    const generation = state.storage.sql.exec<{active_generation: string}>(`
+  const generation = await runInDurableObject(projection, (_instance, state) =>
+    state.storage.sql.exec<{active_generation: string}>(`
       SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-    `).one().active_generation;
-    const facts = state.storage.sql.exec<{
-      row_kind: "detail" | "aggregate";
-      rows: number;
-      logical_bytes: number;
-    }>(`
-      SELECT row_kind, COUNT(*) AS rows, SUM(
-        length(generation) + length(fact_id) + length(fact_hash) + length(principal_ref) +
-        length(source_sequence) + length(COALESCE(occurred_at, '')) +
-        length(COALESCE(safe_record_ref, '')) + length(COALESCE(safe_attempt_ref, '')) +
-        length(COALESCE(reservation_status, '')) + length(COALESCE(bucket_start, '')) +
-        length(COALESCE(summary_fact_id, '')) + length(COALESCE(summary_revision, '')) +
-        length(COALESCE(summary_dimension_key, '')) +
-        length(COALESCE(summary_snapshot_value, '')) + length(source) + length(row_kind) +
-        length(COALESCE(metered_kind, '')) + length(usage_kind) + length(outcome) +
-        length(pricing) + length(COALESCE(deployment_model_id, '')) +
-        length(COALESCE(vendor_id, '')) + length(COALESCE(billing_method_key, '')) +
-        length(COALESCE(external_account_id, '')) + length(COALESCE(gadget_id, '')) +
-        length(cache_hit_input) + length(cache_miss_input) + length(cache_write_input) +
-        length(output_tokens) + length(reasoning_tokens) + length(provider_cost) +
-        length(charged_credits) + length(metered_use_count) +
-        length(billable_api_operations) + length(pre_execution_failures) +
-        length(unknown_operations) + length(metering_attempts) + length(held_reservations) +
-        length(released_reservations) + length(settled_reservations) +
-        length(unreserved_attempts) + length(active_user_contribution) +
-        length(unpriced_model_uses) + length(unpriced_api_operations)
-      ) AS logical_bytes
-      FROM usage_projection_facts WHERE generation = ? GROUP BY row_kind
-    `, generation).toArray();
-    const summary = state.storage.sql.exec<{rows: number; logical_bytes: number}>(`
+    `).one().active_generation);
+  // Reportable rows are spread over the month objects, with only undelivered rows left here, so
+  // the breakdown adds the slices. Usage Summary Facts are not sharded and stay in the root.
+  const factSlices = await readAcrossProjection<{
+    row_kind: "detail" | "aggregate";
+    rows: number;
+    logical_bytes: number | null;
+  }>(projection, `
+    SELECT row_kind, COUNT(*) AS rows, SUM(
+      length(generation) + length(fact_id) + length(fact_hash) + length(principal_ref) +
+      length(source_sequence) + length(COALESCE(occurred_at, '')) +
+      length(COALESCE(safe_record_ref, '')) + length(COALESCE(safe_attempt_ref, '')) +
+      length(COALESCE(reservation_status, '')) + length(COALESCE(bucket_start, '')) +
+      length(COALESCE(summary_fact_id, '')) + length(COALESCE(summary_revision, '')) +
+      length(COALESCE(summary_dimension_key, '')) +
+      length(COALESCE(summary_snapshot_value, '')) + length(source) + length(row_kind) +
+      length(COALESCE(metered_kind, '')) + length(usage_kind) + length(outcome) +
+      length(pricing) + length(COALESCE(deployment_model_id, '')) +
+      length(COALESCE(vendor_id, '')) + length(COALESCE(billing_method_key, '')) +
+      length(COALESCE(external_account_id, '')) + length(COALESCE(gadget_id, '')) +
+      length(cache_hit_input) + length(cache_miss_input) + length(cache_write_input) +
+      length(output_tokens) + length(reasoning_tokens) + length(provider_cost) +
+      length(charged_credits) + length(metered_use_count) +
+      length(billable_api_operations) + length(pre_execution_failures) +
+      length(unknown_operations) + length(metering_attempts) + length(held_reservations) +
+      length(released_reservations) + length(settled_reservations) +
+      length(unreserved_attempts) + length(active_user_contribution) +
+      length(unpriced_model_uses) + length(unpriced_api_operations)
+    ) AS logical_bytes
+    FROM usage_projection_facts WHERE generation = ? GROUP BY row_kind
+  `, generation);
+  const totals = {detail: {rows: 0, bytes: 0}, aggregate: {rows: 0, bytes: 0}};
+  for (const slice of factSlices) {
+    totals[slice.row_kind].rows += slice.rows;
+    totals[slice.row_kind].bytes += slice.logical_bytes ?? 0;
+  }
+  const summary = await runInDurableObject(projection, (_instance, state) =>
+    state.storage.sql.exec<{rows: number; logical_bytes: number}>(`
       SELECT COUNT(*) AS rows, COALESCE(SUM(
         length(generation) + length(summary_fact_id) + length(summary_revision) +
         length(dimension_key) + length(snapshot_value) + length(metered_kind) +
@@ -355,149 +442,27 @@ async function measureProjectionStorageBreakdown(
         length(unpriced_model_uses) + length(unpriced_api_operations)
       ), 0) AS logical_bytes
       FROM usage_projection_summaries WHERE generation = ?
-    `, generation).one();
-    const detail = facts.find(row => row.row_kind === "detail");
-    const aggregate = facts.find(row => row.row_kind === "aggregate");
-    return {
-      detailRows: detail?.rows ?? 0,
-      detailLogicalBytes: detail?.logical_bytes ?? 0,
-      aggregateRows: aggregate?.rows ?? 0,
-      aggregateLogicalBytes: aggregate?.logical_bytes ?? 0,
-      summaryRows: summary.rows,
-      summaryLogicalBytes: summary.logical_bytes,
-      factIndexNames: state.storage.sql.exec<{name: string}>(`
-        SELECT name FROM sqlite_schema
-        WHERE type = 'index' AND tbl_name = 'usage_projection_facts'
-        ORDER BY name
-      `).toArray().map(row => row.name),
-    };
-  });
-}
-
-async function measureCompactProjectionPrototype(
-    projection: DurableObjectStub<UsageProjection>): Promise<{
-  physicalBytes: number;
-  detailRows: number;
-  aggregateMarkerRows: number;
-  dimensionRows: number;
-  principalRows: number;
-  indexNames: string[];
-}> {
-  const beforeBytes = await runInDurableObject(
-    projection, (_instance, state) => state.storage.sql.databaseSize,
-  );
-  const counts = await runInDurableObject(projection, (_instance, state) => {
-    state.storage.sql.exec(`
-      CREATE TABLE capacity_proto_principals (
-        id INTEGER PRIMARY KEY, principal_ref TEXT NOT NULL UNIQUE
-      );
-      INSERT INTO capacity_proto_principals (principal_ref)
-      SELECT DISTINCT principal_ref FROM usage_projection_facts;
-
-      CREATE TABLE capacity_proto_dimensions (
-        id INTEGER PRIMARY KEY, dimension_key TEXT NOT NULL UNIQUE,
-        principal_id INTEGER NOT NULL, source TEXT NOT NULL, usage_kind TEXT NOT NULL,
-        outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT,
-        vendor_id TEXT, billing_method_key TEXT, external_account_id TEXT, gadget_id TEXT
-      );
-      INSERT INTO capacity_proto_dimensions (
-        dimension_key, principal_id, source, usage_kind, outcome, pricing,
-        deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id
-      )
-      SELECT DISTINCT json_array(
-        principal_ref, source, usage_kind, outcome, pricing, deployment_model_id,
-        vendor_id, billing_method_key, external_account_id, gadget_id
-      ), principals.id, source, usage_kind, outcome, pricing, deployment_model_id,
-         vendor_id, billing_method_key, external_account_id, gadget_id
-      FROM usage_projection_facts AS facts
-      JOIN capacity_proto_principals AS principals USING (principal_ref)
-      WHERE row_kind = 'detail';
-      CREATE INDEX capacity_proto_dimensions_filter
-      ON capacity_proto_dimensions(
-        source, usage_kind, outcome, pricing, deployment_model_id,
-        vendor_id, billing_method_key, external_account_id, gadget_id, principal_id
-      );
-
-      CREATE TABLE capacity_proto_details (
-        fact_id TEXT PRIMARY KEY, fact_hash TEXT NOT NULL, principal_id INTEGER NOT NULL,
-        source_sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL, safe_record_ref TEXT,
-        safe_attempt_ref TEXT, reservation_status TEXT, dimension_id INTEGER NOT NULL,
-        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
-        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
-        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
-        billable_api_operations TEXT NOT NULL, pre_execution_failures TEXT NOT NULL,
-        unknown_operations TEXT NOT NULL, metering_attempts TEXT NOT NULL,
-        held_reservations TEXT NOT NULL, released_reservations TEXT NOT NULL,
-        settled_reservations TEXT NOT NULL, unreserved_attempts TEXT NOT NULL,
-        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
-        unpriced_api_operations TEXT NOT NULL,
-        UNIQUE (principal_id, source_sequence)
-      );
-      INSERT INTO capacity_proto_details
-      SELECT facts.fact_id, facts.fact_hash, principals.id, CAST(facts.source_sequence AS INTEGER),
-        facts.occurred_at, facts.safe_record_ref, facts.safe_attempt_ref,
-        facts.reservation_status, dimensions.id, facts.cache_hit_input,
-        facts.cache_miss_input, facts.cache_write_input, facts.output_tokens,
-        facts.reasoning_tokens, facts.provider_cost, facts.charged_credits,
-        facts.metered_use_count, facts.billable_api_operations,
-        facts.pre_execution_failures, facts.unknown_operations, facts.metering_attempts,
-        facts.held_reservations, facts.released_reservations, facts.settled_reservations,
-        facts.unreserved_attempts, facts.active_user_contribution,
-        facts.unpriced_model_uses, facts.unpriced_api_operations
-      FROM usage_projection_facts AS facts
-      JOIN capacity_proto_principals AS principals USING (principal_ref)
-      JOIN capacity_proto_dimensions AS dimensions ON dimensions.dimension_key = json_array(
-        facts.principal_ref, facts.source, facts.usage_kind, facts.outcome, facts.pricing,
-        facts.deployment_model_id, facts.vendor_id, facts.billing_method_key,
-        facts.external_account_id, facts.gadget_id
-      )
-      WHERE facts.row_kind = 'detail' AND facts.applied = 1;
-      CREATE INDEX capacity_proto_details_time
-      ON capacity_proto_details(occurred_at DESC, fact_id DESC);
-      CREATE INDEX capacity_proto_details_dimension_time
-      ON capacity_proto_details(dimension_id, occurred_at DESC, fact_id DESC);
-
-      CREATE TABLE capacity_proto_aggregate_markers (
-        fact_id TEXT PRIMARY KEY, fact_hash TEXT NOT NULL, principal_id INTEGER NOT NULL,
-        source_sequence INTEGER NOT NULL, summary_fact_id TEXT NOT NULL,
-        summary_revision INTEGER NOT NULL,
-        UNIQUE (principal_id, source_sequence)
-      );
-      INSERT INTO capacity_proto_aggregate_markers
-      SELECT facts.fact_id, facts.fact_hash, principals.id,
-        CAST(facts.source_sequence AS INTEGER), facts.summary_fact_id,
-        CAST(facts.summary_revision AS INTEGER)
-      FROM usage_projection_facts AS facts
-      JOIN capacity_proto_principals AS principals USING (principal_ref)
-      WHERE facts.row_kind = 'aggregate' AND facts.applied = 1;
-      CREATE INDEX capacity_proto_aggregate_summary_revision
-      ON capacity_proto_aggregate_markers(summary_fact_id, summary_revision);
-    `);
-    return {
-      detailRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM capacity_proto_details",
-      ).one().count,
-      aggregateMarkerRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM capacity_proto_aggregate_markers",
-      ).one().count,
-      dimensionRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM capacity_proto_dimensions",
-      ).one().count,
-      principalRows: state.storage.sql.exec<{count: number}>(
-        "SELECT COUNT(*) AS count FROM capacity_proto_principals",
-      ).one().count,
-      indexNames: state.storage.sql.exec<{name: string}>(`
-        SELECT name FROM sqlite_schema
-        WHERE type = 'index' AND name LIKE 'capacity_proto_%'
-        ORDER BY name
-      `).toArray().map(row => row.name),
-    };
-  });
-  const afterBytes = await runInDurableObject(
-    projection, (_instance, state) => state.storage.sql.databaseSize,
-  );
-  return {...counts, physicalBytes: afterBytes - beforeBytes};
+    `, generation).one());
+  // The report indexes that carry the per-row cost are the month object's, so they are read from
+  // where a reportable row is actually stored.
+  const [indexedMonth] = await projectionMonths(projection);
+  const indexHost = indexedMonth === undefined
+    ? projection : projectionMonthStub(projection, indexedMonth);
+  const factIndexNames = await runInDurableObject(indexHost, (_instance, state) =>
+    state.storage.sql.exec<{name: string}>(`
+      SELECT name FROM sqlite_schema
+      WHERE type = 'index' AND tbl_name = 'usage_projection_facts'
+      ORDER BY name
+    `).toArray().map(row => row.name));
+  return {
+    detailRows: totals.detail.rows,
+    detailLogicalBytes: totals.detail.bytes,
+    aggregateRows: totals.aggregate.rows,
+    aggregateLogicalBytes: totals.aggregate.bytes,
+    summaryRows: summary.rows,
+    summaryLogicalBytes: summary.logical_bytes,
+    factIndexNames,
+  };
 }
 
 function measuredAssignments(total: number, activeUsers: number): number[] {
@@ -1174,18 +1139,28 @@ async function verifyCapacityResult(
   expect(userStorage.every(value => value.ledgerCount === 801)).toBe(true);
   expect(userStorage.every(value => value.reservationCount === 800)).toBe(true);
   const measuredEndedAt = measuredStartedAt + selected.measuredSeconds * 1_000;
-  const measuredBuckets = await runInDurableObject(projection, (_instance, state) =>
-    state.storage.sql.exec<{aligned_second: string; records: number}>(`
-      SELECT substr(occurred_at, 1, 19) || 'Z' AS aligned_second,
-             COUNT(*) AS records
-      FROM usage_projection_facts
-      WHERE row_kind = 'detail' AND applied = 1
-        AND CAST(metered_use_count AS INTEGER) > 0
-        AND occurred_at >= ? AND occurred_at < ?
-      GROUP BY substr(occurred_at, 1, 19)
-      ORDER BY aligned_second
-    `, new Date(measuredStartedAt).toISOString(), new Date(measuredEndedAt).toISOString())
-        .toArray());
+  const measuredBucketSlices = await readAcrossProjection<{
+    aligned_second: string;
+    records: number;
+  }>(projection, `
+    SELECT substr(occurred_at, 1, 19) || 'Z' AS aligned_second,
+           COUNT(*) AS records
+    FROM usage_projection_facts
+    WHERE row_kind = 'detail' AND applied = 1
+      AND CAST(metered_use_count AS INTEGER) > 0
+      AND occurred_at >= ? AND occurred_at < ?
+    GROUP BY substr(occurred_at, 1, 19)
+  `, new Date(measuredStartedAt).toISOString(), new Date(measuredEndedAt).toISOString());
+  // A UTC second never crosses a month, but one second's rows can be split between a month object
+  // and the root rows still waiting for delivery, so equal seconds are added before comparing.
+  const bucketRecords = new Map<string, number>();
+  for (const slice of measuredBucketSlices) {
+    bucketRecords.set(slice.aligned_second,
+      (bucketRecords.get(slice.aligned_second) ?? 0) + slice.records);
+  }
+  const measuredBuckets = [...bucketRecords]
+      .map(([aligned_second, records]) => ({aligned_second, records}))
+      .toSorted((left, right) => left.aligned_second.localeCompare(right.aligned_second));
   const expectedMeasuredBuckets = Array.from({length: selected.measuredSeconds},
     (_unused, second) => ({
       aligned_second: new Date(measuredStartedAt + second * 1_000)
@@ -1361,15 +1336,29 @@ async function verifyCapacityResult(
     projection, (_instance, state) => state.storage.sql.databaseSize,
   );
   const projectionStorageBreakdown = await measureProjectionStorageBreakdown(projection);
-  const compactProjectionPrototype = selected.mode === "smoke"
-    ? await measureCompactProjectionPrototype(projection)
-    : null;
+  const rootComposition = await measureRootComposition(projection);
+  // Reportable rows live in the UTC month objects now, so the projection's storage is the root
+  // plus its months, and each one is measured against the limit on its own.
+  const measuredMonths = await projectionMonths(projection);
+  let projectionMonthSqliteBytes = 0;
+  for (const month of measuredMonths) {
+    projectionMonthSqliteBytes += await runInDurableObject(
+      projectionMonthStub(projection, month),
+      (_instance, state) => state.storage.sql.databaseSize,
+    );
+  }
   const emptyProjection = exports.UsageProjection.getByName(
     `usage-capacity-storage-empty-${selected.mode}`,
   );
   await emptyProjection.readOverview();
   const emptyProjectionSqliteBytes = await runInDurableObject(
     emptyProjection, (_instance, state) => state.storage.sql.databaseSize,
+  );
+  const emptyProjectionMonthSqliteBytes = await runInDurableObject(
+    exports.UsageProjectionMonth.getByName(
+      `2000-01:usage-capacity-storage-empty-${selected.mode}`,
+    ),
+    (_instance, state) => state.storage.sql.databaseSize,
   );
   const registrySqliteBytes = await runInDurableObject(
     exports.AdminSettings.getByName(""),
@@ -1385,22 +1374,56 @@ async function verifyCapacityResult(
   const projectionMonthlyVariableBytes = Math.max(
     0, projectionSqliteBytes - emptyProjectionSqliteBytes,
   );
+  const monthVariableBytes = Math.max(
+    0, projectionMonthSqliteBytes - emptyProjectionMonthSqliteBytes * measuredMonths.length,
+  );
   const userBaselineBytes = inactiveUserSqliteBytes;
   const typicalMonthlyVariableBytes = Math.max(0, typical.sqliteBytes - userBaselineBytes);
   const hotMonthlyVariableBytes = Math.max(0, hot.sqliteBytes - userBaselineBytes);
   const projectionTargetRecordsPerThirtyDays = 1_000_000n;
   const measuredProjectionRecords = BigInt(expectedRecords);
-  const projectionVariableBytesPerTargetMonth =
-    (BigInt(projectionMonthlyVariableBytes) * projectionTargetRecordsPerThirtyDays +
-      measuredProjectionRecords - 1n) / measuredProjectionRecords;
+  // The root's variable bytes are attributed to what it holds by logical size, because SqlStorage
+  // exposes `databaseSize` alone: deleting rows returns pages to the freelist without shrinking
+  // the database, so a steady state cannot be measured by pruning and then measuring again.
+  const rootLogicalBytes = rootComposition.identityLogicalBytes +
+    projectionStorageBreakdown.summaryLogicalBytes + rootComposition.bookkeepingLogicalBytes;
+  const rootPhysicalPerLogical = rootLogicalBytes === 0
+    ? 0 : projectionMonthlyVariableBytes / rootLogicalBytes;
+  // #74 bounds retained identity to one replay window, so it never reaches twenty-four months.
+  const identityWindowRecords = (projectionTargetRecordsPerThirtyDays *
+    BigInt(RETAINED_IDENTITY_WINDOW_HOURS) + 24n * 30n - 1n) / (24n * 30n);
+  const identityPhysicalPerRow = rootComposition.identityRows === 0 ? 0
+    : rootComposition.identityLogicalBytes / rootComposition.identityRows *
+      rootPhysicalPerLogical;
+  const projectedIdentityBytes = BigInt(Math.ceil(identityPhysicalPerRow)) *
+    identityWindowRecords;
+  // Lifetime Usage Summary Facts do accumulate, so they carry the twenty-four month multiplier.
+  const summaryPhysicalBytes = projectionStorageBreakdown.summaryLogicalBytes *
+    rootPhysicalPerLogical;
+  const summaryBytesPerTargetMonth = (BigInt(Math.ceil(summaryPhysicalBytes)) *
+    projectionTargetRecordsPerThirtyDays + measuredProjectionRecords - 1n) /
+    measuredProjectionRecords;
+  const projectedSummaryBytes = summaryBytesPerTargetMonth * 24n;
+  // Per-User bookkeeping is bounded by the registered Users the profile already provisions.
+  const projectedBookkeepingBytes = BigInt(Math.ceil(
+    rootComposition.bookkeepingLogicalBytes * rootPhysicalPerLogical,
+  ));
   const projectedProjectionTwentyFourMonthBytes = BigInt(emptyProjectionSqliteBytes) +
-    projectionVariableBytesPerTargetMonth * 24n;
+    projectedIdentityBytes + projectedSummaryBytes + projectedBookkeepingBytes;
+  // A month object owns exactly one UTC month, so it is never multiplied by the retention window.
+  const monthBytesPerTargetMonth = (BigInt(monthVariableBytes) *
+    projectionTargetRecordsPerThirtyDays + measuredProjectionRecords - 1n) /
+    measuredProjectionRecords;
+  const projectedProjectionMonthBytes = BigInt(emptyProjectionMonthSqliteBytes) +
+    monthBytesPerTargetMonth;
   const projectedTypicalUserTwentyFourMonthBytes = BigInt(userBaselineBytes) +
     BigInt(typicalMonthlyVariableBytes) * 24n;
   const projectedHotUserTwentyFourMonthBytes = BigInt(userBaselineBytes) +
     BigInt(hotMonthlyVariableBytes) * 24n;
+  // The limit applies to one Durable Object, so the gate reads the largest single object.
   const projectedTwentyFourMonthMaxBytes = [
     projectedProjectionTwentyFourMonthBytes,
+    projectedProjectionMonthBytes,
     projectedTypicalUserTwentyFourMonthBytes,
     projectedHotUserTwentyFourMonthBytes,
   ].reduce((maximum, value) => value > maximum ? value : maximum, 0n);
@@ -1410,6 +1433,10 @@ async function verifyCapacityResult(
     registrySqliteBytes,
     projectionSqliteBytes,
     emptyProjectionSqliteBytes,
+    projectionMonthSqliteBytes,
+    emptyProjectionMonthSqliteBytes,
+    projectionMonthObjects: measuredMonths.length,
+    rootComposition,
     projectionMaintenanceAlarms,
     projectionStorageBreakdown: {
       ...projectionStorageBreakdown,
@@ -1429,16 +1456,6 @@ async function verifyCapacityResult(
       perIndexBytesUnavailableReason:
         "Cloudflare SqlStorage rejects PRAGMA/dbstat with SQLITE_AUTH",
     },
-    compactProjectionPrototype: compactProjectionPrototype === null ? null : {
-      ...compactProjectionPrototype,
-      perRecordPhysicalBytes: compactProjectionPrototype.physicalBytes / expectedRecords,
-      twentyFourMonthDetailAndDedupeBytes: (
-        (BigInt(compactProjectionPrototype.physicalBytes) * 24_000_000n +
-          BigInt(expectedRecords) - 1n) / BigInt(expectedRecords)
-      ).toString(),
-      boundary:
-        "storage-only normalized dimension and applied-fact marker prototype; no production query or migration claim",
-    },
     typicalUserSqliteBytes: typical.sqliteBytes,
     hotUserSqliteBytes: hot.sqliteBytes,
     inactiveUserSqliteBytes,
@@ -1447,12 +1464,17 @@ async function verifyCapacityResult(
       detailRetentionUtcCalendarMonths: 24,
       targetRecordsPerThirtyDays: projectionTargetRecordsPerThirtyDays.toString(),
       measuredProjectionRecords: measuredProjectionRecords.toString(),
-      projectionVariableBytesPerTargetMonth:
-        projectionVariableBytesPerTargetMonth.toString(),
+      retainedIdentityWindowHours: RETAINED_IDENTITY_WINDOW_HOURS,
+      measuredMonthObjects: measuredMonths.length,
+      rootIdentityBytes: projectedIdentityBytes.toString(),
+      rootSummaryBytes: projectedSummaryBytes.toString(),
+      rootBookkeepingBytes: projectedBookkeepingBytes.toString(),
       projectionBytes: projectedProjectionTwentyFourMonthBytes.toString(),
+      monthBytesPerTargetMonth: monthBytesPerTargetMonth.toString(),
+      projectionMonthBytes: projectedProjectionMonthBytes.toString(),
       typicalUserBytes: projectedTypicalUserTwentyFourMonthBytes.toString(),
       hotUserBytes: projectedHotUserTwentyFourMonthBytes.toString(),
-      model: "empty baseline + 24 * measured per-record bytes * 1,000,000 records per 30 days after rebuild cleanup",
+      model: "largest single Durable Object: the root as empty baseline + one replay window of retained identity + 24 * Usage Summary Facts + bounded per-User bookkeeping, and one UTC month object as empty baseline + one month of reportable rows, both at 1,000,000 records per 30 days",
     },
     hardLimitBytes: hardLimitBytes.toString(),
     reviewThresholdBytes: reviewThresholdBytes.toString(),
