@@ -1166,6 +1166,7 @@ function unavailableUsageOverview(registeredUsers: bigint, asOf: string): AdminU
   return {
     metrics: null,
     registeredUsers,
+    capacityReview: null,
     range: {kind: "all-recorded", startedAt: null},
     generation: 0n,
     ingestionWatermark: 0n,
@@ -1629,12 +1630,15 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     try {
       const projection = this.projection.getByName("");
       const bootstrapComplete = await projection.ensureBootstrap();
-      const overview = await projection.readOverview();
-      return mergeProjectionDeliveryHealth({
+      const overview = await projection.readAdminOverview(registeredUsers);
+      const merged = mergeProjectionDeliveryHealth({
         ...overview,
         metrics: bootstrapComplete ? overview.metrics : null,
         registeredUsers,
+        capacityReview: bootstrapComplete ? overview.capacityReview : null,
       }, deliveryHealth);
+      return merged.health.state === "healthy"
+        ? merged : {...merged, capacityReview: null};
     } catch {
       return mergeProjectionDeliveryHealth(
         unavailableUsageOverview(registeredUsers, asOf), deliveryHealth);

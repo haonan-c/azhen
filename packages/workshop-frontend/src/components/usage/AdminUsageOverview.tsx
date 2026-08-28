@@ -2,6 +2,8 @@ import {useCallback, useEffect, useRef, useState, type ReactNode} from "react";
 import type {
   AdminApi,
   AdminUsageApi,
+  AdminUsageCapacityMetric,
+  AdminUsageCapacityReview,
   AdminUsageOverview as AdminUsageOverviewView,
   AdminUsageProjectionState,
 } from "@gadgets/workshop-shared/api";
@@ -189,6 +191,7 @@ export default function AdminUsageOverview({adminApi}: Props) {
         <MetricCard label={messages.admin_usage_unpriced()}
           value={`${formatInteger(metrics.unpricedModelUses)} / ${formatInteger(metrics.unpricedApiOperations)}`} />
       </div>
+      {view.capacityReview && <CapacityReview review={view.capacityReview} />}
       {usage && typeof usage.api.openReport === "function" && (
         <AdminUsageReportBrowser api={usage.api} />
       )}
@@ -220,6 +223,71 @@ export default function AdminUsageOverview({adminApi}: Props) {
         })}</span>
       </div>
     </section>
+  );
+}
+
+function CapacityReview({review}: {review: AdminUsageCapacityReview}) {
+  return (
+    <div role={review.reviewRequired ? "alert" : "status"}
+      className="rounded-xl border border-kumo-warning bg-kumo-tint p-4">
+      <p className="font-medium text-kumo-default">
+        {review.reviewRequired
+          ? messages.admin_usage_capacity_review_required()
+          : messages.admin_usage_capacity_review_clear()}
+      </p>
+      <p className="mt-1 text-xs text-kumo-subtle">
+        {messages.admin_usage_capacity_profile({profile: review.profileId})}
+      </p>
+      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <CapacityMetric label={messages.admin_usage_capacity_registered_users()}
+          metric={review.registeredUsers} />
+        <CapacityMetric label={messages.admin_usage_capacity_daily_active_users()}
+          metric={review.dailyActiveUsers} />
+        <CapacityMetric label={messages.admin_usage_capacity_rolling_records()}
+          metric={review.rollingThirtyDayRecords} />
+        <CapacityMetric label={messages.admin_usage_capacity_second_peak()}
+          metric={review.alignedOneSecondPeakRecords}>
+          <MetricDetail label={messages.admin_usage_capacity_minute_peak()}
+            value={`${formatInteger(review.alignedSixtySecondPeakRecords.current)} / ${formatInteger(review.alignedSixtySecondPeakRecords.target)}`} />
+        </CapacityMetric>
+      </div>
+    </div>
+  );
+}
+
+function CapacityMetric({label, metric, children}: {
+  label: string;
+  metric: AdminUsageCapacityMetric;
+  children?: ReactNode;
+}) {
+  const window = metric.window.kind === "authoritative-current"
+    ? messages.admin_usage_capacity_window_current()
+    : metric.window.kind === "utc-day"
+      ? messages.admin_usage_capacity_window_utc_day({
+        time: new Date(metric.window.startedAt).toLocaleString(getLocale()),
+      })
+      : messages.admin_usage_capacity_window_rolling({
+        time: new Date(metric.window.startedAt).toLocaleString(getLocale()),
+      });
+  return (
+    <div className="rounded-lg border border-kumo-line bg-kumo-elevated p-3">
+      <p className="text-xs font-medium text-kumo-subtle">{label}</p>
+      <p className="mt-1 font-semibold text-kumo-strong">
+        {formatInteger(metric.current)} / {formatInteger(metric.target)}
+      </p>
+      <p className="mt-1 text-xs text-kumo-subtle">
+        {messages.admin_usage_capacity_threshold({
+          threshold: formatInteger(metric.reviewThreshold),
+        })}
+      </p>
+      <p className="mt-1 text-xs text-kumo-subtle">{window}</p>
+      <p className="mt-1 text-xs text-kumo-subtle">
+        {messages.admin_usage_as_of({
+          time: new Date(metric.asOf).toLocaleString(getLocale()),
+        })}
+      </p>
+      {children && <dl className="mt-2">{children}</dl>}
+    </div>
   );
 }
 

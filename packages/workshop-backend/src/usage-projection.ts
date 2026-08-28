@@ -1,5 +1,8 @@
 import {DurableObject} from "cloudflare:workers";
+import {createLogger} from "@gadgets/backend-utils/logger";
 import type {
+  AdminUsageCapacityMetric,
+  AdminUsageCapacityReview,
   AdminUsageReservationStatus,
   AdminUsageReportMetrics,
   AdminUsageReportPage,
@@ -21,6 +24,10 @@ import {
   type FrozenUsageReportQuery,
   type UsageReportCursor,
 } from "./usage-report-query.js";
+import {
+  buildUsageCapacityReview,
+  type UsageCapacityReviewMetricKey,
+} from "./usage-capacity-review.js";
 
 /** Seconds within which a committed User projection fact should reach the deployment projection. */
 export const USAGE_PROJECTION_FACT_TARGET_SECONDS = 10;
@@ -31,6 +38,27 @@ export const USAGE_PROJECTION_OVERVIEW_TARGET_SECONDS = 60;
 const REBUILD_REGISTRY_PAGE_LIMIT = 100;
 const REBUILD_RPC_STEPS_PER_ALARM = 100;
 const REBUILD_ALARM_DEADLINE_MS = 250;
+type UsageCapacityLogFields = {
+  profileId: string;
+  metric: string;
+  current: string;
+  target: string;
+  reviewThreshold: string;
+  reviewRequired: boolean;
+  windowKind: string;
+  asOf: string;
+};
+
+const capacityLogger = createLogger<UsageCapacityLogFields>({
+  component: "workshop.usage.projection",
+});
+
+const CAPACITY_REVIEW_METRICS: UsageCapacityReviewMetricKey[] = [
+  "registered-users",
+  "daily-active-users",
+  "rolling-thirty-day-records",
+  "aligned-one-second-peak-records",
+];
 
 type UsageProjectionFactContribution = {
   schemaVersion: 1;
@@ -358,6 +386,15 @@ const RESERVATION_STATUSES = new Set<AdminUsageReservationStatus>([
 ]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CURRENT_PROJECTION_SCHEMA_VERSION = "4";
+
+/**
+ * Applied facts that must separate a Summary revision from the revision it replaced before
+ * compaction may remove the replaced row. A frozen report can only lose a row it still names when
+ * it was opened before the newer revision was applied, so this lag keeps every report opened
+ * within roughly the last hour of the profile's sustained load untouched. The shared
+ * detail-retention revision still fails an older report instead of changing its rows.
+ */
+const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
 const RETIRED_V2_FACTS_TABLE = "usage_projection_facts_retired_v2";
 const RETIRED_V2_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
 const RETIRED_V3_FACTS_TABLE = "usage_projection_facts_retired_v3";
@@ -492,12 +529,122 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     return {
       metrics,
       registeredUsers: 0n,
+      capacityReview: null,
       range: {kind: "all-recorded", startedAt: totals.started_at},
       generation: BigInt(meta.active_generation),
       ingestionWatermark: BigInt(meta.ingestion_watermark),
       health,
       asOf: health.asOf,
     };
+  }
+
+  /** Read core overview and independently-failing capacity telemetry from one generation. */
+  readAdminOverview(registeredUsers: bigint): AdminUsageOverview {
+    const overview = this.readOverview();
+    if (overview.health.state !== "healthy") {
+      return {...overview, registeredUsers, capacityReview: null};
+    }
+    let capacityReview: AdminUsageCapacityReview | null = null;
+    try {
+      capacityReview = this.readCapacityReview(registeredUsers);
+    } catch {
+      // Capacity telemetry is operational guidance. It must not hide authoritative core totals.
+    }
+    return {...overview, registeredUsers, capacityReview};
+  }
+
+  /** Sample exact content-free telemetry for the fixed usage-capacity-v1 profile. */
+  readCapacityReview(registeredUsers: bigint): AdminUsageCapacityReview {
+    const observedAt = new Date();
+    const asOf = observedAt.toISOString();
+    const utcDayStartedAt = `${asOf.slice(0, 10)}T00:00:00.000Z`;
+    const rollingWindowStartedAt = new Date(
+      observedAt.getTime() - 30 * 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    const meta = this.#meta();
+    const generation = meta.active_generation;
+    const health = this.readHealth();
+    const projectionAsOf = health.latestAppliedSourceAt ?? asOf;
+    const counts = this.ctx.storage.sql.exec<{
+      daily_active_users: string;
+      rolling_records: string;
+    }>(`
+      SELECT
+        CAST(COUNT(DISTINCT CASE
+          WHEN occurred_at >= ? AND CAST(metered_use_count AS INTEGER) > 0
+          THEN principal_ref END) AS TEXT) AS daily_active_users,
+        CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
+          AS rolling_records
+      FROM usage_projection_facts
+      WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+        AND COALESCE(occurred_at, bucket_start) >= ?
+        AND COALESCE(occurred_at, bucket_start) < ?
+    `, utcDayStartedAt, generation, rollingWindowStartedAt, asOf).one();
+    const peaks = this.ctx.storage.sql.exec<{
+      second_peak: string;
+      minute_peak: string;
+    }>(`
+      SELECT
+        CAST(COALESCE(MAX(CASE WHEN bucket_kind = 'second' THEN record_count END), 0)
+          AS TEXT) AS second_peak,
+        CAST(COALESCE(MAX(CASE WHEN bucket_kind = 'minute' THEN record_count END), 0)
+          AS TEXT) AS minute_peak
+      FROM (
+        SELECT 'second' AS bucket_kind,
+          SUM(CAST(metered_use_count AS INTEGER)) AS record_count
+        FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND COALESCE(occurred_at, bucket_start) >= ?
+          AND COALESCE(occurred_at, bucket_start) < ?
+        GROUP BY substr(occurred_at, 1, 19)
+        UNION ALL
+        SELECT 'minute' AS bucket_kind,
+          SUM(CAST(metered_use_count AS INTEGER)) AS record_count
+        FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND COALESCE(occurred_at, bucket_start) >= ?
+          AND COALESCE(occurred_at, bucket_start) < ?
+        GROUP BY substr(occurred_at, 1, 16)
+      )
+    `, generation, rollingWindowStartedAt, asOf,
+    generation, rollingWindowStartedAt, asOf).one();
+    const review = buildUsageCapacityReview({
+      registeredUsers,
+      dailyActiveUsers: BigInt(counts.daily_active_users),
+      rollingThirtyDayRecords: BigInt(counts.rolling_records),
+      alignedOneSecondPeakRecords: BigInt(peaks.second_peak),
+      alignedSixtySecondPeakRecords: BigInt(peaks.minute_peak),
+      utcDayStartedAt,
+      rollingWindowStartedAt,
+    }, {registeredUsers: asOf, projection: projectionAsOf});
+    this.ctx.storage.transactionSync(() => {
+      for (const metricKey of CAPACITY_REVIEW_METRICS) {
+        const value = capacityMetric(review, metricKey);
+        const previous = this.ctx.storage.sql.exec<{review_required: number}>(`
+          SELECT review_required FROM usage_projection_capacity_review_state
+          WHERE metric = ?
+        `, metricKey).toArray()[0];
+        if ((previous === undefined && value.reviewRequired) ||
+            (previous !== undefined && previous.review_required !== Number(value.reviewRequired))) {
+          capacityLogger.info("Usage capacity review state changed", {
+            event: "usage.capacity.review.changed",
+            profileId: review.profileId,
+            metric: metricKey,
+            current: value.current.toString(),
+            target: value.target.toString(),
+            reviewThreshold: value.reviewThreshold.toString(),
+            reviewRequired: value.reviewRequired,
+            windowKind: value.window.kind,
+            asOf: value.asOf,
+          });
+        }
+        this.ctx.storage.sql.exec(`
+          INSERT INTO usage_projection_capacity_review_state (metric, review_required)
+          VALUES (?, ?) ON CONFLICT(metric) DO UPDATE SET review_required = excluded.review_required
+        `, metricKey, Number(value.reviewRequired));
+      }
+    });
+    return review;
   }
 
   /** Capture all server-owned coordinates needed to keep one report immutable. */
@@ -824,6 +971,67 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     });
   }
 
+  /**
+   * Delete at most one bounded page of Summary revisions that a newer applied revision replaced.
+   * Effective revisions, revisions that are not applied yet, and Usage Summary snapshots are kept,
+   * so report totals stay exact. A delayed replay of a removed revision is absorbed by its
+   * retained Summary snapshot and contributes no metric. Frozen reports that could still name a
+   * removed revision are failed through the shared detail-retention revision.
+   */
+  compactSupersededAggregates(
+      limit = 64, watermarkLag = SUPERSEDED_AGGREGATE_WATERMARK_LAG): boolean {
+    // Each batch deletes what it finds, so the candidate set only shrinks and no ordering is
+    // needed to make progress. Leaving it unordered lets the Summary-revision index stop at LIMIT
+    // instead of sorting every superseded row first.
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64 ||
+        !Number.isInteger(watermarkLag) || watermarkLag < 0) {
+      throw new TypeError("Usage Projection aggregate compaction request is invalid.");
+    }
+    return this.ctx.storage.transactionSync(() => {
+      const floor = BigInt(this.#meta().report_watermark) - BigInt(watermarkLag);
+      if (floor < 1n) return true;
+      const floorText = floor.toString();
+      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+        SELECT facts.generation, facts.fact_id
+        FROM usage_projection_facts AS facts
+        WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
+          AND facts.applied_watermark IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM usage_projection_facts AS newer
+            WHERE newer.generation = facts.generation
+              AND newer.row_kind = 'aggregate'
+              AND newer.summary_fact_id = facts.summary_fact_id
+              AND newer.applied = 1
+              AND newer.applied_watermark IS NOT NULL
+              AND (length(newer.applied_watermark) < length(?) OR
+                (length(newer.applied_watermark) = length(?)
+                  AND newer.applied_watermark <= ?))
+              AND (length(newer.summary_revision) > length(facts.summary_revision) OR
+                (length(newer.summary_revision) = length(facts.summary_revision)
+                  AND (newer.summary_revision > facts.summary_revision OR
+                    (newer.summary_revision = facts.summary_revision AND
+                      (length(newer.applied_watermark) < length(facts.applied_watermark) OR
+                        (length(newer.applied_watermark) = length(facts.applied_watermark) AND
+                          newer.applied_watermark < facts.applied_watermark))))))
+          )
+        LIMIT ?
+      `, floorText, floorText, floorText, limit + 1).toArray();
+      const removed = rows.slice(0, limit);
+      for (const row of removed) {
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+      }
+      const meta = this.#meta();
+      if (removed.some(row => row.generation === meta.active_generation)) {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
+      }
+      return rows.length <= limit;
+    });
+  }
+
   /** Start or resume the first bounded authority scan and report whether its totals are verified. */
   async ensureBootstrap(): Promise<boolean> {
     let meta = this.#meta();
@@ -970,7 +1178,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       this.#setMaintenanceTurn("drain");
     }
     await this.#runRetiredProjectionCleanupStep();
-    await this.#scheduleRemainingMaintenance();
+    await this.#scheduleRemainingMaintenance(this.compactSupersededAggregates());
   }
 
   #hasApplyDrain(): boolean {
@@ -1032,11 +1240,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, turn);
   }
 
-  async #scheduleRemainingMaintenance(): Promise<void> {
+  async #scheduleRemainingMaintenance(compactionComplete: boolean): Promise<void> {
     const meta = this.#meta();
     const hasDrain = this.#hasApplyDrain();
-    if (hasDrain || meta.rebuild_state === "rebuilding" || meta.cleanup_generation !== null ||
-        this.#hasRetiredProjectionTable()) {
+    if (hasDrain || !compactionComplete || meta.rebuild_state === "rebuilding" ||
+        meta.cleanup_generation !== null || this.#hasRetiredProjectionTable()) {
       await this.ctx.storage.setAlarm(Date.now() + (hasDrain ? 1_000 : 0));
     }
   }
@@ -2424,6 +2632,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       )
     `);
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_capacity_review_state (
+        metric TEXT PRIMARY KEY,
+        review_required INTEGER NOT NULL CHECK (review_required IN (0, 1))
+      )
+    `);
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_rejections (
         generation TEXT NOT NULL, fact_id TEXT NOT NULL, principal_ref TEXT NOT NULL,
         source_sequence TEXT NOT NULL, source_time TEXT NOT NULL, code TEXT NOT NULL,
@@ -2453,6 +2667,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     if (this.#hasRetiredProjectionTable()) {
       this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now()));
     }
+  }
+}
+
+function capacityMetric(
+    review: AdminUsageCapacityReview,
+    metric: UsageCapacityReviewMetricKey): AdminUsageCapacityMetric {
+  switch (metric) {
+    case "registered-users": return review.registeredUsers;
+    case "daily-active-users": return review.dailyActiveUsers;
+    case "rolling-thirty-day-records": return review.rollingThirtyDayRecords;
+    case "aligned-one-second-peak-records": return review.alignedOneSecondPeakRecords;
   }
 }
 

@@ -27,6 +27,62 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       unpricedApiOperations: 8n,
     },
     registeredUsers: 10n,
+    capacityReview: {
+      profileId: "usage-capacity-v1",
+      registeredUsers: {
+        current: 7_000n,
+        target: 10_000n,
+        reviewThreshold: 7_000n,
+        reviewRequired: true,
+        window: {kind: "authoritative-current"},
+        asOf: "2026-08-24T12:00:02.000Z",
+      },
+      dailyActiveUsers: {
+        current: 699n,
+        target: 1_000n,
+        reviewThreshold: 700n,
+        reviewRequired: false,
+        window: {
+          kind: "utc-day",
+          startedAt: "2026-08-24T00:00:00.000Z",
+        },
+        asOf: "2026-08-24T12:00:02.000Z",
+      },
+      rollingThirtyDayRecords: {
+        current: 700_000n,
+        target: 1_000_000n,
+        reviewThreshold: 700_000n,
+        reviewRequired: true,
+        window: {
+          kind: "rolling-thirty-days",
+          startedAt: "2026-07-25T12:00:02.000Z",
+        },
+        asOf: "2026-08-24T12:00:02.000Z",
+      },
+      alignedOneSecondPeakRecords: {
+        current: 14n,
+        target: 20n,
+        reviewThreshold: 14n,
+        reviewRequired: true,
+        window: {
+          kind: "rolling-thirty-days",
+          startedAt: "2026-07-25T12:00:02.000Z",
+        },
+        asOf: "2026-08-24T12:00:02.000Z",
+      },
+      alignedSixtySecondPeakRecords: {
+        current: 840n,
+        target: 1_200n,
+        reviewThreshold: 840n,
+        reviewRequired: true,
+        window: {
+          kind: "rolling-thirty-days",
+          startedAt: "2026-07-25T12:00:02.000Z",
+        },
+        asOf: "2026-08-24T12:00:02.000Z",
+      },
+      reviewRequired: true,
+    },
     range: {kind: "all-recorded", startedAt: "2026-08-24T12:00:00.000Z"},
     generation: 2n,
     ingestionWatermark: 20n,
@@ -89,6 +145,10 @@ describe("administrator Usage and Credits overview", () => {
     expect(container?.textContent).toContain("6 / 10");
     expect(container?.querySelector('[role="alert"]')?.textContent).toContain("7");
     expect(container?.querySelector('[role="alert"]')?.textContent).toContain("8");
+    expect(container?.textContent).toContain("需要容量 review");
+    expect(container?.textContent).toContain("7,000 / 10,000");
+    expect(container?.textContent).toContain("700,000 / 1,000,000");
+    expect(container?.textContent).toContain("840 / 1,200");
 
     act(() => root?.unmount());
     expect(dispose).toHaveBeenCalledOnce();

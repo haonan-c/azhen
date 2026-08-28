@@ -1,0 +1,103 @@
+{
+  "profileId": "usage-capacity-v1",
+  "lockedAt": "2026-08-26T22:26:20Z",
+  "baselineCommit": "366c92618d583d74666a08600d8bab9655fbed6b",
+  "projectionSchemaVersion": "4",
+  "seed": "usage-capacity-v1-seed-20260826",
+  "toolchain": {
+    "node": "24.19.0",
+    "pnpm": "11.17.0",
+    "wrangler": "4.119.0",
+    "workerd": "1.20260801.1",
+    "capnweb": "0.11.1",
+    "lockfileSha256": "3ccbc7e799f44088af4d72d41504748c2c6f4b71089f782683f2bfabc757674f"
+  },
+  "environment": {
+    "os": "macOS 26.0.1",
+    "kernel": "Darwin 25.0.0 x86_64",
+    "cpu": "Intel Core i7-9750H 2.60GHz",
+    "physicalCores": 6,
+    "logicalCores": 12,
+    "ramBytes": "17179869184",
+    "containerOrVmLimit": "none reported by the local host"
+  },
+  "topology": "Local real workerd and SQLite Durable Objects execute production UsageAccount, UserDurableObject, UsageProjection, Registry, rebuild, and duplicate-ingest code. Model, provider, and Gatekeeper effects are controlled external mocks. This is not a production deployment test.",
+  "command": "corepack pnpm test:usage-capacity -- --out docs/implementation/usage-credits/issue-66/capacity/full-run-20260826",
+  "environmentAllowlist": [
+    "PATH",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "CI",
+    "USAGE_CAPACITY_MODE=full"
+  ],
+  "workerConcurrency": {
+    "vitestFiles": 1,
+    "registeredUserActivationBatch": 50,
+    "offeredLoad": "20 records launched at each aligned second without waiting for the prior batch",
+    "projectionIngestBatchMax": 64,
+    "reportCsvRowsPerPage": 64,
+    "reportCsvChunkBytesMax": 262144
+  },
+  "coldRun": "Fresh Miniflare persistence and fresh User, Registry, and Projection Durable Object names.",
+  "warmRun": "The fixed 120-second 20 records/s phase immediately before the measured phase.",
+  "dataset": {
+    "registeredUsers": 10000,
+    "activeUsers": 1000,
+    "inactiveUsers": 9000,
+    "confirmedUsageRecords": 1000000,
+    "recordsPerActiveUser": 1000,
+    "utcDays": 30,
+    "sources": {
+      "agentModel": 400000,
+      "gadgetModel": 200000,
+      "systemAssistanceModel": 100000,
+      "scheduledModel": 100000,
+      "gatekeeperObservation": 120000,
+      "gatekeeperApprovedAction": 80000
+    },
+    "unpricedApiRecords": 10000,
+    "pricedZeroApiRecords": 190000,
+    "replayedDuplicateFacts": 100000,
+    "outOfOrderFactPairs": 10000,
+    "ackLossReplays": 1
+  },
+  "sustainedLoad": {
+    "warmupSeconds": 120,
+    "measuredSeconds": 900,
+    "recordsPerAlignedSecond": 20,
+    "measuredRecords": 18000,
+    "hotUser": "The first measured second sends 18 concurrent records to User 0 and two to User 1. Every active User still ends with exactly 1,000 records."
+  },
+  "thresholds": {
+    "unexpectedFinalErrors": 0,
+    "lostOrDuplicateCharges": 0,
+    "overdrawOrInvariantCorruption": 0,
+    "authoritativeTerminalWarmP95Ms": 2000,
+    "authoritativeTerminalWarmP99Ms": 5000,
+    "perUserProjectionVisibilityP99Ms": 10000,
+    "adminOverviewVisibilityMaxMs": 60000,
+    "filteredQueryP95Ms": 2000,
+    "filteredQueryP99Ms": 5000,
+    "csvTimeToFirstByteMs": 2000,
+    "csvCompletionMaxMs": 900000,
+    "projectionDrainMaxMs": 60000,
+    "csvRows": 1000000,
+    "applicationCsvRowsBufferedMax": 256,
+    "applicationCsvBytesBufferedMax": 262144,
+    "sqliteDoHardBytes": "10000000000",
+    "sqliteDoReviewBytes": "7000000000"
+  },
+  "capacityReview": {
+    "registeredUsers": {"target": "10000", "reviewThreshold": "7000"},
+    "dailyActiveUsers": {"target": "1000", "reviewThreshold": "700"},
+    "rollingThirtyDayRecords": {"target": "1000000", "reviewThreshold": "700000"},
+    "alignedOneSecondPeakRecords": {"target": "20", "reviewThreshold": "14"},
+    "alignedSixtySecondSupportingCount": {"target": "1200", "reviewThreshold": "840"},
+    "comparison": "current * 10 >= target * 7"
+  }
+}

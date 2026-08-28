@@ -1094,12 +1094,67 @@ export type AdminUsageOverviewMetrics = {
   unpricedApiOperations: bigint;
 };
 
+/** Server-owned sampling window for one deployment capacity review metric. */
+export type AdminUsageCapacityWindow =
+  | {
+      /** The value is an authoritative observation instead of a Projection time range. */
+      kind: "authoritative-current";
+    }
+  | {
+      /** The value covers the current canonical UTC day. */
+      kind: "utc-day";
+      /** Inclusive canonical UTC start of the day. */
+      startedAt: string;
+    }
+  | {
+      /** The value covers the rolling thirty-day Projection window. */
+      kind: "rolling-thirty-days";
+      /** Inclusive canonical UTC start of the rolling window. */
+      startedAt: string;
+    };
+
+/** One exact integer deployment capacity metric and its 70 percent review state. */
+export type AdminUsageCapacityMetric = {
+  /** Exact current sampled value. */
+  current: bigint;
+  /** Exact 100 percent design target. */
+  target: bigint;
+  /** Exact 70 percent review threshold. */
+  reviewThreshold: bigint;
+  /** Whether current multiplied by ten is at least target multiplied by seven. */
+  reviewRequired: boolean;
+  /** Bounded server-owned sampling window. */
+  window: AdminUsageCapacityWindow;
+  /** Canonical UTC observation time for this value. */
+  asOf: string;
+};
+
+/** Capacity review telemetry for the fixed usage-capacity-v1 profile. */
+export type AdminUsageCapacityReview = {
+  /** Stable capacity profile identifier. */
+  profileId: "usage-capacity-v1";
+  /** Current authoritative registered User count. */
+  registeredUsers: AdminUsageCapacityMetric;
+  /** Distinct Usage Principals with confirmed Metered Use in the current UTC day. */
+  dailyActiveUsers: AdminUsageCapacityMetric;
+  /** Confirmed Usage Records in the rolling thirty-day window. */
+  rollingThirtyDayRecords: AdminUsageCapacityMetric;
+  /** Highest confirmed Usage Record count in one aligned UTC second. */
+  alignedOneSecondPeakRecords: AdminUsageCapacityMetric;
+  /** Supporting highest confirmed Usage Record count in one aligned UTC minute. */
+  alignedSixtySecondPeakRecords: AdminUsageCapacityMetric;
+  /** Whether any of the four design targets requires capacity review. */
+  reviewRequired: boolean;
+};
+
 /** Administrator overview of all Usage Projection facts recorded since metering activation. */
 export type AdminUsageOverview = {
   /** Exact totals, or null when the projection is unavailable. */
   metrics: AdminUsageOverviewMetrics | null;
   /** Exact count read from the authoritative User Registry, not the projection. */
   registeredUsers: bigint;
+  /** Capacity telemetry, or null while Projection values are unavailable or unverified. */
+  capacityReview: AdminUsageCapacityReview | null;
   /** Explicit range contract that #63 can later extend with frozen report filters. */
   range: {kind: "all-recorded"; startedAt: string | null};
   /** Active projection generation. */

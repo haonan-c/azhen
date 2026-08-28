@@ -89,6 +89,93 @@ function aggregateFact(
 }
 
 describe("deployment Usage Projection", () => {
+  it("samples exact capacity windows from applied detail facts and survives restart", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T12:00:00.000Z"));
+    try {
+      const projectionName = crypto.randomUUID();
+      const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+      const principalA = crypto.randomUUID();
+      const principalB = crypto.randomUUID();
+      const inputs = [
+        fact({
+          usagePrincipalRef: principalA,
+          occurredAt: "2026-08-26T11:59:59.100Z",
+        }),
+        fact({
+          usagePrincipalRef: principalB,
+          occurredAt: "2026-08-26T11:59:59.900Z",
+        }),
+        fact({
+          usagePrincipalRef: principalA,
+          sourceSequence: 2n,
+          occurredAt: "2026-08-25T11:59:59.000Z",
+        }),
+        fact({
+          usagePrincipalRef: crypto.randomUUID(),
+          occurredAt: "2026-07-27T11:59:59.999Z",
+        }),
+      ];
+      expect(await projection.ingest(inputs)).toMatchObject({rejected: []});
+
+      const review = await projection.readCapacityReview(7_000n);
+      expect(review).toMatchObject({
+        profileId: "usage-capacity-v1",
+        registeredUsers: {current: 7_000n, reviewRequired: true},
+        dailyActiveUsers: {current: 2n, reviewRequired: false},
+        rollingThirtyDayRecords: {current: 3n, reviewRequired: false},
+        alignedOneSecondPeakRecords: {current: 2n, reviewRequired: false},
+        alignedSixtySecondPeakRecords: {current: 2n},
+        reviewRequired: true,
+      });
+      expect(review.dailyActiveUsers.window).toEqual({
+        kind: "utc-day",
+        startedAt: "2026-08-26T00:00:00.000Z",
+      });
+      expect(review.rollingThirtyDayRecords.window).toEqual({
+        kind: "rolling-thirty-days",
+        startedAt: "2026-07-27T12:00:00.000Z",
+      });
+      expect(review.registeredUsers.asOf).toBe("2026-08-26T12:00:00.000Z");
+      expect(review.dailyActiveUsers.asOf).toBe("2026-08-26T11:59:59.900Z");
+      expect(await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{count: number}>(`
+          SELECT COUNT(*) AS count FROM usage_projection_capacity_review_state
+        `).one().count)).toBe(4);
+      vi.setSystemTime(new Date("2026-08-26T12:00:30.000Z"));
+      expect((await projection.readCapacityReview(7_000n)).registeredUsers.asOf)
+        .toBe("2026-08-26T12:00:30.000Z");
+      expect(await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{count: number}>(`
+          SELECT COUNT(*) AS count FROM usage_projection_capacity_review_state
+        `).one().count)).toBe(4);
+      await runInDurableObject(projection, (_instance, state) => {
+        state.storage.sql.exec("DROP TABLE usage_projection_capacity_review_state");
+      });
+      const failSoft = await projection.readAdminOverview(7_000n);
+      expect(failSoft.metrics?.meteredUseCount).toBe(4n);
+      expect(failSoft.capacityReview).toBeNull();
+
+      await expect(runInDurableObject(projection, (_instance, state) => {
+        state.abort("restart capacity Projection");
+      })).rejects.toThrow("restart capacity Projection");
+      const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
+      expect((await restarted.readCapacityReview(7_000n)).registeredUsers.reviewRequired)
+        .toBe(true);
+
+      const gapProjection = testEnv.TEST_USAGE_PROJECTION.getByName(crypto.randomUUID());
+      const principal = crypto.randomUUID();
+      const first = fact({usagePrincipalRef: principal, sourceSequence: 1n});
+      const second = fact({usagePrincipalRef: principal, sourceSequence: 2n});
+      await gapProjection.ingest([second]);
+      expect((await gapProjection.readAdminOverview(7_000n)).capacityReview).toBeNull();
+      await gapProjection.ingest([first]);
+      expect((await gapProjection.readAdminOverview(7_000n)).capacityReview).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps a schema marker fail-closed after a partial Projection upgrade", async () => {
     const projectionName = crypto.randomUUID();
     const projection = testEnv.TEST_USAGE_PROJECTION.getByName(projectionName);
@@ -2514,7 +2601,11 @@ describe("deployment Usage Projection", () => {
     const projectionNamespace = {
       getByName: () => ({
         ensureBootstrap: async () => true,
-        readOverview: async () => projected,
+        readAdminOverview: async (registeredUsers: bigint) => ({
+          ...projected,
+          registeredUsers,
+          capacityReview: null,
+        }),
       }),
     } as unknown as DurableObjectNamespace<UsageProjection>;
     const admin = new AdminUsageApiImpl(

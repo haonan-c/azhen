@@ -8,6 +8,7 @@
     "build": "vp run -r --cache build",
     "run-local": "node scripts/run-local.mjs",
     "test": "node --test scripts/*.test.js && vp run --no-cache @gadgets/workshop-backend#test && vp run --filter './packages/*' --filter '!@gadgets/workshop-backend' --fail-if-no-match --cache --concurrency-limit 1 test",
+    "test:usage-capacity": "pnpm --filter @gadgets/workshop-backend test:usage-capacity -- --full",
     "dev-client": "cd packages/workshop-frontend && pnpm run dev",
     "dev-server": "node run-dev-server.js",
     "clean": "vp run -r clean",
