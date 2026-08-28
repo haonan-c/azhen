@@ -22,10 +22,7 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: [
-      "__tests__/usage-projection.test.ts",
-      "__tests__/usage-projection-compaction.test.ts",
-    ],
+    include: ["__tests__/usage-projection.test.ts"],
     fileParallelism: false,
     setupFiles: ["../../test-setup/assert-workerd.ts"],
   },

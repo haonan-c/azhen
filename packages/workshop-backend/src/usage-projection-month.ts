@@ -114,6 +114,87 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Sample this month's slice of the fixed capacity profile's windows.
+   *
+   * A UTC day, second and minute never cross a month boundary, so this month answers its own slice
+   * exactly and the root object combines slices: peaks by maximum, records by sum, and active
+   * Usage Principals by union, because distinct counts cannot be summed. Only the day's own month
+   * returns Principals, which keeps the union bounded by the deployment's registered Users.
+   */
+  readCapacityWindow(
+      generation: string,
+      dayStartedAtUtc: string,
+      windowStartedAtUtc: string,
+      windowEndedAtUtc: string,
+      principalLimit: number): {
+    dailyActivePrincipals: string[];
+    rollingRecords: string;
+    secondPeakRecords: string;
+    minutePeakRecords: string;
+  } {
+    if (!Number.isSafeInteger(principalLimit) || principalLimit < 1 ||
+        principalLimit > USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX) {
+      throw new TypeError("Usage Projection month capacity principal limit is invalid.");
+    }
+    const dayStartedAt = normalizeCanonicalUtcTimestamp(
+      dayStartedAtUtc, "projection month capacity day start");
+    const windowStartedAt = normalizeCanonicalUtcTimestamp(
+      windowStartedAtUtc, "projection month capacity window start");
+    const windowEndedAt = normalizeCanonicalUtcTimestamp(
+      windowEndedAtUtc, "projection month capacity window end");
+    const principals = usageProjectionMonthKey(dayStartedAt) === this.#monthKey()
+      ? this.ctx.storage.sql.exec<{principal_ref: string}>(`
+        SELECT DISTINCT principal_ref FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND occurred_at >= ? AND CAST(metered_use_count AS INTEGER) > 0
+        LIMIT ?
+      `, generation, dayStartedAt, principalLimit + 1).toArray()
+      : [];
+    if (principals.length > principalLimit) {
+      throw new Error("Usage Projection month has more active Usage Principals than registered.");
+    }
+    const records = this.ctx.storage.sql.exec<{rolling_records: string}>(`
+      SELECT CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
+        AS rolling_records
+      FROM usage_projection_facts
+      WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+        AND COALESCE(occurred_at, bucket_start) >= ?
+        AND COALESCE(occurred_at, bucket_start) < ?
+    `, generation, windowStartedAt, windowEndedAt).one();
+    const peaks = this.ctx.storage.sql.exec<{second_peak: string; minute_peak: string}>(`
+      SELECT
+        CAST(COALESCE(MAX(CASE WHEN bucket_kind = 'second' THEN record_count END), 0)
+          AS TEXT) AS second_peak,
+        CAST(COALESCE(MAX(CASE WHEN bucket_kind = 'minute' THEN record_count END), 0)
+          AS TEXT) AS minute_peak
+      FROM (
+        SELECT 'second' AS bucket_kind,
+          SUM(CAST(metered_use_count AS INTEGER)) AS record_count
+        FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND COALESCE(occurred_at, bucket_start) >= ?
+          AND COALESCE(occurred_at, bucket_start) < ?
+        GROUP BY substr(occurred_at, 1, 19)
+        UNION ALL
+        SELECT 'minute' AS bucket_kind,
+          SUM(CAST(metered_use_count AS INTEGER)) AS record_count
+        FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND COALESCE(occurred_at, bucket_start) >= ?
+          AND COALESCE(occurred_at, bucket_start) < ?
+        GROUP BY substr(occurred_at, 1, 16)
+      )
+    `, generation, windowStartedAt, windowEndedAt,
+    generation, windowStartedAt, windowEndedAt).one();
+    return {
+      dailyActivePrincipals: principals.map(row => row.principal_ref),
+      rollingRecords: records.rolling_records,
+      secondPeakRecords: peaks.second_peak,
+      minutePeakRecords: peaks.minute_peak,
+    };
+  }
+
+  /**
    * Count the Usage Principals that contributed activity to this month under one report filter.
    *
    * Distinct counts cannot be summed across months, so this returns the month's own references and

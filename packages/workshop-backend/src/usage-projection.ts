@@ -567,22 +567,31 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Read core overview and independently-failing capacity telemetry from one generation. */
-  readAdminOverview(registeredUsers: bigint): AdminUsageOverview {
+  async readAdminOverview(registeredUsers: bigint): Promise<AdminUsageOverview> {
     const overview = this.readOverview();
     if (overview.health.state !== "healthy") {
       return {...overview, registeredUsers, capacityReview: null};
     }
     let capacityReview: AdminUsageCapacityReview | null = null;
     try {
-      capacityReview = this.readCapacityReview(registeredUsers);
+      capacityReview = await this.readCapacityReview(registeredUsers);
     } catch {
       // Capacity telemetry is operational guidance. It must not hide authoritative core totals.
     }
     return {...overview, registeredUsers, capacityReview};
   }
 
-  /** Sample exact content-free telemetry for the fixed usage-capacity-v1 profile. */
-  readCapacityReview(registeredUsers: bigint): AdminUsageCapacityReview {
+  /**
+   * Sample exact content-free telemetry for the fixed usage-capacity-v1 profile.
+   *
+   * Applied detail lives in the UTC month object that owns it, and only rows still waiting for
+   * delivery remain here, so the two sets are disjoint and both are read. A UTC day, second and
+   * minute never cross a month boundary, so the windows combine by union for Usage Principals,
+   * by sum for records, and by maximum for peaks. A peak bucket whose rows are split between this
+   * object and its month is therefore reported from the larger side; the profile reads peaks as a
+   * lower bound, and sampling happens once ingest has settled.
+   */
+  async readCapacityReview(registeredUsers: bigint): Promise<AdminUsageCapacityReview> {
     const observedAt = new Date();
     const asOf = observedAt.toISOString();
     const utcDayStartedAt = `${asOf.slice(0, 10)}T00:00:00.000Z`;
@@ -593,21 +602,24 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const generation = meta.active_generation;
     const health = this.readHealth();
     const projectionAsOf = health.latestAppliedSourceAt ?? asOf;
-    const counts = this.ctx.storage.sql.exec<{
-      daily_active_users: string;
-      rolling_records: string;
-    }>(`
-      SELECT
-        CAST(COUNT(DISTINCT CASE
-          WHEN occurred_at >= ? AND CAST(metered_use_count AS INTEGER) > 0
-          THEN principal_ref END) AS TEXT) AS daily_active_users,
-        CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
-          AS rolling_records
+    const undelivered = this.ctx.storage.sql.exec<{principal_ref: string}>(`
+      SELECT DISTINCT principal_ref FROM usage_projection_facts
+      WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+        AND occurred_at >= ? AND CAST(metered_use_count AS INTEGER) > 0
+      LIMIT ?
+    `, generation, utcDayStartedAt,
+    USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX + 1).toArray();
+    if (undelivered.length > USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX) {
+      throw new Error("Usage Projection has more active Usage Principals than registered.");
+    }
+    const counts = this.ctx.storage.sql.exec<{rolling_records: string}>(`
+      SELECT CAST(COALESCE(SUM(CAST(metered_use_count AS INTEGER)), 0) AS TEXT)
+        AS rolling_records
       FROM usage_projection_facts
       WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
         AND COALESCE(occurred_at, bucket_start) >= ?
         AND COALESCE(occurred_at, bucket_start) < ?
-    `, utcDayStartedAt, generation, rollingWindowStartedAt, asOf).one();
+    `, generation, rollingWindowStartedAt, asOf).one();
     const peaks = this.ctx.storage.sql.exec<{
       second_peak: string;
       minute_peak: string;
@@ -636,12 +648,27 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       )
     `, generation, rollingWindowStartedAt, asOf,
     generation, rollingWindowStartedAt, asOf).one();
+    const activePrincipals = new Set(undelivered.map(row => row.principal_ref));
+    let rollingRecords = BigInt(counts.rolling_records);
+    let secondPeak = BigInt(peaks.second_peak);
+    let minutePeak = BigInt(peaks.minute_peak);
+    for (const month of this.#capacityMonths(generation, rollingWindowStartedAt, asOf)) {
+      const slice = await this.#monthStub(month).readCapacityWindow(
+        generation, utcDayStartedAt, rollingWindowStartedAt, asOf,
+        USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX);
+      for (const principal of slice.dailyActivePrincipals) activePrincipals.add(principal);
+      rollingRecords += BigInt(slice.rollingRecords);
+      const monthSecondPeak = BigInt(slice.secondPeakRecords);
+      if (monthSecondPeak > secondPeak) secondPeak = monthSecondPeak;
+      const monthMinutePeak = BigInt(slice.minutePeakRecords);
+      if (monthMinutePeak > minutePeak) minutePeak = monthMinutePeak;
+    }
     const review = buildUsageCapacityReview({
       registeredUsers,
-      dailyActiveUsers: BigInt(counts.daily_active_users),
-      rollingThirtyDayRecords: BigInt(counts.rolling_records),
-      alignedOneSecondPeakRecords: BigInt(peaks.second_peak),
-      alignedSixtySecondPeakRecords: BigInt(peaks.minute_peak),
+      dailyActiveUsers: BigInt(activePrincipals.size),
+      rollingThirtyDayRecords: rollingRecords,
+      alignedOneSecondPeakRecords: secondPeak,
+      alignedSixtySecondPeakRecords: minutePeak,
       utcDayStartedAt,
       rollingWindowStartedAt,
     }, {registeredUsers: asOf, projection: projectionAsOf});
@@ -1154,6 +1181,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * again and can restore detail the reported generation already expired, so filtering here would
    * leave that detail past its cutoff until a retention pass after the switchover.
    */
+  /** Name the stored months of one generation that a capacity window can reach. */
+  #capacityMonths(generation: string, windowStartedAtUtc: string, asOfUtc: string): string[] {
+    return this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_months
+      WHERE generation = ? AND month >= ? AND month <= ? ORDER BY month
+    `, generation, usageProjectionMonthKey(windowStartedAtUtc),
+    usageProjectionMonthKey(asOfUtc)).toArray().map(row => row.month);
+  }
+
   #monthsBefore(cutoffUtc: string): string[] {
     const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
     return this.ctx.storage.sql.exec<{month: string}>(`
