@@ -203,6 +203,30 @@ retained to rebuild deployment reports. It is not an event detail and is not aut
 User's balance or Credit Ledger.
 _Avoid_: Usage Record, analytics event, Credit Ledger Entry
 
+**Usage Projection (用量投影)**:
+The deployment-wide derived read model that the Admin usage report reads. It is built from Usage
+Summary Facts and Usage Record detail and is not authoritative for a User's balance or Credit
+Ledger. A rebuild replaces it from the retained authority.
+_Avoid_: Usage Record store, analytics warehouse, Credit Ledger
+
+**Projection Root Object (投影根对象)**:
+The single Durable Object that owns one Usage Projection's sequence ordering, totals, health, and
+month routing. The code writes the short form *root object*. It applies each fact in Usage Principal sequence order and then gives the
+Reportable Row to the Projection Month Object that owns it.
+_Avoid_: Report store, Projection Month Object
+
+**Projection Month Object (投影月对象)**:
+The Durable Object that holds the Reportable Rows of one UTC calendar month for one Usage
+Projection generation and serves them to the report. The code writes the short form *month object*. It holds no ordering authority and knows no
+report contract. See `docs/adr/0009-shard-the-usage-projection-by-utc-month.md`.
+_Avoid_: Shard for one User, Projection Root Object
+
+**Reportable Row (可报告行)**:
+One applied Usage Projection row the Admin report can name, whether it states a Usage Record or a
+Usage Summary Fact revision. The Projection Root Object applies it; a Projection Month Object
+stores it.
+_Avoid_: Usage Record, Usage Summary Fact
+
 **Usage Source (用量来源)**:
 The origin of Metered Use, such as an Agent conversation, a Gadget, system assistance for a
 Workspace, or an automated task.

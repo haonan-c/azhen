@@ -1,16 +1,6 @@
-import {defineConfig} from "vitest/config";
 import {cloudflareTest} from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
-
-const EXPECTED_USAGE_ADMIN_ERROR_MESSAGES = new Set([
-  "A User account must exist before its Usage Account can be activated.",
-  "Administrator operation ID conflicts with its stored request.",
-  "Original Credit Ledger Entry has already been reversed.",
-  "A Credit Reversal cannot itself be reversed.",
-  "Insufficient Usage Credit.",
-  "Registry search cursor is invalid.",
-  "Usage Record does not exist.",
-]);
+import {defineConfig} from "vitest/config";
 
 export default defineConfig({
   plugins: [
@@ -27,16 +17,15 @@ export default defineConfig({
           TEST_USAGE_PROJECTION: {className: "UsageProjection", useSQLite: true},
           TEST_USAGE_PROJECTION_MONTH: {className: "UsageProjectionMonth", useSQLite: true},
         },
+        kvNamespaces: ["AVATARS"],
       },
     }),
   ],
   test: {
-    include: ["__tests__/usage-account-admin.test.ts"],
+    include: ["__tests__/usage-projection-identity-retention.test.ts"],
+    // This suite reports a measured size breakdown, so its output must reach the run log.
+    disableConsoleIntercept: true,
+    fileParallelism: false,
     setupFiles: ["../../test-setup/assert-workerd.ts"],
-    // Durable Object RPC reports these rejected calls independently from the assertions in this
-    // one negative-test file. Every other unit file keeps Vitest's fail-closed default.
-    onUnhandledError(error) {
-      if (EXPECTED_USAGE_ADMIN_ERROR_MESSAGES.has(error.message)) return false;
-    },
   },
 });

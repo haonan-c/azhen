@@ -2,6 +2,7 @@ import {env, runDurableObjectAlarm, runInDurableObject} from "cloudflare:test";
 import {describe, expect, it, vi} from "vitest";
 import {AdminUsageApiImpl, type AdminSettings} from "../src/admin-settings.js";
 import {UsageAccount} from "../src/usage-account.js";
+import type {ProjectionRebuildStatus} from "@gadgets/workshop-shared/api";
 import type {
   UsageProjection,
   UsageProjectionAggregateFact,
@@ -65,6 +66,67 @@ function fact(overrides: Partial<UsageProjectionDetailFact> = {}): UsageProjecti
     unpricedApiOperations: 0n,
     ...overrides,
   };
+}
+
+/**
+ * Read every reportable row this projection stored, across its UTC month objects.
+ *
+ * Applied rows live in the month object that owns their source time, so a test that used to read
+ * the root object's fact table asks the same question here.
+ */
+async function monthFacts(
+    projection: DurableObjectStub<UsageProjection>): Promise<Record<string, string | null>[]> {
+  const rootId = projection.id.toString();
+  const months = await runInDurableObject(projection, (_instance, state) =>
+    state.storage.sql.exec<{month: string}>(`
+      SELECT DISTINCT month FROM usage_projection_months
+    `).toArray().map(row => row.month));
+  const rows: Record<string, string | null>[] = [];
+  for (const month of months) {
+    rows.push(...await runInDurableObject(
+      testEnv.TEST_USAGE_PROJECTION_MONTH.getByName(`${month}:${rootId}`),
+      (_instance, state) => state.storage.sql.exec<Record<string, string | null>>(`
+        SELECT * FROM usage_projection_facts
+      `).toArray()));
+  }
+  return rows;
+}
+
+/**
+ * Put a delivered row back in the root object's fact table.
+ *
+ * The schema-migration tests below assert that a *populated* current table is moved aside without
+ * being scanned. Delivery now retires the root's copy, so the row is restored here to recreate the
+ * state those migrations run against.
+ */
+async function restoreRootFact(projection: DurableObjectStub<UsageProjection>): Promise<void> {
+  const [row] = await monthFacts(projection);
+  if (row === undefined) throw new Error("No delivered row to restore.");
+  const columns = Object.keys(row);
+  await runInDurableObject(projection, (_instance, state) => {
+    state.storage.sql.exec(
+      `INSERT OR REPLACE INTO usage_projection_facts (${columns.join(", ")})
+       VALUES (${columns.map(() => "?").join(", ")})`,
+      ...columns.map(column => row[column]!),
+    );
+  });
+}
+
+/**
+ * Drive maintenance turns until a rebuild reports its final state.
+ *
+ * A rebuild switches generation only once its own rows have reached their month objects, so it
+ * takes as many turns as delivery needs rather than a fixed number.
+ */
+async function settleRebuild(
+    projection: DurableObjectStub<UsageProjection>,
+    requestId: string): Promise<ProjectionRebuildStatus> {
+  let status = await projection.requestRebuild(requestId);
+  for (let step = 0; step < 32 && status.state === "rebuilding"; step += 1) {
+    await runDurableObjectAlarm(projection);
+    status = await projection.requestRebuild(requestId);
+  }
+  return status;
 }
 
 function aggregateFact(
@@ -210,6 +272,7 @@ describe("deployment Usage Projection", () => {
     const input = fact();
     expect(await projection.ingest([input])).toMatchObject({rejected: []});
     await runDurableObjectAlarm(projection);
+    await restoreRootFact(projection);
     await runInDurableObject(projection, (_instance, state) => {
       state.storage.sql.exec("DROP INDEX usage_projection_report_summary_revision_v4");
       state.storage.sql.exec("ALTER TABLE usage_projection_facts DROP COLUMN applied_watermark");
@@ -250,6 +313,7 @@ describe("deployment Usage Projection", () => {
     const input = fact();
     expect(await projection.ingest([input])).toMatchObject({rejected: []});
     await runDurableObjectAlarm(projection);
+    await restoreRootFact(projection);
     await runInDurableObject(projection, (_instance, state) => {
       const currentIndexes = state.storage.sql.exec<{name: string}>(`
         SELECT name FROM sqlite_master
@@ -379,6 +443,7 @@ describe("deployment Usage Projection", () => {
       acknowledgedFactIds: [input.projectionFactId],
       rejected: [],
     });
+    await restoreRootFact(projection);
     await runInDurableObject(projection, (_instance, state) => {
       state.storage.sql.exec(`
         ALTER TABLE usage_projection_facts DROP COLUMN metering_attempts
@@ -558,7 +623,7 @@ describe("deployment Usage Projection", () => {
     });
     expect(await runInDurableObject(projection, (_instance, state) =>
       state.storage.sql.exec<{fact_hash: string}>(`
-        SELECT fact_hash FROM usage_projection_facts WHERE fact_id = ?
+        SELECT fact_hash FROM usage_projection_expired_sequences WHERE fact_id = ?
       `, legacy.projectionFactId).one().fact_hash)).toBe(expectedHash);
     expect(await projection.ingest([legacy as UsageProjectionDetailFact])).toEqual({
       acknowledgedFactIds: [legacy.projectionFactId],
@@ -604,12 +669,12 @@ describe("deployment Usage Projection", () => {
       rejected: [],
     });
     expect(await runInDurableObject(projection, (_instance, state) =>
-      state.storage.sql.exec<{fact_hash: string; metered_kind: string}>(`
-        SELECT fact_hash, metered_kind FROM usage_projection_facts WHERE fact_id = ?
-      `, legacy.projectionFactId).one())).toEqual({
-      fact_hash: expectedHash,
-      metered_kind: legacy.kind,
-    });
+      state.storage.sql.exec<{fact_hash: string}>(`
+        SELECT fact_hash FROM usage_projection_expired_sequences WHERE fact_id = ?
+      `, legacy.projectionFactId).one().fact_hash)).toBe(expectedHash);
+    expect((await monthFacts(projection))
+      .filter(row => row.fact_id === legacy.projectionFactId)
+      .map(row => row.metered_kind)).toEqual([legacy.kind]);
     expect(await projection.ingest([legacy as UsageProjectionAggregateFact])).toEqual({
       acknowledgedFactIds: [legacy.projectionFactId],
       rejected: [],
@@ -997,14 +1062,9 @@ describe("deployment Usage Projection", () => {
       acknowledgedFactIds: [],
       rejected: [{projectionFactId: invalidAggregate.projectionFactId, code: "invalid-fact"}],
     });
-    const rows = await runInDurableObject(projection, (_instance, state) =>
-      state.storage.sql.exec<{
-        row_kind: string;
-        occurred_at: string | null;
-        bucket_start: string | null;
-      }>(`
-        SELECT row_kind, occurred_at, bucket_start FROM usage_projection_facts
-      `).toArray());
+    const rows = (await monthFacts(projection)).map(row => ({
+      row_kind: row.row_kind, occurred_at: row.occurred_at, bucket_start: row.bucket_start,
+    }));
     expect(rows).toEqual([{
       row_kind: "aggregate",
       occurred_at: null,
@@ -1511,17 +1571,13 @@ describe("deployment Usage Projection", () => {
       meteredUseCount: exactCount + 2n,
       activeUsers: 2n,
     });
-    expect(await runInDurableObject(projection, (_instance, state) =>
-      state.storage.sql.exec<{
-        count: string;
-        pre_execution_failures: string;
-        metered_use_count: string;
-      }>(`
-        SELECT CAST(COUNT(*) AS TEXT) AS count,
-               pre_execution_failures, metered_use_count
-        FROM usage_projection_facts
-        WHERE metered_kind = 'attempt'
-      `).one())).toEqual({
+        const attemptRows = (await monthFacts(projection))
+      .filter(row => row.metered_kind === "attempt");
+    expect({
+      count: attemptRows.length.toString(),
+      pre_execution_failures: attemptRows[0]?.pre_execution_failures,
+      metered_use_count: attemptRows[0]?.metered_use_count,
+    }).toEqual({
       count: "1",
       pre_execution_failures: "2",
       metered_use_count: "0",
@@ -1687,9 +1743,8 @@ describe("deployment Usage Projection", () => {
     });
     const requestId = `poison-rebuild-${crypto.randomUUID()}`;
     await projection.requestRebuild(requestId);
-    await runDurableObjectAlarm(projection);
 
-    expect(await projection.requestRebuild(requestId)).toMatchObject({state: "completed"});
+    expect(await settleRebuild(projection, requestId)).toMatchObject({state: "completed"});
     expect((await projection.readOverview()).metrics?.cacheHitInputTokens).toBe(23n);
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
@@ -1736,8 +1791,7 @@ describe("deployment Usage Projection", () => {
 
     const requestId = `fact-id-authority-${crypto.randomUUID()}`;
     await projection.requestRebuild(requestId);
-    await runDurableObjectAlarm(projection);
-    expect(await projection.requestRebuild(requestId)).toMatchObject({state: "completed"});
+    expect(await settleRebuild(projection, requestId)).toMatchObject({state: "completed"});
     expect((await projection.readOverview()).metrics.cacheHitInputTokens).toBe(10n);
     expect((await projection.readHealth()).sequenceGapCount).toBe(0n);
   });
@@ -3040,6 +3094,12 @@ describe("deployment Usage Projection", () => {
         settledReservations: 0n,
       },
     );
+    // The Usage Summary Fact snapshots stay in the root object; the aggregate rows that name them
+    // live in their month objects, so the principal's Summary identities come from there.
+    const principalSummaryFactIds = (await monthFacts(projection))
+      .filter(row => row.principal_ref === principalRef && row.row_kind === "aggregate" &&
+        row.applied === 1 && typeof row.summary_fact_id === "string")
+      .map(row => row.summary_fact_id as string);
     const projectedPrincipalTotals = await runInDurableObject(
       projection,
       (_instance, state) => state.storage.sql.exec<{
@@ -3067,13 +3127,8 @@ describe("deployment Usage Projection", () => {
         FROM usage_projection_summaries
         WHERE generation = (
           SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-        ) AND summary_fact_id IN (
-          SELECT summary_fact_id FROM usage_projection_facts
-          WHERE generation = (
-            SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-          ) AND principal_ref = ? AND row_kind = 'aggregate' AND applied = 1
-        )
-      `, principalRef).one(),
+        ) AND summary_fact_id IN (${principalSummaryFactIds.map(() => "?").join(", ") || "NULL"})
+      `, ...principalSummaryFactIds).one(),
     );
     expect(projectedPrincipalTotals).toEqual({
       summary_count: latestAuthoritySummaries.size.toString(),
@@ -3121,26 +3176,28 @@ describe("deployment Usage Projection", () => {
     const settings = testEnv.TEST_ADMIN_SETTINGS.getByName("");
     const registered = (await settings.searchRegisteredUsageUsers({query: identity, limit: 1}))
       .users[0]!;
-    await runInDurableObject(user, async (_instance, state) => {
-      for (const prefix of [
-        "usageAccount:projection",
-        "usageAccount:summary",
-        "usageAccount:detail",
-      ]) {
-        for (const [key] of Array.from(state.storage.kv.list({prefix}))) {
-          state.storage.kv.delete(key);
+    await runInDurableObject(user, (_instance, state) => state.storage.deleteAlarm());
+    // Clearing the derived projection state and measuring the next batch have to be one
+    // transaction. Delivery maintenance runs unawaited through `ctx.waitUntil`, so any await
+    // between the two lets a legitimate maintenance turn advance the backfill this measures.
+    const partialBackfill = await runInDurableObject(user, (_instance, state) =>
+      state.storage.transactionSync(() => {
+        for (const prefix of [
+          "usageAccount:projection",
+          "usageAccount:summary",
+          "usageAccount:detail",
+        ]) {
+          for (const [key] of Array.from(state.storage.kv.list({prefix}))) {
+            state.storage.kv.delete(key);
+          }
         }
-      }
-      await state.storage.deleteAlarm();
-    });
-    const partialBackfill = await runInDurableObject(user, (_instance, state) => {
-      expect(new UsageAccount(state.storage).backfillProjectionFactsBatch(32)).toBe(false);
-      return {
-        stage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
-        cursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
-        pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
-      };
-    });
+        expect(new UsageAccount(state.storage).backfillProjectionFactsBatch(32)).toBe(false);
+        return {
+          stage: state.storage.kv.get<string>(PROJECTION_BACKFILL_STAGE_KEY),
+          cursor: state.storage.kv.get<string>(PROJECTION_BACKFILL_CURSOR_KEY),
+          pendingCount: state.storage.kv.get<bigint>(PROJECTION_PENDING_COUNT_KEY),
+        };
+      }));
     expect(partialBackfill).toMatchObject({stage: "gatekeeper", pendingCount: 64n});
     expect(partialBackfill.cursor).toBeDefined();
     await expect(runInDurableObject(user, (_instance, state) => {

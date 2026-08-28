@@ -13,11 +13,22 @@ import type {
   ProjectionRebuildStatus,
   UsageSource,
 } from "@gadgets/workshop-shared/api";
+import {
+  USAGE_PROJECTION_FACT_COLUMNS,
+  createUsageProjectionFactsTable,
+  usageProjectionFactRowValues,
+} from "./usage-projection-facts-schema.js";
+import {
+  type UsageProjectionMonth,
+  type UsageProjectionStoredRow,
+  usageProjectionMonthKey,
+} from "./usage-projection-month.js";
 import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import type {AdminSettings} from "./admin-settings.js";
 import type {UserDurableObject} from "./user.js";
 import {
-  buildUsageReportPredicate,
+  USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX,
+  USAGE_PROJECTION_REPORT_PAGE_MAX,
   decodeUsageReportCursor,
   encodeUsageReportCursor,
   reportLocalTimestamp,
@@ -169,7 +180,7 @@ type ProjectionMetaRow = {
   rebuild_failure_code: ProjectionRebuildStatus["failureCode"];
   cleanup_generation: string | null;
   cleanup_stage:
-    "facts" | "expired-sequences" | "rejections" | "drains" | "principals" |
+    "months" | "facts" | "expired-sequences" | "rejections" | "drains" | "principals" |
     "active-users" | "summaries" | "rebuild-users" | "totals" | null;
   maintenance_turn: "drain" | "lifecycle";
   bootstrap_state: "pending" | "complete";
@@ -225,7 +236,8 @@ type ProjectionTotalsRow = {
   started_at: string | null;
 };
 
-type StoredFactRow = {
+/** One stored reportable Usage Projection row as the report read path selects it. */
+export type StoredFactRow = {
   fact_id: string;
   fact_hash: string;
   principal_ref: string;
@@ -395,6 +407,17 @@ const CURRENT_PROJECTION_SCHEMA_VERSION = "4";
  * detail-retention revision still fails an older report instead of changing its rows.
  */
 const SUPERSEDED_AGGREGATE_WATERMARK_LAG = 100_000;
+
+
+/**
+ * How long a retired fact's identity is kept so a delayed redelivery is still recognized.
+ *
+ * A User outbox retries until the Projection acknowledges, so a replay arrives within seconds, not
+ * days. Beyond this window `usage_projection_principals.high_water` still proves the sequence was
+ * processed and the replay is acknowledged from that alone, which bounds the identity table to
+ * about one day of ingest instead of the whole retention period.
+ */
+const RETAINED_IDENTITY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const RETIRED_V2_FACTS_TABLE = "usage_projection_facts_retired_v2";
 const RETIRED_V2_SUMMARIES_TABLE = "usage_projection_summaries_retired_v2";
 const RETIRED_V3_FACTS_TABLE = "usage_projection_facts_retired_v3";
@@ -404,6 +427,8 @@ const RETIRED_V3_SUMMARIES_TABLE = "usage_projection_summaries_retired_v3";
 export class UsageProjection extends DurableObject<Cloudflare.Env> {
   private admin: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
+  private months: DurableObjectNamespace<UsageProjectionMonth>;
+  private alarmRunning = false;
   private ingestPreparations = 0;
   private rebuildPreparations = 0;
 
@@ -412,6 +437,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.#initializeSchema();
     this.admin = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
+    this.months = this.ctx.exports.UsageProjectionMonth;
   }
 
   /** Idempotently persist and apply a bounded set of immutable User projection facts. */
@@ -499,7 +525,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       }
       if (result.applied) acknowledgedFactIds.push(fact.projectionFactId);
     }
-    if (this.#hasApplyDrain()) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    if (!await this.#deliverMonthOutboxStep() || this.#hasApplyDrain()) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    }
     return {acknowledgedFactIds, rejected};
   }
 
@@ -656,9 +684,159 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const meta = this.#meta();
     return {
       projectionGeneration: BigInt(meta.active_generation),
-      ingestionWatermark: BigInt(meta.report_watermark),
+      ingestionWatermark: this.#reportVisibleWatermark(meta),
       detailRetentionRevision: BigInt(meta.detail_retention_revision),
     };
+  }
+
+  /**
+   * Read the highest watermark whose rows a month object already holds.
+   *
+   * A report must never name a row that its month object has not stored, so visibility stops one
+   * below the oldest row still waiting for delivery rather than at the assigned watermark.
+   */
+  #reportVisibleWatermark(meta: ProjectionMetaRow): bigint {
+    const pending = this.ctx.storage.sql.exec<{applied_watermark: string}>(`
+      SELECT applied_watermark FROM usage_projection_month_outbox
+      ORDER BY length(applied_watermark), applied_watermark LIMIT 1
+    `).toArray()[0];
+    return pending === undefined
+      ? BigInt(meta.report_watermark) : BigInt(pending.applied_watermark) - 1n;
+  }
+
+  /**
+   * Enqueue applied rows that predate month routing so delivery can move them.
+   *
+   * A deployment upgraded from a single-object Projection holds applied rows the outbox never saw.
+   * Routing them through the same outbox means migration has no path of its own: delivery moves
+   * each row to its month object and retires the root's copy exactly as it does for a new fact.
+   */
+  #routeUnroutedAppliedRows(): void {
+    const rows = this.ctx.storage.sql.exec<{
+      generation: string;
+      fact_id: string;
+      occurred_at: string | null;
+      bucket_start: string | null;
+      applied_watermark: string;
+    }>(`
+      SELECT facts.generation, facts.fact_id, facts.occurred_at, facts.bucket_start,
+             facts.applied_watermark
+      FROM usage_projection_facts AS facts
+      WHERE facts.applied = 1 AND facts.applied_watermark IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_projection_month_outbox AS outbox
+          WHERE outbox.generation = facts.generation AND outbox.fact_id = facts.fact_id
+        )
+      LIMIT 64
+    `).toArray();
+    for (const row of rows) {
+      const sourceTime = row.occurred_at ?? row.bucket_start;
+      if (sourceTime === null) continue;
+      this.ctx.storage.sql.exec(`
+        INSERT OR REPLACE INTO usage_projection_month_outbox (
+          generation, fact_id, month, applied_watermark
+        ) VALUES (?, ?, ?, ?)
+      `, row.generation, row.fact_id, usageProjectionMonthKey(sourceTime),
+      row.applied_watermark);
+    }
+  }
+
+  /**
+   * Drop one bounded page of retained fact identities that no replay can still need.
+   *
+   * A row is only removed once it is outside the replay window *and* its Usage Principal has
+   * applied past its sequence, because apply steps over a retired sequence through this same row.
+   * Returns whether nothing prunable is left.
+   */
+  #pruneRetainedIdentitiesStep(): boolean {
+    const cutoff = new Date(Date.now() - RETAINED_IDENTITY_WINDOW_MS).toISOString();
+    const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+      SELECT identities.generation, identities.fact_id
+      FROM usage_projection_expired_sequences AS identities
+      JOIN usage_projection_principals AS principals
+        ON principals.generation = identities.generation
+        AND principals.principal_ref = identities.principal_ref
+      WHERE identities.retired_at < ?
+        AND (length(identities.source_sequence) < length(principals.high_water) OR
+          (length(identities.source_sequence) = length(principals.high_water)
+            AND identities.source_sequence <= principals.high_water))
+      LIMIT ?
+    `, cutoff, 65).toArray();
+    for (const row of rows.slice(0, 64)) {
+      this.ctx.storage.sql.exec(`
+        DELETE FROM usage_projection_expired_sequences WHERE generation = ? AND fact_id = ?
+      `, row.generation, row.fact_id);
+    }
+    return rows.length <= 64;
+  }
+
+  /**
+   * Deliver one bounded page of applied rows to the UTC month object that owns them.
+   *
+   * A Durable Object transaction cannot span a call to another object, so apply commits the metric
+   * fold and leaves the row in this outbox. Delivery is idempotent and only acknowledged rows are
+   * removed, so a failed call is retried by the maintenance alarm without losing or duplicating a
+   * row. Returns whether the outbox is now empty.
+   */
+  async #deliverMonthOutboxStep(): Promise<boolean> {
+    this.#routeUnroutedAppliedRows();
+    const pending = this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_month_outbox
+      ORDER BY length(applied_watermark), applied_watermark LIMIT 1
+    `).toArray()[0];
+    if (pending === undefined) return true;
+    const entries = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
+      SELECT generation, fact_id FROM usage_projection_month_outbox
+      WHERE month = ? ORDER BY length(applied_watermark), applied_watermark LIMIT 64
+    `, pending.month).toArray();
+    const rows: UsageProjectionStoredRow[] = [];
+    const missing: {generation: string; fact_id: string}[] = [];
+    for (const entry of entries) {
+      const row = this.ctx.storage.sql.exec<UsageProjectionStoredRow>(`
+        SELECT ${USAGE_PROJECTION_FACT_COLUMNS.join(", ")} FROM usage_projection_facts
+        WHERE generation = ? AND fact_id = ?
+      `, entry.generation, entry.fact_id).toArray()[0];
+      // Retention or a retired generation can remove a row before its delivery runs. The month
+      // object never needs a row this object no longer holds, so the entry is simply retired.
+      if (row === undefined) missing.push(entry);
+      else rows.push(row);
+    }
+    if (rows.length > 0) {
+      const month = this.#monthStub(pending.month);
+      const stored = new Set(await month.storeRows(rows));
+      for (const row of rows) {
+        if (typeof row.generation !== "string") continue;
+        this.ctx.storage.sql.exec(`
+          INSERT OR IGNORE INTO usage_projection_months (generation, month) VALUES (?, ?)
+        `, row.generation, pending.month);
+      }
+      for (const row of rows) {
+        if (typeof row.fact_id !== "string" || !stored.has(row.fact_id)) continue;
+        // The month object is now the only store for this row. Its identity stays here so a
+        // redelivered fact is still recognized as the same one and acknowledged, and a different
+        // fact that reuses its sequence is still reported as a conflict.
+        this.ctx.storage.sql.exec(`
+          INSERT OR REPLACE INTO usage_projection_expired_sequences (
+            generation, fact_id, principal_ref, source_sequence, fact_hash, retired_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `, row.generation, row.fact_id, row.principal_ref, row.source_sequence, row.fact_hash,
+        new Date().toISOString());
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_month_outbox WHERE generation = ? AND fact_id = ?
+        `, row.generation, row.fact_id);
+      }
+    }
+    for (const entry of missing) {
+      this.ctx.storage.sql.exec(`
+        DELETE FROM usage_projection_month_outbox WHERE generation = ? AND fact_id = ?
+      `, entry.generation, entry.fact_id);
+    }
+    return this.ctx.storage.sql.exec<{present: string}>(`
+      SELECT CAST(EXISTS(SELECT 1 FROM usage_projection_month_outbox LIMIT 1) AS TEXT) AS present
+    `).one().present === "0";
   }
 
   /** Reject unless one frozen report snapshot still names complete current Projection state. */
@@ -667,17 +845,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Read one stable keyset page through the shared normalized report predicate. */
-  listReportRows(
+  async listReportRows(
       query: FrozenUsageReportQuery,
       cursorValue: string | undefined,
-      limit: number): AdminUsageReportPage {
+      limit: number): Promise<AdminUsageReportPage> {
     this.#assertCurrentReportSnapshot(query);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) {
+    if (!Number.isSafeInteger(limit) || limit < 1 ||
+        limit > USAGE_PROJECTION_REPORT_PAGE_MAX) {
       throw new TypeError("Usage report page limit is invalid.");
     }
     const cursor = cursorValue === undefined
       ? undefined : decodeUsageReportCursor(query, cursorValue);
-    const stored = this.#readStoredReportRows(query, cursor, limit + 1, "all");
+    const stored = await this.#readReportRowsAcrossMonths(query, cursor, limit + 1, "all");
     const visible = stored.slice(0, limit);
     const rows = visible.map(row => this.#publicReportRow(query, row));
     const last = visible.at(-1);
@@ -692,7 +871,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   /** Read exact filtered Summary totals without materializing an unbounded row collection. */
-  readReportMetrics(query: FrozenUsageReportQuery): AdminUsageReportMetrics {
+  async readReportMetrics(query: FrozenUsageReportQuery): Promise<AdminUsageReportMetrics> {
     this.#assertCurrentReportSnapshot(query);
     const totals: AdminUsageReportMetrics = {
       providerCostUsdSubunits: 0n,
@@ -717,7 +896,8 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
     let cursor: UsageReportCursor | undefined;
     while (true) {
-      const page = this.#readStoredReportRows(query, cursor, 256, "aggregate");
+      const page = await this.#readReportRowsAcrossMonths(
+        query, cursor, USAGE_PROJECTION_REPORT_PAGE_MAX, "aggregate");
       for (const row of page) {
         totals.providerCostUsdSubunits += BigInt(row.provider_cost);
         totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
@@ -739,45 +919,52 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
       }
       const last = page.at(-1);
-      if (page.length < 256 || !last) break;
+      if (page.length < USAGE_PROJECTION_REPORT_PAGE_MAX || !last) break;
       cursor = {sourceTime: storedFactSourceTime(last), rowId: last.fact_id};
     }
-    const predicate = buildUsageReportPredicate(query, "aggregate");
-    const activeUsers = this.ctx.storage.sql.exec<{count: string}>(`
-      SELECT CAST(COUNT(DISTINCT facts.principal_ref) AS TEXT) AS count
-      FROM usage_projection_facts AS facts${predicate.indexName === null
-        ? "" : ` INDEXED BY ${predicate.indexName}`}
-      WHERE ${predicate.sql} AND facts.active_user_contribution <> '0'
-    `, ...predicate.params).one().count;
-    totals.activeUsers = BigInt(activeUsers);
+    const active = new Set<string>();
+    for (const month of this.#reportMonths(query, undefined)) {
+      for (const principal of await this.#monthStub(month)
+          .listActivePrincipals(query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX)) {
+        active.add(principal);
+      }
+    }
+    totals.activeUsers = BigInt(active.size);
     return totals;
   }
 
-  #readStoredReportRows(
+  /**
+   * Name the UTC months a report may still read, newest first.
+   *
+   * Month objects own disjoint source-time ranges and the report orders by source time, so a page
+   * walks months in order instead of merging them. A cursor already names the month it stopped in,
+   * so months newer than the cursor cannot hold a row the page has not returned.
+   */
+  #reportMonths(query: FrozenUsageReportQuery, cursor: UsageReportCursor | undefined): string[] {
+    const months = this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month DESC
+    `, query.snapshot.projectionGeneration.toString()).toArray().map(row => row.month);
+    if (cursor === undefined) return months;
+    const from = usageProjectionMonthKey(cursor.sourceTime);
+    return months.filter(month => month <= from);
+  }
+
+  /** Read one bounded keyset page by walking month objects from newest to oldest. */
+  async #readReportRowsAcrossMonths(
       query: FrozenUsageReportQuery,
       cursor: UsageReportCursor | undefined,
       limit: number,
-      rowKind: "all" | "aggregate"): StoredFactRow[] {
-    const predicate = buildUsageReportPredicate(query, rowKind, cursor);
-    return this.ctx.storage.sql.exec<StoredFactRow>(`
-      SELECT fact_id, fact_hash, principal_ref, source_sequence, occurred_at, safe_record_ref,
-             safe_attempt_ref, reservation_status,
-             bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
-             summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
-             deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
-             cache_hit_input, cache_miss_input, cache_write_input, output_tokens,
-             reasoning_tokens, provider_cost, charged_credits, metered_use_count,
-             billable_api_operations, pre_execution_failures, unknown_operations,
-             metering_attempts, held_reservations, released_reservations,
-             settled_reservations, unreserved_attempts,
-             active_user_contribution,
-             unpriced_model_uses, unpriced_api_operations, applied, applied_watermark
-      FROM usage_projection_facts AS facts${predicate.indexName === null
-        ? "" : ` INDEXED BY ${predicate.indexName}`}
-      WHERE ${predicate.sql}
-      ORDER BY COALESCE(facts.occurred_at, facts.bucket_start) DESC, facts.fact_id DESC
-      LIMIT ?
-    `, ...predicate.params, limit).toArray();
+      rowKind: "all" | "aggregate"): Promise<StoredFactRow[]> {
+    const rows: StoredFactRow[] = [];
+    let pageCursor = cursor;
+    for (const month of this.#reportMonths(query, cursor)) {
+      if (rows.length >= limit) break;
+      rows.push(...await this.#monthStub(month)
+        .listStoredRows(query, pageCursor, limit - rows.length, rowKind));
+      // A cursor only positions the month it was produced in; older months start at their newest.
+      pageCursor = undefined;
+    }
+    return rows;
   }
 
   #publicReportRow(query: FrozenUsageReportQuery, row: StoredFactRow): AdminUsageReportRow {
@@ -913,7 +1100,95 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * Summary-backed totals are not changed, and a delayed replay of a removed fact is acknowledged
    * without restoring its event timestamp or dimensions.
    */
-  expireDetailBefore(
+  async expireDetailBefore(
+      usagePrincipalRef: string,
+      cutoffUtc: string,
+      limit = 64): Promise<boolean> {
+    const rootComplete = this.#expireRootDetailBefore(usagePrincipalRef, cutoffUtc, limit);
+    let monthsComplete = true;
+    let monthsRemoved = 0;
+    const cutoff = normalizeCanonicalUtcTimestamp(cutoffUtc, "projection detail cutoff");
+    // Months newer than the cutoff hold nothing to expire, so only older ones are visited, and a
+    // month that still has work ends the turn. One turn therefore removes one bounded page, which
+    // is the shape retention had before the rows moved into month objects.
+    for (const month of this.#monthsBefore(cutoff)) {
+      const result = await this.#monthStub(month)
+        .expireDetailBefore(usagePrincipalRef, cutoff, limit);
+      monthsRemoved += result.removed;
+      if (!result.complete) {
+        monthsComplete = false;
+        break;
+      }
+    }
+    if (monthsRemoved > 0) this.#bumpDetailRetentionRevision();
+    return rootComplete && monthsComplete;
+  }
+
+  /**
+   * Address the month object that belongs to this projection.
+   *
+   * The month is the name's prefix so the object can check what it owns, and this projection's own
+   * identity is the suffix so two projections never share a month object.
+   */
+  #monthStub(month: string): DurableObjectStub<UsageProjectionMonth> {
+    return this.months.getByName(`${month}:${this.ctx.id.toString()}`);
+  }
+
+  /**
+   * Signal that rows a frozen report could still name are gone.
+   *
+   * A report freezes this revision when it opens, so bumping it fails the report rather than
+   * letting it silently return fewer rows. Detail retention and aggregate compaction share it.
+   */
+  #bumpDetailRetentionRevision(): void {
+    const meta = this.#meta();
+    this.ctx.storage.sql.exec(`
+      UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
+    `, (BigInt(meta.detail_retention_revision) + 1n).toString());
+  }
+
+  /**
+   * Name every stored month whose range can still hold detail older than one cutoff.
+   *
+   * Every generation is named, not only the reported one. A rebuild reads the retained authority
+   * again and can restore detail the reported generation already expired, so filtering here would
+   * leave that detail past its cutoff until a retention pass after the switchover.
+   */
+  #monthsBefore(cutoffUtc: string): string[] {
+    const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
+    return this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT DISTINCT month FROM usage_projection_months WHERE month <= ? ORDER BY month
+    `, cutoffMonth).toArray().map(row => row.month);
+  }
+
+  /**
+   * Compact superseded Summary revisions in every month object.
+   *
+   * A Usage Summary Fact never spans two months, so each month decides its own effective revision
+   * and no cross-object coordination is needed. Returns whether every month is complete.
+   */
+  async #compactMonthsStep(): Promise<boolean> {
+    const meta = this.#meta();
+    const floor = BigInt(meta.report_watermark) - BigInt(SUPERSEDED_AGGREGATE_WATERMARK_LAG);
+    if (floor < 1n) return true;
+    let complete = true;
+    let removed = 0;
+    // A month that still has work ends the turn, so one turn compacts one bounded page.
+    for (const row of this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month DESC
+    `, meta.active_generation).toArray()) {
+      const result = await this.#monthStub(row.month).compactSupersededAggregates(floor);
+      removed += result.removed;
+      if (!result.complete) {
+        complete = false;
+        break;
+      }
+    }
+    if (removed > 0) this.#bumpDetailRetentionRevision();
+    return complete;
+  }
+
+  #expireRootDetailBefore(
       usagePrincipalRef: string,
       cutoffUtc: string,
       limit = 64): boolean {
@@ -946,9 +1221,10 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       for (const row of removed) {
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_expired_sequences (
-            generation, fact_id, principal_ref, source_sequence
-          ) VALUES (?, ?, ?, ?)
-        `, row.generation, row.fact_id, usagePrincipalRef, row.source_sequence);
+            generation, fact_id, principal_ref, source_sequence, retired_at
+          ) VALUES (?, ?, ?, ?, ?)
+        `, row.generation, row.fact_id, usagePrincipalRef, row.source_sequence,
+        new Date().toISOString());
         const table = row.storage_kind === "fact"
           ? "usage_projection_facts" : "usage_projection_rejections";
         this.ctx.storage.sql.exec(`
@@ -957,9 +1233,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       }
       const meta = this.#meta();
       if (removed.some(row => row.generation === meta.active_generation)) {
-        this.ctx.storage.sql.exec(`
-          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
-        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
+        this.#bumpDetailRetentionRevision();
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO usage_projection_detail_watermarks (principal_ref, cutoff_utc)
@@ -967,67 +1241,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ON CONFLICT(principal_ref) DO UPDATE SET cutoff_utc =
           CASE WHEN cutoff_utc < excluded.cutoff_utc THEN excluded.cutoff_utc ELSE cutoff_utc END
       `, usagePrincipalRef, cutoff);
-      return rows.length <= limit;
-    });
-  }
-
-  /**
-   * Delete at most one bounded page of Summary revisions that a newer applied revision replaced.
-   * Effective revisions, revisions that are not applied yet, and Usage Summary snapshots are kept,
-   * so report totals stay exact. A delayed replay of a removed revision is absorbed by its
-   * retained Summary snapshot and contributes no metric. Frozen reports that could still name a
-   * removed revision are failed through the shared detail-retention revision.
-   */
-  compactSupersededAggregates(
-      limit = 64, watermarkLag = SUPERSEDED_AGGREGATE_WATERMARK_LAG): boolean {
-    // Each batch deletes what it finds, so the candidate set only shrinks and no ordering is
-    // needed to make progress. Leaving it unordered lets the Summary-revision index stop at LIMIT
-    // instead of sorting every superseded row first.
-    if (!Number.isInteger(limit) || limit < 1 || limit > 64 ||
-        !Number.isInteger(watermarkLag) || watermarkLag < 0) {
-      throw new TypeError("Usage Projection aggregate compaction request is invalid.");
-    }
-    return this.ctx.storage.transactionSync(() => {
-      const floor = BigInt(this.#meta().report_watermark) - BigInt(watermarkLag);
-      if (floor < 1n) return true;
-      const floorText = floor.toString();
-      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
-        SELECT facts.generation, facts.fact_id
-        FROM usage_projection_facts AS facts
-        WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
-          AND facts.applied_watermark IS NOT NULL
-          AND EXISTS (
-            SELECT 1 FROM usage_projection_facts AS newer
-            WHERE newer.generation = facts.generation
-              AND newer.row_kind = 'aggregate'
-              AND newer.summary_fact_id = facts.summary_fact_id
-              AND newer.applied = 1
-              AND newer.applied_watermark IS NOT NULL
-              AND (length(newer.applied_watermark) < length(?) OR
-                (length(newer.applied_watermark) = length(?)
-                  AND newer.applied_watermark <= ?))
-              AND (length(newer.summary_revision) > length(facts.summary_revision) OR
-                (length(newer.summary_revision) = length(facts.summary_revision)
-                  AND (newer.summary_revision > facts.summary_revision OR
-                    (newer.summary_revision = facts.summary_revision AND
-                      (length(newer.applied_watermark) < length(facts.applied_watermark) OR
-                        (length(newer.applied_watermark) = length(facts.applied_watermark) AND
-                          newer.applied_watermark < facts.applied_watermark))))))
-          )
-        LIMIT ?
-      `, floorText, floorText, floorText, limit + 1).toArray();
-      const removed = rows.slice(0, limit);
-      for (const row of removed) {
-        this.ctx.storage.sql.exec(`
-          DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
-        `, row.generation, row.fact_id);
-      }
-      const meta = this.#meta();
-      if (removed.some(row => row.generation === meta.active_generation)) {
-        this.ctx.storage.sql.exec(`
-          UPDATE usage_projection_meta SET detail_retention_revision = ? WHERE singleton = 1
-        `, (BigInt(meta.detail_retention_revision) + 1n).toString());
-      }
       return rows.length <= limit;
     });
   }
@@ -1131,6 +1344,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_rebuild_users WHERE generation = ?
         `, generation);
+        // A rebuild that never completed leaves retained identities and queued deliveries behind.
+        // This clear removes the Usage Principal rows whose high water is the only justification
+        // for pruning an identity, so the identities have to go with them or nothing ever can.
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_expired_sequences WHERE generation = ?
+        `, generation);
+        this.ctx.storage.sql.exec(`
+          DELETE FROM usage_projection_month_outbox WHERE generation = ?
+        `, generation);
         this.ctx.storage.sql.exec(`
           INSERT OR REPLACE INTO usage_projection_totals (
             generation, totals_source, provider_cost, charged_credits,
@@ -1159,10 +1381,21 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
 
   /** Resume one bounded rebuild step after an isolate restart. */
   async alarm(): Promise<void> {
-    if (this.ingestPreparations > 0 || this.rebuildPreparations > 0) {
+    // Delivering to a month object awaits another Durable Object, which opens a window a second
+    // alarm could enter and run a second bounded lifecycle step in the same turn.
+    if (this.alarmRunning || this.ingestPreparations > 0 || this.rebuildPreparations > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 1_000);
       return;
     }
+    this.alarmRunning = true;
+    try {
+      await this.#runMaintenanceTurn();
+    } finally {
+      this.alarmRunning = false;
+    }
+  }
+
+  async #runMaintenanceTurn(): Promise<void> {
     const meta = this.#meta();
     const hasDrain = this.#hasApplyDrain();
     const hasLifecycle = meta.rebuild_state === "rebuilding" || meta.cleanup_generation !== null;
@@ -1178,7 +1411,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       this.#setMaintenanceTurn("drain");
     }
     await this.#runRetiredProjectionCleanupStep();
-    await this.#scheduleRemainingMaintenance(this.compactSupersededAggregates());
+    const deliveryComplete = await this.#deliverMonthOutboxStep();
+    const monthCompactionComplete = await this.#compactMonthsStep();
+    const identityPruneComplete = this.#pruneRetainedIdentitiesStep();
+    await this.#scheduleRemainingMaintenance(
+      deliveryComplete && monthCompactionComplete && identityPruneComplete,
+    );
   }
 
   #hasApplyDrain(): boolean {
@@ -1225,7 +1463,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_meta SET rebuild_state = 'failed',
             rebuild_failure_code = 'projection-write-failed', rebuild_completed_at = ?,
-            cleanup_generation = rebuild_generation, cleanup_stage = 'facts'
+            cleanup_generation = rebuild_generation, cleanup_stage = 'months'
           WHERE singleton = 1
         `, new Date().toISOString());
         rebuildFailed = true;
@@ -1451,6 +1689,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (meta.rebuild_state !== "rebuilding" || meta.rebuild_generation !== generation) {
         return;
       }
+      // A report reads its rows from the month objects but bounds them by a watermark, and a
+      // rebuild assigns its watermarks in rebuild order rather than source-time order. Switching
+      // to a generation whose rows are still queued would therefore report a source-time
+      // scattered subset against complete totals, so the switchover waits for delivery.
+      const undelivered = this.ctx.storage.sql.exec<{present: string}>(`
+        SELECT CAST(EXISTS(
+          SELECT 1 FROM usage_projection_month_outbox WHERE generation = ? LIMIT 1
+        ) AS TEXT) AS present
+      `, generation).one().present === "1";
+      if (undelivered) return;
       const pending = this.ctx.storage.sql.exec<{count: string}>(`
         SELECT CAST(COUNT(*) AS TEXT) AS count FROM (
           SELECT fact_id FROM usage_projection_facts WHERE generation = ? AND applied = 0
@@ -1468,7 +1716,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_meta SET rebuild_state = 'failed',
             rebuild_failure_code = 'projection-write-failed', rebuild_completed_at = ?,
-            cleanup_generation = rebuild_generation, cleanup_stage = 'facts'
+            cleanup_generation = rebuild_generation, cleanup_stage = 'months'
           WHERE singleton = 1
         `, new Date().toISOString());
         return;
@@ -1484,7 +1732,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         UPDATE usage_projection_meta SET active_generation = ?, ingestion_watermark = ?,
           latest_applied_source_at = ?, last_ingested_at = ?, failed_ingestion_count = '0',
           failure_code = NULL, rebuild_state = 'completed', rebuild_completed_at = ?,
-          rebuild_failure_code = NULL, cleanup_generation = ?, cleanup_stage = 'facts',
+          rebuild_failure_code = NULL, cleanup_generation = ?, cleanup_stage = 'months',
           bootstrap_state = 'complete'
         WHERE singleton = 1
       `, generation, applied.count, applied.latest,
@@ -1497,7 +1745,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     this.ctx.storage.sql.exec(`
       UPDATE usage_projection_meta SET rebuild_state = 'failed', rebuild_failure_code = ?,
         rebuild_completed_at = ?, cleanup_generation = rebuild_generation,
-        cleanup_stage = 'facts' WHERE singleton = 1
+        cleanup_stage = 'months' WHERE singleton = 1
     `, code, new Date().toISOString());
     this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now()));
   }
@@ -1509,6 +1757,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       throw new Error("Usage Projection refused to clean its active generation.");
     }
     const generation = meta.cleanup_generation;
+    if (meta.cleanup_stage === "months") {
+      if (await this.#cleanRetiredGenerationMonths(generation)) {
+        this.ctx.storage.sql.exec(`
+          UPDATE usage_projection_meta SET cleanup_stage = 'facts' WHERE singleton = 1
+        `);
+      }
+      await this.ctx.storage.setAlarm(Date.now());
+      return;
+    }
     const table = meta.cleanup_stage === "facts" ? "usage_projection_facts"
       : meta.cleanup_stage === "expired-sequences" ? "usage_projection_expired_sequences"
         : meta.cleanup_stage === "rejections" ? "usage_projection_rejections"
@@ -1543,6 +1800,34 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       WHERE singleton = 1
     `, next, next === null ? null : generation);
     if (next !== null) await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  /**
+   * Remove one retired generation from the month objects that hold its reportable rows.
+   *
+   * Its outbox entries go first because a row that will be deleted never needs delivering. A month
+   * is forgotten once it reports itself complete, so the router only names months that still hold
+   * rows. Returns whether the generation is gone from every month.
+   */
+  async #cleanRetiredGenerationMonths(generation: string): Promise<boolean> {
+    this.ctx.storage.sql.exec(`
+      DELETE FROM usage_projection_month_outbox WHERE generation = ?
+    `, generation);
+    const months = this.ctx.storage.sql.exec<{month: string}>(`
+      SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month LIMIT 8
+    `, generation).toArray();
+    if (months.length === 0) return true;
+    for (const {month} of months) {
+      if (!await this.#monthStub(month).removeGeneration(generation)) continue;
+      this.ctx.storage.sql.exec(`
+        DELETE FROM usage_projection_months WHERE generation = ? AND month = ?
+      `, generation, month);
+    }
+    return this.ctx.storage.sql.exec<{present: string}>(`
+      SELECT CAST(EXISTS(
+        SELECT 1 FROM usage_projection_months WHERE generation = ? LIMIT 1
+      ) AS TEXT) AS present
+    `, generation).one().present === "0";
   }
 
   #rebuildStatus(meta: ProjectionMetaRow): ProjectionRebuildStatus {
@@ -1602,7 +1887,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       if (expiredById) {
         const sameSequence = expiredById.principal_ref === fact.usagePrincipalRef &&
           expiredById.source_sequence === fact.sourceSequence.toString();
-        return complete({code: sameSequence ? "invalid-fact" : "fact-id-conflict", stored: true});
+        // The retired sequence already advances through its expired-sequence marker. A new
+        // sequence has no marker yet, so one is stored for it here.
+        const samePrincipalNewSequence =
+          expiredById.principal_ref === fact.usagePrincipalRef && !sameSequence;
+        const stored = sameSequence || samePrincipalNewSequence &&
+          this.#ingestSequenceRejection(
+            fact, generation, "fact-id-conflict", updateActiveMeta,
+          );
+        return complete({code: sameSequence ? "invalid-fact" : "fact-id-conflict", stored});
       }
       const existingMarkerById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
         SELECT fact_id, principal_ref, source_sequence, source_time, code, applied
@@ -1711,20 +2004,34 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       const expiredById = this.ctx.storage.sql.exec<{
         principal_ref: string;
         source_sequence: string;
+        fact_hash: string | null;
       }>(`
-        SELECT principal_ref, source_sequence FROM usage_projection_expired_sequences
+        SELECT principal_ref, source_sequence, fact_hash
+        FROM usage_projection_expired_sequences
         WHERE generation = ? AND fact_id = ?
       `, generation, fact.projectionFactId).toArray()[0];
       if (expiredById) {
+        // A retained hash proves the replay carries the same payload. Rows expired before the
+        // hash was retained have none, and stay judged by identity alone.
         if (expiredById.principal_ref === fact.usagePrincipalRef &&
-            expiredById.source_sequence === fact.sourceSequence.toString()) {
+            expiredById.source_sequence === fact.sourceSequence.toString() &&
+            (expiredById.fact_hash === null || expiredById.fact_hash === hash)) {
           return complete({rejection: null, applied: true, sequenceRejectionAccepted: false});
         }
         if (updateActiveMeta) this.#recordFailureInTransaction(meta, "fact-id-conflict");
+        // The row moved to its month object, but a reused identity at a new sequence must still
+        // leave a marker here or the Usage Principal's sequence stalls at the gap.
+        const samePrincipalNewSequence =
+          expiredById.principal_ref === fact.usagePrincipalRef &&
+          expiredById.source_sequence !== fact.sourceSequence.toString();
+        const sequenceRejectionAccepted = samePrincipalNewSequence &&
+          this.#ingestSequenceRejection(
+            fact, generation, "fact-id-conflict", updateActiveMeta,
+          );
         return complete({
           rejection: "fact-id-conflict",
           applied: false,
-          sequenceRejectionAccepted: false,
+          sequenceRejectionAccepted,
         });
       }
       const existingRejectionById = this.ctx.storage.sql.exec<StoredRejectionRow>(`
@@ -1811,44 +2118,24 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
           });
         }
       }
+      // Nothing here names this fact, and its Usage Principal has already applied past its
+      // sequence, so it is a redelivery whose retained identity was pruned. Acknowledging it is
+      // what `high_water` already proves; storing it would leave a row apply can never reach.
+      const appliedThrough = this.ctx.storage.sql.exec<{high_water: string}>(`
+        SELECT high_water FROM usage_projection_principals
+        WHERE generation = ? AND principal_ref = ?
+      `, generation, fact.usagePrincipalRef).toArray()[0];
+      if (appliedThrough !== undefined &&
+          fact.sourceSequence <= BigInt(appliedThrough.high_water)) {
+        return complete({rejection: null, applied: true, sequenceRejectionAccepted: false});
+      }
       this.ctx.storage.sql.exec(`
-        INSERT INTO usage_projection_facts (
-          generation, fact_id, fact_hash, principal_ref, source_sequence, occurred_at,
-          safe_record_ref, safe_attempt_ref, reservation_status, bucket_start, summary_fact_id,
-          summary_revision, summary_dimension_key,
-          summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
-          deployment_model_id, vendor_id, billing_method_key, external_account_id, gadget_id,
-          cache_hit_input, cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
-          provider_cost, charged_credits, metered_use_count, billable_api_operations,
-          pre_execution_failures, unknown_operations, metering_attempts, held_reservations,
-          released_reservations, settled_reservations, unreserved_attempts,
-          active_user_contribution, unpriced_model_uses, unpriced_api_operations, applied
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        INSERT INTO usage_projection_facts (${USAGE_PROJECTION_FACT_COLUMNS.join(", ")})
+        VALUES (${USAGE_PROJECTION_FACT_COLUMNS.map(() => "?").join(", ")})
       `,
-      generation, fact.projectionFactId, hash, fact.usagePrincipalRef,
-      fact.sourceSequence.toString(), fact.rowKind === "detail" ? fact.occurredAt : null,
-      fact.rowKind === "detail" && typeof fact.safeRecordRef === "string"
-        ? fact.safeRecordRef : null,
-      fact.rowKind === "detail" ? fact.safeAttemptRef : null,
-      fact.rowKind === "detail" ? fact.reservationStatus : null,
-      fact.rowKind === "aggregate" ? fact.bucketStart : null,
-      fact.rowKind === "aggregate" ? fact.summaryFactId : null,
-      fact.rowKind === "aggregate" ? fact.summaryRevision.toString() : null,
-      fact.rowKind === "aggregate" ? aggregateDimensionKey(fact) : null,
-      fact.rowKind === "aggregate" ? aggregateSnapshotValue(fact) : null,
-      fact.source, fact.rowKind, fact.rowKind === "aggregate" ? fact.meteredKind : null, fact.kind,
-      fact.outcome, fact.pricing, fact.deploymentModelId, fact.vendorId, fact.billingMethodKey,
-      fact.externalAccountId, fact.gadgetId, fact.cacheHitInputTokens.toString(),
-      fact.cacheMissInputTokens.toString(), fact.cacheWriteInputTokens.toString(),
-      fact.outputTokens.toString(), fact.reasoningTokens.toString(),
-      fact.providerCostUsdSubunits.toString(), fact.chargedUsageCreditSubunits.toString(),
-      fact.meteredUseCount.toString(), fact.billableApiOperations.toString(),
-      fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
-      fact.meteringAttempts.toString(), fact.heldReservations.toString(),
-      fact.releasedReservations.toString(), fact.settledReservations.toString(),
-      fact.unreservedAttempts.toString(),
-      fact.activeUserContribution.toString(),
-      fact.unpricedModelUses.toString(), fact.unpricedApiOperations.toString());
+      ...usageProjectionFactRowValues(
+        generation, hash, fact, {applied: 0, appliedWatermark: null},
+      ));
       if (updateActiveMeta) {
         this.ctx.storage.sql.exec(`
           UPDATE usage_projection_meta SET last_ingested_at = ? WHERE singleton = 1
@@ -2086,6 +2373,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       WHERE generation = ? AND fact_id = ?
     `, reportWatermark.toString(), generation, fact.fact_id);
     this.ctx.storage.sql.exec(`
+      INSERT OR REPLACE INTO usage_projection_month_outbox (
+        generation, fact_id, month, applied_watermark
+      ) VALUES (?, ?, ?, ?)
+    `, generation, fact.fact_id,
+    usageProjectionMonthKey(storedFactSourceTime(fact)), reportWatermark.toString());
+    this.ctx.storage.sql.exec(`
       UPDATE usage_projection_meta SET report_watermark = ? WHERE singleton = 1
     `, reportWatermark.toString());
     if (updateActiveMeta) {
@@ -2260,79 +2553,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   #createCurrentFactsTableAndIndexes(): void {
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS usage_projection_facts (
-        generation TEXT NOT NULL, fact_id TEXT NOT NULL, fact_hash TEXT NOT NULL,
-        principal_ref TEXT NOT NULL, source_sequence TEXT NOT NULL, occurred_at TEXT,
-        safe_record_ref TEXT, safe_attempt_ref TEXT, reservation_status TEXT,
-        bucket_start TEXT, summary_fact_id TEXT, summary_revision TEXT,
-        summary_dimension_key TEXT, summary_snapshot_value TEXT,
-        source TEXT NOT NULL, row_kind TEXT NOT NULL, metered_kind TEXT, usage_kind TEXT NOT NULL,
-        outcome TEXT NOT NULL, pricing TEXT NOT NULL, deployment_model_id TEXT, vendor_id TEXT,
-        billing_method_key TEXT, external_account_id TEXT, gadget_id TEXT,
-        cache_hit_input TEXT NOT NULL, cache_miss_input TEXT NOT NULL,
-        cache_write_input TEXT NOT NULL, output_tokens TEXT NOT NULL,
-        reasoning_tokens TEXT NOT NULL, provider_cost TEXT NOT NULL,
-        charged_credits TEXT NOT NULL, metered_use_count TEXT NOT NULL,
-        billable_api_operations TEXT NOT NULL,
-        pre_execution_failures TEXT NOT NULL, unknown_operations TEXT NOT NULL,
-        metering_attempts TEXT NOT NULL, held_reservations TEXT NOT NULL,
-        released_reservations TEXT NOT NULL, settled_reservations TEXT NOT NULL,
-        unreserved_attempts TEXT NOT NULL,
-        active_user_contribution TEXT NOT NULL, unpriced_model_uses TEXT NOT NULL,
-        unpriced_api_operations TEXT NOT NULL, applied INTEGER NOT NULL,
-        applied_watermark TEXT,
-        PRIMARY KEY (generation, fact_id), UNIQUE (generation, principal_ref, source_sequence),
-        CHECK ((row_kind = 'detail' AND occurred_at IS NOT NULL AND bucket_start IS NULL AND
-                metered_kind IS NULL AND
-                summary_fact_id IS NULL AND summary_revision IS NULL AND
-                summary_dimension_key IS NULL AND summary_snapshot_value IS NULL) OR
-               (row_kind = 'aggregate' AND occurred_at IS NULL AND safe_record_ref IS NULL AND
-                safe_attempt_ref IS NULL AND reservation_status IS NULL AND
-                metered_kind IS NOT NULL AND
-                bucket_start IS NOT NULL AND
-                summary_fact_id IS NOT NULL AND summary_revision IS NOT NULL AND
-                summary_dimension_key IS NOT NULL AND summary_snapshot_value IS NOT NULL))
-      );
-      CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v4
-      ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start));
-      CREATE INDEX IF NOT EXISTS usage_projection_report_time_v4
-      ON usage_projection_facts(
-        generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
-      );
-      CREATE INDEX IF NOT EXISTS usage_projection_report_principal_time_v4
-      ON usage_projection_facts(generation, principal_ref,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_gadget_time_v4
-      ON usage_projection_facts(generation, gadget_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_model_time_v4
-      ON usage_projection_facts(generation, deployment_model_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_method_time_v4
-      ON usage_projection_facts(generation, vendor_id, billing_method_key,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_external_time_v4
-      ON usage_projection_facts(generation, external_account_id,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_source_time_v4
-      ON usage_projection_facts(generation, source,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_outcome_time_v4
-      ON usage_projection_facts(generation, outcome,
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_unknown_time_v4
-      ON usage_projection_facts(
-        generation, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC
-      ) WHERE outcome IN ('usage-unknown-held', 'usage-unknown-released');
-      CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v4
-      ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
-        COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v4
-      ON usage_projection_facts(
-        generation, summary_fact_id, applied, applied_watermark, summary_revision
-      )
-    `);
+    createUsageProjectionFactsTable(this.ctx.storage.sql);
   }
 
   #createCurrentSummariesTableAndIndex(): void {
@@ -2626,9 +2847,43 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         UNIQUE (generation, principal_ref, source_sequence)
       )
     `);
+    // A row whose reportable copy now lives in a month object keeps its content hash here, so a
+    // redelivery of the same fact identity with a different payload is still a conflict.
+    const identityColumns = new Set(this.ctx.storage.sql.exec<{name: string}>(
+      "PRAGMA table_info(usage_projection_expired_sequences)",
+    ).toArray().map(column => column.name));
+    if (!identityColumns.has("fact_hash")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_expired_sequences ADD COLUMN fact_hash TEXT
+      `);
+    }
+    // Rows that predate this column were written only by detail retention, so each is at least a
+    // full retention window old and no live delivery can still replay it. The empty default sorts
+    // before every canonical timestamp, which makes them prunable on the first maintenance turn.
+    if (!identityColumns.has("retired_at")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_expired_sequences
+        ADD COLUMN retired_at TEXT NOT NULL DEFAULT ''
+      `);
+    }
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_detail_watermarks (
         principal_ref TEXT PRIMARY KEY, cutoff_utc TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_month_outbox (
+        generation TEXT NOT NULL, fact_id TEXT NOT NULL, month TEXT NOT NULL,
+        applied_watermark TEXT NOT NULL,
+        PRIMARY KEY (generation, fact_id)
+      );
+      CREATE INDEX IF NOT EXISTS usage_projection_month_outbox_order
+      ON usage_projection_month_outbox(month, length(applied_watermark), applied_watermark)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS usage_projection_months (
+        generation TEXT NOT NULL, month TEXT NOT NULL,
+        PRIMARY KEY (generation, month)
       )
     `);
     this.ctx.storage.sql.exec(`
@@ -3013,30 +3268,6 @@ function storedFactSourceTime(fact: StoredFactRow): string {
   const sourceTime = fact.row_kind === "detail" ? fact.occurred_at : fact.bucket_start;
   if (sourceTime === null) throw new Error("Usage Projection fact source time is missing.");
   return sourceTime;
-}
-
-function aggregateDimensionKey(fact: UsageProjectionAggregateFact): string {
-  return JSON.stringify([
-    fact.schemaVersion, fact.usagePrincipalRef, fact.bucketStart,
-    fact.source, fact.kind, fact.meteredKind, fact.outcome, fact.pricing, fact.deploymentModelId,
-    fact.vendorId, fact.billingMethodKey, fact.externalAccountId, fact.gadgetId,
-  ]);
-}
-
-function aggregateSnapshotValue(fact: UsageProjectionAggregateFact): string {
-  return JSON.stringify([
-    fact.cacheHitInputTokens.toString(), fact.cacheMissInputTokens.toString(),
-    fact.cacheWriteInputTokens.toString(), fact.outputTokens.toString(),
-    fact.reasoningTokens.toString(), fact.providerCostUsdSubunits.toString(),
-    fact.chargedUsageCreditSubunits.toString(), fact.meteredUseCount.toString(),
-    fact.billableApiOperations.toString(),
-    fact.preExecutionFailures.toString(), fact.unknownOperations.toString(),
-    fact.meteringAttempts.toString(), fact.heldReservations.toString(),
-    fact.releasedReservations.toString(), fact.settledReservations.toString(),
-    fact.unreservedAttempts.toString(),
-    fact.activeUserContribution.toString(), fact.unpricedModelUses.toString(),
-    fact.unpricedApiOperations.toString(),
-  ]);
 }
 
 function storedFactMetricSnapshot(fact: StoredFactRow): ProjectionMetricSnapshot {

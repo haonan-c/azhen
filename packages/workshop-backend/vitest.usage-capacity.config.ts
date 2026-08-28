@@ -26,7 +26,6 @@ export default defineConfig({
       "__capacity__/usage-capacity-v1.test.ts",
       "__capacity__/usage-method-inventory.test.ts",
       "__capacity__/usage-retention-storage.test.ts",
-      "__capacity__/usage-aggregate-compaction-storage.test.ts",
     ],
     disableConsoleIntercept: true,
     fileParallelism: false,

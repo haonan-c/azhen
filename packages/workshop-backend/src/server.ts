@@ -27,6 +27,7 @@ import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { wrapDoStubForTelemetry } from "./do-telemetry";
 import { UsageProjection } from "./usage-projection.js";
+import { UsageProjectionMonth } from "./usage-projection-month.js";
 import { publicBillingMethodInventory } from "./generated/public-billing-methods.js";
 import {
   isPublicPublishedApiMethod,
@@ -128,8 +129,11 @@ export { LanguageModelGatekeeper };
 // Re-export entrypoint types from admin-settings.ts.
 export { AdminSettings };
 
-// Re-export the replaceable deployment Usage Projection Durable Object.
+// Re-export the replaceable Projection Root Object.
 export { UsageProjection };
+
+// Re-export the Projection Month Object.
+export { UsageProjectionMonth };
 
 // Re-export entrypoint types from user.ts.
 export { UserDurableObject, GatekeeperConnectCallbackImpl };
