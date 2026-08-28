@@ -53,7 +53,18 @@ export function prepareCapacityLogForPersistence(log) {
 /** Validate exact, mode-specific evidence before a capacity run can be marked successful. */
 export function validateCapacityResult(result, mode) {
   const errors = [];
-  const expected = mode === "full" ? {
+  // `reduced` lowers only how many Users are active. The record mix is keyed to the per-User
+  // count, so lowering that instead would drop every Gatekeeper billing method from the run.
+  const expected = mode === "reduced" ? {
+    registeredUsers: 10_000,
+    activeUsers: 200,
+    recordsPerUser: 1_000,
+    warmSeconds: 120,
+    measuredSeconds: 900,
+    offeredRecordsPerSecond: 20,
+    tickMilliseconds: 1_000,
+    duplicateFacts: 20_000,
+  } : mode === "full" ? {
     registeredUsers: 10_000,
     activeUsers: 1_000,
     recordsPerUser: 1_000,
@@ -173,7 +184,7 @@ export function validateCapacityResult(result, mode) {
         item.expectedMeteredUses !== item?.actualMeteredUses)) {
     errors.push("Filtered query or report-timezone evidence is incomplete or too slow.");
   }
-  const expectedPairs = mode === "full" ? 10_000 : 10;
+  const expectedPairs = mode === "smoke" ? 10 : expected.activeUsers * 10;
   if (result?.outOfOrder?.pairs !== expectedPairs ||
       result?.outOfOrder?.orderedMeteredUses !==
         result?.outOfOrder?.outOfOrderMeteredUses) {
@@ -198,7 +209,7 @@ export function validateCapacityResult(result, mode) {
       result.rebuildConsistency.dimensionGroups < 1 ||
       result?.rebuildConsistency?.coveredMethods !==
         result?.rebuildConsistency?.expectedCoveredMethods ||
-      (mode === "full" && result.rebuildConsistency.coveredMethods < 355)) {
+      (mode !== "smoke" && result.rebuildConsistency.coveredMethods < 355)) {
     errors.push("Projection rebuild or dimension coverage evidence is incomplete.");
   }
   if (mode === "full" && (!result.capacity.registeredUsers.reviewRequired ||

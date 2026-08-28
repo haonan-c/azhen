@@ -13,12 +13,13 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../..");
 const args = process.argv.slice(2);
-const smoke = args.includes("--smoke");
-const full = args.includes("--full");
-if (smoke === full) {
-  throw new TypeError("Exactly one of --smoke or --full is required.");
+const selectedModes = ["smoke", "reduced", "full"].filter(
+  candidate => args.includes(`--${candidate}`),
+);
+if (selectedModes.length !== 1) {
+  throw new TypeError("Exactly one of --smoke, --reduced or --full is required.");
 }
-const mode = smoke ? "smoke" : "full";
+const mode = selectedModes[0];
 const outputIndex = args.indexOf("--out");
 if (outputIndex >= 0 && args[outputIndex + 1] === undefined) {
   throw new TypeError("--out requires a directory.");
@@ -31,7 +32,7 @@ await mkdir(outputDirectory, {recursive: true});
 
 const chunks = [];
 const commands = [
-  ...smoke ? [] : [
+  ...mode === "smoke" ? [] : [
     {
       name: "capnweb-backend",
       args: [

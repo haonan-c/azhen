@@ -20,7 +20,7 @@ import type {UsageProjection, UsageProjectionFact} from "../src/usage-projection
 import type {UserDurableObject} from "../src/user.js";
 import {projectionMonthStub, projectionMonths, readAcrossProjection} from "./projection-rows.js";
 
-type CapacityMode = "full" | "smoke";
+type CapacityMode = "full" | "reduced" | "smoke";
 
 type CapacityProfile = {
   mode: CapacityMode;
@@ -87,6 +87,24 @@ async function connectCapacityRpc(): Promise<RpcStub<PublicApi>> {
 }
 
 function profile(mode: CapacityMode): CapacityProfile {
+  // `reduced` keeps every shape of the full profile and lowers only how many Users are active.
+  // The record mix is keyed to `recordsPerUser === 1_000`: `sourceForOrdinal` returns every source
+  // and ordinals at or above 800 are Gatekeeper use, so lowering the per-User count instead would
+  // leave a run with one source, no Gatekeeper billing methods and nothing to cover. Two hundred
+  // active Users still cover all 355 public billing methods and seed 200,000 records, which is
+  // hours rather than half a day at the rate one workerd process sustains.
+  if (mode === "reduced") {
+    return {
+      mode,
+      registeredUsers: 10_000,
+      activeUsers: 200,
+      recordsPerUser: 1_000,
+      warmSeconds: 120,
+      measuredSeconds: 900,
+      offeredRecordsPerSecond: 20,
+      tickMilliseconds: 1_000,
+    };
+  }
   return mode === "full" ? {
     mode,
     registeredUsers: 10_000,
@@ -500,7 +518,7 @@ async function verifyOutOfOrderDelivery(
   orderedMeteredUses: string;
   outOfOrderMeteredUses: string;
 }> {
-  const pairTarget = selected.mode === "full" ? 10_000 : 10;
+  const pairTarget = selected.mode === "smoke" ? 10 : selected.activeUsers * 10;
   const pairsPerUser = Math.ceil(pairTarget / selected.activeUsers);
   const orderedFacts: UsageProjectionFact[] = [];
   const higherFacts: UsageProjectionFact[] = [];
@@ -886,8 +904,11 @@ async function measureReportWorkload(
 }
 
 test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", async () => {
-  if (testEnv.USAGE_CAPACITY_MODE !== "smoke" && testEnv.USAGE_CAPACITY_MODE !== "full") {
-    throw new TypeError("USAGE_CAPACITY_MODE must be explicitly set to smoke or full.");
+  if (testEnv.USAGE_CAPACITY_MODE !== "smoke" && testEnv.USAGE_CAPACITY_MODE !== "reduced" &&
+      testEnv.USAGE_CAPACITY_MODE !== "full") {
+    throw new TypeError(
+      "USAGE_CAPACITY_MODE must be explicitly set to smoke, reduced or full.",
+    );
   }
   const mode = testEnv.USAGE_CAPACITY_MODE;
   const selected = profile(mode);
@@ -1226,7 +1247,7 @@ async function verifyCapacityResult(
     length: Math.ceil(selected.measuredSeconds / 60),
   }, (_unused, minute) => measuredBuckets.slice(minute * 60, (minute + 1) * 60)
       .reduce((sum, bucket) => sum + bucket.records, 0));
-  if (selected.mode === "full") {
+  if (selected.mode !== "smoke") {
     expect(measuredMinuteCounts).toEqual(Array.from({length: 15}, () => 1_200));
   }
   const warmSamples = samples.filter(sample => sample.phase === "warm");
@@ -1283,11 +1304,17 @@ async function verifyCapacityResult(
   expect(overview.metrics.unpricedApiOperations).toBe(BigInt(selected.activeUsers * 10));
   expect(overview.metrics.billableApiOperations).toBe(BigInt(selected.activeUsers * 200));
   const capacity = await projection.readCapacityReview(BigInt(selected.registeredUsers));
+  if (selected.mode !== "smoke") {
+    // The counts follow the profile, so a reduced run still proves the telemetry is exact.
+    expect(capacity.registeredUsers.current).toBe(BigInt(selected.registeredUsers));
+    expect(capacity.dailyActiveUsers.current).toBe(BigInt(selected.activeUsers));
+    expect(capacity.rollingThirtyDayRecords.current).toBe(BigInt(expectedRecords));
+    expect(capacity.alignedOneSecondPeakRecords.current)
+      .toBeGreaterThanOrEqual(BigInt(selected.offeredRecordsPerSecond));
+  }
   if (selected.mode === "full") {
-    expect(capacity.registeredUsers.current).toBe(10_000n);
-    expect(capacity.dailyActiveUsers.current).toBe(1_000n);
-    expect(capacity.rollingThirtyDayRecords.current).toBe(1_000_000n);
-    expect(capacity.alignedOneSecondPeakRecords.current).toBeGreaterThanOrEqual(20n);
+    // Only the full profile reaches the Acceptance Oracle target, so only it can turn the 70%
+    // reviews on. A reduced run sits below every threshold by construction.
     expect(capacity.reviewRequired).toBe(true);
   }
   const capacityTelemetry = await measureCapacityTelemetry(
@@ -1312,7 +1339,7 @@ async function verifyCapacityResult(
 
   let duplicateFacts = 0;
   let conflictingFact: UsageProjectionFact | null = null;
-  const duplicateTarget = selected.mode === "full" ? 100_000 : 10;
+  const duplicateTarget = selected.mode === "smoke" ? 10 : selected.activeUsers * 100;
   for (let userIndex = 0;
     userIndex < selected.activeUsers && duplicateFacts < duplicateTarget;
     userIndex += 1) {
