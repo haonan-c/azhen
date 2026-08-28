@@ -50,3 +50,6 @@ allowBuilds:
   protobufjs: true
   sharp: true
   workerd: true
+
+patchedDependencies:
+  '@cloudflare/vitest-pool-workers@0.20.3': patches/@cloudflare__vitest-pool-workers@0.20.3.patch

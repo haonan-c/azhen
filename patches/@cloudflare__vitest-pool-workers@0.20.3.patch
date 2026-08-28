@@ -1,0 +1,32 @@
+diff --git a/dist/worker/lib/cloudflare/test-internal.mjs b/dist/worker/lib/cloudflare/test-internal.mjs
+index c8dd26dde566fa9964e5f8a22ff10b247f16046d..0221394186bf2be6df61cd977bc92cc68a0a9c1d 100644
+--- a/dist/worker/lib/cloudflare/test-internal.mjs
++++ b/dist/worker/lib/cloudflare/test-internal.mjs
+@@ -310,13 +310,21 @@ const IGNORED_KEYS = ["self"];
+ * things a little trickier for us...
+ */
+ function createProxyPrototypeClass(superClass, getUnknownPrototypeKey) {
++	let prototypeWrapped = false;
+ 	function Class(...args) {
+-		Class.prototype = new Proxy(Class.prototype, { get(target, key, receiver) {
+-			const value = Reflect.get(target, key, receiver);
+-			if (value !== void 0) return value;
+-			if (typeof key === "symbol" || IGNORED_KEYS.includes(key)) return;
+-			return getUnknownPrototypeKey.call(receiver, key);
+-		} });
++		// Wrap the prototype once. Re-wrapping on every construction nests one Proxy per
++		// instance, so a property lookup costs one stack frame per past construction and a
++		// workload that constructs a few thousand Durable Objects in one isolate dies with
++		// "Maximum call stack size exceeded" inside this constructor.
++		if (!prototypeWrapped) {
++			prototypeWrapped = true;
++			Class.prototype = new Proxy(Class.prototype, { get(target, key, receiver) {
++				const value = Reflect.get(target, key, receiver);
++				if (value !== void 0) return value;
++				if (typeof key === "symbol" || IGNORED_KEYS.includes(key)) return;
++				return getUnknownPrototypeKey.call(receiver, key);
++			} });
++		}
+ 		return Reflect.construct(superClass, args, Class);
+ 	}
+ 	Reflect.setPrototypeOf(Class.prototype, superClass.prototype);

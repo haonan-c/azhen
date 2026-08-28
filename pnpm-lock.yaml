@@ -33,6 +33,9 @@ overrides:
   '@types/node': 26.1.0
   '@lezer/markdown': 1.6.4
 
+patchedDependencies:
+  '@cloudflare/vitest-pool-workers@0.20.3': b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024
+
 importers:
 
   .:
@@ -73,7 +76,7 @@ importers:
         version: 7.29.7
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       '@cloudflare/workers-types':
         specifier: ^5.20260722.1
         version: 5.20260804.1
@@ -116,7 +119,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
@@ -193,7 +196,7 @@ importers:
         version: 2.9.2(@date-fns/tz@1.5.0)(@phosphor-icons/react@2.1.10(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(date-fns@4.4.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.4.3)
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       '@codemirror/commands':
         specifier: ^6.10.4
         version: 6.10.4
@@ -336,7 +339,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
@@ -373,7 +376,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
@@ -565,7 +568,7 @@ importers:
         version: 2.9.2(@date-fns/tz@1.5.0)(@phosphor-icons/react@2.1.10(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@types/react@19.2.18)(date-fns@4.4.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(zod@4.4.3)
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       '@phosphor-icons/react':
         specifier: ^2.1.10
         version: 2.1.10(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -669,7 +672,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
@@ -728,7 +731,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       miniflare:
         specifier: 5.20260801.0-alpha
         version: 5.20260801.0-alpha
@@ -833,7 +836,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       jsonc-parser:
         specifier: ^3.3.1
         version: 3.3.1
@@ -851,7 +854,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       '@cloudflare/workers-types':
         specifier: ^5.20260722.1
         version: 5.20260804.1
@@ -906,7 +909,7 @@ importers:
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: 'catalog:'
-        version: 0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
+        version: 0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)
       esbuild:
         specifier: ^0.28.1
         version: 0.28.1
@@ -5894,7 +5897,7 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@cloudflare/vitest-pool-workers@0.20.3(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)':
+  '@cloudflare/vitest-pool-workers@0.20.3(patch_hash=b9a959d8fdb812994252c0dbb09653088fef1c805260429f8ee7314187bf2024)(@cloudflare/workers-types@5.20260804.1)(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10)':
     dependencies:
       '@vitest/runner': 4.1.10
       '@vitest/snapshot': 4.1.10
