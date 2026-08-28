@@ -18,6 +18,7 @@ export default defineConfig({
           TEST_ADMIN_SETTINGS: {className: "AdminSettings", useSQLite: true},
           TEST_USER: {className: "UserDurableObject", useSQLite: true},
           TEST_USAGE_PROJECTION: {className: "UsageProjection", useSQLite: true},
+          TEST_USAGE_PROJECTION_MONTH: {className: "UsageProjectionMonth", useSQLite: true},
         },
         kvNamespaces: ["AVATARS"],
       },

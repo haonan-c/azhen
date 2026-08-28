@@ -179,6 +179,22 @@ export function normalizeAdminUsageReportFilter(
 }
 
 /** Compile the only allowlisted SQL predicate used by Usage reports. */
+/**
+ * Largest keyset page the Admin report reads at once.
+ *
+ * The root object bounds a caller's page here and a month object accepts one more, because a
+ * keyset read fetches one extra row to learn whether another page follows.
+ */
+export const USAGE_PROJECTION_REPORT_PAGE_MAX = 256;
+
+/**
+ * Largest number of Usage Principal references one month returns for a distinct active-User count.
+ *
+ * Distinct counts cannot be summed across months, so the root unions each month's own references.
+ * The result is bounded by the deployment's registered Users.
+ */
+export const USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX = 10_000;
+
 export function buildUsageReportPredicate(
   query: FrozenUsageReportQuery,
   rowKind: "all" | "aggregate" = "all",

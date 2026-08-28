@@ -6,6 +6,7 @@ import {
 import {describe, expect, it} from "vitest";
 import {AdminApiImpl, AdminUsageApiImpl, type AdminSettings} from "../src/admin-settings.js";
 import {UsageAccount, type GatekeeperUsageAttribution} from "../src/usage-account.js";
+import type {UsageProjectionMonth} from "../src/usage-projection-month.js";
 import type {UsageProjection} from "../src/usage-projection.js";
 import type {UserDurableObject} from "../src/user.js";
 import {isAvatarStorageKey} from "../src/avatar-key.js";
@@ -14,6 +15,7 @@ const testEnv = env as unknown as {
   TEST_ADMIN_SETTINGS: DurableObjectNamespace<AdminSettings>;
   TEST_USER: DurableObjectNamespace<UserDurableObject>;
   TEST_USAGE_PROJECTION: DurableObjectNamespace<UsageProjection>;
+  TEST_USAGE_PROJECTION_MONTH: DurableObjectNamespace<UsageProjectionMonth>;
   AVATARS: KVNamespace;
 };
 const users = testEnv.TEST_USER;
@@ -581,13 +583,27 @@ describe("registered User deletion and pseudonymous financial retention", () => 
       ),
     );
     expect(rebuilt.metrics!.activeUsers).toBeGreaterThanOrEqual(1n);
-    expect(await runInDurableObject(rebuiltProjection, (_instance, state) =>
-      state.storage.sql.exec<{count: string}>(`
-        SELECT CAST(COUNT(*) AS TEXT) AS count FROM usage_projection_facts
-        WHERE generation = (
-          SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
-        ) AND principal_ref = ? AND row_kind = 'aggregate' AND applied = 1
-      `, registered.registeredUserRef).one().count)).not.toBe("0");
+    // Reportable rows live in their UTC month object, so the pseudonymous Usage Summary Fact
+    // revisions that must survive deletion are counted where the report reads them.
+    const {generation, months} = await runInDurableObject(rebuiltProjection, (_instance, state) => ({
+      generation: state.storage.sql.exec<{active_generation: string}>(`
+        SELECT active_generation FROM usage_projection_meta WHERE singleton = 1
+      `).one().active_generation,
+      months: state.storage.sql.exec<{month: string}>(`
+        SELECT DISTINCT month FROM usage_projection_months
+      `).toArray().map(row => row.month),
+    }));
+    let retainedAggregates = 0;
+    for (const month of months) {
+      retainedAggregates += await runInDurableObject(
+        testEnv.TEST_USAGE_PROJECTION_MONTH
+          .getByName(`${month}:${rebuiltProjection.id.toString()}`),
+        (_instance, state) => state.storage.sql.exec<{count: number}>(`
+          SELECT COUNT(*) AS count FROM usage_projection_facts
+          WHERE generation = ? AND principal_ref = ? AND row_kind = 'aggregate' AND applied = 1
+        `, generation, registered.registeredUserRef).one().count);
+    }
+    expect(retainedAggregates).toBeGreaterThan(0);
 
     const revision = await adminSettings().getRegisteredUsageUsersRevision();
     const principals = await adminSettings()
