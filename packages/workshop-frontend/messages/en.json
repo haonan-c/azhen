@@ -483,7 +483,7 @@
   "conversation_retry_tooltip": "Retry the last action.",
   "conversation_switched_model": "Switched to {name}",
   "conversation_thinking": "Thinking",
-  "conversation_tokens": "{count} tokens",
+  "conversation_tokens": "{count} tokens · incomplete history, not billed",
   "conversation_toast_changes_accept_error": "Failed to accept changes",
   "conversation_toast_changes_accepted": "Changes accepted",
   "conversation_toast_changes_discard_error": "Failed to discard changes",

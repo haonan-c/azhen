@@ -4638,7 +4638,7 @@ function ChatInterface({
 }: ChatInterfaceProps) {
   // Persistent cache that survives reconnects
   const toasts = useKumoToastManager();
-  const { authenticatedApi, currentUser } = useAuthenticatedApi();
+  const { authenticatedApi, currentUser, isAdmin } = useAuthenticatedApi();
   const authenticatedApiRef = useRef(authenticatedApi);
   authenticatedApiRef.current = authenticatedApi;
   const getOverseer = useCallback(() => overseer, [overseer]);
@@ -7029,7 +7029,7 @@ function ChatInterface({
                         <span className="flex-shrink-0">
                           {formatChatRowTime(chat.lastActive, bucket, chatListNow)}
                         </span>
-                        {chat.totalCost != null && (
+                        {isAdmin && chat.totalCost != null && (
                           <>
                             <span className="flex-shrink-0" aria-hidden="true">·</span>
                             <span className="flex-shrink-0 font-mono">
@@ -8182,7 +8182,7 @@ function ChatInterface({
                         })}
                       </span>
                     )}
-                    {currentChatMetadata?.totalCost != null && (
+                    {isAdmin && currentChatMetadata?.totalCost != null && (
                       <span>{formatUsdCost(currentChatMetadata.totalCost)}</span>
                     )}
                   </div>
