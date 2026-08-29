@@ -213,10 +213,13 @@ function roundRobinAssignments(total: number, activeUsers: number): number[] {
   return Array.from({length: total}, (_unused, index) => index % activeUsers);
 }
 
-function capacityDigest(value: unknown): string {
-  const canonical = JSON.stringify(value, (_key, item) =>
+function capacityJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
     typeof item === "bigint" ? item.toString() : item);
-  return createHash("sha256").update(canonical).digest("hex");
+}
+
+function capacityDigest(value: unknown): string {
+  return createHash("sha256").update(capacityJson(value)).digest("hex");
 }
 
 function percentile(samples: number[], quantile: number): number {
@@ -1321,7 +1324,8 @@ async function verifyCapacityResult(
   expect(latency.projectionVisibility.p99Ms).toBeLessThanOrEqual(10_000);
   expect(latency.adminOverviewVisibility.maxMs).toBeLessThanOrEqual(60_000);
   expect(projectionDrainMs).toBeLessThanOrEqual(60_000);
-  const preRebuildMetricsDigest = capacityDigest((await projection.readOverview()).metrics);
+  const preRebuildMetrics = (await projection.readOverview()).metrics;
+  const preRebuildMetricsDigest = capacityDigest(preRebuildMetrics);
   const preRebuildDetail = await readProjectionDetailDigest(projection);
 
   const rebuildStarted = performance.now();
@@ -1339,6 +1343,19 @@ async function verifyCapacityResult(
   const overview = await projection.readOverview();
   const postRebuildMetricsDigest = capacityDigest(overview.metrics);
   const postRebuildDetail = await readProjectionDetailDigest(projection);
+  // A digest says the rebuild did not reproduce the reported totals but not which total moved, and
+  // one run of this profile costs hours, so the fields are reported before they are asserted.
+  if (postRebuildMetricsDigest !== preRebuildMetricsDigest ||
+      postRebuildDetail.digest !== preRebuildDetail.digest) {
+    console.warn(`USAGE_CAPACITY_REBUILD_DIFF before=${
+      capacityJson(preRebuildMetrics)} after=${capacityJson(overview.metrics)} detail=${
+      capacityJson({
+        before: {groups: preRebuildDetail.dimensionGroups,
+          methods: preRebuildDetail.coveredMethods},
+        after: {groups: postRebuildDetail.dimensionGroups,
+          methods: postRebuildDetail.coveredMethods},
+      })}`);
+  }
   expect(postRebuildMetricsDigest).toBe(preRebuildMetricsDigest);
   expect(postRebuildDetail.digest).toBe(preRebuildDetail.digest);
   const expectedCoveredMethods = Math.min(
