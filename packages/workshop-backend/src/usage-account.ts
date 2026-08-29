@@ -23,6 +23,7 @@ import {
   type UserModelUsageRecord,
   type UserUsageRecordPage,
   type UserUsageRecordPageRequest,
+  createInsufficientUsageCreditError,
 } from "@gadgets/workshop-shared/api";
 import {
   calculateModelChargeSubunits,
@@ -1980,8 +1981,14 @@ export class UsageAccount {
         return { value: existing };
       }
 
-      if (totals.ledgerBalanceSubunits - totals.reservedSubunits < amountSubunits) {
-        return { error: new Error("Insufficient Usage Credit.") };
+      const availableSubunits = totals.ledgerBalanceSubunits - totals.reservedSubunits;
+      if (availableSubunits < amountSubunits) {
+        return {
+          error: createInsufficientUsageCreditError({
+            availableSubunits,
+            requiredSubunits: amountSubunits,
+          }),
+        };
       }
 
       const reservation: CreditReservation = {
@@ -2129,9 +2136,14 @@ export class UsageAccount {
             this.storage.kv.get(RESERVATION_PREFIX + operationId) !== undefined) {
           return {error: new Error("Operation ID already records a pricing decision.")};
         }
-        if (totals.ledgerBalanceSubunits - totals.reservedSubunits <
-            reservationAmountSubunits) {
-          return {error: new Error("Insufficient Usage Credit.")};
+        const availableSubunits = totals.ledgerBalanceSubunits - totals.reservedSubunits;
+        if (availableSubunits < reservationAmountSubunits) {
+          return {
+            error: createInsufficientUsageCreditError({
+              availableSubunits,
+              requiredSubunits: reservationAmountSubunits,
+            }),
+          };
         }
         const reservation: CreditReservation = {
           operationId,
@@ -2556,8 +2568,14 @@ export class UsageAccount {
       let reservationId: string | null = null;
       if (normalizedSnapshot.pricing === "priced") {
         if (reservationAmountSubunits > 0n) {
-          if (totals.ledgerBalanceSubunits - totals.reservedSubunits < reservationAmountSubunits) {
-            return {error: new Error("Insufficient Usage Credit.")};
+          const availableSubunits = totals.ledgerBalanceSubunits - totals.reservedSubunits;
+          if (availableSubunits < reservationAmountSubunits) {
+            return {
+              error: createInsufficientUsageCreditError({
+                availableSubunits,
+                requiredSubunits: reservationAmountSubunits,
+              }),
+            };
           }
           this.storage.kv.put<CreditReservation>(RESERVATION_PREFIX + operationId, {
             operationId,
