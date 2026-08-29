@@ -180,6 +180,16 @@ which story 34 says they must not.
 Neither finding touches the authority. Balances, reservations, charges, and the Ledger are correct;
 this is display.
 
+### Resolution status
+
+`566b2c9` closes the story 66 half and the story 34 half. Both dollar figures are now
+administrator-only, and the token indicator reads "incomplete history, not billed" in both locales.
+`conversation-history.localization.test.tsx` proves a User does not see the figure, an administrator
+does, and the indicator carries its label.
+
+The story 26 half is still open in #76. It needs the rejection to carry the available balance and
+the required amount across RPC, and a localized message that states both and links to usage details.
+
 ## Method
 
 The test index was built by parsing every `it(` and `test(` name under `packages/`, including
