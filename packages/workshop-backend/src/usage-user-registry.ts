@@ -284,12 +284,16 @@ export class UsageUserRegistry {
         !Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new TypeError("Usage Projection Registry page is invalid.");
     }
+    // `ORDER BY` resolves an output alias before a source column, so aliasing the text as
+    // `sequence` would sort this page by decimal text while `WHERE` and the keyset cursor stay
+    // numeric. The two orders disagree from the tenth principal on, and every row that sorts after
+    // a page's last element but numerically below the cursor is then skipped for good.
     const rows = this.storage.sql.exec<{
-      sequence: string;
+      sequence_text: string;
       registered_user_ref: string;
       user_do_id: string;
     }>(`
-      SELECT CAST(sequence AS TEXT) AS sequence, registered_user_ref, user_do_id FROM (
+      SELECT CAST(sequence AS TEXT) AS sequence_text, registered_user_ref, user_do_id FROM (
         SELECT sequence, registered_user_ref, user_do_id FROM usage_user_registry
         UNION ALL
         SELECT sequence, registered_user_ref, user_do_id
@@ -301,7 +305,7 @@ export class UsageUserRegistry {
     `, (afterSequence ?? 0n).toString(), maximumSequence.toString(), limit + 1).toArray();
     const hasNext = rows.length > limit;
     const page = rows.slice(0, limit).map(row => ({
-      sequence: BigInt(row.sequence),
+      sequence: BigInt(row.sequence_text),
       registeredUserRef: row.registered_user_ref,
       userDoId: row.user_do_id,
     }));

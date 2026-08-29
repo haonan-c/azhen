@@ -13,6 +13,39 @@ const testEnv = env as unknown as {
 };
 
 describe("authoritative Usage User Registry", () => {
+  it("pages every registered Principal exactly once past the tenth sequence", async () => {
+    // The rebuild walks the Registry through this page contract, so a page that sorts by one order
+    // and advances its cursor by another silently rebuilds a deployment without the Users it skips.
+    const registry = testEnv.TEST_ADMIN_SETTINGS.getByName(`registry-paging-${crypto.randomUUID()}`);
+    const registered = 130;
+    for (let index = 0; index < registered; index += 1) {
+      await registry.registerUsageUser({
+        registrationEventId: crypto.randomUUID(),
+        registeredUserRef: crypto.randomUUID(),
+        registeredAt: "2026-08-24T12:00:00.000Z",
+        activatedAt: "2026-08-24T12:00:00.000Z",
+        userDoId: index.toString(16).padStart(64, "a"),
+        identity: `registry-paging-${index}@example.test`,
+        displayName: `Registry Paging ${index}`,
+      });
+    }
+    const revision = await registry.getRegisteredUsageUsersRevision();
+    expect(revision).toBe(BigInt(registered));
+
+    const seen: bigint[] = [];
+    let cursor: bigint | null = null;
+    for (let page = 0; page < registered; page += 1) {
+      const listed = await registry.listUsageProjectionPrincipals(cursor, revision, 100);
+      seen.push(...listed.principals.map(principal => principal.sequence));
+      if (listed.nextSequence === null) break;
+      cursor = listed.nextSequence;
+    }
+
+    expect(seen).toEqual(
+      Array.from({length: registered}, (_value, index) => BigInt(index + 1)),
+    );
+  });
+
   it("rolls back the grant, totals, and outbox together when registration input fails", async () => {
     const id = testEnv.TEST_USER.idFromName(`registry-rollback-${crypto.randomUUID()}`);
     const user = testEnv.TEST_USER.get(id);
