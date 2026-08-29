@@ -15,6 +15,7 @@ import type {
 
 const testState = vi.hoisted(() => ({
   addToast: vi.fn<(toast: unknown) => void>(),
+  isAdmin: false,
 }))
 
 vi.mock('@cloudflare/kumo', async (importOriginal) => ({
@@ -29,6 +30,7 @@ vi.mock('./AuthContext', () => ({
       setPreferredModel: async () => {},
     },
     currentUser: { id: 'user-1', username: 'owner', name: 'Owner' },
+    isAdmin: testState.isAdmin,
   }),
 }))
 
@@ -185,6 +187,17 @@ const messages: AiChatMessage[] = [
   },
 ]
 
+// The chat list renders the AI Gateway cost as a dollar amount. It is deployment cost, so only a
+// deployment administrator may see it.
+function usdCost(value: number): string {
+  return new Intl.NumberFormat('zh', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
+  }).format(value)
+}
+
 describe('localized conversation history', () => {
   let container: HTMLDivElement | undefined
   let root: Root | undefined
@@ -195,6 +208,7 @@ describe('localized conversation history', () => {
     root = undefined
     window.history.replaceState({}, '', '/')
     localStorage.clear()
+    testState.isAdmin = false
     vi.clearAllMocks()
   })
 
@@ -336,7 +350,7 @@ describe('localized conversation history', () => {
     expect(onOpenGadget).toHaveBeenCalledWith(11)
   }, 15_000)
 
-  it('localizes the Chinese conversation list and formats its time and cost', async () => {
+  it('localizes the Chinese conversation list and keeps deployment cost off a User view', async () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const now = new Date()
     const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
@@ -384,12 +398,52 @@ describe('localized conversation history', () => {
     expect(container.textContent).toContain('LIST TITLE VERBATIM')
     expect(container.textContent).toContain('智能体 · AGENT SPAWNER VERBATIM')
     expect(container.textContent).toContain('待处理的更改')
-    expect(container.textContent).toContain(new Intl.NumberFormat('zh', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 4,
-      maximumFractionDigits: 4,
-    }).format(0.1234))
+    expect(container.textContent).not.toContain(usdCost(0.1234))
+  })
+
+  it('shows the deployment cost in the conversation list to an administrator', async () => {
+    testState.isAdmin = true
+    window.history.replaceState({}, '', '/zh/workspace/7')
+    const now = new Date()
+    const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
+    const overseer = {
+      subscribeToChat: () => disposable,
+      subscribeToActions: async (subscriber: ActionsSubscriber) => {
+        subscriber.ready()
+        return disposable
+      },
+      listChats: async () => [{
+        id: 8,
+        title: 'LIST TITLE VERBATIM',
+        started: now,
+        lastActive: now,
+        totalCost: 0.1234,
+      }],
+      listModels: async () => [AGENT],
+      listSlashCommands: async () => [],
+    } as unknown as RpcStub<Overseer>
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(
+      <ChatInterface
+        workspaceId="workspace-8"
+        overseer={overseer}
+        selectedChatId={null}
+        onNavigateToChat={() => {}}
+        pendingConsoleLogCount={0}
+        consoleLogPreview=""
+        consoleLogSeverity="info"
+        onConsumeConsoleLogs={() => ''}
+        onDiscardConsoleLogs={() => {}}
+        onOpenGadget={() => {}}
+        outputOfWorkpiece={() => undefined}
+      />,
+    ))
+
+    expect(container.textContent).toContain('LIST TITLE VERBATIM')
+    expect(container.textContent).toContain(usdCost(0.1234))
   })
 
   it('keeps the complete response, approval, connection, and result journey usable in English', async () => {
@@ -410,6 +464,7 @@ describe('localized conversation history', () => {
         started: AT,
         lastActive: AT,
         hasProposedChanges: true,
+        totalTokens: 1234,
       }],
       listModels: async () => [AGENT],
       listSlashCommands: async () => [],
@@ -459,6 +514,8 @@ describe('localized conversation history', () => {
     expect(container.textContent).toContain(
       'Error: This message came from a retired usage limit. Retry to use the current Usage Credits.',
     )
+    // The token count predates Usage Credits and is not a Usage Record, so it says so.
+    expect(container.textContent).toContain('1,234 tokens · incomplete history, not billed')
     expect(container.textContent).not.toContain('Connect your Cloudflare account')
     expect(container.textContent).not.toContain('Add credits')
     expect(container.textContent).not.toContain('Continue')

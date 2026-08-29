@@ -483,7 +483,7 @@
   "conversation_retry_tooltip": "重试上一个操作。",
   "conversation_switched_model": "已切换到 {name}",
   "conversation_thinking": "思考中",
-  "conversation_tokens": "{count} 个令牌",
+  "conversation_tokens": "{count} 个令牌 · 不完整历史，不计费",
   "conversation_toast_changes_accept_error": "接受更改失败",
   "conversation_toast_changes_accepted": "已接受更改",
   "conversation_toast_changes_discard_error": "放弃更改失败",
