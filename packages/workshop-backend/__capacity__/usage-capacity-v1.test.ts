@@ -1365,6 +1365,35 @@ async function verifyCapacityResult(
     }));
     console.warn(`USAGE_CAPACITY_REBUILD_STATE alarms=${rebuildAlarms} ${
       capacityJson(rebuildMeta)}`);
+    // A subset has two causes that need different fixes: the facts never reached the new
+    // generation, or they reached it and were held. These counts separate the two.
+    const factCounts = await readAcrossProjection<
+        {generation: string; applied: number; rows: number}>(projection, `
+      SELECT generation, applied, COUNT(*) AS rows FROM usage_projection_facts
+      GROUP BY generation, applied
+    `);
+    const rootCounts = await runInDurableObject(projection, (_instance, state) => ({
+      drains: state.storage.sql.exec<{count: number}>(
+        `SELECT COUNT(*) AS count FROM usage_projection_drains`).one().count,
+      rejections: state.storage.sql.exec<{generation: string; rows: number}>(
+        `SELECT generation, COUNT(*) AS rows FROM usage_projection_rejections
+         GROUP BY generation`).toArray(),
+      principals: state.storage.sql.exec<
+        {generation: string; rows: number; max_high_water: string}>(
+        `SELECT generation, COUNT(*) AS rows, MAX(CAST(high_water AS INTEGER)) AS max_high_water
+         FROM usage_projection_principals GROUP BY generation`).toArray(),
+    }));
+    const sampled = [];
+    for (const stub of stubs.slice(0, 3)) {
+      const page = await stub.stub.listUsageProjectionFacts(null, 100);
+      sampled.push({
+        facts: page.facts.length,
+        backfillComplete: page.backfillComplete,
+        next: page.nextSourceSequence?.toString() ?? null,
+      });
+    }
+    console.warn(`USAGE_CAPACITY_REBUILD_SOURCES facts=${capacityJson(factCounts)} root=${
+      capacityJson(rootCounts)} users=${capacityJson(sampled)}`);
     console.warn(`USAGE_CAPACITY_REBUILD_DIFF before=${
       capacityJson(preRebuildMetrics)} after=${capacityJson(overview.metrics)} detail=${
       capacityJson({
