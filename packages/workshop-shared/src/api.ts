@@ -1153,8 +1153,6 @@ export type AdminUsageOverview = {
   metrics: AdminUsageOverviewMetrics | null;
   /** Exact count read from the authoritative User Registry, not the projection. */
   registeredUsers: bigint;
-  /** Capacity telemetry, or null while Projection values are unavailable or unverified. */
-  capacityReview: AdminUsageCapacityReview | null;
   /** Explicit range contract that #63 can later extend with frozen report filters. */
   range: {kind: "all-recorded"; startedAt: string | null};
   /** Active projection generation. */
@@ -1694,6 +1692,20 @@ export type AdminActionReconciliationResult = {
 export interface AdminUsageApi {
   /** Read all-recorded deployment totals and structured projection health. */
   getOverview(): Promise<AdminUsageOverview>;
+
+  /**
+   * Read capacity telemetry for the fixed `usage-capacity-v1` profile.
+   *
+   * This is separate from `getOverview` because its cost is linear in the retained detail rows:
+   * it aggregates a rolling thirty-day window and groups that window by second and by minute for
+   * the aligned peaks. Measured on the production path it is 16 ms at a thousand records and
+   * 2.1 s at two hundred thousand, so leaving it on the overview path made the overview too slow
+   * to poll. The windows it reports are a day and thirty days, so it does not need the overview's
+   * refresh rate. Returns null when the projection is unavailable or its values are not yet
+   * verified, because capacity telemetry is operational guidance and must never delay or hide the
+   * authoritative totals.
+   */
+  getCapacityReview(): Promise<AdminUsageCapacityReview | null>;
 
   /** Read one registered User's balance directly from its authoritative Usage Account. */
   getBalance(registeredUserRef: string): Promise<AdminUsageBalanceState>;

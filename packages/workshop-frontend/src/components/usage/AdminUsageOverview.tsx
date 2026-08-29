@@ -19,6 +19,14 @@ import AdminUsageReportBrowser from "./AdminUsageReportBrowser.js";
 
 /** Administrator Usage Projection refresh interval. */
 export const ADMIN_USAGE_REFRESH_INTERVAL_MS = 30_000;
+/**
+ * Capacity telemetry refreshes far more slowly than the overview.
+ *
+ * Its cost on the server is linear in the retained detail rows, and the windows it reports are a
+ * day and thirty days, so reading it at the overview's rate would be expensive and would tell the
+ * administrator nothing new.
+ */
+export const ADMIN_CAPACITY_REFRESH_INTERVAL_MS = 300_000;
 
 type Props = {
   adminApi: RpcStub<AdminApi>;
@@ -44,6 +52,7 @@ const HEALTH_LABELS: Record<AdminUsageProjectionState, () => string> = {
 export default function AdminUsageOverview({adminApi}: Props) {
   const [usage, setUsage] = useState<UsageCapabilityState | null>(null);
   const [view, setView] = useState<AdminUsageOverviewView | null>(null);
+  const [capacityReview, setCapacityReview] = useState<AdminUsageCapacityReview | null>(null);
   const [error, setError] = useState(false);
   const [capabilityRetry, setCapabilityRetry] = useState(0);
   const requestSequence = useRef(0);
@@ -62,14 +71,26 @@ export default function AdminUsageOverview({adminApi}: Props) {
     }
   }, []);
 
+  const refreshCapacity = useCallback(async (api: RpcStub<AdminUsageApi>) => {
+    try {
+      const next = await api.getCapacityReview();
+      if (!mounted.current) return;
+      setCapacityReview(next);
+    } catch {
+      // Capacity telemetry is operational guidance and must not disturb the overview.
+    }
+  }, []);
+
   useEffect(() => {
     mounted.current = true;
     setUsage(null);
     setView(null);
+    setCapacityReview(null);
     setError(false);
     let disposed = false;
     let stub: RpcStub<AdminUsageApi> | null = null;
     let interval: ReturnType<typeof setInterval> | undefined;
+    let capacityInterval: ReturnType<typeof setInterval> | undefined;
     void (async () => {
       try {
         const api = await adminApi.getUsageApi();
@@ -82,6 +103,9 @@ export default function AdminUsageOverview({adminApi}: Props) {
         await refresh(api);
         if (!disposed) {
           interval = setInterval(() => void refresh(api), ADMIN_USAGE_REFRESH_INTERVAL_MS);
+          void refreshCapacity(api);
+          capacityInterval = setInterval(
+            () => void refreshCapacity(api), ADMIN_CAPACITY_REFRESH_INTERVAL_MS);
         }
       } catch {
         if (!disposed) setError(true);
@@ -92,9 +116,10 @@ export default function AdminUsageOverview({adminApi}: Props) {
       mounted.current = false;
       requestSequence.current += 1;
       if (interval !== undefined) clearInterval(interval);
+      if (capacityInterval !== undefined) clearInterval(capacityInterval);
       stub?.[Symbol.dispose]();
     };
-  }, [adminApi, capabilityRetry, refresh]);
+  }, [adminApi, capabilityRetry, refresh, refreshCapacity]);
 
   if (view === null && !error) {
     return <p role="status" className="text-sm text-kumo-subtle">{messages.admin_usage_loading()}</p>;
@@ -191,7 +216,7 @@ export default function AdminUsageOverview({adminApi}: Props) {
         <MetricCard label={messages.admin_usage_unpriced()}
           value={`${formatInteger(metrics.unpricedModelUses)} / ${formatInteger(metrics.unpricedApiOperations)}`} />
       </div>
-      {view.capacityReview && <CapacityReview review={view.capacityReview} />}
+      {capacityReview && <CapacityReview review={capacityReview} />}
       {usage && typeof usage.api.openReport === "function" && (
         <AdminUsageReportBrowser api={usage.api} />
       )}

@@ -557,7 +557,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     return {
       metrics,
       registeredUsers: 0n,
-      capacityReview: null,
       range: {kind: "all-recorded", startedAt: totals.started_at},
       generation: BigInt(meta.active_generation),
       ingestionWatermark: BigInt(meta.ingestion_watermark),
@@ -566,19 +565,21 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
   }
 
-  /** Read core overview and independently-failing capacity telemetry from one generation. */
-  async readAdminOverview(registeredUsers: bigint): Promise<AdminUsageOverview> {
-    const overview = this.readOverview();
-    if (overview.health.state !== "healthy") {
-      return {...overview, registeredUsers, capacityReview: null};
-    }
-    let capacityReview: AdminUsageCapacityReview | null = null;
-    try {
-      capacityReview = await this.readCapacityReview(registeredUsers);
-    } catch {
-      // Capacity telemetry is operational guidance. It must not hide authoritative core totals.
-    }
-    return {...overview, registeredUsers, capacityReview};
+  /** Read core overview totals for one generation against the authoritative registered count. */
+  readAdminOverview(registeredUsers: bigint): AdminUsageOverview {
+    return {...this.readOverview(), registeredUsers};
+  }
+
+  /**
+   * Read capacity telemetry, or null while the projection's values are not yet trustworthy.
+   *
+   * Capacity telemetry is operational guidance, so an unhealthy projection reports nothing rather
+   * than a number read from a generation that is still catching up.
+   */
+  async readAdminCapacityReview(
+      registeredUsers: bigint): Promise<AdminUsageCapacityReview | null> {
+    if (this.readHealth().state !== "healthy") return null;
+    return this.readCapacityReview(registeredUsers);
   }
 
   /**

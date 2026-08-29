@@ -1049,6 +1049,11 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
     }).toBe(BigInt(preseedExpected));
 
     const samples: CapacitySample[] = [];
+    const tickCommitMs: number[] = [];
+    let projectionPolls = 0;
+    let projectionPollMs = 0;
+    let adminPolls = 0;
+    let adminPollMs = 0;
     const pending: Promise<void>[] = [];
     let visibilityChain = Promise.resolve();
     let offeredAfterPreseed = 0;
@@ -1095,17 +1100,31 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
         });
         const committed = Promise.all(batch);
         pending.push(committed.then(() => undefined));
+        // The loop waits for its own batch, so this is how long the deployment took to commit one
+        // second's offered records. A flat cost is a throughput ceiling; a rising one is table
+        // growth. The arrival delay is the running total of whatever this exceeds one tick by.
+        const commitStartedAt = performance.now();
         await committed;
+        tickCommitMs.push(performance.now() - commitStartedAt);
         offeredAfterPreseed += users.length;
         const expectedVisible = BigInt(preseedExpected + offeredAfterPreseed);
         visibilityChain = visibilityChain.then(async () => {
           await committed;
-          while ((await projection.readOverview()).metrics.meteredUseCount < expectedVisible) {
+          while (true) {
+            const polledAt = performance.now();
+            const seen = (await projection.readOverview()).metrics.meteredUseCount;
+            projectionPollMs += performance.now() - polledAt;
+            projectionPolls += 1;
+            if (seen >= expectedVisible) break;
             await new Promise(resolve => setTimeout(resolve, 50));
           }
           sample.projectionVisibleLatencyMs = performance.now() - arrivedAt;
-          while (((await visibilityApi.getOverview()).metrics?.meteredUseCount ?? 0n) <
-            expectedVisible) {
+          while (true) {
+            const polledAt = performance.now();
+            const seen = (await visibilityApi.getOverview()).metrics?.meteredUseCount ?? 0n;
+            adminPollMs += performance.now() - polledAt;
+            adminPolls += 1;
+            if (seen >= expectedVisible) break;
             await new Promise(resolve => setTimeout(resolve, 50));
           }
           sample.adminVisibleLatencyMs = performance.now() - arrivedAt;
@@ -1123,6 +1142,17 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
     const loadStoppedAt = performance.now();
     await Promise.all(pending);
     await visibilityChain;
+    // The tick loop waits for its own batch, so this is what the deployment took to commit one
+    // second's offered records. Flat across the run is a throughput ceiling; rising is table
+    // growth. The poll totals say how much of the same capacity the visibility probes consumed.
+    const commitTrend = [0, 1, 2, 3].map(quarter => {
+      const size = Math.floor(tickCommitMs.length / 4);
+      const slice = tickCommitMs.slice(quarter * size, (quarter + 1) * size);
+      return Math.round(slice.reduce((sum, value) => sum + value, 0) / Math.max(slice.length, 1));
+    });
+    console.warn(`USAGE_CAPACITY_TICK_COST meanMsByQuarter=${JSON.stringify(commitTrend)} polls=${
+      JSON.stringify({projectionPolls, projectionPollMs: Math.round(projectionPollMs),
+        adminPolls, adminPollMs: Math.round(adminPollMs)})}`);
     await expect.poll(async () => {
       const current = await projection.readOverview();
       return current.health.pendingEventCount === 0n &&
@@ -1262,6 +1292,21 @@ async function verifyCapacityResult(
     adminOverviewVisibility: summarizeLatency(samples.map(sample =>
       sample.adminVisibleLatencyMs ?? Number.POSITIVE_INFINITY)),
   };
+  // The arrival delay says how late this harness fired its own tick. A single stall and a loop
+  // that never catches up both show up in `maxMs`, and they mean different things, so the shape is
+  // reported before it is asserted: the worst ticks with their phase and index, and how many ticks
+  // were late at all.
+  const lateTicks = samples
+      .map((sample, index) => ({
+        index,
+        phase: sample.phase,
+        delayMs: Math.round(sample.arrivalDelayMs),
+      }))
+      .filter(tick => tick.delayMs > selected.tickMilliseconds);
+  console.warn(`USAGE_CAPACITY_ARRIVAL ticks=${samples.length} late=${lateTicks.length} ${
+    JSON.stringify(latency.arrival)} worst=${JSON.stringify(
+    lateTicks.toSorted((left, right) => right.delayMs - left.delayMs).slice(0, 8))} first=${
+    JSON.stringify(lateTicks.slice(0, 5))}`);
   expect(latency.arrival.maxMs).toBeLessThanOrEqual(selected.tickMilliseconds);
   expect(latency.authoritativeWarm.p95Ms).toBeLessThanOrEqual(2_000);
   expect(latency.authoritativeWarm.p99Ms).toBeLessThanOrEqual(5_000);

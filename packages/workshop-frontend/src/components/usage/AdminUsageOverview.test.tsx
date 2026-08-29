@@ -3,7 +3,11 @@
 
 import {act} from "react";
 import {createRoot, type Root} from "react-dom/client";
-import type {AdminApi, AdminUsageOverview} from "@gadgets/workshop-shared/api";
+import type {
+  AdminApi,
+  AdminUsageCapacityReview,
+  AdminUsageOverview,
+} from "@gadgets/workshop-shared/api";
 import type {RpcStub} from "capnweb";
 import {afterEach, describe, expect, it, vi} from "vitest";
 import AdminUsageOverviewPanel from "./AdminUsageOverview.js";
@@ -27,62 +31,6 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
       unpricedApiOperations: 8n,
     },
     registeredUsers: 10n,
-    capacityReview: {
-      profileId: "usage-capacity-v1",
-      registeredUsers: {
-        current: 7_000n,
-        target: 10_000n,
-        reviewThreshold: 7_000n,
-        reviewRequired: true,
-        window: {kind: "authoritative-current"},
-        asOf: "2026-08-24T12:00:02.000Z",
-      },
-      dailyActiveUsers: {
-        current: 699n,
-        target: 1_000n,
-        reviewThreshold: 700n,
-        reviewRequired: false,
-        window: {
-          kind: "utc-day",
-          startedAt: "2026-08-24T00:00:00.000Z",
-        },
-        asOf: "2026-08-24T12:00:02.000Z",
-      },
-      rollingThirtyDayRecords: {
-        current: 700_000n,
-        target: 1_000_000n,
-        reviewThreshold: 700_000n,
-        reviewRequired: true,
-        window: {
-          kind: "rolling-thirty-days",
-          startedAt: "2026-07-25T12:00:02.000Z",
-        },
-        asOf: "2026-08-24T12:00:02.000Z",
-      },
-      alignedOneSecondPeakRecords: {
-        current: 14n,
-        target: 20n,
-        reviewThreshold: 14n,
-        reviewRequired: true,
-        window: {
-          kind: "rolling-thirty-days",
-          startedAt: "2026-07-25T12:00:02.000Z",
-        },
-        asOf: "2026-08-24T12:00:02.000Z",
-      },
-      alignedSixtySecondPeakRecords: {
-        current: 840n,
-        target: 1_200n,
-        reviewThreshold: 840n,
-        reviewRequired: true,
-        window: {
-          kind: "rolling-thirty-days",
-          startedAt: "2026-07-25T12:00:02.000Z",
-        },
-        asOf: "2026-08-24T12:00:02.000Z",
-      },
-      reviewRequired: true,
-    },
     range: {kind: "all-recorded", startedAt: "2026-08-24T12:00:00.000Z"},
     generation: 2n,
     ingestionWatermark: 20n,
@@ -106,6 +54,63 @@ function overview(overrides: Partial<AdminUsageOverview> = {}): AdminUsageOvervi
   };
 }
 
+const CAPACITY_REVIEW: AdminUsageCapacityReview = {
+    profileId: "usage-capacity-v1",
+    registeredUsers: {
+      current: 7_000n,
+      target: 10_000n,
+      reviewThreshold: 7_000n,
+      reviewRequired: true,
+      window: {kind: "authoritative-current"},
+      asOf: "2026-08-24T12:00:02.000Z",
+    },
+    dailyActiveUsers: {
+      current: 699n,
+      target: 1_000n,
+      reviewThreshold: 700n,
+      reviewRequired: false,
+      window: {
+        kind: "utc-day",
+        startedAt: "2026-08-24T00:00:00.000Z",
+      },
+      asOf: "2026-08-24T12:00:02.000Z",
+    },
+    rollingThirtyDayRecords: {
+      current: 700_000n,
+      target: 1_000_000n,
+      reviewThreshold: 700_000n,
+      reviewRequired: true,
+      window: {
+        kind: "rolling-thirty-days",
+        startedAt: "2026-07-25T12:00:02.000Z",
+      },
+      asOf: "2026-08-24T12:00:02.000Z",
+    },
+    alignedOneSecondPeakRecords: {
+      current: 14n,
+      target: 20n,
+      reviewThreshold: 14n,
+      reviewRequired: true,
+      window: {
+        kind: "rolling-thirty-days",
+        startedAt: "2026-07-25T12:00:02.000Z",
+      },
+      asOf: "2026-08-24T12:00:02.000Z",
+    },
+    alignedSixtySecondPeakRecords: {
+      current: 840n,
+      target: 1_200n,
+      reviewThreshold: 840n,
+      reviewRequired: true,
+      window: {
+        kind: "rolling-thirty-days",
+        startedAt: "2026-07-25T12:00:02.000Z",
+      },
+      asOf: "2026-08-24T12:00:02.000Z",
+    },
+    reviewRequired: true,
+};
+
 describe("administrator Usage and Credits overview", () => {
   let root: Root | undefined;
   let container: HTMLDivElement | undefined;
@@ -122,6 +127,8 @@ describe("administrator Usage and Credits overview", () => {
     const dispose = vi.fn<() => void>();
     const usage = {
       getOverview: vi.fn<() => Promise<AdminUsageOverview>>().mockResolvedValue(view),
+      getCapacityReview: vi.fn<() => Promise<AdminUsageCapacityReview | null>>()
+          .mockResolvedValue(CAPACITY_REVIEW),
       [Symbol.dispose]: dispose,
     };
     const admin = {
@@ -320,9 +327,13 @@ describe("administrator Usage and Credits overview", () => {
 
   it("ignores a late poll response and keeps the newest overview", async () => {
     let poll: (() => void) | undefined;
+    // The panel arms two intervals: the overview poll and the much slower capacity poll. This
+    // test drives the overview poll, which is the one armed first.
+    const armed: (() => void)[] = [];
     vi.spyOn(globalThis, "setInterval").mockImplementation((handler) => {
-      poll = handler as () => void;
-      return 1 as unknown as ReturnType<typeof setInterval>;
+      armed.push(handler as () => void);
+      poll ??= armed[0];
+      return armed.length as unknown as ReturnType<typeof setInterval>;
     });
     let resolveOlder!: (value: AdminUsageOverview) => void;
     let resolveNewer!: (value: AdminUsageOverview) => void;
@@ -334,6 +345,8 @@ describe("administrator Usage and Credits overview", () => {
         .mockResolvedValueOnce(overview({registeredUsers: 1n}))
         .mockReturnValueOnce(older)
         .mockReturnValueOnce(newer),
+      getCapacityReview: vi.fn<() => Promise<AdminUsageCapacityReview | null>>()
+          .mockResolvedValue(null),
       [Symbol.dispose]: dispose,
     };
     const admin = {

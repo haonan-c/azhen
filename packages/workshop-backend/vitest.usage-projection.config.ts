@@ -25,5 +25,12 @@ export default defineConfig({
     include: ["__tests__/usage-projection.test.ts"],
     fileParallelism: false,
     setupFiles: ["../../test-setup/assert-workerd.ts"],
+    // The capacity-review fail-soft test drops the table the review reads, and asserts the read
+    // rejects so the administrator path is the one that softens it. All other errors stay
+    // fail-closed.
+    onUnhandledError(error) {
+      if (error.message ===
+        "no such table: usage_projection_capacity_review_state: SQLITE_ERROR") return false;
+    },
   },
 });

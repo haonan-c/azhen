@@ -214,9 +214,11 @@ describe("deployment Usage Projection", () => {
       await runInDurableObject(projection, (_instance, state) => {
         state.storage.sql.exec("DROP TABLE usage_projection_capacity_review_state");
       });
-      const failSoft = await projection.readAdminOverview(7_000n);
-      expect(failSoft.metrics?.meteredUseCount).toBe(4n);
-      expect(failSoft.capacityReview).toBeNull();
+      // Capacity telemetry is read on its own path now, so losing its state must not disturb the
+      // authoritative totals the overview reports.
+      const failSoft = projection.readAdminOverview(7_000n);
+      expect((await failSoft).metrics?.meteredUseCount).toBe(4n);
+      await expect(projection.readAdminCapacityReview(7_000n)).rejects.toThrow();
 
       await expect(runInDurableObject(projection, (_instance, state) => {
         state.abort("restart capacity Projection");
@@ -230,9 +232,9 @@ describe("deployment Usage Projection", () => {
       const first = fact({usagePrincipalRef: principal, sourceSequence: 1n});
       const second = fact({usagePrincipalRef: principal, sourceSequence: 2n});
       await gapProjection.ingest([second]);
-      expect((await gapProjection.readAdminOverview(7_000n)).capacityReview).toBeNull();
+      expect(await gapProjection.readAdminCapacityReview(7_000n)).toBeNull();
       await gapProjection.ingest([first]);
-      expect((await gapProjection.readAdminOverview(7_000n)).capacityReview).not.toBeNull();
+      expect(await gapProjection.readAdminCapacityReview(7_000n)).not.toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -2658,7 +2660,6 @@ describe("deployment Usage Projection", () => {
         readAdminOverview: async (registeredUsers: bigint) => ({
           ...projected,
           registeredUsers,
-          capacityReview: null,
         }),
       }),
     } as unknown as DurableObjectNamespace<UsageProjection>;

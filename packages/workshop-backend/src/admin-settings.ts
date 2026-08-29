@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUnknownUsageReconciliationRequest, type AdminUnknownUsageReconciliationResult, type AdminUsageBalanceState, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AdminUsageApi, AdminUsageDeductRequest, AdminUsageGrantRequest, AdminUsageOperationResult, AdminUsageReconcileRequest, AdminUsageReverseRequest, AdminUsageUserSearchRequest, AdminUsageUserSearchResult, AiChatAuthorInfo, AiGatewayInfo, AiModelConfig, AiModelProvider, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, DeploymentModelCatalog, GatekeeperChargeSnapshot, InitialGrantSnapshot, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, ModelChargeSnapshot, UsageRateAdminView, UsageRateChange, isAmbientGatekeeperMode, isBannerColor, isHexColor, type AdminActionReconciliationRequest, type AdminActionReconciliationResult, type AdminUnknownUsageReconciliationRequest, type AdminUnknownUsageReconciliationResult, type AdminUsageBalanceState, type AdminUsageCapacityReview, type AdminUsageDeleteUserRequest, type AdminUsageDeleteUserResult, type AdminUsageOverview, type AdminUsageRecordPageRequest, type ProjectionRebuildStatus, type UserUsageRecordPage } from '@gadgets/workshop-shared/api';
 import { GatekeeperVendor } from '@gadgets/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcStub, RpcTarget } from 'capnweb';
@@ -1166,7 +1166,6 @@ function unavailableUsageOverview(registeredUsers: bigint, asOf: string): AdminU
   return {
     metrics: null,
     registeredUsers,
-    capacityReview: null,
     range: {kind: "all-recorded", startedAt: null},
     generation: 0n,
     ingestionWatermark: 0n,
@@ -1631,17 +1630,30 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
       const projection = this.projection.getByName("");
       const bootstrapComplete = await projection.ensureBootstrap();
       const overview = await projection.readAdminOverview(registeredUsers);
-      const merged = mergeProjectionDeliveryHealth({
+      return mergeProjectionDeliveryHealth({
         ...overview,
         metrics: bootstrapComplete ? overview.metrics : null,
         registeredUsers,
-        capacityReview: bootstrapComplete ? overview.capacityReview : null,
       }, deliveryHealth);
-      return merged.health.state === "healthy"
-        ? merged : {...merged, capacityReview: null};
     } catch {
       return mergeProjectionDeliveryHealth(
         unavailableUsageOverview(registeredUsers, asOf), deliveryHealth);
+    }
+  }
+
+  async getCapacityReview(): Promise<AdminUsageCapacityReview | null> {
+    await assertAdminCapabilityActive(this.users, this.adminUserId);
+    if (!this.projection) return null;
+    // Capacity telemetry is operational guidance, so it reports nothing rather than failing the
+    // administrator's read. Its cost is linear in the retained detail rows, which is why it is
+    // not on the overview path; see `AdminUsageApi.getCapacityReview`.
+    try {
+      const projection = this.projection.getByName("");
+      if (!await projection.ensureBootstrap()) return null;
+      const registeredUsers = await this.admin.countRegisteredUsageUsers();
+      return await projection.readAdminCapacityReview(registeredUsers);
+    } catch {
+      return null;
     }
   }
 
