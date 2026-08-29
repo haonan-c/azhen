@@ -299,9 +299,35 @@ because none used more than nine principals.
 The commit cost of the run that cleared the rebuild gate is the best measured: quarter means of
 193 / 182 / 187 / 183 ms and a slowest tick of 401 ms.
 
-The report filter gate is the first gate no run had reached. Which of the twelve filters missed it is
-not yet known, because the assertion fires inside the per-filter loop; the test now names the filter
-and keeps its samples.
+## The administrator report gate the rebuild fix exposed
+
+The first of the twelve filters is the one that misses. Measured on the narrowed profile:
+
+```text
+USAGE_CAPACITY_REPORT_QUERY name=all rows=40000 p95=7865 p99=7896 min=7106 max=7896
+```
+
+An unfiltered report overview over 40,000 records takes about 7.5 seconds, and the spread from 7,106
+to 7,896 ms across thirty samples says this is the cost of the work rather than a spike.
+
+`readReportMetrics` pages the matching aggregate rows at
+`USAGE_PROJECTION_REPORT_PAGE_MAX` = 256 and sums nineteen `BigInt` fields per row in JavaScript,
+and each page is a fan-out read across every UTC month object. Forty thousand rows is about 157
+pages, or 48 ms a page. The cost is linear in matching rows, so the first-release target of one
+million Usage Records projects to roughly 190 seconds against a 2,000 ms gate, and against the one
+minute User Story 48 states for overview aggregates.
+
+The exactness constraint is why the summation is in JavaScript: these totals are TEXT-encoded
+bigints that exceed `Number` range by design, and `usage-rates.test.ts` and
+`usage-summary-facts.test.ts` both pin values above it, so a plain SQL `SUM` would not be safe for
+every field.
+
+The bounded change that fits the existing architecture is to let each month object sum its own
+matching rows and return one partial total, the way `readCapacityWindow` already does, so the root
+combines a handful of partial sums instead of paging thousands of times across objects. That keeps
+the arithmetic exact and in JavaScript while removing the per-page fan-out. It has not been
+attempted, and whether one month object can scan its share of a million rows inside one request is
+the question that decides it.
 
 ## Full-run evaluation
 
