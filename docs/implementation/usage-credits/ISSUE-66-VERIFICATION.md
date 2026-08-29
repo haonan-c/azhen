@@ -253,6 +253,56 @@ User facts. It is not a regression from the sharding; it is a gate that no run h
 The comparison was between two SHA-256 digests, which said that a total moved without saying which
 one, so the test now reports both metric objects before it asserts.
 
+## The Registry page defect this verification found
+
+The rebuild gate, reached for the first time once sustained ingest passed, failed: the reported
+totals after a rebuild were a twentieth of the totals before it, and every metric fell by the same
+ratio. Instrumentation narrowed it to two of forty Usage Principals reaching the new generation,
+while the Registry walk reported all 9,103 Users processed, the source Users still held their facts,
+and there were no rejections and no drains. Four readings of the code were wrong before a two-minute
+focused reproduction found it; a thirty-six minute capacity run is the wrong instrument for a
+question that can be asked directly.
+
+`UsageUserRegistry.listProjectionPrincipals` selected `CAST(sequence AS TEXT) AS sequence` and then
+ordered by `sequence`. SQLite resolves `ORDER BY` against an output alias before a source column, so
+the page sorted by decimal text while its `WHERE` clause and the caller's keyset cursor stayed
+numeric. The two orders agree only up to nine principals. Measured at 130 registered principals:
+
+```text
+page 0: size=100 cursor=null first=1   last=71  next=71
+page 1: size=59  cursor=71   first=100 last=99  next=null
+```
+
+The first page ends at sequence 71 because 71 is the hundredth entry in decimal-text order. The
+cursor then advances to 71 numerically, so the second page returns 72 through 130. Sequences 8 and 9
+are returned by no page at all, and 29 principals are returned twice.
+
+Every consumer of that contract inherits the skip. A rebuild walks the Registry through it, so it
+rebuilt a deployment without the Users it skipped and reported itself complete. So does the
+bootstrap: before the fix the capacity profile bootstrapped 9,103 of its 10,000 registered Users and
+called that done; after the fix it bootstraps 10,000.
+
+The fix aliases the text as `sequence_text` so `ORDER BY` stays on the integer column.
+`usage-user-registry.test.ts` gains a regression test that registers 130 principals and asserts every
+sequence is paged exactly once; without the fix it fails with the decimal-text order and 159 entries,
+the same 159 the capacity profile reported as `rebuild_users_processed`. No existing test caught this
+because none used more than nine principals.
+
+## Gate progress after the Registry fix
+
+| Gate | Before | After |
+| --- | --- | --- |
+| Sustained ingest, 20 records a second for 1,020 ticks | reached | 0 late, max arrival 383 ms |
+| Rebuild reproduces the reported totals | 1/20 of them | passes |
+| Administrator report filter latency | never reached | fails, p95 7,866 ms against 2,000 ms |
+
+The commit cost of the run that cleared the rebuild gate is the best measured: quarter means of
+193 / 182 / 187 / 183 ms and a slowest tick of 401 ms.
+
+The report filter gate is the first gate no run had reached. Which of the twelve filters missed it is
+not yet known, because the assertion fires inside the per-filter loop; the test now names the filter
+and keeps its samples.
+
 ## Full-run evaluation
 
 Pending: parse the formal JSON artifact, report p50/p95/p99/max/sample/error counts, exact source
