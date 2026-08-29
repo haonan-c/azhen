@@ -196,6 +196,44 @@ What the three fixes do establish: the profile now reaches steady-state seeding 
 stage passing, and both formal Cap'n Web steps pass on this branch (20 passed, 4 skipped, then 31
 passed).
 
+## What the reduced profile now proves, and the gate it reached
+
+The `reduced` profile keeps every shape of the full profile and lowers only how many Users are
+active, so it exercises the same paths at a size one workerd process finishes.
+
+**The sustained-ingest gate passes.** The run of 2026-08-29 offered 20 records a second for 1,020
+aligned ticks and was never late:
+
+| Measure | Result | Gate |
+| --- | ---: | ---: |
+| Late ticks | 0 of 1,020 | -- |
+| Arrival delay p50 / p95 / p99 / max | 97 / 584 / 698 / 806 ms | max <= 1,000 ms |
+| Commit cost by quarter | 234 / 288 / 729 / 713 ms | -- |
+| Slowest tick | 1,265 ms at tick 502 | -- |
+| Errors | 0 | 0 |
+
+The earlier run of the same profile reported 638 late ticks and a maximum arrival delay of
+21,497,282 ms, with a mean of 84,930 ms a tick through its second quarter. The only commit between
+the two runs adds a `console.warn` after the loop, so the tick path is identical and the stall did
+not reproduce. The slowest-tick report is what distinguishes the two: a stall shows as a contiguous
+run of slow ticks, and this run's fifteen slowest are spread from tick 502 to tick 994 and span only
+1,265 ms down to 890 ms. The stall is recorded as an environment event, not as a property of this
+code, because nothing here reproduces it.
+
+**A later gate now fails.** Every earlier run stopped at the arrival-delay assertion, so the rebuild
+gate had never been reached. It is reached now, and the reported totals before and after a rebuild
+do not match:
+
+```text
+verifyCapacityResult __capacity__/usage-capacity-v1.test.ts:1342
+expect(postRebuildMetricsDigest).toBe(preRebuildMetricsDigest)
+```
+
+This is the check behind User Story 50, that the deployment projection is rebuilt from authoritative
+User facts. It is not a regression from the sharding; it is a gate that no run had reached before.
+The comparison was between two SHA-256 digests, which said that a total moved without saying which
+one, so the test now reports both metric objects before it asserts.
+
 ## Full-run evaluation
 
 Pending: parse the formal JSON artifact, report p50/p95/p99/max/sample/error counts, exact source
