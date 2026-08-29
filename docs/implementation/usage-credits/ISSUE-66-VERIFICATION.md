@@ -214,11 +214,30 @@ aligned ticks and was never late:
 
 The earlier run of the same profile reported 638 late ticks and a maximum arrival delay of
 21,497,282 ms, with a mean of 84,930 ms a tick through its second quarter. The only commit between
-the two runs adds a `console.warn` after the loop, so the tick path is identical and the stall did
-not reproduce. The slowest-tick report is what distinguishes the two: a stall shows as a contiguous
-run of slow ticks, and this run's fifteen slowest are spread from tick 502 to tick 994 and span only
-1,265 ms down to 890 ms. The stall is recorded as an environment event, not as a property of this
-code, because nothing here reproduces it.
+the two runs adds a `console.warn` after the loop, so the tick path is identical.
+
+**A maintenance burst is real, and the gate is close to it.** Five runs of this profile at two
+sizes now exist, and the slowest-tick report separates them by shape rather than by maximum:
+
+| Run | Active Users | Late ticks | Max arrival | Slowest fifteen |
+| --- | ---: | ---: | ---: | --- |
+| reduced #5 | 200 | 638 | 21,497,282 ms | not reported |
+| reduced #6 | 200 | 0 | 806 ms | spread, 1,265 to 890 ms |
+| narrowed #1 | 40 | 0 | 317 ms | -- |
+| narrowed #2 | 40 | 0 | 367 ms | -- |
+| narrowed #3 | 40 | 1 | 1,132 ms | **contiguous, ticks 124 to 139** |
+
+The narrowed run that failed is the informative one. Its quarter means are 249 / 185 / 184 / 183 ms,
+far under the 1,000 ms budget, and its fifteen slowest ticks are the *consecutive* block 124 to 139,
+each between 838 and 1,261 ms. One localized burst of about sixteen seconds early in the measured
+phase, not a throughput ceiling. The single late tick, index 133, sits inside it.
+
+So the profile is not comfortably inside its arrival gate: one maintenance burst is enough to cross
+a 1,000 ms maximum. Whatever runs once over the preseeded rows early in the measured phase --
+month compaction, detail retention, or the identity prune are the candidates -- is worth measuring
+before this gate is called met. The 21,497,282 ms outlier of reduced #5 is twenty thousand times
+larger than anything since and is still treated as an environment event; the sixteen-second burst
+is not.
 
 **A later gate now fails.** Every earlier run stopped at the arrival-delay assertion, so the rebuild
 gate had never been reached. It is reached now, and the reported totals before and after a rebuild
