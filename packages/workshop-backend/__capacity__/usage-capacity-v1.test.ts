@@ -836,6 +836,11 @@ async function measureReportWorkload(
     }
     const p95Ms = percentile(samplesMs, 0.95);
     const p99Ms = percentile(samplesMs, 0.99);
+    // The gate fires inside the loop, so a failure would otherwise name no filter and keep no
+    // samples. One run of this profile costs an hour.
+    console.warn(`USAGE_CAPACITY_REPORT_QUERY name=${name} rows=${
+      expectedMeteredUses} p95=${Math.round(p95Ms)} p99=${Math.round(p99Ms)} min=${
+      Math.round(Math.min(...samplesMs))} max=${Math.round(Math.max(...samplesMs))}`);
     expect(p95Ms).toBeLessThanOrEqual(2_000);
     expect(p99Ms).toBeLessThanOrEqual(5_000);
     querySamples.push({
