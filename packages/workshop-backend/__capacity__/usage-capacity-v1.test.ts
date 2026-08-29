@@ -1153,6 +1153,14 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
     console.warn(`USAGE_CAPACITY_TICK_COST meanMsByQuarter=${JSON.stringify(commitTrend)} polls=${
       JSON.stringify({projectionPolls, projectionPollMs: Math.round(projectionPollMs),
         adminPolls, adminPollMs: Math.round(adminPollMs)})}`);
+    // A quarter mean hides where the cost went. One contiguous run of slow ticks is a single
+    // event the deployment stalled on; ticks spread evenly apart are periodic maintenance.
+    const slowestTicks = tickCommitMs
+      .map((milliseconds, tick) => ({tick, ms: Math.round(milliseconds)}))
+      .sort((left, right) => right.ms - left.ms)
+      .slice(0, 15);
+    console.warn(`USAGE_CAPACITY_SLOWEST_TICKS ticks=${tickCommitMs.length} ${
+      JSON.stringify(slowestTicks)}`);
     await expect.poll(async () => {
       const current = await projection.readOverview();
       return current.health.pendingEventCount === 0n &&
