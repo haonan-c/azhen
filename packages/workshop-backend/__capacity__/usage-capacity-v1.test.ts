@@ -1347,6 +1347,24 @@ async function verifyCapacityResult(
   // one run of this profile costs hours, so the fields are reported before they are asserted.
   if (postRebuildMetricsDigest !== preRebuildMetricsDigest ||
       postRebuildDetail.digest !== preRebuildDetail.digest) {
+    // Which totals moved says the rebuild applied a subset. This says how much of the Registry it
+    // walked before it declared itself complete, which is where a subset comes from.
+    const rebuildMeta = await runInDurableObject(projection, (_instance, state) => ({
+      meta: state.storage.sql.exec(`
+        SELECT rebuild_state, rebuild_users_processed, rebuild_registry_complete,
+               rebuild_registry_cursor, rebuild_registry_revision, rebuild_authority_complete,
+               active_generation, rebuild_generation
+        FROM usage_projection_meta WHERE singleton = 1
+      `).one(),
+      queued: state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_rebuild_users
+      `).one().count,
+      principals: state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_active_users
+      `).one().count,
+    }));
+    console.warn(`USAGE_CAPACITY_REBUILD_STATE alarms=${rebuildAlarms} ${
+      capacityJson(rebuildMeta)}`);
     console.warn(`USAGE_CAPACITY_REBUILD_DIFF before=${
       capacityJson(preRebuildMetrics)} after=${capacityJson(overview.metrics)} detail=${
       capacityJson({
