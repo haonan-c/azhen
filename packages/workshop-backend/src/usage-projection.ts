@@ -924,7 +924,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
     const active = new Set<string>();
     for (const month of this.#reportMonths(query, undefined)) {
-      const partial = await this.#monthStub(month).readReportMetrics(query);
+      const result = await this.#monthStub(month).readReportMetrics(
+        query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX);
+      const partial = result.metrics;
       totals.providerCostUsdSubunits += partial.providerCostUsdSubunits;
       totals.chargedUsageCreditSubunits += partial.chargedUsageCreditSubunits;
       totals.cacheHitInputTokens += partial.cacheHitInputTokens;
@@ -943,10 +945,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       totals.unreservedAttempts += partial.unreservedAttempts;
       totals.unpricedModelUses += partial.unpricedModelUses;
       totals.unpricedApiOperations += partial.unpricedApiOperations;
-      for (const principal of await this.#monthStub(month)
-          .listActivePrincipals(query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX)) {
-        active.add(principal);
-      }
+      for (const principal of result.activePrincipals) active.add(principal);
     }
     totals.activeUsers = BigInt(active.size);
     return totals;

@@ -114,9 +114,18 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
     return readUsageProjectionReportRows(this.ctx.storage.sql, query, cursor, limit, rowKind);
   }
 
-  /** Read this month's exact filtered Usage Summary Fact totals in one local scan. */
-  readReportMetrics(query: FrozenUsageReportQuery): AdminUsageReportRowMetrics {
-    const predicate = buildUsageReportPredicate(query, "aggregate");
+  /** Read this month's exact filtered metrics and active Principals in one local scan. */
+  readReportMetrics(
+      query: FrozenUsageReportQuery,
+      principalLimit: number): {
+        metrics: AdminUsageReportRowMetrics;
+        activePrincipals: string[];
+      } {
+    if (!Number.isSafeInteger(principalLimit) || principalLimit < 1 ||
+        principalLimit > USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX) {
+      throw new TypeError("Usage Projection month principal limit is invalid.");
+    }
+    const predicate = buildUsageReportPredicate(query, "aggregate-revisions");
     const totals: AdminUsageReportRowMetrics = {
       providerCostUsdSubunits: 0n,
       chargedUsageCreditSubunits: 0n,
@@ -156,16 +165,34 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       unreserved_attempts: string;
       unpriced_model_uses: string;
       unpriced_api_operations: string;
+      principal_ref: string;
+      active_user_contribution: string;
     }>(`
+      -- A Summary identity fixes every report dimension, so report filters can run before ranking.
+      -- Decimal bigint text sorts exactly by length and then lexicographically.
+      WITH ranked AS (
+        SELECT provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+          metered_use_count, pre_execution_failures, unknown_operations, metering_attempts,
+          held_reservations, released_reservations, settled_reservations, unreserved_attempts,
+          unpriced_model_uses, unpriced_api_operations, principal_ref, active_user_contribution,
+          ROW_NUMBER() OVER (
+            PARTITION BY summary_fact_id
+            ORDER BY length(summary_revision) DESC, summary_revision DESC,
+              length(applied_watermark), applied_watermark
+          ) AS effective_rank
+        FROM usage_projection_facts AS facts${predicate.indexName === null
+          ? "" : ` INDEXED BY ${predicate.indexName}`}
+        WHERE ${predicate.sql}
+      )
       SELECT provider_cost, charged_credits, cache_hit_input, cache_miss_input,
         cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
         metered_use_count, pre_execution_failures, unknown_operations, metering_attempts,
         held_reservations, released_reservations, settled_reservations, unreserved_attempts,
-        unpriced_model_uses, unpriced_api_operations
-      FROM usage_projection_facts AS facts${predicate.indexName === null
-        ? "" : ` INDEXED BY ${predicate.indexName}`}
-      WHERE ${predicate.sql}
+        unpriced_model_uses, unpriced_api_operations, principal_ref, active_user_contribution
+      FROM ranked WHERE effective_rank = 1
     `, ...predicate.params);
+    const activePrincipals = new Set<string>();
     for (const row of rows) {
       totals.providerCostUsdSubunits += BigInt(row.provider_cost);
       totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
@@ -185,8 +212,12 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       totals.unreservedAttempts += BigInt(row.unreserved_attempts);
       totals.unpricedModelUses += BigInt(row.unpriced_model_uses);
       totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
+      if (row.active_user_contribution !== "0") activePrincipals.add(row.principal_ref);
+      if (activePrincipals.size > principalLimit) {
+        throw new Error("Usage Projection month has more active Usage Principals than registered.");
+      }
     }
-    return totals;
+    return {metrics: totals, activePrincipals: [...activePrincipals]};
   }
 
   /**
@@ -268,31 +299,6 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       secondPeakRecords: peaks.second_peak,
       minutePeakRecords: peaks.minute_peak,
     };
-  }
-
-  /**
-   * Count the Usage Principals that contributed activity to this month under one report filter.
-   *
-   * Distinct counts cannot be summed across months, so this returns the month's own references and
-   * the root object unions them. The result is bounded by the deployment's registered Users.
-   */
-  listActivePrincipals(query: FrozenUsageReportQuery, limit: number): string[] {
-    if (!Number.isSafeInteger(limit) || limit < 1 ||
-        limit > USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX) {
-      throw new TypeError("Usage Projection month principal limit is invalid.");
-    }
-    const predicate = buildUsageReportPredicate(query, "aggregate");
-    const rows = this.ctx.storage.sql.exec<{principal_ref: string}>(`
-      SELECT DISTINCT facts.principal_ref
-      FROM usage_projection_facts AS facts${predicate.indexName === null
-        ? "" : ` INDEXED BY ${predicate.indexName}`}
-      WHERE ${predicate.sql} AND facts.active_user_contribution <> '0'
-      LIMIT ?
-    `, ...predicate.params, limit + 1).toArray();
-    if (rows.length > limit) {
-      throw new Error("Usage Projection month has more active Usage Principals than registered.");
-    }
-    return rows.map(row => row.principal_ref);
   }
 
   /**

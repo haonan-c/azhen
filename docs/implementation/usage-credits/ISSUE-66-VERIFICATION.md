@@ -5,9 +5,10 @@ Date: 2026-08-26
 Baseline: `366c92618d583d74666a08600d8bab9655fbed6b`
 
 Status: **IN PROGRESS — the Projection storage gate is unblocked by #73 and #74, and the capacity
-model now projects per Durable Object. No formal full `usage-capacity-v1` run has completed: the
-profile needs about 12.4 hours to seed its records on this machine, which is longer than its own
-timeout. See "Why the formal full run does not complete here".**
+model now projects per Durable Object. A 10,000-registered / 40-active-User narrowed run completes
+every in-test gate, including rebuild and report latency. No formal full `usage-capacity-v1` run has
+completed: the full profile needs about 12.4 hours to seed its records on this machine, which is
+longer than its own timeout. See "Why the formal full run does not complete here".**
 
 ## Verification boundary
 
@@ -374,8 +375,66 @@ during that phase. A second report-only diagnostic was stopped during bootstrap 
 about four times slower than the established account and bootstrap baselines, because any latency
 result from it would not be comparable. Neither attempt is counted as a capacity PASS.
 
-The report implementation and focused regression are complete. Issue #66 remains open because the
-locked capacity profile and its sustained-ingest gate still need a valid run.
+The report implementation and first focused regression were complete at this point. A later valid
+narrowed run reached the report gate and exposed one remaining Summary-revision cost, described
+below. Issue #66 remains open because the locked full profile still needs a formal result.
+
+## Summary revision chains and the final narrowed run
+
+The first focused report fixture gave every aggregate row a different Summary identity. The real
+capacity workload does not: it keeps long absolute-snapshot revision chains for each Summary
+identity. That difference was decisive. A capacity-shaped real workerd fixture now stores two UTC
+months, forty Usage Principals, 40,000 aggregate revisions, 40,000 detail rows, and eighty Summary
+chains of about 500 revisions each. It opens and disposes the public filtered report capability for
+each of thirty measured samples.
+
+With the prior month-local partial aggregation, this fixture reported p95 6,618 ms. The month query
+still used one correlated `NOT EXISTS` search per candidate aggregate revision to find the effective
+revision, then ran a second filtered scan for active Principals. The production change ranks every
+eligible revision once with `ROW_NUMBER() OVER (PARTITION BY summary_fact_id ...)`, sums only rank
+one, and collects active Principals from the same rows. Decimal TEXT revisions and watermarks keep
+exact bigint order by sorting first on text length and then lexicographically. Applying report
+filters before ranking is safe because a Summary identity fixes every report dimension.
+
+The same fixture reports p95 289 ms alone and 318 ms in the capacity configuration suite, about
+twenty-one times faster. It also asserts the exact 40,000 metered uses, forty active Users, and a
+provider-cost total above `Number.MAX_SAFE_INTEGER`.
+
+The subsequent narrowed production-path run used the unchanged 120-second warm-up, 900-second
+measured window, and twenty offered records each second. Only `activeUsers` was changed from 200 to
+40 locally. `caffeinate` prevented host sleep. All four capacity configuration tests passed; the
+main test completed in about 64 minutes with these results:
+
+| Gate | Result |
+| --- | --- |
+| Sustained ingest | 0 errors; 0 late ticks; arrival p50 / p95 / p99 / max = 1 / 3 / 85 / 425 ms |
+| Authority and Projection | 40,000 authoritative records; 80,000 facts; 40,000 projected records |
+| Rebuild | 5,776 alarms; 1,035,546 ms; metric and detail digests identical before and after |
+| Dimension and method coverage | 3,993 dimension groups; 355 / 355 billing methods |
+| Filtered report queries | every exact row total matched; worst p95 1,348 ms; worst p99 1,504 ms |
+| Former failing model filter | 32,000 expected and actual; p95 1,269 ms; p99 1,356 ms |
+| Unfiltered sample | 40,000 expected and actual; p95 1,385 ms; p99 1,392 ms |
+| Report rows and CSV | both 49,706 rows; CSV privacy findings empty; capability released |
+| Capacity telemetry | p95 784 ms; max 823 ms |
+| Ledger consistency | forty Users; zero equation, negative-balance, held-reservation, or grant failures |
+
+The outer runner returned status 1 only because `--reduced` is locked to 200 active Users and
+200,000 records, while this diagnostic intentionally used forty and 40,000. Its profile validator
+therefore rejected the artifact after the in-test capacity checks had passed. This is a valid
+narrowed diagnostic, not a formal `reduced` or full-profile PASS. Temporary profile edits and host
+instrumentation were removed before the final diff.
+
+Local artifact hashes:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `usage-capacity-v1.log` | `6f7c9e3a548071a2ddbd6e65dd513aa92b26912a6225019201801582685e485a` |
+| `usage-capacity-v1.json` | `c4807a30d26456081a1e76f0ab82c2f61fa05b4f4a8c6e9f579a23e892f8dc5e` |
+| `privacy-scan.json` | `720063bda79a8e1b08355eba273a03993749bb8365ddfcc6cff069bb9ceaaf6e` |
+
+One earlier narrowed attempt is excluded. `pmset` records a 2,053-second clamshell sleep during
+rebuild, and the host sampler has a matching 2,050.628-second gap while workerd accumulated only
+0.61 CPU seconds. That failure is a host pause, not rebuild evidence.
 
 ## Full-run evaluation
 
