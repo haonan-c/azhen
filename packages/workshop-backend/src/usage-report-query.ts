@@ -207,22 +207,18 @@ export function buildUsageReportPredicate(
   clauses.push(`(length(facts.applied_watermark) < length(?) OR
     (length(facts.applied_watermark) = length(?) AND facts.applied_watermark <= ?))`);
   params.push(watermark, watermark, watermark);
-  const effectiveAggregate = `facts.row_kind = 'aggregate' AND NOT EXISTS (
-    SELECT 1 FROM usage_projection_facts AS newer
-    WHERE newer.generation = facts.generation
-      AND newer.row_kind = 'aggregate'
-      AND newer.summary_fact_id = facts.summary_fact_id
-      AND newer.applied = 1
-      AND newer.applied_watermark IS NOT NULL
-      AND (length(newer.applied_watermark) < length(?) OR
-        (length(newer.applied_watermark) = length(?) AND newer.applied_watermark <= ?))
-      AND (length(newer.summary_revision) > length(facts.summary_revision) OR
-        (length(newer.summary_revision) = length(facts.summary_revision)
-          AND (newer.summary_revision > facts.summary_revision OR
-            (newer.summary_revision = facts.summary_revision AND
-              (length(newer.applied_watermark) < length(facts.applied_watermark) OR
-                (length(newer.applied_watermark) = length(facts.applied_watermark) AND
-                  newer.applied_watermark < facts.applied_watermark))))))
+  const effectiveAggregate = `facts.row_kind = 'aggregate' AND facts.fact_id = (
+    SELECT newest.fact_id FROM usage_projection_facts AS newest
+    WHERE newest.generation = facts.generation
+      AND newest.row_kind = 'aggregate'
+      AND newest.summary_fact_id = facts.summary_fact_id
+      AND newest.applied = 1
+      AND newest.applied_watermark IS NOT NULL
+      AND (length(newest.applied_watermark) < length(?) OR
+        (length(newest.applied_watermark) = length(?) AND newest.applied_watermark <= ?))
+    ORDER BY length(newest.summary_revision) DESC, newest.summary_revision DESC,
+      length(newest.applied_watermark), newest.applied_watermark
+    LIMIT 1
   )`;
   if (rowKind === "aggregate") {
     clauses.push(effectiveAggregate);

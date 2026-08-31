@@ -133,7 +133,7 @@ function storedDetailRow(
   )) as UsageProjectionStoredRow;
 }
 
-test("keeps a capacity-shaped filtered Summary overview inside the latency gate", async () => {
+test("keeps capacity-shaped Summary overview and CSV inside their latency gates", async () => {
   const name = `report-latency-${crypto.randomUUID()}`;
   const projection = exports.UsageProjection.getByName(name);
   const rootId = exports.UsageProjection.idFromName(name).toString();
@@ -193,4 +193,29 @@ test("keeps a capacity-shaped filtered Summary overview inside the latency gate"
     .toBe(BigInt(SUMMARY_ROWS) * EXACT_PROVIDER_COST);
   expect(overview.metrics.activeUsers).toBe(BigInt(ACTIVE_PRINCIPALS));
   expect(p95Ms).toBeLessThanOrEqual(2_000);
+
+  using csvReport = await usage.openReport({deploymentModelIds: ["capacity-model"]});
+  const csvStarted = performance.now();
+  const reader = (await csvReport.exportCsv()).getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let csvRows = 0;
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    pending += decoder.decode(value, {stream: true});
+    const lines = pending.split("\r\n");
+    pending = lines.pop()!;
+    csvRows += lines.filter(line => line.startsWith("detail,") ||
+      line.startsWith("aggregate,")).length;
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  pending += decoder.decode();
+  if (pending.startsWith("detail,") || pending.startsWith("aggregate,")) csvRows += 1;
+  const csvDurationMs = performance.now() - csvStarted;
+  console.warn(`USAGE_REPORT_FOCUSED_CSV rows=${csvRows} durationMs=${
+    Math.round(csvDurationMs)}`);
+  expect(csvRows).toBe(SUMMARY_ROWS + MONTHS.length * ACTIVE_PRINCIPALS);
+  // This fixture is one fifth of the locked reduced profile and scales its fifteen-minute gate.
+  expect(csvDurationMs).toBeLessThanOrEqual(3 * 60 * 1_000);
 });

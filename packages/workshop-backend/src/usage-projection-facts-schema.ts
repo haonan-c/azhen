@@ -84,10 +84,13 @@ export function createUsageProjectionFactsTable(sql: SqlStorage): void {
       CREATE INDEX IF NOT EXISTS usage_projection_report_pricing_kind_time_v4
       ON usage_projection_facts(generation, pricing, COALESCE(metered_kind, usage_kind),
         COALESCE(occurred_at, bucket_start) DESC, fact_id DESC);
-      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v4
+      DROP INDEX IF EXISTS usage_projection_report_summary_revision_v4;
+      CREATE INDEX IF NOT EXISTS usage_projection_report_summary_revision_v5
       ON usage_projection_facts(
-        generation, summary_fact_id, applied, applied_watermark, summary_revision
-      )
+        generation, summary_fact_id, applied,
+        length(summary_revision) DESC, summary_revision DESC,
+        length(applied_watermark), applied_watermark
+      ) WHERE row_kind = 'aggregate' AND applied_watermark IS NOT NULL
     `);
 }
 

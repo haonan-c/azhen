@@ -1134,6 +1134,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
         LIMIT 200
       `, ...predicate.params).toArray().map(row => row.detail).join("\n"));
     expect(plan).toContain("usage_projection_report_model_time");
+    expect(plan).toContain("usage_projection_report_summary_revision_v5");
     expect(plan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
   });
 

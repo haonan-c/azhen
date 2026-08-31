@@ -7,8 +7,10 @@ Baseline: `366c92618d583d74666a08600d8bab9655fbed6b`
 Status: **IN PROGRESS — the Projection storage gate is unblocked by #73 and #74, and the capacity
 model now projects per Durable Object. A 10,000-registered / 40-active-User narrowed run completes
 every in-test gate, including rebuild and report latency. No formal full `usage-capacity-v1` run has
-completed: the full profile needs about 12.4 hours to seed its records on this machine, which is
-longer than its own timeout. See "Why the formal full run does not complete here".**
+completed. A locked 200-active-User `reduced` run passed sustained ingest and rebuild but failed its
+CSV duration gate; the focused fix passes the same physical report-row shape, but the locked run has
+not been repeated. The full profile needs about 12.4 hours to seed its records on this machine,
+which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
 ## Verification boundary
 
@@ -435,6 +437,53 @@ Local artifact hashes:
 One earlier narrowed attempt is excluded. `pmset` records a 2,053-second clamshell sleep during
 rebuild, and the host sampler has a matching 2,050.628-second gap while workerd accumulated only
 0.61 CPU seconds. That failure is a host pause, not rebuild evidence.
+
+## The locked reduced run and CSV revision lookup
+
+Commit `f6099ae` was then run without temporary instrumentation under the locked `reduced` profile:
+10,000 registered Users, 200 active Users, 200,000 authoritative records, the unchanged 120-second
+warm-up and 900-second measured window, and twenty offered records each second. `caffeinate` kept
+the host awake. Both Cap'n Web preflight groups passed, as did account creation and bootstrap:
+10,000 accounts in 110.9 seconds and 10,000 / 10,000 bootstrapped Users in 89.8 seconds. Preseed
+completed its 179,600 records in 7,564.4 seconds at about 23.7 records a second.
+
+The sustained-ingest gate passed with zero late ticks and zero errors. Arrival p50 / p95 / p99 /
+max was 158 / 536 / 621 / 898 ms. The test then crossed rebuild completion, both rebuild digest
+assertions, and capacity review. It stopped before query sampling at the CSV duration assertion:
+
+```text
+expected 3145735 to be less than or equal to 900000
+measureReportWorkload __capacity__/usage-capacity-v1.test.ts:767
+```
+
+The CSV streamed for 3,145,735 ms, or 52 minutes 26 seconds, against the locked fifteen-minute
+gate. Because the assertion precedes the result marker, the runner correctly produced no JSON and
+did not label the run a PASS. Its raw log SHA-256 is
+`8afb4b83cfd568d9805530eb33b9b45b85fcfc24b105dd62d46b4891eed1e5bb`; the log-only privacy scan
+passed with SHA-256 `3823733d1dc7e78a1549fd3eec9957e9373ce5c7f967724d3e2a6701444ba5c2`.
+
+The row and CSV path still used a correlated `NOT EXISTS` for every aggregate revision. The v4
+index ordered watermark before revision, while the query needed the greatest decimal revision and
+then the earliest watermark. A long Summary chain therefore repeated a scan that the overview fix
+had already removed from its own path.
+
+The focused fix replaces that predicate with one ordered `LIMIT 1` lookup and replaces, rather
+than adds to, the v4 index with a v5 expression index ordered by decimal-text revision length,
+revision, watermark length, and watermark. Historical report watermarks keep the same predicate;
+no current-only materialized state was introduced. A query-plan assertion pins the v5 lookup and
+the absence of a temporary sort.
+
+The permanent capacity regression retains the 40,000-revision / 40,000-detail fixture and now
+streams its CSV with the same one-millisecond slow consumer as the locked test. It reports 40,080
+rows in 12,551 ms, versus 286,969 ms for the earlier 40-User capacity artifact, and remains under
+the three-minute one-fifth-scale gate. A temporary exact-shape diagnostic increased only the
+fixture constants to 200,000 revisions, 200,000 details, and 200 Principals. It reported overview
+p95 1,127 ms and streamed 200,400 rows in 156,762 ms, both inside the locked 2,000 ms and fifteen-
+minute gates. The constants were restored after measurement.
+
+This is focused evidence for the report-row shape, not a locked `reduced` PASS. The six-hour locked
+run must be repeated to cover its exact 249,000-row dimension mix, post-fix storage bytes, report
+query samples, out-of-order and ACK-loss checks, ledger checks, restart, and final result marker.
 
 ## Full-run evaluation
 
