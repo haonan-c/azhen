@@ -1,4 +1,5 @@
 import {DurableObject} from "cloudflare:workers";
+import type {AdminUsageReportRowMetrics} from "@gadgets/workshop-shared/api";
 import {normalizeCanonicalUtcTimestamp} from "./usage-rates.js";
 import {
   USAGE_PROJECTION_FACT_COLUMNS,
@@ -111,6 +112,81 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       throw new TypeError("Usage Projection month page limit is invalid.");
     }
     return readUsageProjectionReportRows(this.ctx.storage.sql, query, cursor, limit, rowKind);
+  }
+
+  /** Read this month's exact filtered Usage Summary Fact totals in one local scan. */
+  readReportMetrics(query: FrozenUsageReportQuery): AdminUsageReportRowMetrics {
+    const predicate = buildUsageReportPredicate(query, "aggregate");
+    const totals: AdminUsageReportRowMetrics = {
+      providerCostUsdSubunits: 0n,
+      chargedUsageCreditSubunits: 0n,
+      cacheHitInputTokens: 0n,
+      cacheMissInputTokens: 0n,
+      cacheWriteInputTokens: 0n,
+      outputTokens: 0n,
+      reasoningTokens: 0n,
+      billableApiOperations: 0n,
+      meteredUseCount: 0n,
+      preExecutionFailures: 0n,
+      unknownOperations: 0n,
+      meteringAttempts: 0n,
+      heldReservations: 0n,
+      releasedReservations: 0n,
+      settledReservations: 0n,
+      unreservedAttempts: 0n,
+      unpricedModelUses: 0n,
+      unpricedApiOperations: 0n,
+    };
+    const rows = this.ctx.storage.sql.exec<{
+      provider_cost: string;
+      charged_credits: string;
+      cache_hit_input: string;
+      cache_miss_input: string;
+      cache_write_input: string;
+      output_tokens: string;
+      reasoning_tokens: string;
+      billable_api_operations: string;
+      metered_use_count: string;
+      pre_execution_failures: string;
+      unknown_operations: string;
+      metering_attempts: string;
+      held_reservations: string;
+      released_reservations: string;
+      settled_reservations: string;
+      unreserved_attempts: string;
+      unpriced_model_uses: string;
+      unpriced_api_operations: string;
+    }>(`
+      SELECT provider_cost, charged_credits, cache_hit_input, cache_miss_input,
+        cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
+        metered_use_count, pre_execution_failures, unknown_operations, metering_attempts,
+        held_reservations, released_reservations, settled_reservations, unreserved_attempts,
+        unpriced_model_uses, unpriced_api_operations
+      FROM usage_projection_facts AS facts${predicate.indexName === null
+        ? "" : ` INDEXED BY ${predicate.indexName}`}
+      WHERE ${predicate.sql}
+    `, ...predicate.params);
+    for (const row of rows) {
+      totals.providerCostUsdSubunits += BigInt(row.provider_cost);
+      totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
+      totals.cacheHitInputTokens += BigInt(row.cache_hit_input);
+      totals.cacheMissInputTokens += BigInt(row.cache_miss_input);
+      totals.cacheWriteInputTokens += BigInt(row.cache_write_input);
+      totals.outputTokens += BigInt(row.output_tokens);
+      totals.reasoningTokens += BigInt(row.reasoning_tokens);
+      totals.billableApiOperations += BigInt(row.billable_api_operations);
+      totals.meteredUseCount += BigInt(row.metered_use_count);
+      totals.preExecutionFailures += BigInt(row.pre_execution_failures);
+      totals.unknownOperations += BigInt(row.unknown_operations);
+      totals.meteringAttempts += BigInt(row.metering_attempts);
+      totals.heldReservations += BigInt(row.held_reservations);
+      totals.releasedReservations += BigInt(row.released_reservations);
+      totals.settledReservations += BigInt(row.settled_reservations);
+      totals.unreservedAttempts += BigInt(row.unreserved_attempts);
+      totals.unpricedModelUses += BigInt(row.unpriced_model_uses);
+      totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
+    }
+    return totals;
   }
 
   /**

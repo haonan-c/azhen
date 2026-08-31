@@ -898,7 +898,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
   }
 
-  /** Read exact filtered Summary totals without materializing an unbounded row collection. */
+  /** Read exact filtered Summary totals from one partial sum per UTC month. */
   async readReportMetrics(query: FrozenUsageReportQuery): Promise<AdminUsageReportMetrics> {
     this.#assertCurrentReportSnapshot(query);
     const totals: AdminUsageReportMetrics = {
@@ -922,36 +922,27 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       unpricedApiOperations: 0n,
       activeUsers: 0n,
     };
-    let cursor: UsageReportCursor | undefined;
-    while (true) {
-      const page = await this.#readReportRowsAcrossMonths(
-        query, cursor, USAGE_PROJECTION_REPORT_PAGE_MAX, "aggregate");
-      for (const row of page) {
-        totals.providerCostUsdSubunits += BigInt(row.provider_cost);
-        totals.chargedUsageCreditSubunits += BigInt(row.charged_credits);
-        totals.cacheHitInputTokens += BigInt(row.cache_hit_input);
-        totals.cacheMissInputTokens += BigInt(row.cache_miss_input);
-        totals.cacheWriteInputTokens += BigInt(row.cache_write_input);
-        totals.outputTokens += BigInt(row.output_tokens);
-        totals.reasoningTokens += BigInt(row.reasoning_tokens);
-        totals.billableApiOperations += BigInt(row.billable_api_operations);
-        totals.meteredUseCount += BigInt(row.metered_use_count);
-        totals.preExecutionFailures += BigInt(row.pre_execution_failures);
-        totals.unknownOperations += BigInt(row.unknown_operations);
-        totals.meteringAttempts += BigInt(row.metering_attempts);
-        totals.heldReservations += BigInt(row.held_reservations);
-        totals.releasedReservations += BigInt(row.released_reservations);
-        totals.settledReservations += BigInt(row.settled_reservations);
-        totals.unreservedAttempts += BigInt(row.unreserved_attempts);
-        totals.unpricedModelUses += BigInt(row.unpriced_model_uses);
-        totals.unpricedApiOperations += BigInt(row.unpriced_api_operations);
-      }
-      const last = page.at(-1);
-      if (page.length < USAGE_PROJECTION_REPORT_PAGE_MAX || !last) break;
-      cursor = {sourceTime: storedFactSourceTime(last), rowId: last.fact_id};
-    }
     const active = new Set<string>();
     for (const month of this.#reportMonths(query, undefined)) {
+      const partial = await this.#monthStub(month).readReportMetrics(query);
+      totals.providerCostUsdSubunits += partial.providerCostUsdSubunits;
+      totals.chargedUsageCreditSubunits += partial.chargedUsageCreditSubunits;
+      totals.cacheHitInputTokens += partial.cacheHitInputTokens;
+      totals.cacheMissInputTokens += partial.cacheMissInputTokens;
+      totals.cacheWriteInputTokens += partial.cacheWriteInputTokens;
+      totals.outputTokens += partial.outputTokens;
+      totals.reasoningTokens += partial.reasoningTokens;
+      totals.billableApiOperations += partial.billableApiOperations;
+      totals.meteredUseCount += partial.meteredUseCount;
+      totals.preExecutionFailures += partial.preExecutionFailures;
+      totals.unknownOperations += partial.unknownOperations;
+      totals.meteringAttempts += partial.meteringAttempts;
+      totals.heldReservations += partial.heldReservations;
+      totals.releasedReservations += partial.releasedReservations;
+      totals.settledReservations += partial.settledReservations;
+      totals.unreservedAttempts += partial.unreservedAttempts;
+      totals.unpricedModelUses += partial.unpricedModelUses;
+      totals.unpricedApiOperations += partial.unpricedApiOperations;
       for (const principal of await this.#monthStub(month)
           .listActivePrincipals(query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX)) {
         active.add(principal);

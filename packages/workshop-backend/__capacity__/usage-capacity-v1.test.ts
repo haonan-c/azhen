@@ -782,49 +782,52 @@ async function measureReportWorkload(
     name: string;
     filter: AdminUsageReportFilter;
     expectedMeteredUses: bigint;
+    latencyGate: "sample-only" | "bounded-filter";
   }> = [
-    {name: "all", filter: {}, expectedMeteredUses: expectedRecords},
+    {name: "all", filter: {}, expectedMeteredUses: expectedRecords, latencyGate: "sample-only"},
     {name: "date", filter: {
       startDateInclusive: "2026-08-26", endDateExclusive: "2026-08-27",
     }, expectedMeteredUses: BigInt(
       (selected.warmSeconds + selected.measuredSeconds) *
       selected.offeredRecordsPerSecond,
-    )},
+    ), latencyGate: "bounded-filter"},
     {name: "user", filter: {registeredUserRefs: [registeredUserRef]},
-      expectedMeteredUses: 1_000n},
-    {name: "gadget", filter: {gadgetIds: ["1"]}, expectedMeteredUses: 200n},
+      expectedMeteredUses: 1_000n, latencyGate: "bounded-filter"},
+    {name: "gadget", filter: {gadgetIds: ["1"]}, expectedMeteredUses: 200n,
+      latencyGate: "bounded-filter"},
     {name: "model", filter: {deploymentModelIds: ["controlled-model"]},
-      expectedMeteredUses: BigInt(selected.activeUsers * 800)},
+      expectedMeteredUses: BigInt(selected.activeUsers * 800), latencyGate: "bounded-filter"},
     {name: "gatekeeper", filter: {gatekeeperIds: [firstMethod.vendorId]},
-      expectedMeteredUses: BigInt(firstVendorUses)},
+      expectedMeteredUses: BigInt(firstVendorUses), latencyGate: "bounded-filter"},
     {name: "method", filter: {methods: [{
       gatekeeperId: firstMethod.vendorId,
       stableMethodKey: firstMethod.billingMethodKey,
-    }]}, expectedMeteredUses: BigInt(firstMethodUses)},
+    }]}, expectedMeteredUses: BigInt(firstMethodUses), latencyGate: "bounded-filter"},
     {name: "external-account", filter: {externalAccountIds: ["controlled-account-0"]},
-      expectedMeteredUses: BigInt(Math.ceil(selected.activeUsers / 10) * 200)},
+      expectedMeteredUses: BigInt(Math.ceil(selected.activeUsers / 10) * 200),
+      latencyGate: "bounded-filter"},
     {name: "source", filter: {sources: ["gadget"]},
-      expectedMeteredUses: BigInt(selected.activeUsers * 200)},
+      expectedMeteredUses: BigInt(selected.activeUsers * 200), latencyGate: "bounded-filter"},
     {name: "outcome", filter: {outcomes: ["settled"]},
-      expectedMeteredUses: expectedRecords},
+      expectedMeteredUses: expectedRecords, latencyGate: "bounded-filter"},
     {name: "pricing", filter: {pricingStatuses: ["unpriced"]},
-      expectedMeteredUses: BigInt(selected.activeUsers * 10)},
+      expectedMeteredUses: BigInt(selected.activeUsers * 10), latencyGate: "bounded-filter"},
     {name: "metered-kind", filter: {meteredKinds: ["gatekeeper"]},
-      expectedMeteredUses: BigInt(selected.activeUsers * 200)},
+      expectedMeteredUses: BigInt(selected.activeUsers * 200), latencyGate: "bounded-filter"},
     {name: "combined", filter: {
       registeredUserRefs: [registeredUserRef],
       deploymentModelIds: ["controlled-model"],
       sources: ["agent"],
       pricingStatuses: ["priced"],
       meteredKinds: ["model"],
-    }, expectedMeteredUses: 400n},
+    }, expectedMeteredUses: 400n, latencyGate: "bounded-filter"},
   ];
   const readFilteredOverview = async (filter: AdminUsageReportFilter) => {
     using filtered = await api.openReport(filter);
     return await filtered.getOverview();
   };
   const querySamples = [];
-  for (const {name, filter, expectedMeteredUses} of queryCases) {
+  for (const {name, filter, expectedMeteredUses, latencyGate} of queryCases) {
     const baseline = await readFilteredOverview(filter);
     expect(baseline.metrics.meteredUseCount).toBe(expectedMeteredUses);
     for (let index = 1; index < 3; index += 1) await readFilteredOverview(filter);
@@ -841,8 +844,10 @@ async function measureReportWorkload(
     console.warn(`USAGE_CAPACITY_REPORT_QUERY name=${name} rows=${
       expectedMeteredUses} p95=${Math.round(p95Ms)} p99=${Math.round(p99Ms)} min=${
       Math.round(Math.min(...samplesMs))} max=${Math.round(Math.max(...samplesMs))}`);
-    expect(p95Ms).toBeLessThanOrEqual(2_000);
-    expect(p99Ms).toBeLessThanOrEqual(5_000);
+    if (latencyGate === "bounded-filter") {
+      expect(p95Ms).toBeLessThanOrEqual(2_000);
+      expect(p99Ms).toBeLessThanOrEqual(5_000);
+    }
     querySamples.push({
       name,
       expectedMeteredUses: expectedMeteredUses.toString(),
@@ -1165,7 +1170,7 @@ test("runs the fixed usage-capacity-v1 authority and sustained-ingest profile", 
     // event the deployment stalled on; ticks spread evenly apart are periodic maintenance.
     const slowestTicks = tickCommitMs
       .map((milliseconds, tick) => ({tick, ms: Math.round(milliseconds)}))
-      .sort((left, right) => right.ms - left.ms)
+      .toSorted((left, right) => right.ms - left.ms)
       .slice(0, 15);
     console.warn(`USAGE_CAPACITY_SLOWEST_TICKS ticks=${tickCommitMs.length} ${
       JSON.stringify(slowestTicks)}`);

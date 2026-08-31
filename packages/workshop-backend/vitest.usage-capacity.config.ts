@@ -25,6 +25,7 @@ export default defineConfig({
     include: [
       "__capacity__/usage-capacity-v1.test.ts",
       "__capacity__/usage-method-inventory.test.ts",
+      "__capacity__/usage-report-overview-latency.test.ts",
       "__capacity__/usage-retention-storage.test.ts",
     ],
     disableConsoleIntercept: true,
