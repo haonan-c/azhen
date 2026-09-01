@@ -8,9 +8,10 @@ Status: **IN PROGRESS — the Projection storage gate is unblocked by #73 and #7
 model now projects per Durable Object. A 10,000-registered / 40-active-User narrowed run completes
 every in-test gate, including rebuild and report latency. No formal full `usage-capacity-v1` run has
 completed. A locked 200-active-User `reduced` run passed sustained ingest and rebuild but failed its
-CSV duration gate; the focused fix passes the same physical report-row shape. Its first locked
-repeat was invalidated by a 2,458-second host clamshell sleep during rebuild and is not capacity
-evidence. The full profile needs about 12.4 hours to seed its records on this machine,
+CSV duration gate; the focused fix passes the same physical report-row shape. Its first post-fix
+repeat was invalidated by a 2,458-second host clamshell sleep during rebuild, and its second
+post-fix repeat failed the arrival gate during a maintenance burst; neither is a reduced PASS.
+The full profile needs about 12.4 hours to seed its records on this machine,
 which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
 ## Verification boundary
@@ -499,6 +500,23 @@ override clamshell sleep. This is an environment-invalid sample, not evidence of
 index failure. The raw log SHA-256 is
 `f64fc212505da5401182da37660306a92a3bfc57cd1e4ca573046344ce5cd223`; its log-only privacy scan
 passed with SHA-256 `3823733d1dc7e78a1549fd3eec9957e9373ce5c7f967724d3e2a6701444ba5c2`.
+
+The second post-fix locked run used the backend runner directly with the same `reduced` profile.
+It completed both preflight groups, 10,000 account creations, 10,000 / 10,000 bootstrap, and all
+179,600 preseed records in 7,558.2 seconds. The measured 1,020 ticks had zero operation errors,
+but 31 ticks were late: arrival p50 / p95 / p99 / max was 108 / 578 / 3,005 / 3,814 ms. The
+slowest commit samples cluster around ticks 877–989, with a contiguous late block at ticks
+980–994. The runner stopped at the arrival assertion before rebuild, so it produced no result
+marker. Its focused report checks still passed (40,080 CSV rows in 15,707 ms), and its privacy
+scan passed. The raw log SHA-256 is
+`ca89af762a583dddd2b5d6202e30f900ab54d2fd47cd2dd57cb441e8c005863e`.
+
+This shape matches the earlier narrowed run's contiguous maintenance burst, rather than the
+steady throughput ceiling that the quarter means would show. The power log contains no sleep or
+wake during this run. It is therefore a valid capacity-gate failure, but it does not implicate
+the report v5 lookup: the focused overview and CSV path remain within their gates. The arrival
+maintenance burst still needs a separate bounded investigation before #66 can close; the test
+thresholds were not relaxed and the run is not called PASS.
 
 ## Full-run evaluation
 
