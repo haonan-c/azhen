@@ -8,8 +8,9 @@ Status: **IN PROGRESS — the Projection storage gate is unblocked by #73 and #7
 model now projects per Durable Object. A 10,000-registered / 40-active-User narrowed run completes
 every in-test gate, including rebuild and report latency. No formal full `usage-capacity-v1` run has
 completed. A locked 200-active-User `reduced` run passed sustained ingest and rebuild but failed its
-CSV duration gate; the focused fix passes the same physical report-row shape, but the locked run has
-not been repeated. The full profile needs about 12.4 hours to seed its records on this machine,
+CSV duration gate; the focused fix passes the same physical report-row shape. Its first locked
+repeat was invalidated by a 2,458-second host clamshell sleep during rebuild and is not capacity
+evidence. The full profile needs about 12.4 hours to seed its records on this machine,
 which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
 ## Verification boundary
@@ -484,6 +485,20 @@ minute gates. The constants were restored after measurement.
 This is focused evidence for the report-row shape, not a locked `reduced` PASS. The six-hour locked
 run must be repeated to cover its exact 249,000-row dimension mix, post-fix storage bytes, report
 query samples, out-of-order and ACK-loss checks, ledger checks, restart, and final result marker.
+
+The first post-fix locked repeat is excluded from that evidence. It passed both preflight groups,
+created and bootstrapped all 10,000 Users, seeded all 179,600 records, and passed sustained ingest
+with zero late ticks and zero errors. Arrival p50 / p95 / p99 / max was 101 / 240 / 340 / 555 ms.
+During rebuild, workerd then reported `Alarm exceeded its allowed execution time` and the run
+stopped before rebuild digest and CSV assertions.
+
+The host power log independently explains that failure: macOS entered `Clamshell Sleep` at
+2026-08-31 21:25:49 -0400 for 2,458 seconds and woke at 22:06:47; workerd reported the alarm failure
+immediately after wake. The test was wrapped in `caffeinate -dimsu`, but macOS does not let that
+override clamshell sleep. This is an environment-invalid sample, not evidence of a rebuild or v5
+index failure. The raw log SHA-256 is
+`f64fc212505da5401182da37660306a92a3bfc57cd1e4ca573046344ce5cd223`; its log-only privacy scan
+passed with SHA-256 `3823733d1dc7e78a1549fd3eec9957e9373ce5c7f967724d3e2a6701444ba5c2`.
 
 ## Full-run evaluation
 
