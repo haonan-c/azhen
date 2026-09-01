@@ -653,10 +653,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     let rollingRecords = BigInt(counts.rolling_records);
     let secondPeak = BigInt(peaks.second_peak);
     let minutePeak = BigInt(peaks.minute_peak);
-    for (const month of this.#capacityMonths(generation, rollingWindowStartedAt, asOf)) {
-      const slice = await this.#monthStub(month).readCapacityWindow(
-        generation, utcDayStartedAt, rollingWindowStartedAt, asOf,
-        USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX);
+    const capacitySlices = await Promise.all(
+      this.#capacityMonths(generation, rollingWindowStartedAt, asOf).map(month =>
+        this.#monthStub(month).readCapacityWindow(
+          generation, utcDayStartedAt, rollingWindowStartedAt, asOf,
+          USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX)),
+    );
+    for (const slice of capacitySlices) {
       for (const principal of slice.dailyActivePrincipals) activePrincipals.add(principal);
       rollingRecords += BigInt(slice.rollingRecords);
       const monthSecondPeak = BigInt(slice.secondPeakRecords);
@@ -674,14 +677,18 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       rollingWindowStartedAt,
     }, {registeredUsers: asOf, projection: projectionAsOf});
     this.ctx.storage.transactionSync(() => {
+      const previous = new Map(this.ctx.storage.sql.exec<{
+        metric: string;
+        review_required: number;
+      }>(`
+        SELECT metric, review_required FROM usage_projection_capacity_review_state
+      `).toArray().map(row => [row.metric, row.review_required] as const));
       for (const metricKey of CAPACITY_REVIEW_METRICS) {
         const value = capacityMetric(review, metricKey);
-        const previous = this.ctx.storage.sql.exec<{review_required: number}>(`
-          SELECT review_required FROM usage_projection_capacity_review_state
-          WHERE metric = ?
-        `, metricKey).toArray()[0];
-        if ((previous === undefined && value.reviewRequired) ||
-            (previous !== undefined && previous.review_required !== Number(value.reviewRequired))) {
+        const previousValue = previous.get(metricKey);
+        const changed = previousValue === undefined ||
+          previousValue !== Number(value.reviewRequired);
+        if (changed) {
           capacityLogger.info("Usage capacity review state changed", {
             event: "usage.capacity.review.changed",
             profileId: review.profileId,
@@ -693,11 +700,11 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
             windowKind: value.window.kind,
             asOf: value.asOf,
           });
+          this.ctx.storage.sql.exec(`
+            INSERT INTO usage_projection_capacity_review_state (metric, review_required)
+            VALUES (?, ?) ON CONFLICT(metric) DO UPDATE SET review_required = excluded.review_required
+          `, metricKey, Number(value.reviewRequired));
         }
-        this.ctx.storage.sql.exec(`
-          INSERT INTO usage_projection_capacity_review_state (metric, review_required)
-          VALUES (?, ?) ON CONFLICT(metric) DO UPDATE SET review_required = excluded.review_required
-        `, metricKey, Number(value.reviewRequired));
       }
     });
     return review;
