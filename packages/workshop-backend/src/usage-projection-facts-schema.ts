@@ -52,6 +52,9 @@ export function createUsageProjectionFactsTable(sql: SqlStorage): void {
       );
       CREATE INDEX IF NOT EXISTS usage_projection_facts_pending_v4
       ON usage_projection_facts(generation, applied, COALESCE(occurred_at, bucket_start));
+      CREATE INDEX IF NOT EXISTS usage_projection_facts_capacity_detail_v1
+      ON usage_projection_facts(generation, applied, occurred_at, principal_ref)
+      WHERE row_kind = 'detail';
       CREATE INDEX IF NOT EXISTS usage_projection_report_time_v4
       ON usage_projection_facts(
         generation, applied, COALESCE(occurred_at, bucket_start) DESC, fact_id DESC

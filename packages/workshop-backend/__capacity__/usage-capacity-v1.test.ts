@@ -278,11 +278,22 @@ async function measureCapacityTelemetry(
           .toArray().map(row => row.detail));
   expect(queryPlan.some(detail =>
     detail.includes("usage_projection_facts_pending_v4"))).toBe(true);
+  const activePrincipalQueryPlan = await runInDurableObject(
+    projectionMonthStub(projection, plannedMonth), (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT DISTINCT principal_ref FROM usage_projection_facts
+        WHERE generation = ? AND applied = 1 AND row_kind = 'detail'
+          AND occurred_at >= ? AND CAST(metered_use_count AS INTEGER) > 0
+        LIMIT ?
+      `, generation, "2026-08-26T00:00:00.000Z", 101).toArray().map(row => row.detail));
+  expect(activePrincipalQueryPlan.some(detail =>
+    detail.includes("usage_projection_facts_capacity_detail_v1"))).toBe(true);
   return {
     samplesMs,
     p95Ms: percentile(samplesMs, 0.95),
     maxMs: Math.max(...samplesMs),
-    queryPlan,
+    queryPlan: [...queryPlan, ...activePrincipalQueryPlan],
   };
 }
 
