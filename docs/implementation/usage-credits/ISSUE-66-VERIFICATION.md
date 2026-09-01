@@ -13,6 +13,11 @@ repeat was invalidated by a 2,458-second host clamshell sleep during rebuild, an
 post-fix repeat failed the arrival gate during a maintenance burst. A subsequent dual-index
 repeat removed that burst but still had one 1,085 ms late tick, and a further dual-index repeat
 had 88 late ticks with a 17,969 ms maximum; none is a reduced PASS.
+A bounded single-User method-inventory run then observed up to 50 overlapping background
+Projection-maintenance tasks. The branch now coalesces those `ctx.waitUntil`-started maintenance
+runs while keeping the Durable Object `alarm()` entrypoint unchanged; focused Projection,
+capacity-method, TypeScript, lint, and Cap'n Web preflight checks pass. The fix still needs one
+clean locked reduced run.
 The full profile needs about 12.4 hours to seed its records on this machine,
 which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
@@ -555,8 +560,18 @@ The host power log has no Sleep, Wake, or DarkWake event during the run. Its raw
 This is a valid capacity-gate failure, not an acceptance PASS. The dual-index change removes the
 previous isolated maintenance burst in one run but does not make the arrival gate reliable: this
 repeat shows both an early cluster and a severe late-window cluster without a host sleep event.
-The next step is a bounded investigation of the residual arrival-path contention, not another
-threshold relaxation.
+The bounded investigation used a temporary overlap counter around the User DO's background
+Projection-maintenance start. A 10–20 second method-inventory workload reached 50 concurrent
+maintenance tasks, while the test's 355 method calls still passed. This identifies the residual
+contention as overlapping `ctx.waitUntil` maintenance work, not report-row lookup latency. The
+branch now coalesces those background runs and retains a one-second alarm when a new request
+arrives during an in-flight run. The persistent `alarm()` method remains the direct recovery
+entrypoint because the Projection race tests depend on its existing ownership behavior.
+
+Focused validation after the change is clean: Usage Projection 61/61, method inventory 1/1,
+backend TypeScript, lint, and Cap'n Web preflight 20 passed / 4 skipped. This is still not a
+capacity acceptance result. The next step is one clean locked reduced run with the fix; do not
+relax the arrival threshold.
 
 ## Full-run evaluation
 

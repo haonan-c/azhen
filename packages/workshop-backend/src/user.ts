@@ -350,6 +350,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private usageProjection: DurableObjectNamespace<UsageProjection>;
   private projectionPreparations = new Set<bigint>();
+  private projectionMaintenanceRun: Promise<void> | null = null;
   private usageBalanceSubscribers = new Set<RpcStub<UsageCreditBalanceSubscriber>>();
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
@@ -433,14 +434,45 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   #scheduleProjectionDelivery(preparationRevision: bigint): void {
     this.#finishProjectionPreparation(preparationRevision);
+    this.#requestProjectionMaintenance();
+  }
+
+  #requestProjectionMaintenance(): void {
+    if (this.projectionMaintenanceRun !== null) {
+      try {
+        this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now() + 1_000));
+      } catch (error) {
+        logger.warn("Usage Projection delivery could not retain its alarm", {
+          event: "usage.projection.delivery.alarm.failed",
+          error,
+        });
+      }
+      return;
+    }
+    const run = this.#startProjectionMaintenance();
     try {
-      this.ctx.waitUntil(this.#runProjectionMaintenance());
+      this.ctx.waitUntil(run);
     } catch (error) {
       // The alarm was persisted before the authoritative Usage Account transaction began.
       logger.warn("Usage Projection delivery could not be scheduled", {
         event: "usage.projection.delivery.schedule.failed",
         error,
       });
+    }
+  }
+
+  #startProjectionMaintenance(): Promise<void> {
+    if (this.projectionMaintenanceRun !== null) return this.projectionMaintenanceRun;
+    const run = this.#runProjectionMaintenanceLoop();
+    this.projectionMaintenanceRun = run;
+    return run;
+  }
+
+  async #runProjectionMaintenanceLoop(): Promise<void> {
+    try {
+      await this.#runProjectionMaintenance();
+    } finally {
+      this.projectionMaintenanceRun = null;
     }
   }
 
