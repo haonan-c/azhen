@@ -10,7 +10,8 @@ every in-test gate, including rebuild and report latency. No formal full `usage-
 completed. A locked 200-active-User `reduced` run passed sustained ingest and rebuild but failed its
 CSV duration gate; the focused fix passes the same physical report-row shape. Its first post-fix
 repeat was invalidated by a 2,458-second host clamshell sleep during rebuild, and its second
-post-fix repeat failed the arrival gate during a maintenance burst; neither is a reduced PASS.
+post-fix repeat failed the arrival gate during a maintenance burst. A subsequent dual-index
+repeat removed that burst but still had one 1,085 ms late tick; none is a reduced PASS.
 The full profile needs about 12.4 hours to seed its records on this machine,
 which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
@@ -525,6 +526,19 @@ while v4 searched the watermark prefix). The branch now retains both indexes and
 compaction inner lookup. Compaction 5/5, Projection 61/61, report 26/26, backend `tsc`, and lint
 all pass after this change. The locked reduced run must be repeated with this dual-index layout;
 the failed v5-only arrival sample is not reused as evidence for the corrected layout.
+
+The first dual-index locked run then completed preseed and the full 1,020-tick measured window. It
+had zero operation errors and one late tick: arrival p50 / p95 / p99 / max was 182 / 598 / 745 /
+1,085 ms, with tick 917 the only late sample. Commit-cost means were 303 / 401 / 492 / 551 ms;
+the slowest samples were spread across ticks 433–437 and 890–922 rather than forming the previous
+980–994 burst. The run stopped at the arrival assertion before rebuild, with no result marker. The
+focused report checks passed (40,080 CSV rows in 12,559 ms), the privacy scan passed, and the host
+power log contains no sleep or wake during the run. Its raw log SHA-256 is
+`1a4d8aa4ad7feaa7fcdd8c481807666cd6e6655ad76b0d71024a70b077adf609`.
+
+This is a valid near-threshold capacity result, not an acceptance PASS. A repeat is needed to
+separate one scheduling outlier from a reproducible residual maintenance cost before any further
+change to the arrival path.
 
 ## Full-run evaluation
 
