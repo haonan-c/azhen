@@ -118,6 +118,19 @@ function outbox(projection: DurableObjectStub<UsageProjection>) {
 }
 
 describe("Usage Projection month delivery", () => {
+  it("uses the global applied-watermark index for the oldest pending row", async () => {
+    const projection = await ready(`delivery-order-index-${crypto.randomUUID()}`);
+    const plan = await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT month FROM usage_projection_month_outbox
+        ORDER BY length(applied_watermark), applied_watermark LIMIT 1
+      `).toArray().map(row => row.detail));
+    expect(plan.some(detail => detail.includes(
+      "usage_projection_month_outbox_global_order_v1",
+    ))).toBe(true);
+  });
+
   it("delivers each applied row to the UTC month its source time names", async () => {
     const name = `delivery-${crypto.randomUUID()}`;
     const projection = await ready(name);

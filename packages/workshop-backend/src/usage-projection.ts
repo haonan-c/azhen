@@ -2912,7 +2912,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         PRIMARY KEY (generation, fact_id)
       );
       CREATE INDEX IF NOT EXISTS usage_projection_month_outbox_order
-      ON usage_projection_month_outbox(month, length(applied_watermark), applied_watermark)
+      ON usage_projection_month_outbox(month, length(applied_watermark), applied_watermark);
+      CREATE INDEX IF NOT EXISTS usage_projection_month_outbox_global_order_v1
+      ON usage_projection_month_outbox(length(applied_watermark), applied_watermark)
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_months (
