@@ -469,11 +469,12 @@ index ordered watermark before revision, while the query needed the greatest dec
 then the earliest watermark. A long Summary chain therefore repeated a scan that the overview fix
 had already removed from its own path.
 
-The focused fix replaces that predicate with one ordered `LIMIT 1` lookup and replaces, rather
-than adds to, the v4 index with a v5 expression index ordered by decimal-text revision length,
-revision, watermark length, and watermark. Historical report watermarks keep the same predicate;
-no current-only materialized state was introduced. A query-plan assertion pins the v5 lookup and
-the absence of a temporary sort.
+The focused fix replaces that predicate with one ordered `LIMIT 1` lookup and adds a v5 expression
+index ordered by decimal-text revision length, revision, watermark length, and watermark.
+Compaction has a different access pattern: it filters by watermark before checking a newer
+revision, so the existing v4 index remains and compaction explicitly uses it. Historical report
+watermarks keep the same predicate; no current-only materialized state was introduced. Query-plan
+assertions pin the v5 report lookup and the absence of a temporary sort.
 
 The permanent capacity regression retains the 40,000-revision / 40,000-detail fixture and now
 streams its CSV with the same one-millisecond slow consumer as the locked test. It reports 40,080
@@ -517,6 +518,13 @@ wake during this run. It is therefore a valid capacity-gate failure, but it does
 the report v5 lookup: the focused overview and CSV path remain within their gates. The arrival
 maintenance burst still needs a separate bounded investigation before #66 can close; the test
 thresholds were not relaxed and the run is not called PASS.
+
+A follow-up read-only plan benchmark on the 40,000-row revision fixture measured the compaction
+candidate lookup at 15 ms with v5-only and 1 ms with v4 (the v5 plan scanned its expression index,
+while v4 searched the watermark prefix). The branch now retains both indexes and pins v4 for the
+compaction inner lookup. Compaction 5/5, Projection 61/61, report 26/26, backend `tsc`, and lint
+all pass after this change. The locked reduced run must be repeated with this dual-index layout;
+the failed v5-only arrival sample is not reused as evidence for the corrected layout.
 
 ## Full-run evaluation
 

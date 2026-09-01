@@ -358,6 +358,7 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
           AND facts.applied_watermark IS NOT NULL
           AND EXISTS (
             SELECT 1 FROM usage_projection_facts AS newer
+              INDEXED BY usage_projection_report_summary_revision_v4
             WHERE newer.generation = facts.generation
               AND newer.row_kind = 'aggregate'
               AND newer.summary_fact_id = facts.summary_fact_id

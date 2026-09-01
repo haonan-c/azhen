@@ -276,6 +276,7 @@ describe("deployment Usage Projection", () => {
     await runDurableObjectAlarm(projection);
     await restoreRootFact(projection);
     await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec("DROP INDEX usage_projection_report_summary_revision_v4");
       state.storage.sql.exec("DROP INDEX usage_projection_report_summary_revision_v5");
       state.storage.sql.exec("ALTER TABLE usage_projection_facts DROP COLUMN applied_watermark");
       state.storage.sql.exec(`
