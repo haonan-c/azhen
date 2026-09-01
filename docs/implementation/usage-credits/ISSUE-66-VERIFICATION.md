@@ -18,11 +18,13 @@ Projection-maintenance tasks. The branch now coalesces those `ctx.waitUntil`-sta
 runs while keeping the Durable Object `alarm()` entrypoint unchanged; focused Projection,
 capacity-method, TypeScript, lint, and Cap'n Web preflight checks pass. A clean locked run after
 the fix passed sustained arrival but stopped at the capacity-telemetry p95 gate (3,220 ms against
-2,000 ms). A detail-only capacity index was added and a confirming locked run was started, but it
-was intentionally stopped during preseed at 40,014 of 179,600 records before measurement. No
-reduced PASS is claimed. The remaining item is a performance optimization and is tracked in
-[#77](https://github.com/haonan-c/azhen/issues/77); the existing Usage Credit paths remain usable and their correctness-focused
-checks pass. The full profile needs about 12.4 hours to seed its records on this machine,
+2,000 ms). A detail-only capacity index was added. A subsequent locked run with that index and the
+contention change completed preseed and sustained ingest with zero late ticks, but failed the
+Projection visibility p99 gate at 14,945 ms against 10,000 ms before reaching capacity telemetry.
+It produced no result marker and is not a reduced PASS. The remaining item is a performance
+optimization and is tracked in [#77](https://github.com/haonan-c/azhen/issues/77); the existing
+Usage Credit paths remain usable and their correctness-focused checks pass. The full profile needs
+about 12.4 hours to seed its records on this machine,
 which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
 ## Verification boundary
@@ -574,8 +576,9 @@ entrypoint because the Projection race tests depend on its existing ownership be
 
 Focused validation after the change is clean: Usage Projection 61/61, method inventory 1/1,
 backend TypeScript, lint, and Cap'n Web preflight 20 passed / 4 skipped. This is still not a
-capacity acceptance result. The capacity-index rerun was deferred by user decision; do not relax
-either threshold. The remaining p95 work is recorded in [#77](https://github.com/haonan-c/azhen/issues/77).
+capacity acceptance result. The latest locked run was allowed to complete its measured window but
+failed the Projection visibility p99 gate before the capacity telemetry gate; do not relax either
+threshold. The remaining p95 work is recorded in [#77](https://github.com/haonan-c/azhen/issues/77).
 
 The first clean locked run after the User-DO maintenance single-flight fix completed account
 creation, bootstrap, all 179,600 preseed records, and the full measured window without a host
@@ -595,10 +598,12 @@ public `readCapacityReview()` seam ten times after three warm-up calls. Adding a
 about 220 ms to about 115 ms for that shape. Rewriting every capacity query to use `occurred_at`
 made p95 worse (about 198 ms), so the fix keeps the existing expression-index path for rolling
 totals and peaks and uses the new partial index for the daily active-principal lookup only. The
-locked 200-active-User profile was started to validate this change at scale, then stopped during
-preseed at 40,014 / 179,600 records. It produced no measurement window, result marker, or
-acceptance conclusion. The 3,220 ms sample is therefore retained as the last completed telemetry
-failure, and the optimization is deferred to [#77](https://github.com/haonan-c/azhen/issues/77).
+locked 200-active-User profile completed preseed and the measured window after the user resumed the
+work. It passed sustained arrival (late=0, maximum 935 ms), but Projection visibility p99 was
+14,945 ms against the 10,000 ms gate. The runner stopped before capacity telemetry, rebuild, and
+report assertions, so it produced no result marker or acceptance conclusion. The 3,220 ms sample
+is retained as the last completed capacity-telemetry failure; this run is a separate visibility
+gate failure. Both performance items are tracked in [#77](https://github.com/haonan-c/azhen/issues/77).
 
 ## Full-run evaluation
 
