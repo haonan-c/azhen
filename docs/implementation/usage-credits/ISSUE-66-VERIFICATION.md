@@ -21,11 +21,13 @@ the fix passed sustained arrival but stopped at the capacity-telemetry p95 gate 
 2,000 ms). A detail-only capacity index was added. A subsequent locked run with that index and the
 contention change completed preseed and sustained ingest with zero late ticks, but failed the
 Projection visibility p99 gate at 14,945 ms against 10,000 ms before reaching capacity telemetry.
-It produced no result marker and is not a reduced PASS. The remaining item is a performance
-optimization and is tracked in [#77](https://github.com/haonan-c/azhen/issues/77); the existing
-Usage Credit paths remain usable and their correctness-focused checks pass. The full profile needs
-about 12.4 hours to seed its records on this machine,
-which is longer than its own timeout. See "Why the formal full run does not complete here".**
+The fresh locked repeat after the global ordering index also completed preseed and sustained ingest
+with zero late ticks, but failed the same Projection visibility p99 gate at 13,949 ms. Neither run
+produced a result marker or is a reduced PASS. The remaining item is a performance optimization and
+is tracked in [#77](https://github.com/haonan-c/azhen/issues/77); the existing Usage Credit paths
+remain usable and their correctness-focused checks pass. The full profile needs about 12.4 hours to
+seed its records on this machine, which is longer than its own timeout. See "Why the formal full run
+does not complete here".**
 
 ## Verification boundary
 
@@ -619,6 +621,29 @@ The query-plan regression was red before the index and green after it. The full 
 suite passes 15/15, and backend TypeScript plus lint remain clean. This is a targeted performance
 fix, not capacity acceptance evidence. A fresh locked reduced run is required to measure whether
 the visibility p99 gate now clears.
+
+The fresh locked reduced run on 2026-09-01 used the unchanged 200-active-User profile with
+`caffeinate -dimsu` and no host Sleep or Wake event during the run. It created 10,000 accounts,
+bootstrapped all 10,000 Users, seeded all 179,600 preseed records, and completed the 1,020-tick
+measured window. Arrival passed with zero late ticks and zero operation errors:
+
+| Measure | Result | Gate |
+| --- | ---: | ---: |
+| Arrival p50 / p95 / p99 / max | 225 / 549 / 706 / 983 ms | max <= 1,000 ms |
+| Commit cost by quarter | 480 / 214 / 213 / 222 ms | -- |
+| Projection visibility p99 | 13,949 ms | <= 10,000 ms |
+
+The capacity test stopped at the Projection visibility assertion, before capacity telemetry,
+rebuild, and its result marker. The global ordering index therefore did not clear this gate at the
+locked scale. The other capacity files in the same run passed: the focused report check measured
+40,000 overview rows at p95 285 ms and 40,080 CSV rows in 15,116 ms; method inventory passed 1/1;
+retention/storage passed 1/1; and the privacy scan was empty. This is a valid capacity-gate failure,
+not an acceptance PASS. The raw log SHA-256 is
+`b984da96fafc01a2a05a351ca77692e3c0d9596ce1c6f43b5719c293685df2f3`; its privacy scan SHA-256 is
+`3823733d1dc7e78a1549fd3eec9957e9373ce5c7f967724d3e2a6701444ba5c2`.
+
+The index remains because its query-plan regression is valid and it improves the intended access
+path; the residual visibility contention is deferred to [#77](https://github.com/haonan-c/azhen/issues/77).
 
 ## Full-run evaluation
 
