@@ -605,6 +605,21 @@ report assertions, so it produced no result marker or acceptance conclusion. The
 is retained as the last completed capacity-telemetry failure; this run is a separate visibility
 gate failure. Both performance items are tracked in [#77](https://github.com/haonan-c/azhen/issues/77).
 
+## Global pending-delivery ordering index
+
+The locked visibility failure exposed a concrete queueing cost in the root Projection. Every ingest
+and report-coordinate read selected the oldest `usage_projection_month_outbox` row by decimal
+`applied_watermark`, but the existing index began with `month`, so the global ordering required a
+temporary sort as the outbox grew. Commit `d1bceac` adds
+`usage_projection_month_outbox_global_order_v1` on `(length(applied_watermark), applied_watermark)`.
+It serves both the oldest-row delivery lookup and the report-visible-watermark lookup; the
+month-prefixed index remains for the bounded per-month page.
+
+The query-plan regression was red before the index and green after it. The full month-delivery
+suite passes 15/15, and backend TypeScript plus lint remain clean. This is a targeted performance
+fix, not capacity acceptance evidence. A fresh locked reduced run is required to measure whether
+the visibility p99 gate now clears.
+
 ## Full-run evaluation
 
 Pending: parse the formal JSON artifact, report p50/p95/p99/max/sample/error counts, exact source
