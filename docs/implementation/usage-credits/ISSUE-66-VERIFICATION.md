@@ -11,7 +11,8 @@ completed. A locked 200-active-User `reduced` run passed sustained ingest and re
 CSV duration gate; the focused fix passes the same physical report-row shape. Its first post-fix
 repeat was invalidated by a 2,458-second host clamshell sleep during rebuild, and its second
 post-fix repeat failed the arrival gate during a maintenance burst. A subsequent dual-index
-repeat removed that burst but still had one 1,085 ms late tick; none is a reduced PASS.
+repeat removed that burst but still had one 1,085 ms late tick, and a further dual-index repeat
+had 88 late ticks with a 17,969 ms maximum; none is a reduced PASS.
 The full profile needs about 12.4 hours to seed its records on this machine,
 which is longer than its own timeout. See "Why the formal full run does not complete here".**
 
@@ -539,6 +540,23 @@ power log contains no sleep or wake during the run. Its raw log SHA-256 is
 This is a valid near-threshold capacity result, not an acceptance PASS. A repeat is needed to
 separate one scheduling outlier from a reproducible residual maintenance cost before any further
 change to the arrival path.
+
+The second dual-index locked run completed both preflight groups, 10,000 account creations,
+10,000 / 10,000 bootstrap, all 179,600 preseed records in 7,611.3 seconds, and the full 1,020-tick
+measured window. It had zero operation errors but 88 late ticks: arrival p50 / p95 / p99 / max was
+173 / 5,918 / 16,365 / 17,969 ms. The first late block began at ticks 225–229; the worst samples
+were ticks 1,009–1,017. Commit-cost means were 394 / 428 / 479 / 685 ms, with the slowest samples
+at ticks 224, 521–548, and 955–1,008. The runner stopped at the arrival assertion before rebuild,
+so it produced no result marker. The focused report checks passed (40,000 overview rows and 40,080
+CSV rows in 14,267 ms), as did method inventory and retention/storage; the privacy scan passed.
+The host power log has no Sleep, Wake, or DarkWake event during the run. Its raw log SHA-256 is
+`f2cab2b684b3f43e96a7c5ffb8549e19312deae3a5ddc75131f3b65593c7a5c2`.
+
+This is a valid capacity-gate failure, not an acceptance PASS. The dual-index change removes the
+previous isolated maintenance burst in one run but does not make the arrival gate reliable: this
+repeat shows both an early cluster and a severe late-window cluster without a host sleep event.
+The next step is a bounded investigation of the residual arrival-path contention, not another
+threshold relaxation.
 
 ## Full-run evaluation
 
