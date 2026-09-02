@@ -2949,7 +2949,14 @@ export async function runAgent(
   // error triage after the loop settles. (pi never throws for provider failures; the loop
   // reports them as a final assistant message with stopReason "error"/"aborted".) Nothing from a
   // failed turn is persisted.
-  let turnFailure: {message: string} | undefined;
+  let turnFailure: {
+    message: string;
+    code?: string;
+    insufficientUsageCredit?: {
+      availableSubunits: bigint;
+      requiredSubunits: bigint;
+    };
+  } | undefined;
 
   // Turn cap, replacing the old stepCountIs(30).
   let turnCount = 0;
@@ -3018,7 +3025,22 @@ export async function runAgent(
         if (message.stopReason === "error" || message.stopReason === "aborted") {
           // Persist nothing from a failed or cancelled model request; rethrown after the loop
           // returns.
-          turnFailure = {message: message.errorMessage ?? "The model request failed."};
+          let failedMessage = message as AssistantMessage & {
+            usageCreditErrorCode?: string;
+            insufficientUsageCredit?: {
+              availableSubunits: bigint;
+              requiredSubunits: bigint;
+            };
+          };
+          turnFailure = {
+            message: message.errorMessage ?? "The model request failed.",
+            ...(failedMessage.usageCreditErrorCode
+              ? {code: failedMessage.usageCreditErrorCode}
+              : {}),
+            ...(failedMessage.insufficientUsageCredit
+              ? {insufficientUsageCredit: failedMessage.insufficientUsageCredit}
+              : {}),
+          };
           break;
         }
         // Note: a turn the model completed is persisted even if the user cancelled while its
@@ -3173,7 +3195,12 @@ export async function runAgent(
     // Other failures become an AgentTurnError carrying the failing request's HTTP status (when
     // it can be determined) for the overseer's triage.
     throw new AgentTurnError(
-        turnFailure.message, httpStatusFromError(turnFailure.message, handle));
+        turnFailure.message,
+        httpStatusFromError(turnFailure.message, handle),
+        {
+          code: turnFailure.code,
+          insufficientUsageCredit: turnFailure.insufficientUsageCredit,
+        });
   }
 
   // The turn ran, so there is no checkpoint to report.

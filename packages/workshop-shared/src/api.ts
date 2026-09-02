@@ -3785,6 +3785,8 @@ export type AiChatMessageBody = {
   message: string;
   /** Optional machine-readable code for presenting a stable category of error. */
   code?: string;
+  /** Amounts for an insufficient Usage Credit reservation, when the rejection carried them. */
+  insufficientUsageCredit?: InsufficientUsageCreditAmounts;
 } | {
   /**
    * Indicates that a callback was received on the agent's `self` object. When the agent uses

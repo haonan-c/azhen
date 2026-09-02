@@ -86,6 +86,7 @@ import {
   MessageFormatRef,
   OutputIcon,
   OutputFormatOffer,
+  USAGE_CREDIT_ERROR_CODES,
 } from "@gadgets/workshop-shared/api";
 import { ActionKind, ResourceDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -105,6 +106,7 @@ import type { SelectableItem } from "./ResourcePicker";
 import GatekeeperModal from "./GatekeeperModal";
 import { GatekeeperIcon } from "./components/GatekeeperIcon";
 import { formatNoun, formatOfferNoun, FORMAT_ICONS } from "./components/format/formats";
+import { formatUsageCreditSubunits } from "./components/billing/formatUsageCredits";
 import { FormatMiniature } from "./components/format/FormatVisuals";
 import { formatIconDataUrl } from "./components/format/formatIconImage";
 import { locateMessageFormatRefs } from "./components/format/messageFormatRefs";
@@ -7791,9 +7793,22 @@ function ChatInterface({
                               msg.sequence === lastMessageSequence &&
                               !isAgentActive;
                             const expanded = expandedErrors.has(key);
-                            const errorMessage = msg.code === "usage_limit"
-                              ? uiMessages.conversation_legacy_usage_limit()
-                              : msg.message;
+                            const insufficientUsageCredit =
+                              msg.code === USAGE_CREDIT_ERROR_CODES.insufficientCredit
+                                ? msg.insufficientUsageCredit
+                                : undefined;
+                            const errorMessage = insufficientUsageCredit
+                              ? uiMessages.conversation_insufficient_usage_credit({
+                                available: formatUsageCreditSubunits(
+                                  insufficientUsageCredit.availableSubunits),
+                                required: formatUsageCreditSubunits(
+                                  insufficientUsageCredit.requiredSubunits),
+                              })
+                              : msg.code === USAGE_CREDIT_ERROR_CODES.insufficientCredit
+                                ? uiMessages.conversation_insufficient_usage_credit_fallback()
+                                : msg.code === "usage_limit"
+                                  ? uiMessages.conversation_legacy_usage_limit()
+                                  : msg.message;
                             return (
                               <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
                                 <div className="flex w-full items-center gap-2 px-1.5 py-1">
@@ -7822,6 +7837,16 @@ function ChatInterface({
                                       </span>
                                     </Tooltip>
                                   </button>
+                                  {msg.code === USAGE_CREDIT_ERROR_CODES.insufficientCredit && (
+                                    <a
+                                      href={window.location.pathname.startsWith('/zh')
+                                        ? '/zh/profile#usage'
+                                        : '/profile#usage'}
+                                      className="flex-shrink-0 text-[13px] font-medium text-kumo-default underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kumo-ring"
+                                    >
+                                      {uiMessages.conversation_insufficient_usage_credit_link()}
+                                    </a>
+                                  )}
                                   {isLast && (
                                     <Tooltip content={uiMessages.conversation_retry_tooltip()} asChild>
                                       <button

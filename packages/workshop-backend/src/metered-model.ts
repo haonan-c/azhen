@@ -13,7 +13,14 @@ import type {
 } from "./usage-account.js";
 import type { UserDurableObject } from "./user.js";
 import { createWorkshopLogger } from "./observability.js";
-import type { AiModelProvider, ModelChargeSnapshot } from "@gadgets/workshop-shared/api";
+import {
+  getInsufficientUsageCreditAmounts,
+  getUsageCreditErrorCode,
+  USAGE_CREDIT_ERROR_CODES,
+  type AiModelProvider,
+  type InsufficientUsageCreditAmounts,
+  type ModelChargeSnapshot,
+} from "@gadgets/workshop-shared/api";
 
 const MAX_SSE_LINE_BYTES = 1_048_576;
 const logger = createWorkshopLogger("workshop.metered-model");
@@ -39,7 +46,7 @@ type ModelUsageAccount = Pick<
   DurableObjectStub<UserDurableObject>,
   "beginModelUsage" | "markModelUsageStarted" | "failModelUsageBeforeExecution" |
   "completeModelUsage"
->;
+> & Partial<Pick<DurableObjectStub<UserDurableObject>, "beginModelUsageForMetering">>;
 
 /** Persisted identity and financial input for one recoverable Agent inference. */
 export type ModelUsageOperation = {
@@ -138,55 +145,84 @@ export function meterModelHandle(
       let terminalBeforeExecution = false;
       let operationFinished = false;
       let lastMessage: AssistantMessage | undefined;
+      let meteringFailure: MeteringFailure | undefined;
       const callerFetch = streamOptions.fetch ?? globalThis.fetch;
       const callerOnPayload = streamOptions.onPayload;
 
       const inner = handle.stream(model, context, {
         ...streamOptions,
         onPayload: async (payload, payloadModel) => {
-          const replaced = await callerOnPayload?.(payload, payloadModel);
-          const finalPayload = replaced ?? payload;
-          const issuedSnapshot = await options.usageRates.issueModelChargeSnapshot(
-            usageProvider,
-            model.id,
-          );
-          let issuedBound: ModelUsageReservationBound;
-          if (usageProvider === "deepseek") {
-            const outputLimit = requestOutputLimit(finalPayload, model.maxTokens);
-            const inputBound = deepSeekInputTokenUpperBound(
-              finalPayload,
-              model.contextWindow,
-              outputLimit,
+          try {
+            const replaced = await callerOnPayload?.(payload, payloadModel);
+            const finalPayload = replaced ?? payload;
+            const issuedSnapshot = await options.usageRates.issueModelChargeSnapshot(
+              usageProvider,
+              model.id,
             );
-            issuedBound = reservationBoundFor(
-              issuedSnapshot,
-              inputBound,
-              BigInt(outputLimit),
-            );
-          } else {
-            if (issuedSnapshot.pricing === "priced") {
-              throw new Error(
-                `Provider "${usageProvider}" has a price but no verified Usage parser.`,
+            let issuedBound: ModelUsageReservationBound;
+            if (usageProvider === "deepseek") {
+              const outputLimit = requestOutputLimit(finalPayload, model.maxTokens);
+              const inputBound = deepSeekInputTokenUpperBound(
+                finalPayload,
+                model.contextWindow,
+                outputLimit,
+              );
+              issuedBound = reservationBoundFor(
+                issuedSnapshot,
+                inputBound,
+                BigInt(outputLimit),
+              );
+            } else {
+              if (issuedSnapshot.pricing === "priced") {
+                throw new Error(
+                  `Provider "${usageProvider}" has a price but no verified Usage parser.`,
+                );
+              }
+              issuedBound = {
+                cacheHitInputTokens: 0n,
+                cacheMissInputTokens: 0n,
+                outputTokens: 0n,
+              };
+            }
+            operation = operations.acquire({
+              chargeSnapshot: issuedSnapshot,
+              reservationBound: issuedBound,
+            });
+            if (options.user.beginModelUsageForMetering) {
+              const begun = await options.user.beginModelUsageForMetering(
+                operation.operationId,
+                options.attribution,
+                operation.chargeSnapshot,
+                operation.reservationBound,
+              );
+              if (begun.status === "insufficient-credit") {
+                meteringFailure = {
+                  code: USAGE_CREDIT_ERROR_CODES.insufficientCredit,
+                  insufficientUsageCredit: begun.amounts,
+                };
+                throw new Error("Insufficient Usage Credit.");
+              }
+            } else {
+              await options.user.beginModelUsage(
+                operation.operationId,
+                options.attribution,
+                operation.chargeSnapshot,
+                operation.reservationBound,
               );
             }
-            issuedBound = {
-              cacheHitInputTokens: 0n,
-              cacheMissInputTokens: 0n,
-              outputTokens: 0n,
-            };
+            began = true;
+            return finalPayload;
+          } catch (error) {
+            const code = getUsageCreditErrorCode(error);
+            const amounts = getInsufficientUsageCreditAmounts(error);
+            if (code !== undefined || amounts !== undefined) {
+              meteringFailure = {
+                code,
+                insufficientUsageCredit: amounts,
+              };
+            }
+            throw error;
           }
-          operation = operations.acquire({
-            chargeSnapshot: issuedSnapshot,
-            reservationBound: issuedBound,
-          });
-          await options.user.beginModelUsage(
-            operation.operationId,
-            options.attribution,
-            operation.chargeSnapshot,
-            operation.reservationBound,
-          );
-          began = true;
-          return finalPayload;
         },
         fetch: async (input, init) => {
           if (!began) {
@@ -223,7 +259,7 @@ export function meterModelHandle(
               continue;
             }
             if (!began) {
-              outer.push(event);
+              outer.push(annotateMeteringFailure(event, meteringFailure));
               continue;
             }
             if (!operation) throw new Error("Model Usage operation is unavailable.");
@@ -296,6 +332,32 @@ function messageFromEvent(event: AssistantMessageEvent): AssistantMessage {
   if (event.type === "done") return event.message;
   if (event.type === "error") return event.error;
   return event.partial;
+}
+
+type MeteringFailure = {
+  code?: string;
+  insufficientUsageCredit?: InsufficientUsageCreditAmounts;
+};
+
+type MeteredAssistantMessage = AssistantMessage & {
+  usageCreditErrorCode?: string;
+  insufficientUsageCredit?: InsufficientUsageCreditAmounts;
+};
+
+function annotateMeteringFailure(
+    event: AssistantMessageEvent, failure: MeteringFailure | undefined): AssistantMessageEvent {
+  if (!failure || event.type !== "error") return event;
+  let error = event.error as MeteredAssistantMessage;
+  return {
+    ...event,
+    error: {
+      ...error,
+      ...(failure.code ? {usageCreditErrorCode: failure.code} : {}),
+      ...(failure.insufficientUsageCredit
+        ? {insufficientUsageCredit: failure.insufficientUsageCredit}
+        : {}),
+    },
+  };
 }
 
 function billingFailureEvent(message: AssistantMessage): AssistantMessageEvent {

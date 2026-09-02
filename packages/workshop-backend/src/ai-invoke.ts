@@ -1,4 +1,5 @@
-import type { Message, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Usage } from "@earendil-works/pi-ai";
+import type { InsufficientUsageCreditAmounts } from "@gadgets/workshop-shared/api";
 import type { ModelHandle } from "./ai-models.js";
 
 /**
@@ -21,10 +22,19 @@ export function zeroUsage(): Usage {
 export class AgentTurnError extends Error {
   /** HTTP status of the failing request, when the handle observed a response for it. */
   readonly statusCode?: number;
+  /** Stable application error code, when the failed request has one. */
+  readonly code?: string;
+  /** Usage Credit amounts for a rejected reservation, when the failure carried them. */
+  readonly insufficientUsageCredit?: InsufficientUsageCreditAmounts;
 
-  constructor(message: string, statusCode?: number) {
+  constructor(message: string, statusCode?: number, details?: {
+    code?: string;
+    insufficientUsageCredit?: InsufficientUsageCreditAmounts;
+  }) {
     super(message);
     this.statusCode = statusCode;
+    this.code = details?.code;
+    this.insufficientUsageCredit = details?.insufficientUsageCredit;
   }
 }
 
@@ -72,7 +82,14 @@ export async function completeText(handle: ModelHandle, args: {
     // Surface a cancellation as the abort reason, like a directly-aborted request would.
     args.signal?.throwIfAborted();
     const errorMessage = message.errorMessage ?? "The model request failed.";
-    throw new AgentTurnError(errorMessage, httpStatusFromError(errorMessage, handle));
+    let failedMessage = message as AssistantMessage & {
+      usageCreditErrorCode?: string;
+      insufficientUsageCredit?: InsufficientUsageCreditAmounts;
+    };
+    throw new AgentTurnError(errorMessage, httpStatusFromError(errorMessage, handle), {
+      code: failedMessage.usageCreditErrorCode,
+      insufficientUsageCredit: failedMessage.insufficientUsageCredit,
+    });
   }
   return message.content
       .filter(block => block.type === "text")

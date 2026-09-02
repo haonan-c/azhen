@@ -350,6 +350,86 @@ describe('localized conversation history', () => {
     expect(onOpenGadget).toHaveBeenCalledWith(11)
   }, 15_000)
 
+  it('shows the localized Usage Credit amounts and balance link after a rejected reservation', async () => {
+    window.history.replaceState({}, '', '/zh/workspace/7')
+    const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
+    const overseer = {
+      subscribeToChat: () => disposable,
+      subscribeToActions: async (subscriber: ActionsSubscriber) => {
+        subscriber.ready()
+        return disposable
+      },
+      listChats: async () => [{
+        id: 7,
+        title: 'CREDIT ERROR CHAT',
+        started: AT,
+        lastActive: AT,
+      }],
+      listModels: async () => [AGENT],
+      listSlashCommands: async () => [],
+      getChatHistory: async () => ({messages: [{
+        chatId: 7,
+        sequence: 1,
+        timestamp: AT,
+        author: AGENT,
+        type: 'error',
+        code: 'INSUFFICIENT_USAGE_CREDIT',
+        message: 'Insufficient Usage Credit.',
+        insufficientUsageCredit: {
+          availableSubunits: 0n,
+          requiredSubunits: 2_000_000_000_000_000_000n,
+        },
+      }]}),
+    } as unknown as RpcStub<Overseer>
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(
+      <ChatInterface
+        workspaceId="workspace-7"
+        overseer={overseer}
+        selectedChatId={7}
+        onNavigateToChat={() => {}}
+        pendingConsoleLogCount={0}
+        consoleLogPreview=""
+        consoleLogSeverity="info"
+        onConsumeConsoleLogs={() => ''}
+        onDiscardConsoleLogs={() => {}}
+        onOpenGadget={() => {}}
+        outputOfWorkpiece={() => undefined}
+      />,
+    ))
+
+    expect(container.textContent).toContain('错误：使用额度不足。可用余额：0；本次需要：2。')
+    const balanceLink = [...container.querySelectorAll<HTMLAnchorElement>('a')]
+      .find(anchor => anchor.textContent === '查看使用额度余额')
+    expect(balanceLink?.getAttribute('href')).toBe('/zh/profile#usage')
+
+    window.history.replaceState({}, '', '/en/workspace/7')
+    await act(async () => root!.render(
+      <ChatInterface
+        workspaceId="workspace-7"
+        overseer={overseer}
+        selectedChatId={7}
+        onNavigateToChat={() => {}}
+        pendingConsoleLogCount={0}
+        consoleLogPreview=""
+        consoleLogSeverity="info"
+        onConsumeConsoleLogs={() => ''}
+        onDiscardConsoleLogs={() => {}}
+        onOpenGadget={() => {}}
+        outputOfWorkpiece={() => undefined}
+      />,
+    ))
+
+    expect(container.textContent)
+      .toContain('Error: Not enough Usage Credits. Available balance: 0; this operation requires: 2.')
+    const englishBalanceLink = [...container.querySelectorAll<HTMLAnchorElement>('a')]
+      .find(anchor => anchor.textContent === 'View your Usage Credit balance')
+    expect(englishBalanceLink?.getAttribute('href')).toBe('/profile#usage')
+  })
+
   it('localizes the Chinese conversation list and keeps deployment cost off a User view', async () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const now = new Date()
