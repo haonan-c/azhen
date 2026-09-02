@@ -938,9 +938,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       activeUsers: 0n,
     };
     const active = new Set<string>();
-    for (const month of this.#reportMonths(query, undefined)) {
-      const result = await this.#monthStub(month).readReportMetrics(
-        query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX);
+    // Month objects own disjoint UTC ranges, so their partial sums do not depend on one another.
+    // Start all RPCs before awaiting them to keep overview latency bounded by the slowest month.
+    const partials = await Promise.all(this.#reportMonths(query, undefined).map(month =>
+      this.#monthStub(month).readReportMetrics(
+        query, USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX)));
+    for (const result of partials) {
       const partial = result.metrics;
       totals.providerCostUsdSubunits += partial.providerCostUsdSubunits;
       totals.chargedUsageCreditSubunits += partial.chargedUsageCreditSubunits;
