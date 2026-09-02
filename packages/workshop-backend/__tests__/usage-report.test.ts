@@ -1269,7 +1269,7 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     expect(legacyCsvRowIds.toSorted()).toEqual(legacyRows.map(row => row.rowId).toSorted());
   });
 
-  it("keeps a one-million-row CSV lazy and bounded by one 64-row page", async () => {
+  it("keeps a one-million-row CSV lazy and bounded by one 256-row page", async () => {
     const totalRows = 1_000_000;
     let calls = 0;
     let servedRows = 0;
@@ -1308,8 +1308,8 @@ describe("Issue #63 frozen administrator Usage reports", () => {
     reader.releaseLock();
 
     expect(servedRows).toBe(totalRows);
-    expect(calls).toBe(Math.ceil(totalRows / ADMIN_USAGE_CSV_PAGE_SIZE));
-    expect(maxRows).toBe(ADMIN_USAGE_CSV_PAGE_SIZE);
+    expect(calls).toBe(Math.ceil(totalRows / 256));
+    expect(maxRows).toBe(256);
     expect(maxChunkBytes).toBeLessThanOrEqual(ADMIN_USAGE_CSV_MAX_CHUNK_BYTES);
     expect(totalBytes).toBeGreaterThan(0n);
   }, 60_000);

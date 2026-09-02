@@ -2916,7 +2916,7 @@ describe("approved Action billing", () => {
       .toBe(prefetchQueries.length);
     expect(prefetchQueries.every(event => event.queryInFlight === 1)).toBe(true);
     expect(prefetchEvents.filter(event => event.event === "page-query-end")
-      .every(event => event.queryInFlight === 0 && (event.rowCount ?? 65) <= 64)).toBe(true);
+      .every(event => event.queryInFlight === 0 && (event.rowCount ?? 257) <= 256)).toBe(true);
     const prefetchedRows = prefetchEvents.filter(event => event.event === "page-query-end")
       .reduce((total, event) => total + (event.rowCount ?? 0), 0);
     expect(prefetchedRows).toBeLessThan(66 + USAGE_REPORT_SEED_ROWS);
@@ -2933,7 +2933,7 @@ describe("approved Action billing", () => {
     const dataRows = new TextDecoder().decode(dataChunk.value)
       .split("\r\n").filter(Boolean);
     expect(dataRows.length).toBeGreaterThan(0);
-    expect(dataRows.length).toBeLessThanOrEqual(64);
+    expect(dataRows.length).toBeLessThanOrEqual(256);
     expect(dataChunk.value.byteLength).toBeLessThanOrEqual(256 * 1024);
     await new Promise(resolve => setTimeout(resolve, 100));
     const pausedTelemetry = await readUsageReportTelemetry();
@@ -2952,7 +2952,7 @@ describe("approved Action billing", () => {
         USAGE_REPORT_MAX_CHUNK_BYTES,
     );
     expect(completedPagesAtPause.every(event =>
-      event.queryInFlight === 0 && (event.rowCount ?? 65) <= 64)).toBe(true);
+      event.queryInFlight === 0 && (event.rowCount ?? 257) <= 256)).toBe(true);
     const rowsAtPause = completedPagesAtPause
       .reduce((total, event) => total + (event.rowCount ?? 0), 0);
     expect(rowsAtPause).toBeLessThan(66 + USAGE_REPORT_SEED_ROWS);

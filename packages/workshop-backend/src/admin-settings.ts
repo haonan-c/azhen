@@ -1229,7 +1229,7 @@ async function assertAdminCapabilityActive(
 }
 
 /** Maximum number of Usage rows encoded into one CSV stream chunk. */
-export const ADMIN_USAGE_CSV_PAGE_SIZE = 64;
+export const ADMIN_USAGE_CSV_PAGE_SIZE = 256;
 
 /** Maximum encoded byte length held by one Usage CSV stream chunk. */
 export const ADMIN_USAGE_CSV_MAX_CHUNK_BYTES = 256 * 1024;
