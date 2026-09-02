@@ -149,6 +149,73 @@ describe("Usage Projection month delivery", () => {
     expect(await outbox(projection)).toEqual([]);
   });
 
+  it("defers month delivery while ingests overlap", async () => {
+    const name = `delivery-concurrent-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const first = detail(crypto.randomUUID(), {sourceSequence: 1n});
+    const second = detail(crypto.randomUUID(), {sourceSequence: 1n});
+
+    const [firstResult, secondResult] = await Promise.all([
+      projection.ingest([first]),
+      projection.ingest([second]),
+    ]);
+    expect(firstResult).toEqual({
+      acknowledgedFactIds: [first.projectionFactId],
+      rejected: [],
+    });
+    expect(secondResult).toEqual({
+      acknowledgedFactIds: [second.projectionFactId],
+      rejected: [],
+    });
+    const pendingState = await runInDurableObject(projection, (_instance, state) => ({
+      meteredUseCount: state.storage.sql.exec<{count: string}>(`
+        SELECT metered_use_count AS count FROM usage_projection_totals
+        WHERE generation = (SELECT active_generation FROM usage_projection_meta WHERE singleton = 1)
+      `).one().count,
+      outbox: state.storage.sql.exec<{count: number}>(`
+        SELECT COUNT(*) AS count FROM usage_projection_month_outbox
+      `).one().count,
+      oldestPendingWatermark: state.storage.sql.exec<{watermark: string}>(`
+        SELECT applied_watermark AS watermark FROM usage_projection_month_outbox
+        ORDER BY length(applied_watermark), applied_watermark LIMIT 1
+      `).toArray()[0]?.watermark ?? null,
+    }));
+    expect(BigInt(pendingState.meteredUseCount)).toBe(2n);
+    expect(pendingState.outbox).toBeGreaterThan(0);
+    expect(BigInt(pendingState.oldestPendingWatermark!) - 1n).toBeLessThan(2n);
+
+    for (let step = 0; step < 4 && (await outbox(projection)).length > 0; step += 1) {
+      await runDurableObjectAlarm(projection);
+    }
+    expect(await outbox(projection)).toEqual([]);
+    expect(await monthRowCount(name, "2026-08", first.projectionFactId)).toBe(1);
+    expect(await monthRowCount(name, "2026-08", second.projectionFactId)).toBe(1);
+  });
+
+  it("drains deferred month delivery after a Projection restart", async () => {
+    const name = `delivery-concurrent-restart-${crypto.randomUUID()}`;
+    const projection = await ready(name);
+    const first = detail(crypto.randomUUID(), {sourceSequence: 1n});
+    const second = detail(crypto.randomUUID(), {sourceSequence: 1n});
+
+    await Promise.all([projection.ingest([first]), projection.ingest([second])]);
+    await runInDurableObject(projection, async (_instance, state) => {
+      await state.storage.deleteAlarm();
+    });
+    expect((await outbox(projection)).length).toBeGreaterThan(0);
+    await expect(runInDurableObject(projection, (_instance, state) => {
+      state.abort("restart deferred month delivery");
+    })).rejects.toThrow("restart deferred month delivery");
+
+    const restarted = testEnv.TEST_USAGE_PROJECTION.getByName(name);
+    for (let step = 0; step < 16 && (await outbox(restarted)).length > 0; step += 1) {
+      await runInDurableObject(restarted, instance => instance.alarm());
+    }
+    expect(await outbox(restarted)).toEqual([]);
+    expect(await monthRowCount(name, "2026-08", first.projectionFactId)).toBe(1);
+    expect(await monthRowCount(name, "2026-08", second.projectionFactId)).toBe(1);
+  });
+
   it("keeps the report watermark behind a row that is not delivered yet", async () => {
     const projection = await ready(`delivery-watermark-${crypto.randomUUID()}`);
     const principal = crypto.randomUUID();

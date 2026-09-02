@@ -430,6 +430,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   private months: DurableObjectNamespace<UsageProjectionMonth>;
   private alarmRunning = false;
   private ingestPreparations = 0;
+  private monthDeliveryDeferred = false;
   private rebuildPreparations = 0;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
@@ -446,10 +447,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       throw new TypeError("Usage Projection ingestion batch is invalid.");
     }
     this.ingestPreparations += 1;
+    if (this.ingestPreparations > 1) this.monthDeliveryDeferred = true;
     try {
       return await this.#ingestPrepared(facts);
     } finally {
       this.ingestPreparations -= 1;
+      if (this.ingestPreparations === 0) this.monthDeliveryDeferred = false;
     }
   }
 
@@ -525,7 +528,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       }
       if (result.applied) acknowledgedFactIds.push(fact.projectionFactId);
     }
-    if (!await this.#deliverMonthOutboxStep() || this.#hasApplyDrain()) {
+    // A concurrent ingest keeps the cross-DO month RPC off every overlapping caller's critical
+    // path. Root apply and acknowledgement stay synchronous; the durable alarm drains the outbox
+    // after the input gate closes.
+    const deliveryComplete = this.monthDeliveryDeferred
+      ? false : await this.#deliverMonthOutboxStep();
+    if (!deliveryComplete || this.#hasApplyDrain()) {
       await this.ctx.storage.setAlarm(Date.now() + 1_000);
     }
     return {acknowledgedFactIds, rejected};

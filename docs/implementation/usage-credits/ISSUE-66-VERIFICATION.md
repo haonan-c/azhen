@@ -645,6 +645,32 @@ not an acceptance PASS. The raw log SHA-256 is
 The index remains because its query-plan regression is valid and it improves the intended access
 path; the residual visibility contention is deferred to [#77](https://github.com/haonan-c/azhen/issues/77).
 
+## Concurrent Projection ingest deferral (#77)
+
+The residual visibility queue was traced to `UsageProjection.ingest()` awaiting a cross-Durable
+Object month delivery while other ingests were active. The root apply and acknowledgement do not
+need that RPC; the durable month outbox already provides idempotent retry and the report watermark
+stays behind undelivered rows. The implementation now marks an overlapping ingest group and skips
+the synchronous month delivery for every call in that group. A scheduled alarm drains the outbox
+after the input gate closes. Serial ingests keep their previous immediate-delivery behavior.
+
+The red regression reproduced the old behavior: two concurrent ingests returned only after the
+month outbox had been synchronously drained. The new regression verifies that both acknowledgements
+and root totals complete first, that the report watermark remains below the undelivered rows, and
+that an alarm drains both rows. A second test aborts the Projection after the concurrent calls and
+verifies that a restarted instance drains the durable outbox without duplicate month rows.
+
+Focused validation is green: month delivery 17/17, report 26/26, retention 28/28, admin 18/18,
+backend TypeScript, and lint with zero errors. A short smoke capacity run also completed its result
+marker: arrival late=0 with p95 1 ms, Projection visibility p99 78 ms, rebuild digests equal,
+report/CSV, method inventory, retention/storage, ledger, privacy and final consistency all passed.
+The smoke artifact hashes are `d1d4f44eaa88dae315ab93ce13a421d1956f6dbd656dab11919dd6fd897bc844`
+for the log, `dfe018feb5b04683345769f91fab6edd4142b3532e5821ef445a53d9f2bd7fd8` for the result,
+and `720063bda79a8e1b08355eba273a03993749bb8365ddfcc6cff069bb9ceaaf6e` for the privacy file.
+
+This is not the locked reduced acceptance result. The 200-active-User, 1,020-tick run remains
+required before closing #77 or #66; thresholds were not changed.
+
 ## Full-run evaluation
 
 Pending: parse the formal JSON artifact, report p50/p95/p99/max/sample/error counts, exact source
