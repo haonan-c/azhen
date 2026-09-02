@@ -125,7 +125,10 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
         principalLimit > USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX) {
       throw new TypeError("Usage Projection month principal limit is invalid.");
     }
-    const predicate = buildUsageReportPredicate(query, "aggregate-revisions");
+    // Summary dimensions are immutable for one summary_fact_id. The aggregate predicate resolves
+    // the newest revision through the summary-revision index before applying those dimensions,
+    // which is equivalent to ranking the full history without materializing every revision.
+    const predicate = buildUsageReportPredicate(query, "aggregate");
     const totals: AdminUsageReportRowMetrics = {
       providerCostUsdSubunits: 0n,
       chargedUsageCreditSubunits: 0n,
@@ -168,29 +171,14 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
       principal_ref: string;
       active_user_contribution: string;
     }>(`
-      -- A Summary identity fixes every report dimension, so report filters can run before ranking.
-      -- Decimal bigint text sorts exactly by length and then lexicographically.
-      WITH ranked AS (
-        SELECT provider_cost, charged_credits, cache_hit_input, cache_miss_input,
-          cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
-          metered_use_count, pre_execution_failures, unknown_operations, metering_attempts,
-          held_reservations, released_reservations, settled_reservations, unreserved_attempts,
-          unpriced_model_uses, unpriced_api_operations, principal_ref, active_user_contribution,
-          ROW_NUMBER() OVER (
-            PARTITION BY summary_fact_id
-            ORDER BY length(summary_revision) DESC, summary_revision DESC,
-              length(applied_watermark), applied_watermark
-          ) AS effective_rank
-        FROM usage_projection_facts AS facts${predicate.indexName === null
-          ? "" : ` INDEXED BY ${predicate.indexName}`}
-        WHERE ${predicate.sql}
-      )
       SELECT provider_cost, charged_credits, cache_hit_input, cache_miss_input,
         cache_write_input, output_tokens, reasoning_tokens, billable_api_operations,
         metered_use_count, pre_execution_failures, unknown_operations, metering_attempts,
         held_reservations, released_reservations, settled_reservations, unreserved_attempts,
         unpriced_model_uses, unpriced_api_operations, principal_ref, active_user_contribution
-      FROM ranked WHERE effective_rank = 1
+      FROM usage_projection_facts AS facts${predicate.indexName === null
+        ? "" : ` INDEXED BY ${predicate.indexName}`}
+      WHERE ${predicate.sql}
     `, ...predicate.params);
     const activePrincipals = new Set<string>();
     for (const row of rows) {
