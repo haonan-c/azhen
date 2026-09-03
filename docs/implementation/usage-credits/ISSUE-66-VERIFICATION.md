@@ -671,6 +671,106 @@ and `720063bda79a8e1b08355eba273a03993749bb8365ddfcc6cff069bb9ceaaf6e` for the p
 This is not the locked reduced acceptance result. The 200-active-User, 1,020-tick run remains
 required before closing #77 or #66; thresholds were not changed.
 
+## Reporting the whole gate ladder in one run
+
+Seven reduced runs had produced seven different failures. The cause was the shape of the
+verification, not only the deployment: the performance thresholds were a chain of `expect` calls, so
+a run that missed the first one spent its whole one-to-four hours to report a single number. Across
+those seven runs `arrival.max`, `authoritativeWarm.p95` and `projectionVisibility.p99` had each been
+observed exactly once, and no run had ever reported the ladder.
+
+`verifyCapacityResult` now records every threshold as it measures it and asserts the ladder once,
+before the result marker. `USAGE_CAPACITY_PERFORMANCE_GATES` reports all ten with their measured
+value, limit and pass flag, and the marker carries the same list so a passing run records its
+margins. No threshold and no field of `usage-capacity-v1-profile.json` changed, correctness
+assertions still fail where they are, and `validateCapacityResult` re-checks arrival against the
+locked tick independently of the test, so a late run still cannot produce an accepted marker. A
+`--smoke` run confirmed the marker, artifacts and empty privacy scan are unchanged.
+
+## Three measured maintenance costs
+
+Each of these reproduces in seconds, against the hour or more a capacity run costs.
+
+| Measurement | Result |
+| --- | --- |
+| `compactSupersededAggregates` with nothing to compact | `SCAN facts USING INDEX usage_projection_report_summary_revision_v5`; 4 ms, 9 ms, 38 ms at 2,000, 8,000 and 32,000 aggregate rows |
+| retained-identity prune | `SCAN identities` over `usage_projection_expired_sequences`, which delivery grows by one row per reportable row (measured 1,024 to 6,144, linear) |
+| root ingest throughput | 656 to 450 records a second across 6,144 delivered records, tracking the identity-row count |
+
+Two earlier expectations did not survive the measurement. The compaction scan is a full *index*
+scan, not a table scan: SQLite does select the partial index. And the twelve
+`usage_projection_report_*` indexes the root object carries but never reads are not the throughput
+story. The root's `usage_projection_facts` reaches zero rows in steady state, because delivery
+removes each row, so those indexes are a constant cost on empty B-trees rather than a growing one.
+Removing them is still real waste to recover, and it needs the query plan of every root query first;
+it is not done here.
+
+## What the bounded maintenance turn changed
+
+Commit `9a43ee2` indexes the prune by retirement time, ends the compaction month loop on the same
+250 ms deadline the rebuild step already used, and stops background maintenance rescheduling itself
+at `Date.now() + 0`. Delivery and the lifecycle steps keep the immediate next alarm because a reader
+waits on them.
+
+The locked reduced run of 2026-09-03 on that commit removed the sustained maintenance regime. Its
+commit cost by quarter is the lowest recorded:
+
+| Run | Commit cost by quarter | Arrival |
+| --- | --- | --- |
+| global ordering index | 480 / 214 / 213 / 222 ms | late 0, max 983 ms |
+| CSV page 256 (v4) | 358 / 202 / 189 / 192 ms | late 0, max 774 ms |
+| v5 | 382 / 177 / 169 / 366 ms | late 30, max 3,962 ms |
+| v7 | 389 / 434 / 405 / 155 ms | late 31, max 4,167 ms |
+| bounded maintenance turn | 406 / **199 / 164 / 164** ms | late 18, max 4,780 ms |
+
+Arrival still failed, but with a different shape: the eight worst ticks are all in the warm window
+at indexes 26 to 33, from one 3,055 ms stall at tick 24, at the preseed-to-warm transition. The 900
+measured ticks are otherwise clean at p50 142 ms and p95 535 ms. Earlier failures were spread or
+sustained. This is a capacity-gate failure, not an acceptance PASS.
+
+## The report gate no run had reached
+
+That run was the first to get past the latency ladder, and it failed the report workload with
+`Usage report snapshot is stale.`
+
+Superseded-aggregate compaction shared `detail_retention_revision` with detail retention, so
+removing any row failed every open report. Detail retention needs that, because it removes rows by
+time and an open report can still name them. Compaction does not: it only removes a revision that a
+newer revision replaced at or below `report_watermark - SUPERSEDED_AGGREGATE_WATERMARK_LAG`, so a
+report frozen at or above that floor already reads the newer revision and never named the removed
+one. Only a report frozen below the floor can still be reading a revision that is now gone. The
+reduced profile exports 200,000 rows over minutes, so any background compaction in that window
+failed the export.
+
+Commit `fba2b8a` records that floor in `compacted_aggregate_floor` and fails a report frozen below
+it. The existing contract is unchanged: the test that freezes a report and then moves the watermark
+to 1,000,000 puts that report far below the floor and is still failed. The new regression covers the
+report at or above the floor, and is red without the change with the error the capacity run
+produced. Existing objects take the column with a zero default, which fails nothing.
+
+Commit `30018fe` reports a maintenance turn that overruns the alarm deadline, with the cost and
+completion of delivery, compaction and pruning, so the remaining warm-window stall can be attributed
+without another four-hour run. Turns inside the deadline log nothing.
+
+## The host invalidates runs, and has been doing so
+
+The first attempt at a locked run on `30018fe` failed its Cap'n Web preflight after three minutes:
+`action-billing.test.ts` failed a retained replay with `WebSocket connection failed`. The same test
+fails identically at `9d42c8a`, with none of this branch's later changes applied, and it had passed
+that same preflight five hours earlier. The failing stage moved between attempts
+(`legacy-delete-user`, `legacy-approve-target`, `legacy-verify-user-surface-deleted`).
+
+The host was at 12.9 GB of 14.3 GB swap on 16 GiB of physical memory, with a load average near 8 on
+six physical cores, from desktop applications outside this verification. workerd fleets are the
+memory consumers in this repository's test setup, and an OOM-killed workerd wedges its vitest parent
+rather than failing.
+
+This is recorded because it bears on the earlier evidence as well. Runs v4, v5 and v7 share
+essentially the same code, and their arrival maxima are 774 ms, 3,962 ms and 4,167 ms. A swing of
+that size on unchanged code is consistent with host memory pressure, so a locked run started while
+the host is paging cannot be treated as capacity evidence either way. Locked runs from here need the
+host's free memory recorded at the start of the run.
+
 ## Full-run evaluation
 
 Pending: parse the formal JSON artifact, report p50/p95/p99/max/sample/error counts, exact source
