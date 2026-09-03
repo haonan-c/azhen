@@ -187,6 +187,41 @@ describe("Usage Projection superseded aggregate compaction", () => {
       .rejects.toThrow("Usage report snapshot is stale.");
   });
 
+  it("keeps a report frozen at or above the compaction floor", async () => {
+    const {projection, usage} = isolated(`compaction-survives-${crypto.randomUUID()}`);
+    await ready(projection);
+    const principal = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const first = aggregate(principal, {summaryFactId, providerCostUsdSubunits: 10n});
+    await projection.ingest([first]);
+    await projection.ingest([aggregate(principal, {
+      ...first,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 2n,
+      summaryRevision: 2n,
+      providerCostUsdSubunits: 25n,
+    })]);
+    // Frozen after both revisions, so this report already reads the second one. Compaction removes
+    // the first, which this report never named, and therefore must not fail it.
+    using frozen = await usage().openReport({registeredUserRefs: [principal]});
+    expect((await frozen.getOverview()).metrics.providerCostUsdSubunits).toBe(25n);
+
+    // The floor is the report watermark less the lag, so this puts it exactly at the second
+    // revision: the first becomes removable while this report stays at or above the floor.
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET report_watermark = ? WHERE singleton = 1
+      `, String(100_002));
+    });
+    await runDurableObjectAlarm(projection);
+    expect(await aggregateRows(projection, summaryFactId)).toHaveLength(1);
+
+    expect((await frozen.listRows({limit: 10})).rows).toEqual([
+      expect.objectContaining({summaryRevision: 2n}),
+    ]);
+    expect((await frozen.getOverview()).metrics.providerCostUsdSubunits).toBe(25n);
+  });
+
   it("bounds each compaction batch and reports incomplete work", async () => {
     const {projection} = isolated(`compaction-bounded-${crypto.randomUUID()}`);
     await ready(projection);

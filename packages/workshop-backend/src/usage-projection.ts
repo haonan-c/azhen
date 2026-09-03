@@ -160,6 +160,7 @@ type ProjectionMetaRow = {
   ingestion_watermark: string;
   report_watermark: string;
   detail_retention_revision: string;
+  compacted_aggregate_floor: string;
   last_ingested_at: string | null;
   latest_applied_source_at: string | null;
   failed_ingestion_count: string;
@@ -1081,6 +1082,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         meta.bootstrap_state !== "complete" ||
         query.snapshot.projectionGeneration.toString() !== meta.active_generation ||
         query.snapshot.ingestionWatermark > BigInt(meta.report_watermark) ||
+        query.snapshot.ingestionWatermark < BigInt(meta.compacted_aggregate_floor) ||
         query.detailRetentionRevision !== BigInt(meta.detail_retention_revision)) {
       throw new Error("Usage report snapshot is stale.");
     }
@@ -1174,7 +1176,9 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * Signal that rows a frozen report could still name are gone.
    *
    * A report freezes this revision when it opens, so bumping it fails the report rather than
-   * letting it silently return fewer rows. Detail retention and aggregate compaction share it.
+   * letting it silently return fewer rows. Detail retention removes rows by time, which any open
+   * report can still name, so it fails all of them. Superseded-aggregate compaction is narrower and
+   * reports its floor through `#recordCompactedAggregateFloor` instead.
    */
   #bumpDetailRetentionRevision(): void {
     const meta = this.#meta();
@@ -1247,8 +1251,24 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         break;
       }
     }
-    if (removed > 0) this.#bumpDetailRetentionRevision();
+    if (removed > 0) this.#recordCompactedAggregateFloor(floor);
     return complete;
+  }
+
+  /**
+   * Remember the highest Summary-revision floor compaction has removed rows at.
+   *
+   * A removed revision was replaced by a newer one applied at or below this floor, so a report
+   * frozen at or above it already reads the newer revision and never named the removed one. Only a
+   * report frozen below the floor could still be reading a revision that is now gone, so only that
+   * report has to fail. The floor never moves backwards.
+   */
+  #recordCompactedAggregateFloor(floor: bigint): void {
+    const meta = this.#meta();
+    if (BigInt(meta.compacted_aggregate_floor) >= floor) return;
+    this.ctx.storage.sql.exec(`
+      UPDATE usage_projection_meta SET compacted_aggregate_floor = ? WHERE singleton = 1
+    `, floor.toString());
   }
 
   #expireRootDetailBefore(
@@ -2598,7 +2618,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     return this.ctx.storage.sql.exec<ProjectionMetaRow>(`
       SELECT projection_schema_version, active_generation, ingestion_watermark, report_watermark,
              last_ingested_at,
-             detail_retention_revision,
+             detail_retention_revision, compacted_aggregate_floor,
              latest_applied_source_at, failed_ingestion_count, failure_code,
              rebuild_request_id, rebuild_state, rebuild_generation, rebuild_users_processed,
              rebuild_registry_revision, rebuild_registry_cursor, rebuild_registry_complete,
@@ -2657,6 +2677,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         active_generation TEXT NOT NULL,
         ingestion_watermark TEXT NOT NULL, report_watermark TEXT NOT NULL,
         detail_retention_revision TEXT NOT NULL,
+        compacted_aggregate_floor TEXT NOT NULL DEFAULT '0',
         last_ingested_at TEXT,
         latest_applied_source_at TEXT, failed_ingestion_count TEXT NOT NULL,
         failure_code TEXT, rebuild_request_id TEXT, rebuild_state TEXT,
@@ -2688,6 +2709,12 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       this.ctx.storage.sql.exec(`
         ALTER TABLE usage_projection_meta
         ADD COLUMN detail_retention_revision TEXT NOT NULL DEFAULT '0'
+      `);
+    }
+    if (!metaColumns.has("compacted_aggregate_floor")) {
+      this.ctx.storage.sql.exec(`
+        ALTER TABLE usage_projection_meta
+        ADD COLUMN compacted_aggregate_floor TEXT NOT NULL DEFAULT '0'
       `);
     }
     if (!metaColumns.has("rebuild_authority_complete")) {
