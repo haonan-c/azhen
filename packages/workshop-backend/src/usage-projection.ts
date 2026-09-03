@@ -58,6 +58,13 @@ type UsageCapacityLogFields = {
   reviewRequired: boolean;
   windowKind: string;
   asOf: string;
+  maintenanceTurnMs: number;
+  maintenanceDeliveryMs: number;
+  maintenanceCompactionMs: number;
+  maintenancePruneMs: number;
+  maintenanceDeliveryComplete: boolean;
+  maintenanceCompactionComplete: boolean;
+  maintenancePruneComplete: boolean;
 };
 
 const capacityLogger = createLogger<UsageCapacityLogFields>({
@@ -1494,9 +1501,27 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
       this.#setMaintenanceTurn("drain");
     }
     await this.#runRetiredProjectionCleanupStep();
+    // Every step below is bounded, so a turn that still overruns the deadline is the one worth
+    // seeing. `Date` can be moved by a caller, so the cost is read from the monotonic clock.
+    const turnStartedAt = performance.now();
     const deliveryComplete = await this.#deliverMonthOutboxStep();
+    const deliveredAt = performance.now();
     const monthCompactionComplete = await this.#compactMonthsStep();
+    const compactedAt = performance.now();
     const identityPruneComplete = this.#pruneRetainedIdentitiesStep();
+    const prunedAt = performance.now();
+    if (prunedAt - turnStartedAt > MAINTENANCE_ALARM_DEADLINE_MS) {
+      capacityLogger.debug("Usage Projection maintenance turn overran its deadline", {
+        event: "projection.maintenance.turn.slow",
+        maintenanceTurnMs: Math.round(prunedAt - turnStartedAt),
+        maintenanceDeliveryMs: Math.round(deliveredAt - turnStartedAt),
+        maintenanceCompactionMs: Math.round(compactedAt - deliveredAt),
+        maintenancePruneMs: Math.round(prunedAt - compactedAt),
+        maintenanceDeliveryComplete: deliveryComplete,
+        maintenanceCompactionComplete: monthCompactionComplete,
+        maintenancePruneComplete: identityPruneComplete,
+      });
+    }
     await this.#scheduleRemainingMaintenance(
       deliveryComplete, monthCompactionComplete && identityPruneComplete,
     );
