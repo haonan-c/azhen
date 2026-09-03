@@ -259,3 +259,72 @@ describe("Usage Projection superseded aggregate compaction", () => {
     expect(await aggregateRows(projection, summaryFactId)).toHaveLength(1);
   });
 });
+
+describe("Usage Projection maintenance cost", () => {
+  it("prunes retained identity through the retirement index instead of scanning", async () => {
+    const {projection} = isolated(`prune-plan-${crypto.randomUUID()}`);
+    await ready(projection);
+    // Delivery adds one identity row per reportable row, so this table holds a whole replay
+    // window. A scan of it runs on every maintenance turn, and the turn that finds nothing left to
+    // prune is the one that reads every row.
+    const plan = await runInDurableObject(projection, (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT identities.generation, identities.fact_id
+        FROM usage_projection_expired_sequences AS identities
+        JOIN usage_projection_principals AS principals
+          ON principals.generation = identities.generation
+          AND principals.principal_ref = identities.principal_ref
+        WHERE identities.retired_at < ?
+          AND (length(identities.source_sequence) < length(principals.high_water) OR
+            (length(identities.source_sequence) = length(principals.high_water)
+              AND identities.source_sequence <= principals.high_water))
+        LIMIT ?
+      `, "2026-08-24T12:00:00.000Z", 65).toArray().map(row => row.detail));
+    expect(plan.some(detail => detail.includes(
+      "SEARCH identities USING INDEX usage_projection_expired_sequences_retired_v1",
+    ))).toBe(true);
+    expect(plan.some(detail => detail.includes("SCAN identities"))).toBe(false);
+  });
+
+  it("reschedules background maintenance behind a delay instead of respinning at once",
+      async () => {
+    const {projection} = isolated(`maintenance-delay-${crypto.randomUUID()}`);
+    await ready(projection);
+    const principal = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const base = aggregate(principal, {summaryFactId});
+    await projection.ingest([base]);
+    // More superseded revisions than one compaction page, so the step reports incomplete work.
+    for (let revision = 2n; revision <= 70n; revision += 1n) {
+      await projection.ingest([aggregate(principal, {
+        ...base,
+        projectionFactId: crypto.randomUUID(),
+        sourceSequence: revision,
+        summaryRevision: revision,
+      })]);
+    }
+    await runInDurableObject(projection, (_instance, state) => {
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET report_watermark = '1000000' WHERE singleton = 1
+      `);
+    });
+    // Drain delivery first: an outbox a reader is waiting on keeps the immediate next alarm.
+    for (let alarms = 0; alarms < 1_000; alarms += 1) {
+      const pending = await runInDurableObject(projection, (_instance, state) =>
+        state.storage.sql.exec<{count: number}>(
+          "SELECT COUNT(*) AS count FROM usage_projection_month_outbox").one().count);
+      if (pending === 0) break;
+      await runDurableObjectAlarm(projection);
+    }
+    // The turn runs at or after this reading, so a delayed reschedule lands at or after it plus
+    // the delay, while an immediate one lands before it.
+    const beforeTurn = await runInDurableObject(projection, () => Date.now());
+    await runDurableObjectAlarm(projection);
+    const alarm = await runInDurableObject(
+      projection, (_instance, state) => state.storage.getAlarm(),
+    );
+    expect(alarm).not.toBeNull();
+    expect(alarm! - beforeTurn).toBeGreaterThanOrEqual(1_000);
+  });
+});

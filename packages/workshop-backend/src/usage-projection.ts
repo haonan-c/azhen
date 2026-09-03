@@ -48,7 +48,7 @@ export const USAGE_PROJECTION_OVERVIEW_TARGET_SECONDS = 60;
 
 const REBUILD_REGISTRY_PAGE_LIMIT = 100;
 const REBUILD_RPC_STEPS_PER_ALARM = 100;
-const REBUILD_ALARM_DEADLINE_MS = 250;
+const MAINTENANCE_ALARM_DEADLINE_MS = 250;
 type UsageCapacityLogFields = {
   profileId: string;
   metric: string;
@@ -1228,13 +1228,21 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     if (pendingDelivery) return true;
     let complete = true;
     let removed = 0;
-    // A month that still has work ends the turn, so one turn compacts one bounded page.
+    // Each month answers by scanning its own applied aggregate rows, so the cost of one call grows
+    // with that month. Walking every month in one turn is what let a deployment exceed the alarm
+    // execution limit and break the object. A month that still has work, and the deadline, both end
+    // the turn: one turn compacts one bounded page and the next alarm resumes.
+    const deadline = Date.now() + MAINTENANCE_ALARM_DEADLINE_MS;
     for (const row of this.ctx.storage.sql.exec<{month: string}>(`
       SELECT month FROM usage_projection_months WHERE generation = ? ORDER BY month DESC
     `, meta.active_generation).toArray()) {
       const result = await this.#monthStub(row.month).compactSupersededAggregates(floor);
       removed += result.removed;
       if (!result.complete) {
+        complete = false;
+        break;
+      }
+      if (Date.now() >= deadline) {
         complete = false;
         break;
       }
@@ -1470,7 +1478,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const monthCompactionComplete = await this.#compactMonthsStep();
     const identityPruneComplete = this.#pruneRetainedIdentitiesStep();
     await this.#scheduleRemainingMaintenance(
-      deliveryComplete && monthCompactionComplete && identityPruneComplete,
+      deliveryComplete, monthCompactionComplete && identityPruneComplete,
     );
   }
 
@@ -1533,13 +1541,19 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, turn);
   }
 
-  async #scheduleRemainingMaintenance(compactionComplete: boolean): Promise<void> {
+  async #scheduleRemainingMaintenance(
+      deliveryComplete: boolean, backgroundComplete: boolean): Promise<void> {
     const meta = this.#meta();
     const hasDrain = this.#hasApplyDrain();
-    if (hasDrain || !compactionComplete || meta.rebuild_state === "rebuilding" ||
-        meta.cleanup_generation !== null || this.#hasRetiredProjectionTable()) {
-      await this.ctx.storage.setAlarm(Date.now() + (hasDrain ? 1_000 : 0));
-    }
+    const lifecyclePending = meta.rebuild_state === "rebuilding" ||
+      meta.cleanup_generation !== null || this.#hasRetiredProjectionTable();
+    if (!hasDrain && deliveryComplete && backgroundComplete && !lifecyclePending) return;
+    // A reader is waiting on delivery and on the lifecycle steps, so those keep the next alarm.
+    // Compaction and identity pruning are background maintenance whose cost grows with the stored
+    // months: rescheduling them with no delay puts one more bounded scan between every pair of
+    // ingests until they finish, which is what a sustained arrival window measures as a stall.
+    const backgroundOnly = !hasDrain && deliveryComplete && !lifecyclePending;
+    await this.ctx.storage.setAlarm(Date.now() + (hasDrain || backgroundOnly ? 1_000 : 0));
   }
 
   #hasRetiredProjectionTable(): boolean {
@@ -1573,7 +1587,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
   }
 
   async #runRebuildStep(): Promise<void> {
-    const deadline = Date.now() + REBUILD_ALARM_DEADLINE_MS;
+    const deadline = Date.now() + MAINTENANCE_ALARM_DEADLINE_MS;
     let steps = 0;
     while (steps < REBUILD_RPC_STEPS_PER_ALARM &&
         (steps === 0 || Date.now() < deadline)) {
@@ -2921,6 +2935,14 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         ADD COLUMN retired_at TEXT NOT NULL DEFAULT ''
       `);
     }
+    // Delivery adds one identity row per reportable row, so this table holds a whole replay window
+    // of them. Without this index the maintenance prune scans every one of them on every turn, and
+    // the turn a fully pruned window makes that scan find nothing is the most expensive turn there
+    // is. Ordering by the retirement time lets the scan stop at the first row inside the window.
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS usage_projection_expired_sequences_retired_v1
+      ON usage_projection_expired_sequences(retired_at)
+    `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS usage_projection_detail_watermarks (
         principal_ref TEXT PRIMARY KEY, cutoff_utc TEXT NOT NULL
