@@ -1216,6 +1216,16 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     const meta = this.#meta();
     const floor = BigInt(meta.report_watermark) - BigInt(SUPERSEDED_AGGREGATE_WATERMARK_LAG);
     if (floor < 1n) return true;
+    // Keep the hot ingest path focused on applying and delivering new rows. Compaction is
+    // maintenance work and can scan a large month table; while delivery is still queued, defer it
+    // to the first alarm after the outbox reaches a quiet point so it cannot create a burst that
+    // delays the next ingest tick.
+    const pendingDelivery = this.ctx.storage.sql.exec<{present: string}>(`
+      SELECT CAST(EXISTS(
+        SELECT 1 FROM usage_projection_month_outbox LIMIT 1
+      ) AS TEXT) AS present
+    `).one().present === "1";
+    if (pendingDelivery) return true;
     let complete = true;
     let removed = 0;
     // A month that still has work ends the turn, so one turn compacts one bounded page.
