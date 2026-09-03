@@ -227,6 +227,32 @@ function percentile(samples: number[], quantile: number): number {
   return sorted[Math.max(0, Math.ceil(sorted.length * quantile) - 1)] ?? 0;
 }
 
+type PerformanceGate = {gate: string; measuredMs: number; limitMs: number};
+
+/**
+ * Every performance threshold this profile measures, in the order it measured them.
+ *
+ * One run costs hours, so a chained `expect` that stops at the first breach spends that time to
+ * report one number. Each threshold is recorded here as it is measured and the whole ladder is
+ * asserted once, at the end of the run. Correctness assertions still fail where they are: a wrong
+ * total is a defect, not a measurement. The thresholds themselves are unchanged.
+ */
+const performanceGates: PerformanceGate[] = [];
+
+function recordPerformanceGate(gate: string, measuredMs: number, limitMs: number): void {
+  performanceGates.push({gate, measuredMs, limitMs});
+}
+
+function assertPerformanceGates(): void {
+  console.warn(`USAGE_CAPACITY_PERFORMANCE_GATES ${JSON.stringify(performanceGates.map(entry => ({
+    gate: entry.gate,
+    measuredMs: Math.round(entry.measuredMs),
+    limitMs: entry.limitMs,
+    pass: entry.measuredMs <= entry.limitMs,
+  })))}`);
+  expect(performanceGates.filter(entry => entry.measuredMs > entry.limitMs)).toEqual([]);
+}
+
 function summarizeLatency(samples: number[], errorCount = 0): LatencySummary {
   return {
     p50Ms: percentile(samples, 0.5),
@@ -774,8 +800,8 @@ async function measureReportWorkload(
   const csv = await consumeCsv(await report.exportCsv());
   expect(csv.rows).toBe(paginatedRows.rows);
   expect(csv.rows).toBeGreaterThanOrEqual(Number(expectedRecords));
-  expect(csv.firstByteMs).toBeLessThanOrEqual(2_000);
-  expect(csv.durationMs).toBeLessThanOrEqual(15 * 60 * 1_000);
+  recordPerformanceGate("csv.firstByte", csv.firstByteMs, 2_000);
+  recordPerformanceGate("csv.duration", csv.durationMs, 15 * 60 * 1_000);
 
   using cancelledReport = await api.openReport({});
   const cancelledReader = (await cancelledReport.exportCsv()).getReader();
@@ -1339,12 +1365,13 @@ async function verifyCapacityResult(
     JSON.stringify(latency.arrival)} worst=${JSON.stringify(
     lateTicks.toSorted((left, right) => right.delayMs - left.delayMs).slice(0, 8))} first=${
     JSON.stringify(lateTicks.slice(0, 5))}`);
-  expect(latency.arrival.maxMs).toBeLessThanOrEqual(selected.tickMilliseconds);
-  expect(latency.authoritativeWarm.p95Ms).toBeLessThanOrEqual(2_000);
-  expect(latency.authoritativeWarm.p99Ms).toBeLessThanOrEqual(5_000);
-  expect(latency.projectionVisibility.p99Ms).toBeLessThanOrEqual(10_000);
-  expect(latency.adminOverviewVisibility.maxMs).toBeLessThanOrEqual(60_000);
-  expect(projectionDrainMs).toBeLessThanOrEqual(60_000);
+  recordPerformanceGate("arrival.max", latency.arrival.maxMs, selected.tickMilliseconds);
+  recordPerformanceGate("authoritativeWarm.p95", latency.authoritativeWarm.p95Ms, 2_000);
+  recordPerformanceGate("authoritativeWarm.p99", latency.authoritativeWarm.p99Ms, 5_000);
+  recordPerformanceGate("projectionVisibility.p99", latency.projectionVisibility.p99Ms, 10_000);
+  recordPerformanceGate("adminOverviewVisibility.max", latency.adminOverviewVisibility.maxMs,
+    60_000);
+  recordPerformanceGate("projectionDrain", projectionDrainMs, 60_000);
   const preRebuildMetrics = (await projection.readOverview()).metrics;
   const preRebuildMetricsDigest = capacityDigest(preRebuildMetrics);
   const preRebuildDetail = await readProjectionDetailDigest(projection);
@@ -1459,7 +1486,7 @@ async function verifyCapacityResult(
     projection,
     BigInt(selected.registeredUsers),
   );
-  expect(capacityTelemetry.p95Ms).toBeLessThanOrEqual(2_000);
+  recordPerformanceGate("capacityTelemetry.p95", capacityTelemetry.p95Ms, 2_000);
   const registeredUsers = await exports.AdminSettings.getByName("")
       .countRegisteredUsageUsers();
   expect(registeredUsers).toBe(BigInt(selected.registeredUsers));
@@ -1539,7 +1566,7 @@ async function verifyCapacityResult(
   expect(ledgerConsistency.negativeAvailableUsers).toBe(0);
   expect(ledgerConsistency.heldReservationUsers).toBe(0);
   expect(ledgerConsistency.initialGrantFailures).toBe(0);
-  expect(ledgerConsistency.balanceRead.p95Ms).toBeLessThanOrEqual(1_000);
+  recordPerformanceGate("ledgerBalanceRead.p95", ledgerConsistency.balanceRead.p95Ms, 1_000);
 
   let projectionMaintenanceAlarms = 0;
   while (projectionMaintenanceAlarms < 100_000) {
@@ -1759,8 +1786,10 @@ async function verifyCapacityResult(
     measuredMinuteCounts,
     latency,
     projectionDrainMs,
+    performanceGates,
     samples,
   };
+  assertPerformanceGates();
   const json = JSON.stringify(result, (_key, value) =>
     typeof value === "bigint" ? value.toString() : value);
   console.warn(`USAGE_CAPACITY_RESULT_BASE64=${btoa(json)}`);
