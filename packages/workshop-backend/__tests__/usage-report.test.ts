@@ -9,7 +9,6 @@ import {RpcStub} from "cloudflare:workers";
 import {beforeAll, describe, expect, it} from "vitest";
 import {
   ADMIN_USAGE_CSV_MAX_CHUNK_BYTES,
-  ADMIN_USAGE_CSV_PAGE_SIZE,
   ADMIN_USAGE_MAX_OPEN_REPORTS,
   AdminUsageApiImpl,
   AdminUsageReportImpl,
