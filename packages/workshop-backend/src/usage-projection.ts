@@ -1830,21 +1830,27 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
         `, new Date().toISOString());
         return;
       }
-      const applied = this.ctx.storage.sql.exec<{count: string; latest: string | null}>(`
-        SELECT CAST(COUNT(*) AS TEXT) AS count,
-               MAX(COALESCE(occurred_at, bucket_start)) AS latest
+      const applied = this.ctx.storage.sql.exec<{latest: string | null}>(`
+        SELECT MAX(COALESCE(occurred_at, bucket_start)) AS latest
         FROM usage_projection_facts
         WHERE generation = ? AND applied = 1
       `, generation).one();
       const completedAt = new Date().toISOString();
+      // `ingestion_watermark` is not rewritten here. It counts the facts this Projection has
+      // ingested live -- `#applyFact` advances it only for the active generation, and neither the
+      // rebuild's own re-ingestion nor the dual write into the rebuild generation touches it. A
+      // rebuild re-derives facts that were already counted, so the count does not change. Writing
+      // a fresh count here also could not produce one: a delivered row is deleted from
+      // `usage_projection_facts`, which leaves that table holding only what delivery has not moved
+      // yet, so counting it returned whatever the delivery race had left behind.
       this.ctx.storage.sql.exec(`
-        UPDATE usage_projection_meta SET active_generation = ?, ingestion_watermark = ?,
+        UPDATE usage_projection_meta SET active_generation = ?,
           latest_applied_source_at = ?, last_ingested_at = ?, failed_ingestion_count = '0',
           failure_code = NULL, rebuild_state = 'completed', rebuild_completed_at = ?,
           rebuild_failure_code = NULL, cleanup_generation = ?, cleanup_stage = 'months',
           bootstrap_state = 'complete'
         WHERE singleton = 1
-      `, generation, applied.count, applied.latest,
+      `, generation, applied.latest,
       applied.latest, completedAt, meta.active_generation);
     });
     this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now()));

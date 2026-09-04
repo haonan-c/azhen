@@ -2795,8 +2795,14 @@ describe("deployment Usage Projection", () => {
     });
     await newUser.markGatekeeperUsageStarted(newOperationId);
     await newUser.completeGatekeeperUsage(newOperationId, "executed");
+    // A rebuild re-derives facts that were counted when they were first ingested, so it must not
+    // move this count. It used to be rewritten at switchover from a COUNT over the root fact
+    // table, which delivery empties as it moves rows to their month object, so the count landed on
+    // whatever the delivery race had left behind and could fall to zero.
     await expect.poll(async () => (await projection.readOverview()).ingestionWatermark)
       .toBe(projectedBefore.ingestionWatermark + 4n);
+    expect((await projection.readOverview()).ingestionWatermark)
+      .toBeGreaterThanOrEqual(projectedBefore.ingestionWatermark);
     const expectedMetrics = (await projection.readOverview()).metrics;
     await expect(runInDurableObject(projection, (_instance, state) => {
       state.abort("interrupt rebuild alarm");
