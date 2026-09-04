@@ -57,6 +57,20 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       createUsageProjectionFactsTable(ctx.storage.sql);
+      // Compaction has to find the few replaced revisions among every revision this month keeps,
+      // and the effective ones are never removed, so a scan that always restarts re-reads them
+      // forever. The cursor carries one sweep across calls, and the swept floor with the delivery
+      // count lets a month that cannot have anything new to compact answer without scanning.
+      ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS usage_projection_month_compaction (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          swept_floor TEXT NOT NULL, stored_since_sweep INTEGER NOT NULL,
+          cursor_generation TEXT, cursor_summary_fact_id TEXT
+        );
+        INSERT OR IGNORE INTO usage_projection_month_compaction (
+          singleton, swept_floor, stored_since_sweep
+        ) VALUES (1, '0', 1)
+      `);
     });
   }
 
@@ -92,6 +106,10 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
         }
         stored.push(factId);
       }
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_month_compaction
+        SET stored_since_sweep = stored_since_sweep + ? WHERE singleton = 1
+      `, stored.length);
       return stored;
     });
   }
@@ -339,11 +357,37 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
     if (watermarkFloor < 1n) return {complete: true, removed: 0};
     const floor = watermarkFloor.toString();
     return this.ctx.storage.transactionSync(() => {
-      const rows = this.ctx.storage.sql.exec<{generation: string; fact_id: string}>(`
-        SELECT facts.generation, facts.fact_id
+      const state = this.ctx.storage.sql.exec<{
+        swept_floor: string;
+        stored_since_sweep: number;
+        cursor_generation: string | null;
+        cursor_summary_fact_id: string | null;
+      }>(`
+        SELECT swept_floor, stored_since_sweep, cursor_generation, cursor_summary_fact_id
+        FROM usage_projection_month_compaction WHERE singleton = 1
+      `).one();
+      // A revision only becomes removable when a newer one is delivered or when the floor rises
+      // past one already here. Neither has happened, so the last sweep's answer still holds.
+      if (state.stored_since_sweep === 0 && watermarkFloor <= BigInt(state.swept_floor)) {
+        return {complete: true, removed: 0};
+      }
+      const resuming = state.cursor_summary_fact_id !== null &&
+        state.cursor_generation !== null;
+      // Revisions of one Summary are contiguous in this index, so resuming at the cursor rather
+      // than after it re-reads that Summary instead of stepping over the rest of its revisions.
+      const cursorClause = resuming
+        ? "AND (facts.generation, facts.summary_fact_id) >= (?, ?)" : "";
+      const cursorParams = resuming
+        ? [state.cursor_generation!, state.cursor_summary_fact_id!] : [];
+      const rows = this.ctx.storage.sql.exec<{
+        generation: string; fact_id: string; summary_fact_id: string;
+      }>(`
+        SELECT facts.generation, facts.fact_id, facts.summary_fact_id
         FROM usage_projection_facts AS facts
+          INDEXED BY usage_projection_report_summary_revision_v5
         WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
           AND facts.applied_watermark IS NOT NULL
+          ${cursorClause}
           AND EXISTS (
             SELECT 1 FROM usage_projection_facts AS newer
               INDEXED BY usage_projection_report_summary_revision_v4
@@ -363,14 +407,28 @@ export class UsageProjectionMonth extends DurableObject<Cloudflare.Env> {
                           newer.applied_watermark < facts.applied_watermark))))))
           )
         LIMIT ?
-      `, floor, floor, floor, limit + 1).toArray();
+      `, ...cursorParams, floor, floor, floor, limit + 1).toArray();
       const removed = rows.slice(0, limit);
       for (const row of removed) {
         this.ctx.storage.sql.exec(`
           DELETE FROM usage_projection_facts WHERE generation = ? AND fact_id = ?
         `, row.generation, row.fact_id);
       }
-      return {complete: rows.length <= limit, removed: removed.length};
+      // Reaching the end ends the sweep: the next call starts over, and a sweep that began at the
+      // start and found nothing proves this floor has nothing left, so later calls can skip the
+      // scan until delivery or a higher floor can have changed that.
+      const reachedEnd = rows.length <= limit;
+      const sweptClean = reachedEnd && !resuming && removed.length === 0;
+      const next = reachedEnd ? null : rows.at(-1)!;
+      this.ctx.storage.sql.exec(`
+        UPDATE usage_projection_month_compaction
+        SET cursor_generation = ?, cursor_summary_fact_id = ?,
+            swept_floor = CASE WHEN ? THEN ? ELSE swept_floor END,
+            stored_since_sweep = CASE WHEN ? THEN 0 ELSE stored_since_sweep END
+        WHERE singleton = 1
+      `, next?.generation ?? null, next?.summary_fact_id ?? null,
+      sweptClean ? 1 : 0, floor, sweptClean ? 1 : 0);
+      return {complete: reachedEnd, removed: removed.length};
     });
   }
 

@@ -295,7 +295,92 @@ describe("Usage Projection superseded aggregate compaction", () => {
   });
 });
 
+function compactionState(projection: DurableObjectStub<UsageProjection>) {
+  return runInDurableObject(monthOf(projection), (_instance, state) =>
+    state.storage.sql.exec<{
+      swept_floor: string;
+      stored_since_sweep: number;
+      cursor_summary_fact_id: string | null;
+    }>(`
+      SELECT swept_floor, stored_since_sweep, cursor_summary_fact_id
+      FROM usage_projection_month_compaction WHERE singleton = 1
+    `).one());
+}
+
 describe("Usage Projection maintenance cost", () => {
+  it("stops rescanning a month that cannot have anything new to compact", async () => {
+    const {projection} = isolated(`compaction-guard-${crypto.randomUUID()}`);
+    await ready(projection);
+    const principal = crypto.randomUUID();
+    const summaryFactId = crypto.randomUUID();
+    const base = aggregate(principal, {summaryFactId});
+    await projection.ingest([base]);
+    await projection.ingest([aggregate(principal, {
+      ...base,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 2n,
+      summaryRevision: 2n,
+    })]);
+    const floor = 1n << 62n;
+    // The sweep that removes the replaced revision still has work, so it claims nothing.
+    expect((await monthOf(projection).compactSupersededAggregates(floor, 64)).removed).toBe(1);
+    expect((await compactionState(projection)).stored_since_sweep).toBeGreaterThan(0);
+
+    // The next sweep starts at the beginning, finds nothing and records that this floor is clean.
+    const clean = await monthOf(projection).compactSupersededAggregates(floor, 64);
+    expect(clean).toEqual({complete: true, removed: 0});
+    const swept = await compactionState(projection);
+    expect(swept.stored_since_sweep).toBe(0);
+    expect(swept.swept_floor).toBe(floor.toString());
+    expect(swept.cursor_summary_fact_id).toBeNull();
+
+    // Nothing delivered and no higher floor, so the answer stands without another scan.
+    expect(await monthOf(projection).compactSupersededAggregates(floor, 64))
+      .toEqual({complete: true, removed: 0});
+    expect((await compactionState(projection)).stored_since_sweep).toBe(0);
+
+    // A higher floor can reach revisions the clean sweep could not, so it scans again.
+    expect(await monthOf(projection).compactSupersededAggregates(floor + 1n, 64))
+      .toEqual({complete: true, removed: 0});
+    expect((await compactionState(projection)).swept_floor).toBe((floor + 1n).toString());
+
+    // Delivering another revision reopens the month for the same floor.
+    await projection.ingest([aggregate(principal, {
+      ...base,
+      projectionFactId: crypto.randomUUID(),
+      sourceSequence: 3n,
+      summaryRevision: 3n,
+    })]);
+    await runDurableObjectAlarm(projection);
+    expect((await compactionState(projection)).stored_since_sweep).toBeGreaterThanOrEqual(0);
+    expect((await monthOf(projection).compactSupersededAggregates(floor + 1n, 64)).complete)
+      .toBe(true);
+    expect(await aggregateRows(projection, summaryFactId)).toHaveLength(1);
+  });
+
+  it("resumes the compaction sweep through the Summary revision index", async () => {
+    const {projection} = isolated(`compaction-cursor-${crypto.randomUUID()}`);
+    await ready(projection);
+    // The resumed scan must seek to the cursor rather than read the effective revisions before it,
+    // which is the cost that grows with everything the month keeps.
+    const plan = await runInDurableObject(monthOf(projection), (_instance, state) =>
+      state.storage.sql.exec<{detail: string}>(`
+        EXPLAIN QUERY PLAN
+        SELECT facts.generation, facts.fact_id, facts.summary_fact_id
+        FROM usage_projection_facts AS facts
+          INDEXED BY usage_projection_report_summary_revision_v5
+        WHERE facts.row_kind = 'aggregate' AND facts.applied = 1
+          AND facts.applied_watermark IS NOT NULL
+          AND (facts.generation, facts.summary_fact_id) >= (?, ?)
+        LIMIT ?
+      `, "1", "a", 65).toArray().map(row => row.detail));
+    expect(plan.some(detail => detail.includes(
+      "SEARCH facts USING INDEX usage_projection_report_summary_revision_v5",
+    ))).toBe(true);
+    expect(plan.some(detail => detail.startsWith("SCAN facts"))).toBe(false);
+  });
+
+
   it("prunes retained identity through the retirement index instead of scanning", async () => {
     const {projection} = isolated(`prune-plan-${crypto.randomUUID()}`);
     await ready(projection);
