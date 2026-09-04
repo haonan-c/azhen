@@ -763,7 +763,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     collaborator[Symbol.dispose]();
     owner[Symbol.dispose]();
     publicApi[Symbol.dispose]();
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     const enabling = await signInWhenAvailable(collaboratorName);
     const enablingWorkspace = await enabling.user.openGadget(workspaceId);
@@ -816,7 +816,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     observing.user[Symbol.dispose]();
     observing.publicApi[Symbol.dispose]();
     armBusinessRequestGate();
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     await Promise.race([
       businessRequestStarted,
@@ -1174,7 +1174,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     workspace[Symbol.dispose]();
     user[Symbol.dispose]();
     publicApi[Symbol.dispose]();
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     await waitFor("the first duplicate-delivery physical call", async () =>
       physicalCalls.length === 1 ? true : null, 80_000);
@@ -1237,7 +1237,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     schedulerUi[Symbol.dispose]();
     observing.user[Symbol.dispose]();
     observing.publicApi[Symbol.dispose]();
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     await waitFor("the real same-run retry alarm time", async () =>
       Date.now() > firstRetry.nextFire! + 3_000 ? true : null, 80_000);
@@ -1352,7 +1352,7 @@ describe.sequential("complete first-party Gatekeeper billing tracer", () => {
     workspace[Symbol.dispose]();
     user[Symbol.dispose]();
     publicApi[Symbol.dispose]();
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     const reopened = await signInWhenAvailable(username);
     expect(await reopened.user.getUsageCreditBalance()).toMatchObject({

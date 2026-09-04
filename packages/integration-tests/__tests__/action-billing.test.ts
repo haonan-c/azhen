@@ -1801,7 +1801,7 @@ describe("approved Action billing", () => {
         .toBe("applying");
     }
 
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     using reopenedOwnerPublicApi = connect(harness.url);
     using reopenedSubmitterPublicApi = connect(harness.url);

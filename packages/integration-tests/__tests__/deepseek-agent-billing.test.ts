@@ -1051,7 +1051,7 @@ describe("DeepSeek Agent billing", () => {
     // Reload every real Worker while preserving Durable Object storage. This is the TestHarness
     // equivalent of aborting the active objects; unlike targeted eviction, it also works when a
     // persisted Hook capability still has a live reference to the Overseer.
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
     loaderReloadComplete = true;
 
     const enablingSession = await signInWhenAvailable(builderName);
@@ -1343,7 +1343,7 @@ describe("DeepSeek Agent billing", () => {
     ownerWorkspace[Symbol.dispose]();
     owner[Symbol.dispose]();
     ownerPublicApi[Symbol.dispose]();
-    await harness.server.update(options => options);
+    await harness.restartRuntime();
 
     const secondAfterRestartSession = await signInWhenAvailable(secondName);
     let secondAfterRestartPublicApi = secondAfterRestartSession.publicApi;

@@ -141,7 +141,52 @@ export type Harness = {
    */
   fetchWorker(name: string, ...args: Parameters<TestHarness["fetch"]>)
       : ReturnType<TestHarness["fetch"]>;
+  /**
+   * Restart the Worker runtime, and return only once the reload that trails it has happened.
+   *
+   * Always use this rather than `server.update()` directly. A restart replaces the runtime
+   * process, which severs every open WebSocket with no close frame -- the client sees the
+   * transport fail, not a closed session. `server.update()` resolves on the *first* reload it
+   * observes, and a second reload trails it by several seconds; unwaited, that one lands inside
+   * whatever test is running by then and breaks the sessions of a test that never asked for a
+   * restart. Waiting here keeps the damage inside the test that did ask.
+   */
+  restartRuntime(): Promise<void>;
 };
+
+// How long to give the reload that trails `server.update()`.
+//
+// Measured on this repo, that reload lands about 4.5s after `update()` returns; the wait usually
+// ends there, and this cap only bounds the case where no reload trails at all. Tests that restart
+// pay it in full, so keep it near the measured gap rather than generous: the suites that restart
+// also race real scheduled callbacks.
+const TRAILING_RELOAD_TIMEOUT_MS = 15_000;
+
+/**
+ * Wait for the reload that trails a restart, by holding one session open until it is severed.
+ *
+ * A reload replaces the runtime process, so an open session is the signal: it goes away with no
+ * close frame the moment the reload happens. Resolves either way -- an expired timeout means no
+ * reload trailed this restart, which is the outcome a fixed wrangler would produce.
+ */
+function waitForTrailingReload(url: URL): Promise<void> {
+  return new Promise(resolve => {
+    const wsUrl = new URL("/api", url);
+    wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(wsUrl.toString());
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.close();
+      resolve();
+    };
+    const timer = setTimeout(settle, TRAILING_RELOAD_TIMEOUT_MS);
+    socket.addEventListener("close", settle);
+    socket.addEventListener("error", settle);
+  });
+}
 
 export async function startHarness(opts: {
   gatekeepers: GatekeeperSpec[];
@@ -181,6 +226,10 @@ export async function startHarness(opts: {
     server,
     url,
     fetchWorker: (name, ...args) => server.getWorker(name).fetch(...args),
+    restartRuntime: async () => {
+      await server.update(options => options);
+      await waitForTrailingReload(url);
+    },
   };
 }
 

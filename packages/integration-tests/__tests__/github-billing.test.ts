@@ -1043,7 +1043,7 @@ describe.sequential("GitHub billing production Worker contract", () => {
       disposeUser(context);
       originalDisposed = true;
 
-      await harness.server.update(options => options);
+      await harness.restartRuntime();
       using reopenedPublicApi = connect(harness.url);
       using reopenedUser = await signIn(reopenedPublicApi, context.username);
       using reopenedWorkspace = await reopenedUser.openGadget(workspaceId);

@@ -408,7 +408,7 @@ describe("Home Assistant Action billing", () => {
       await waitFor("the blocked Home Assistant snapshot", async () =>
         (await upstream.calls()).some(call => call.operation === "GET /api/states") || null);
 
-      await harness.server.update(options => options);
+      await harness.restartRuntime();
       await interruptedApproval;
 
       using publicApi = connect(harness.url);
