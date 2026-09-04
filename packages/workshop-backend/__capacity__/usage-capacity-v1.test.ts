@@ -882,8 +882,8 @@ async function measureReportWorkload(
       expectedMeteredUses} p95=${Math.round(p95Ms)} p99=${Math.round(p99Ms)} min=${
       Math.round(Math.min(...samplesMs))} max=${Math.round(Math.max(...samplesMs))}`);
     if (latencyGate === "bounded-filter") {
-      expect(p95Ms).toBeLessThanOrEqual(2_000);
-      expect(p99Ms).toBeLessThanOrEqual(5_000);
+      recordPerformanceGate(`reportQuery.${name}.p95`, p95Ms, 2_000);
+      recordPerformanceGate(`reportQuery.${name}.p99`, p99Ms, 5_000);
     }
     querySamples.push({
       name,
