@@ -216,7 +216,7 @@ describe("deployment Usage Projection", () => {
       });
       // Capacity telemetry is read on its own path now, so losing its state must not disturb the
       // authoritative totals the overview reports.
-      const failSoft = projection.readAdminOverview(7_000n);
+      const failSoft = projection.readOverview();
       expect((await failSoft).metrics?.meteredUseCount).toBe(4n);
       await expect(projection.readAdminCapacityReview(7_000n)).rejects.toThrow();
 
@@ -2658,10 +2658,7 @@ describe("deployment Usage Projection", () => {
     const projectionNamespace = {
       getByName: () => ({
         ensureBootstrap: async () => true,
-        readAdminOverview: async (registeredUsers: bigint) => ({
-          ...projected,
-          registeredUsers,
-        }),
+        readOverview: async () => projected,
       }),
     } as unknown as DurableObjectNamespace<UsageProjection>;
     const admin = new AdminUsageApiImpl(

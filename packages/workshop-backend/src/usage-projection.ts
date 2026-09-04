@@ -581,11 +581,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     };
   }
 
-  /** Read core overview totals for one generation against the authoritative registered count. */
-  readAdminOverview(registeredUsers: bigint): AdminUsageOverview {
-    return {...this.readOverview(), registeredUsers};
-  }
-
   /**
    * Read capacity telemetry, or null while the projection's values are not yet trustworthy.
    *
@@ -1194,13 +1189,6 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     `, (BigInt(meta.detail_retention_revision) + 1n).toString());
   }
 
-  /**
-   * Name every stored month whose range can still hold detail older than one cutoff.
-   *
-   * Every generation is named, not only the reported one. A rebuild reads the retained authority
-   * again and can restore detail the reported generation already expired, so filtering here would
-   * leave that detail past its cutoff until a retention pass after the switchover.
-   */
   /** Name the stored months of one generation that a capacity window can reach. */
   #capacityMonths(generation: string, windowStartedAtUtc: string, asOfUtc: string): string[] {
     return this.ctx.storage.sql.exec<{month: string}>(`
@@ -1210,6 +1198,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
     usageProjectionMonthKey(asOfUtc)).toArray().map(row => row.month);
   }
 
+  /**
+   * Name every stored month whose range can still hold detail older than one cutoff.
+   *
+   * Every generation is named, not only the reported one. A rebuild reads the retained authority
+   * again and can restore detail the reported generation already expired, so filtering here would
+   * leave that detail past its cutoff until a retention pass after the switchover.
+   */
   #monthsBefore(cutoffUtc: string): string[] {
     const cutoffMonth = usageProjectionMonthKey(cutoffUtc);
     return this.ctx.storage.sql.exec<{month: string}>(`

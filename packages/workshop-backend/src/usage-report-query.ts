@@ -197,7 +197,7 @@ export const USAGE_PROJECTION_ACTIVE_PRINCIPAL_PAGE_MAX = 10_000;
 
 export function buildUsageReportPredicate(
   query: FrozenUsageReportQuery,
-  rowKind: "all" | "aggregate" | "aggregate-revisions" = "all",
+  rowKind: "all" | "aggregate" = "all",
   cursor?: UsageReportCursor,
 ): UsageReportPredicate {
   const {snapshot} = query;
@@ -223,8 +223,6 @@ export function buildUsageReportPredicate(
   if (rowKind === "aggregate") {
     clauses.push(effectiveAggregate);
     params.push(watermark, watermark, watermark);
-  } else if (rowKind === "aggregate-revisions") {
-    clauses.push("facts.row_kind = 'aggregate'");
   } else {
     clauses.push(`(facts.row_kind = 'detail' OR (${effectiveAggregate}))`);
     params.push(watermark, watermark, watermark);

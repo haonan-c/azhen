@@ -1,7 +1,6 @@
 import {describe, expect, it} from "vitest";
 import {
   buildUsageCapacityReview,
-  capacityReviewTransitions,
   isUsageCapacityReviewRequired,
 } from "../src/usage-capacity-review.js";
 
@@ -60,53 +59,5 @@ describe("usage-capacity-v1 review telemetry", () => {
       reviewThreshold: 840n,
     });
     expect(review.reviewRequired).toBe(true);
-  });
-
-  it("emits only independent state transitions, including recovery", () => {
-    const below = buildUsageCapacityReview({
-      registeredUsers: 6_999n,
-      dailyActiveUsers: 699n,
-      rollingThirtyDayRecords: 699_999n,
-      alignedOneSecondPeakRecords: 13n,
-      alignedSixtySecondPeakRecords: 839n,
-      utcDayStartedAt: "2026-08-26T00:00:00.000Z",
-      rollingWindowStartedAt: "2026-07-27T12:00:00.000Z",
-    }, {
-      registeredUsers: "2026-08-26T12:00:00.000Z",
-      projection: "2026-08-26T12:00:00.000Z",
-    });
-    const active = buildUsageCapacityReview({
-      registeredUsers: 7_000n,
-      dailyActiveUsers: 700n,
-      rollingThirtyDayRecords: 700_000n,
-      alignedOneSecondPeakRecords: 14n,
-      alignedSixtySecondPeakRecords: 840n,
-      utcDayStartedAt: "2026-08-26T00:00:00.000Z",
-      rollingWindowStartedAt: "2026-07-27T12:00:00.000Z",
-    }, {
-      registeredUsers: "2026-08-26T12:00:01.000Z",
-      projection: "2026-08-26T12:00:01.000Z",
-    });
-
-    expect(capacityReviewTransitions(null, below)).toEqual([]);
-    expect(capacityReviewTransitions(null, active)).toEqual([
-      "registered-users",
-      "daily-active-users",
-      "rolling-thirty-day-records",
-      "aligned-one-second-peak-records",
-    ]);
-    expect(capacityReviewTransitions(below, below)).toEqual([]);
-    expect(capacityReviewTransitions(below, active)).toEqual([
-      "registered-users",
-      "daily-active-users",
-      "rolling-thirty-day-records",
-      "aligned-one-second-peak-records",
-    ]);
-    expect(capacityReviewTransitions(active, below)).toEqual([
-      "registered-users",
-      "daily-active-users",
-      "rolling-thirty-day-records",
-      "aligned-one-second-peak-records",
-    ]);
   });
 });

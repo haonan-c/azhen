@@ -1629,7 +1629,7 @@ export class AdminUsageApiImpl extends RpcTarget implements AdminUsageApi {
     try {
       const projection = this.projection.getByName("");
       const bootstrapComplete = await projection.ensureBootstrap();
-      const overview = await projection.readAdminOverview(registeredUsers);
+      const overview = await projection.readOverview();
       return mergeProjectionDeliveryHealth({
         ...overview,
         metrics: bootstrapComplete ? overview.metrics : null,

@@ -91,22 +91,3 @@ export function buildUsageCapacityReview(
     review.alignedOneSecondPeakRecords.reviewRequired;
   return review;
 }
-
-const TRANSITION_METRICS = [
-  ["registered-users", "registeredUsers"],
-  ["daily-active-users", "dailyActiveUsers"],
-  ["rolling-thirty-day-records", "rollingThirtyDayRecords"],
-  ["aligned-one-second-peak-records", "alignedOneSecondPeakRecords"],
-] as const;
-
-/** Return only the four capacity metrics whose review state changed. */
-export function capacityReviewTransitions(
-    previous: AdminUsageCapacityReview | null,
-    current: AdminUsageCapacityReview): UsageCapacityReviewMetricKey[] {
-  if (previous === null) {
-    return TRANSITION_METRICS.flatMap(([metricKey, property]) =>
-      current[property].reviewRequired ? [metricKey] : []);
-  }
-  return TRANSITION_METRICS.flatMap(([metricKey, property]) =>
-    previous[property].reviewRequired === current[property].reviewRequired ? [] : [metricKey]);
-}
