@@ -997,13 +997,22 @@ three-arm discriminated union with `startedAt` present only on the two dated arm
 shape matches the declaration with nothing widened. Every new exported member carries a doc comment,
 as the kernel rule requires.
 
-The single `pnpm test` failure is `deepseek-agent-billing` > "traces owner and two collaborators
-through App, Action, restart, and Scheduler", filed as
-[#79](https://github.com/haonan-c/azhen/issues/79). A runtime restart re-runs the agent's Scheduler
-Hook registration turn, so the test sees two registrations instead of one. It fails the same way on
-this branch with the #78 fix reverted, so it is neither caused by this branch nor by that fix, and
-it is not on the Usage Credit path. Six full-file runs with the fix gave three clean runs and three
-failures across the file's two restart tests.
+`pnpm test` has two intermittent failures on this host, and no other. Neither is caused by this
+branch, and each was held against a control run:
+
+- `deepseek-agent-billing` > "traces owner and two collaborators through App, Action, restart, and
+  Scheduler", filed as [#79](https://github.com/haonan-c/azhen/issues/79). A runtime restart
+  re-runs the agent's Scheduler Hook registration turn, so the test sees two registrations instead
+  of one. It fails the same way with the #78 fix reverted, and it is not on the Usage Credit path.
+  Six full-file runs with the fix gave three clean and three failed.
+- `usage-projection.test.ts` > "rebuilds a new generation only from Registry and retained User
+  authority", filed as [#81](https://github.com/haonan-c/azhen/issues/81). This is the isolation
+  flake the branch has carried from the start. Measured here: with the tree unchanged it failed 2
+  of 3 focused runs, and with the tree stashed it failed 2 of 3 as well, so the rate is the same
+  with and without the working changes.
+
+Because the run stops at the first failing package, a run that trips the projection flake reports
+less than a full pass; a run that does not reaches the end with only #79.
 
 ## The diff review
 
@@ -1021,14 +1030,26 @@ carries the paying principal's own available balance and the amount asked for, a
 no provider cost, no deployment multiplier, no other User. The new capacity logging emits counts,
 thresholds and timestamps only.
 
-**One residual disclosure is accepted, not fixed.** The amounts ride on the chat error body, and
-`Overseer.listChats` is workspace-scoped with no per-User filter, so a workspace collaborator can
-read the remaining Usage Credit balance of the collaborator whose turn ran out of credit. Usage
-Credit balance is per-User financial state rather than workspace state, so this is a real widening.
-It is accepted here because it is not attacker-triggerable, the audience is the trusted collaborator
-set that already reads every chat message and the gadget's code, and share-link "use" sessions are
-denied chat entirely. A reviewer who disagrees should say so: the fix is to keep the amounts out of
-the chat body and deliver them on the acting User's own surface.
+**One disclosure was found and is now fixed.** The amounts rode on the chat error body, and
+`Overseer.listChats` is workspace-scoped with no per-User filter, so a workspace collaborator could
+read the remaining Usage Credit balance of the collaborator whose turn ran out of credit. A Usage
+Credit balance is per-User financial state rather than workspace state, so this was a real widening
+even though it is not attacker-triggerable.
+
+The rejection now carries its code and nothing else, and the amounts stop at the Usage Account.
+`InsufficientUsageCreditAmounts` and `getInsufficientUsageCreditAmounts` leave the shared API,
+`AiChatMessageBody` loses its field, and the propagation that existed only to reach that field is
+removed from `metered-model`, `ai-invoke` and `agent`. `beginModelUsageForMetering` stays: it still
+carries the classification across a boundary that drops custom error properties, but its
+`insufficient-credit` arm returns no payload. The frontend falls back to the string that already
+existed for an absent amount, so no string was added, and the amount-bearing one is removed from
+both catalogues. The link to the User's own balance page stays, which is the surface a balance
+belongs on.
+
+The cost is that the acting User no longer reads "available X, required Y" in the chat. Restoring
+the required amount alone would be a small follow-up; the available amount should not return to a
+workspace-wide surface. The regenerated `capnweb-validate` output no longer names the field, and
+two tests now guard the absence rather than the old wording.
 
 **Correctness: one medium finding, filed as
 [#80](https://github.com/haonan-c/azhen/issues/80).** The new
@@ -1066,9 +1087,14 @@ The four changes remove 78 lines and add 11. Every gate in the table above was t
 modules and 36 asset blobs, and `pnpm test`'s one failure still being only
 [#79](https://github.com/haonan-c/azhen/issues/79).
 
-Acceptance therefore still needs: [#79](https://github.com/haonan-c/azhen/issues/79),
-[#80](https://github.com/haonan-c/azhen/issues/80) or an argument that it is unreachable, and a
-decision on the accepted disclosure.
+The chat disclosure the security pass found is fixed, and the gate table above was re-run once more
+at `3d9279b` with the same results, including the regenerated `capnweb-validate` output no longer
+naming the removed field.
+
+Acceptance therefore still needs three test issues settled and nothing else:
+[#79](https://github.com/haonan-c/azhen/issues/79),
+[#80](https://github.com/haonan-c/azhen/issues/80) or an argument that it is unreachable, and
+[#81](https://github.com/haonan-c/azhen/issues/81).
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
