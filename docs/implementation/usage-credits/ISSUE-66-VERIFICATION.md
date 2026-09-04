@@ -4,30 +4,31 @@ Date: 2026-08-26
 
 Baseline: `366c92618d583d74666a08600d8bab9655fbed6b`
 
-Status: **IN PROGRESS — the Projection storage gate is unblocked by #73 and #74, and the capacity
-model now projects per Durable Object. A 10,000-registered / 40-active-User narrowed run completes
-every in-test gate, including rebuild and report latency. No formal full `usage-capacity-v1` run has
-completed. A locked 200-active-User `reduced` run passed sustained ingest and rebuild but failed its
-CSV duration gate; the focused fix passes the same physical report-row shape. Its first post-fix
-repeat was invalidated by a 2,458-second host clamshell sleep during rebuild, and its second
-post-fix repeat failed the arrival gate during a maintenance burst. A subsequent dual-index
-repeat removed that burst but still had one 1,085 ms late tick, and a further dual-index repeat
-had 88 late ticks with a 17,969 ms maximum; none is a reduced PASS.
-A bounded single-User method-inventory run then observed up to 50 overlapping background
-Projection-maintenance tasks. The branch now coalesces those `ctx.waitUntil`-started maintenance
-runs while keeping the Durable Object `alarm()` entrypoint unchanged; focused Projection,
-capacity-method, TypeScript, lint, and Cap'n Web preflight checks pass. A clean locked run after
-the fix passed sustained arrival but stopped at the capacity-telemetry p95 gate (3,220 ms against
-2,000 ms). A detail-only capacity index was added. A subsequent locked run with that index and the
-contention change completed preseed and sustained ingest with zero late ticks, but failed the
-Projection visibility p99 gate at 14,945 ms against 10,000 ms before reaching capacity telemetry.
-The fresh locked repeat after the global ordering index also completed preseed and sustained ingest
-with zero late ticks, but failed the same Projection visibility p99 gate at 13,949 ms. Neither run
-produced a result marker or is a reduced PASS. The remaining item is a performance optimization and
-is tracked in [#77](https://github.com/haonan-c/azhen/issues/77); the existing Usage Credit paths
-remain usable and their correctness-focused checks pass. The full profile needs about 12.4 hours to
-seed its records on this machine, which is longer than its own timeout. See "Why the formal full run
-does not complete here".**
+Status: **REDUCED PROFILE PASSES — the run of 2026-09-04 passed every gate the 200-active-User
+`reduced` profile measures, with 0 late arrival ticks and a 944 ms maximum against 1,000 ms, and
+correctness held: exact record totals, 20,000 duplicate replays, an equal-digest rebuild, all 355
+public Gatekeeper billing methods, and a 4.38 GB 24-month storage projection against the 10 GB
+per-object limit. See "The reduced profile passes every gate". It reached that after the profile
+was changed to measure every threshold before asserting any of them, and after four Projection
+changes: an index for the retained-identity prune, a bounded maintenance turn that no longer
+respins with no delay, a narrower report invalidation that fails only the reports compaction can
+change, and a compaction sweep that resumes on a cursor instead of rereading every effective
+revision.**
+
+**The formal full profile still does not run here.** Its 979,600 preseed records need about 12.4
+hours against the run's own 12-hour timeout, and the preseed path has no removable bottleneck: one
+active User and thirteen concurrent Users seed at the same rate, no one step of the terminal-usage
+protocol dominates, and the one candidate that looked removable was measured and rejected. See
+"The preseed path has no removable bottleneck". The reduced profile meets two of the four locked
+capacity targets exactly, 10,000 registered Users and a 20-record aligned one-second peak, and
+reaches one fifth of the other two by construction.
+
+**The reduced run is capacity evidence, not a formal driver run.** The driver's
+`capnweb-report-stream` preflight is blocked by
+[#78](https://github.com/haonan-c/azhen/issues/78), which reproduces on `dev`, so the capacity step
+ran alone under the driver's own validation helpers. A formal `test:usage-capacity` run is still
+required once #78 is fixed. The remaining performance item is tracked in
+[#77](https://github.com/haonan-c/azhen/issues/77).
 
 ## Verification boundary
 
@@ -770,6 +771,75 @@ essentially the same code, and their arrival maxima are 774 ms, 3,962 ms and 4,1
 that size on unchanged code is consistent with host memory pressure, so a locked run started while
 the host is paging cannot be treated as capacity evidence either way. Locked runs from here need the
 host's free memory recorded at the start of the run.
+
+## The reduced profile passes every gate
+
+The run of 2026-09-04T02:02:41Z on the 200-active-User `reduced` profile passed every gate the
+profile measures. It is the first run that measured the whole ladder, and the first that passed it.
+
+| Gate | Result | Limit |
+| --- | ---: | ---: |
+| Arrival max, 1,020 ticks, 0 late | 944 ms | 1,000 ms |
+| Authoritative warm commit p95 / p99 | 774 / 960 ms | 2,000 / 5,000 ms |
+| Projection visibility p99 | 1,706 ms | 10,000 ms |
+| Administrator overview visibility max | 3,148 ms | 60,000 ms |
+| Projection drain | 843 ms | 60,000 ms |
+| Capacity telemetry p95 | 1,098 ms | 2,000 ms |
+| CSV first byte / duration | 29 ms / 193,453 ms | 2,000 / 900,000 ms |
+| Filtered overview p95, worst of eleven filters | 1,120 ms | 2,000 ms |
+| Ledger balance read p95 | 17 ms | 1,000 ms |
+
+Correctness held with it: 200,000 authoritative records equal 200,000 Projection records, 20,000
+duplicate replays changed nothing, the rebuild reproduced both digests in 9,915 alarms, and all 355
+public Gatekeeper billing methods were covered. The 24-month storage model projects 4.38 GB against
+the 10 GB per-object limit.
+
+Two of the four locked capacity targets are met exactly, and both are past their review threshold:
+10,000 registered Users and an aligned one-second peak of 20 records. The other two are at one
+fifth of target by construction, because `reduced` lowers only how many Users are active: 200 daily
+active Users against 1,000, and 200,000 rolling thirty-day records against 1,000,000.
+
+The run used `USAGE_CAPACITY_MODE=reduced` through the capacity step alone, because the driver's
+`capnweb-report-stream` preflight is blocked by
+[#78](https://github.com/haonan-c/azhen/issues/78), which reproduces on `dev`. The capacity step
+passed every check the driver applies, using the driver's own
+`validateCapacityResult`, `scanCapacityLog` and persistence helpers, and the privacy scan is empty.
+It is capacity evidence, not a formal driver run: SHA-256
+`3c239baded4c26b7f592f38600cd1514f490d6d1fe6c3e9b73daa1fc03c5ff08` for the log,
+`7b6dce98357aa14618cafe94086e6c50f536d5883ad696abe826bbac87abb668` for the result, and
+`1ff62cc0288fb7556fe7ec55fc7c163f65fa8f525bb11041b032891cf1daaa83` for the privacy file. A formal
+run of `test:usage-capacity` is still required once #78 is fixed.
+
+## The preseed path has no removable bottleneck
+
+The three changes that made the gates pass are maintenance and report changes. None of them moved
+preseed, and preseed is what decides whether the full profile can run at all:
+
+| Run | Records a second, across the eight progress reports | Preseed |
+| --- | --- | ---: |
+| before the compaction cursor | 94.1 93.7 73.4 56.5 51.2 47.9 45.8 44.3 | 4,166 s |
+| after it | 95.8 95.0 77.3 60.0 55.1 48.6 45.4 44.0 | 4,224 s |
+
+Three measurements say where the limit is, and none of them names a part to fix.
+
+**Concurrency buys nothing.** The `smoke` profile seeds 994 records through one active User at 94
+records a second. `reduced` seeds through thirteen concurrent Users and starts at 95.8. Widening
+the batch by ten times moved an earlier measurement by 1.4%. The limit is what one workerd process
+puts through the path, not how many records are in flight.
+
+**No step dominates.** Timing the three calls of the terminal-usage protocol separately over 800
+preseed records: `beginModelUsage` 31.1 s, `markModelUsageStarted` 22.4 s, `completeModelUsage`
+31.1 s, so 37% / 26% / 37% of about 10 ms of serialized Durable Object time per record.
+
+**The one candidate was measured and rejected.** `#prepareProjectionDeliveryAlarm` awaits a durable
+`setAlarm` on every one of those three calls. Removing that line entirely seeded 994 records in
+10.5 s against a 10.1 s, 10.6 s and 12.0 s baseline, which is no measurable change. The line was
+restored.
+
+What remains is the aggregate cost of the real three-step billing protocol in one local workerd
+process. The full profile's 979,600 preseed records therefore still need about 12.4 hours against
+the run's own 12-hour timeout, and the earlier estimate that fixing the throughput decay would
+bring that to about 3 hours did not hold.
 
 ## Full-run evaluation
 
