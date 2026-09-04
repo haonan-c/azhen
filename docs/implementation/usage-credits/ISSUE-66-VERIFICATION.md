@@ -980,8 +980,22 @@ Run on 2026-09-04 after the formal driver run, on `codex/issue-66` at `92039c5`:
 | `git diff --check` | PASS |
 | `node --test scripts/release-manifest.test.js` | PASS, 4/4 |
 | Production-shape release dry-run | PASS, 19 workers, 85 modules, 36 asset blobs, no upload or promote |
-| Generated type review | Not required: `workshop-shared` is unchanged on this branch |
-| Skeptical correctness and architecture/security diff review | **Still open** |
+| Generated type review | PASS, and it *was* required |
+| Skeptical correctness and architecture/security diff review | Done, see below |
+
+The generated type review was first recorded here as not required, on the belief that
+`workshop-shared` is unchanged on this branch. That was wrong: `src/api.ts` gains 126 lines, which
+add `AdminUsageApi.getCapacityReview()`, the `AdminUsageCapacityReview` / `AdminUsageCapacityMetric`
+/ `AdminUsageCapacityWindow` types, the `USAGE_CREDIT_ERROR_CODES` family with
+`createInsufficientUsageCreditError` and `getInsufficientUsageCreditAmounts`, and an optional
+`insufficientUsageCredit` field on `AiChatMessageBody`. The review was then done. In the
+`capnweb-validate` output for both `AdminUsageApiImpl` and `AuthenticatedApiImpl`,
+`getCapacityReview` takes no argument and returns `null | AdminUsageCapacityReview`; `profileId` is
+a literal; each of the five metrics validates as `AdminUsageCapacityMetric` with `current`,
+`target` and `reviewThreshold` as `bigint`, not widened to number or string; and `window` keeps its
+three-arm discriminated union with `startedAt` present only on the two dated arms. The generated
+shape matches the declaration with nothing widened. Every new exported member carries a doc comment,
+as the kernel rule requires.
 
 The single `pnpm test` failure is `deepseek-agent-billing` > "traces owner and two collaborators
 through App, Action, restart, and Scheduler", filed as
@@ -991,9 +1005,59 @@ this branch with the #78 fix reverted, so it is neither caused by this branch no
 it is not on the Usage Credit path. Six full-file runs with the fix gave three clean runs and three
 failures across the file's two restart tests.
 
-Two gates remain before acceptance can be claimed: [#79](https://github.com/haonan-c/azhen/issues/79),
-and the skeptical correctness and architecture/security review of the 54-commit,
-6,328-insertion diff against `dev`.
+## The diff review
+
+Both passes cover `dev...HEAD` restricted to source: 26 files, 2,205 insertions and 170 deletions.
+Documentation, lock files, message catalogues and the profile JSON are excluded, and so are the
+capacity suites, which are test-only.
+
+**Security: no finding survived the confidence bar.** The report query and the projection files bind
+every filter value with `?`; the only interpolated identifiers are module constants and
+`predicate.indexName`, whose type is a one-member literal union produced from a boolean, so no
+attacker text can reach `INDEXED BY`. `getCapacityReview` sits on `AdminUsageApiImpl`, reachable only
+through `AdminApi.getUsageApi()` and therefore only through `getAdminApi()`, which returns null for a
+non-admin; it also re-checks with `assertAdminCapabilityActive`. `InsufficientUsageCreditAmounts`
+carries the paying principal's own available balance and the amount asked for, and nothing else --
+no provider cost, no deployment multiplier, no other User. The new capacity logging emits counts,
+thresholds and timestamps only.
+
+**One residual disclosure is accepted, not fixed.** The amounts ride on the chat error body, and
+`Overseer.listChats` is workspace-scoped with no per-User filter, so a workspace collaborator can
+read the remaining Usage Credit balance of the collaborator whose turn ran out of credit. Usage
+Credit balance is per-User financial state rather than workspace state, so this is a real widening.
+It is accepted here because it is not attacker-triggerable, the audience is the trusted collaborator
+set that already reads every chat message and the gadget's code, and share-link "use" sessions are
+denied chat entirely. A reviewer who disagrees should say so: the fix is to keep the amounts out of
+the chat body and deliver them on the acting User's own surface.
+
+**Correctness: one medium finding, filed as
+[#80](https://github.com/haonan-c/azhen/issues/80).** The new
+`compacted_aggregate_floor` gate in `#assertCurrentReportSnapshot` turns a stale snapshot into a
+hard `Usage report snapshot is stale.` The gate's own logic is sound, but it assumes the reported
+watermark never falls below the floor, and two verified facts allow it to: neither
+`#routeUnroutedAppliedRows` nor `#reportVisibleWatermark` filters by generation, so rows of a
+generation being cleaned up can re-enter the outbox and pull the watermark backwards. Not
+reproduced; the interleaving needs a specific cleanup window.
+
+**Three confirmed kernel-hygiene items**, each verified by reading the call sites. They are not
+defects, but the kernel rule is that fewer lines here is the point:
+
+| Item | State |
+| --- | --- |
+| `capacityReviewTransitions` in `usage-capacity-review.ts` | referenced only by its own test; `readCapacityReview` re-implements the same decision inline, and treats a first read as changed where the helper treats it as unchanged |
+| `buildUsageReportPredicate`'s `"aggregate-revisions"` row kind | declared and branched, no caller |
+| `UsageProjection.readAdminOverview(registeredUsers)` | returns `{...readOverview(), registeredUsers}`, and its one caller re-sets `registeredUsers` to the same value on the next line, so the parameter and the added RPC method change nothing |
+
+A misplaced doc comment was also found: the block describing `#monthsBefore` now sits above
+`#capacityMonths`, and it explains why that code does *not* filter by generation, which is the
+opposite of what `#capacityMonths` does.
+
+None of the three items is removed here, because each is a kernel edit that would re-open the gate
+table above. They are the first thing to settle if this branch is prepared for merge.
+
+Acceptance therefore still needs: [#79](https://github.com/haonan-c/azhen/issues/79),
+[#80](https://github.com/haonan-c/azhen/issues/80) or an argument that it is unreachable, and a
+decision on the three hygiene items and the accepted disclosure.
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
