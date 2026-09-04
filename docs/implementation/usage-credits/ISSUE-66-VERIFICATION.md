@@ -1072,7 +1072,25 @@ hard `Usage report snapshot is stale.` The gate's own logic is sound, but it ass
 watermark never falls below the floor, and two verified facts allow it to: neither
 `#routeUnroutedAppliedRows` nor `#reportVisibleWatermark` filters by generation, so rows of a
 generation being cleaned up can re-enter the outbox and pull the watermark backwards. Not
-reproduced; the interleaving needs a specific cleanup window.
+reproduced when filed; the interleaving needs a specific cleanup window.
+
+It has since been reproduced and fixed. The missing condition was a retired generation holding
+**more than one cleanup page**: `#runCleanupStep` deletes 64 fact rows per turn, and its early
+`return` ends that method rather than the turn, so `#runMaintenanceTurn` runs delivery immediately
+afterwards and the router takes what cleanup left. At one row cleanup always wins, which is why a
+small repro showed nothing.
+
+The watermark regression is transient — route and deliver both land inside one turn — but one
+effect is permanent: delivery wrote the retired rows back into month objects cleanup had already
+cleared and re-registered the generation in `usage_projection_months`, a table the `'months'` stage
+has finished with and no later stage visits. One turn before the fix left
+`retiredRoot=0 retiredMonths=1 expired=1`. That is the assertable symptom the regression test uses.
+Both queries now skip `cleanup_generation`, the rule the cleanup code already states for its own
+outbox delete. Fixed in `c8496f7`.
+
+The test proves the mechanism and the permanent leak at test scale, not the
+`Usage report snapshot is stale.` message itself: the floor is `report_watermark - 100_000` and is
+recorded only once compaction removes a row, so the hard error needs a deployment past that scale.
 
 **Three confirmed kernel-hygiene items, now removed.** Each was verified by reading its call sites
 first. None is a defect, but the kernel rule is that fewer lines here is the point:
@@ -1109,10 +1127,12 @@ naming the removed field.
 third time at `967e3c3` with the same results. `pnpm test` now reaches the end of its packages with
 one failure rather than stopping partway.
 
-Acceptance therefore still needs [#79](https://github.com/haonan-c/azhen/issues/79) and
-[#80](https://github.com/haonan-c/azhen/issues/80), the latter either fixed or argued unreachable.
-[#82](https://github.com/haonan-c/azhen/issues/82) is a health-field misreport found on the way and
-is not on the acceptance path.
+[#80](https://github.com/haonan-c/azhen/issues/80) was then reproduced and fixed, and the gate
+table was re-run a fourth time at `c8496f7` with the same results.
+
+Acceptance therefore still needs [#79](https://github.com/haonan-c/azhen/issues/79) and nothing
+else. [#82](https://github.com/haonan-c/azhen/issues/82) is a health-field misreport found on the
+way and is not on the acceptance path.
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
