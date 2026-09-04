@@ -997,22 +997,36 @@ three-arm discriminated union with `startedAt` present only on the two dated arm
 shape matches the declaration with nothing widened. Every new exported member carries a doc comment,
 as the kernel rule requires.
 
-`pnpm test` has two intermittent failures on this host, and no other. Neither is caused by this
-branch, and each was held against a control run:
+`pnpm test` has one intermittent failure on this host, and no other:
+`deepseek-agent-billing` > "traces owner and two collaborators through App, Action, restart, and
+Scheduler", filed as [#79](https://github.com/haonan-c/azhen/issues/79). A runtime restart re-runs
+the agent's Scheduler Hook registration turn, so the test sees two registrations instead of one. It
+fails the same way with the #78 fix reverted, and it is not on the Usage Credit path. Six full-file
+runs with the fix gave three clean and three failed.
 
-- `deepseek-agent-billing` > "traces owner and two collaborators through App, Action, restart, and
-  Scheduler", filed as [#79](https://github.com/haonan-c/azhen/issues/79). A runtime restart
-  re-runs the agent's Scheduler Hook registration turn, so the test sees two registrations instead
-  of one. It fails the same way with the #78 fix reverted, and it is not on the Usage Credit path.
-  Six full-file runs with the fix gave three clean and three failed.
-- `usage-projection.test.ts` > "rebuilds a new generation only from Registry and retained User
-  authority", filed as [#81](https://github.com/haonan-c/azhen/issues/81). This is the isolation
-  flake the branch has carried from the start. Measured here: with the tree unchanged it failed 2
-  of 3 focused runs, and with the tree stashed it failed 2 of 3 as well, so the rate is the same
-  with and without the working changes.
+A second failure was recorded here and has since been fixed, which is worth keeping because the
+reasoning that first dismissed it was wrong. `usage-projection.test.ts` > "rebuilds a new
+generation only from Registry and retained User authority" was carried as a test-isolation flake.
+The measurement behind that was sound — it failed 2 of 3 focused runs with the working changes and
+2 of 3 with them stashed — but the conclusion drawn from it was not: an equal rate shows only that
+the working changes are innocent, never that the test is at fault.
 
-Because the run stops at the first failing package, a run that trips the projection flake reports
-less than a full pass; a run that does not reaches the end with only #79.
+Run alone the test failed 4 of 4, which made it a deterministic loop rather than a flake, and
+instrumenting the failing poll found the cause in the code. `#finishRebuild` set
+`ingestion_watermark` at switchover from a `COUNT(*)` over `usage_projection_facts`, the root
+table that delivery empties as it moves each row to its month object, so the count returned
+whatever the delivery race had left behind. The probe caught the Projection reporting
+`ingestion_watermark` 2 against a `report_watermark` of 10, with an empty root table, no pending
+events and `state: healthy`. The column is now left alone: it counts live ingestion, which
+`#applyFact` advances only on the active-generation path, and a rebuild re-derives facts that were
+counted when they first arrived. Fixed in `967e3c3`; the test now passes 3 of 3 alone and 4 of 4
+across the file, and [#81](https://github.com/haonan-c/azhen/issues/81) records the diagnosis.
+
+This changed nothing about report correctness: `meta.ingestion_watermark` is read only by
+`readOverview()`, while report snapshots take their watermark from `#reportVisibleWatermark`, which
+reads `report_watermark` — a column the switchover does not write. The same switchover statement
+still reads the drained table for `latest_applied_source_at` and `last_ingested_at`, filed as
+[#82](https://github.com/haonan-c/azhen/issues/82).
 
 ## The diff review
 
@@ -1091,10 +1105,14 @@ The chat disclosure the security pass found is fixed, and the gate table above w
 at `3d9279b` with the same results, including the regenerated `capnweb-validate` output no longer
 naming the removed field.
 
-Acceptance therefore still needs three test issues settled and nothing else:
-[#79](https://github.com/haonan-c/azhen/issues/79),
-[#80](https://github.com/haonan-c/azhen/issues/80) or an argument that it is unreachable, and
-[#81](https://github.com/haonan-c/azhen/issues/81).
+[#81](https://github.com/haonan-c/azhen/issues/81) was then fixed, and the gate table was re-run a
+third time at `967e3c3` with the same results. `pnpm test` now reaches the end of its packages with
+one failure rather than stopping partway.
+
+Acceptance therefore still needs [#79](https://github.com/haonan-c/azhen/issues/79) and
+[#80](https://github.com/haonan-c/azhen/issues/80), the latter either fixed or argued unreachable.
+[#82](https://github.com/haonan-c/azhen/issues/82) is a health-field misreport found on the way and
+is not on the acceptance path.
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
