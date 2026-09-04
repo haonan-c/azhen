@@ -841,12 +841,115 @@ process. The full profile's 979,600 preseed records therefore still need about 1
 the run's own 12-hour timeout, and the earlier estimate that fixing the throughput decay would
 bring that to about 3 hours did not hold.
 
+## The formal driver run
+
+The section above ends by saying that a formal run of `test:usage-capacity` is still required once
+[#78](https://github.com/haonan-c/azhen/issues/78) is fixed. #78 is fixed, and that run has now
+happened. It supersedes the capacity-evidence status of the 2026-09-04T02:02:41Z run; the earlier
+entry stays as written, because it records what was true then.
+
+#78 was not a Usage defect at all. `harness.server.update(options => options)` in
+`action-billing.test.ts` restarts the Worker runtime, and a reload trails that restart by about
+4.5 s, after `update()` has returned. The trailing reload replaced the runtime process inside a
+later test and severed its WebSocket sessions with no close frame, which Cap'n Web reports as
+`WebSocket connection failed.` `Harness.restartRuntime()` now waits that reload out. See the Issue
+for the control run and the process-lifetime evidence.
+
+The formal run used the driver with no step skipped or replaced:
+
+```
+caffeinate -dimsu corepack pnpm --filter @gadgets/workshop-backend test:usage-capacity \
+  -- --reduced --out /tmp/azhen-issue-66-formal-20260904-103407
+```
+
+It started 2026-09-04T10:34:07Z and finished 2026-09-04T14:04:12Z on `codex/issue-66` at
+`92039c5`, with a clean tracked worktree. The host was quiet at the start: load 2.99, 2.44 GB of
+4.00 GB swap in use; it stayed between load 3.1 and 5.9 throughout, and swap never grew past
+2.45 GB. `host-state-start.txt`, `host-state-end.txt` and a per-minute `host-samples.log` are
+archived beside the artifacts.
+
+All three driver steps ran and all three exited 0:
+
+| Step | Result |
+| --- | --- |
+| `capnweb-backend` | PASS, 3 files, 20 passed, 4 skipped |
+| `capnweb-report-stream` | PASS, 1 file, 31 passed |
+| `capacity` | PASS, 4 files, 4 tests, 11,735 s |
+
+The driver prints its artifacts line only when it has collected no failure, so that line is the
+verdict: every step exited 0, the result marker was present, the driver's own
+`validateCapacityResult` found nothing against the `reduced` mode, and `scanCapacityLog` returned
+an empty privacy scan. Artifact hashes:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `usage-capacity-v1.log` | `9e314f332761532ff6144941d7c380bd591a813815ebda3c7345d247a0cf44cb` |
+| `usage-capacity-v1.json` | `6fb54b01864a798e2bf3b98dcc2be69b16b8419109a7e7605f8d3d935c8cee0c` |
+| `privacy-scan.json` | `720063bda79a8e1b08355eba273a03993749bb8365ddfcc6cff069bb9ceaaf6e` |
+
 ## Full-run evaluation
 
-Pending: parse the formal JSON artifact, report p50/p95/p99/max/sample/error counts, exact source
-totals, authority/Projection consistency, rebuild duration, duplicate/conflict result, SQLite bytes,
-24-month conservative storage extrapolation, and the four active review metrics. A PASS conclusion
-must not be written until every locked threshold has been checked.
+The formal artifact is `usage-capacity-v1.json`, run id
+`usage-capacity-v1-reduced-2026-08-26T00:17:00.050Z` under controlled seed
+`usage-capacity-v1-seed-20260826`, on local real workerd/SQLite production code paths with
+controlled external mocks. The profile is `reduced`: 10,000 registered Users, 200 active Users,
+1,000 records per User, 120 warm seconds, 900 measured seconds, 20 offered records a second on a
+one-second tick.
+
+**Every locked threshold was checked.** All 34 performance gates are inside their limits; none is
+over. Percentiles, with sample and error counts:
+
+| Measurement | p50 | p95 | p99 | max | samples | errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Arrival | 39 ms | 375 ms | 451 ms | 751 ms | 1,020 | 0 |
+| Authoritative warm commit | 140 ms | 626 ms | 849 ms | 1,005 ms | 2,400 | 0 |
+| Projection visibility | 636 ms | 1,135 ms | 1,253 ms | 2,146 ms | 1,020 | 0 |
+| Administrator overview visibility | 1,006 ms | 1,317 ms | 1,863 ms | 2,298 ms | 1,020 | 0 |
+| Ledger balance read | 2 ms | 18 ms | 45 ms | 45 ms | 30 | 0 |
+
+The gates those feed, against their limits: arrival max 751 / 1,000 ms with 0 late ticks of 1,020;
+authoritative warm p95/p99 626 / 849 against 2,000 / 5,000 ms; Projection visibility p99 1,253 /
+10,000 ms; administrator overview visibility max 2,298 / 60,000 ms; Projection drain 753 /
+60,000 ms; capacity telemetry p95 1,136 / 2,000 ms; CSV first byte 16 / 2,000 ms and duration
+202,593 / 900,000 ms; the worst of the twelve filtered overview p95 gates, `reportQuery.outcome`,
+1,093 / 2,000 ms; ledger balance read p95 18 / 1,000 ms.
+
+**Source totals and consistency.** 200,000 authoritative records produced 400,000 authority
+Projection facts and 200,000 Projection records, so authority and Projection agree exactly. 20,000
+duplicate facts changed nothing. The rebuild ran 9,859 alarms in 5,717,228 ms and reproduced both
+digests: metrics `af253a38…6e4e5a` and detail `a9d3ac51…4217769` are identical before and after,
+over 5,753 dimension groups, and all 355 of the 355 expected public Gatekeeper billing methods were
+covered. 2,000 out-of-order pairs gave 4,000 metered uses either way. The acknowledgement-loss
+replay left totals unchanged, and the restart reproduced the same metrics digest with totals
+unchanged. Across 200 Users the ledger equation failed 0 times, with 0 negative available balances,
+0 stuck reservations and 0 initial-grant failures.
+
+**SQLite bytes and the 24-month model.** Registry 7,479,296 B; Projection 215,318,528 B against
+229,376 B empty; Projection month 642,777,088 B over 2 objects against 86,016 B empty; a typical
+User 19,501,056 B, the hot User 19,623,936 B, an inactive User 12,288 B. The Projection breakdown
+is 200,000 detail rows (74,142,679 logical B), 82,455 aggregate rows (52,018,002 B) and 43,272
+summary rows (15,213,202 B). The conservative 24-month extrapolation is **4,387,393,772 B against
+the 10,000,000,000 B hard limit**, and below the 7,000,000,000 B review threshold, so the model
+reports neither a limit breach nor a required review.
+
+**The four active review metrics**, as the `reduced` profile can reach them:
+
+| Metric | Current | Target | Review threshold | Review required |
+| --- | ---: | ---: | ---: | --- |
+| Registered Users | 10,000 | 10,000 | 7,000 | yes |
+| Daily active Users | 200 | 1,000 | 700 | no |
+| Rolling 30-day records | 200,000 | 1,000,000 | 700,000 | no |
+| Aligned one-second peak | 20 | 20 | 14 | yes |
+
+Two targets are met exactly and are past their review threshold. The other two remain at one fifth
+of target by construction, because `reduced` lowers only how many Users are active. That is the
+amended acceptance target of this Issue, not a shortfall against it, and the reason the full
+profile is not reachable here is measured in the two sections above.
+
+**Conclusion: PASS against the amended reduced target.** Every locked threshold the profile
+measures was checked and met, the correctness invariants hold, storage stays inside its hard limit
+and below its review threshold, and the evidence comes from a complete formal driver run whose own
+validator and privacy scan accepted it.
 
 ## Gates re-run on this branch
 
@@ -865,18 +968,32 @@ storage gate in `ISSUE-66-CAPACITY-DECISION.md` and a valid formal full run.
 
 ## Final gates
 
-Pending after the full run and any necessary fix:
+Run on 2026-09-04 after the formal driver run, on `codex/issue-66` at `92039c5`:
 
-- focused workerd, real Cap'n Web, frontend and privacy tests;
-- affected package build/test;
-- `corepack pnpm build`;
-- `corepack pnpm test`;
-- `corepack pnpm lint`;
-- `git diff --check`;
-- `node --test scripts/release-manifest.test.js`;
-- generated type review if the shared RPC shape requires it;
-- production-shape release dry-run in a temporary directory, with no upload, promote or deploy;
-- skeptical correctness and architecture/security diff review.
+| Gate | Result |
+| --- | --- |
+| Focused workerd and real Cap'n Web tests | PASS, as the driver's `capnweb-backend` and `capnweb-report-stream` steps |
+| Affected package build (`@gadgets/integration-tests`) | PASS |
+| `corepack pnpm build` | PASS |
+| `corepack pnpm test` | **1 known flake**, see below; every other suite passed |
+| `corepack pnpm lint` | PASS, 0 errors |
+| `git diff --check` | PASS |
+| `node --test scripts/release-manifest.test.js` | PASS, 4/4 |
+| Production-shape release dry-run | PASS, 19 workers, 85 modules, 36 asset blobs, no upload or promote |
+| Generated type review | Not required: `workshop-shared` is unchanged on this branch |
+| Skeptical correctness and architecture/security diff review | **Still open** |
+
+The single `pnpm test` failure is `deepseek-agent-billing` > "traces owner and two collaborators
+through App, Action, restart, and Scheduler", filed as
+[#79](https://github.com/haonan-c/azhen/issues/79). A runtime restart re-runs the agent's Scheduler
+Hook registration turn, so the test sees two registrations instead of one. It fails the same way on
+this branch with the #78 fix reverted, so it is neither caused by this branch nor by that fix, and
+it is not on the Usage Credit path. Six full-file runs with the fix gave three clean runs and three
+failures across the file's two restart tests.
+
+Two gates remain before acceptance can be claimed: [#79](https://github.com/haonan-c/azhen/issues/79),
+and the skeptical correctness and architecture/security review of the 54-commit,
+6,328-insertion diff against `dev`.
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
