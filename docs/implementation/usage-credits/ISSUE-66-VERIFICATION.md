@@ -1039,8 +1039,8 @@ watermark never falls below the floor, and two verified facts allow it to: neith
 generation being cleaned up can re-enter the outbox and pull the watermark backwards. Not
 reproduced; the interleaving needs a specific cleanup window.
 
-**Three confirmed kernel-hygiene items**, each verified by reading the call sites. They are not
-defects, but the kernel rule is that fewer lines here is the point:
+**Three confirmed kernel-hygiene items, now removed.** Each was verified by reading its call sites
+first. None is a defect, but the kernel rule is that fewer lines here is the point:
 
 | Item | State |
 | --- | --- |
@@ -1048,16 +1048,27 @@ defects, but the kernel rule is that fewer lines here is the point:
 | `buildUsageReportPredicate`'s `"aggregate-revisions"` row kind | declared and branched, no caller |
 | `UsageProjection.readAdminOverview(registeredUsers)` | returns `{...readOverview(), registeredUsers}`, and its one caller re-sets `registeredUsers` to the same value on the next line, so the parameter and the added RPC method change nothing |
 
-A misplaced doc comment was also found: the block describing `#monthsBefore` now sits above
-`#capacityMonths`, and it explains why that code does *not* filter by generation, which is the
-opposite of what `#capacityMonths` does.
+The removal of `capacityReviewTransitions` keeps the persisted mechanism and drops the in-memory
+one. `readCapacityReview` compares against `usage_projection_capacity_review_state`, which survives
+a Durable Object restart; the helper compared two whole review objects, which the Durable Object
+never holds. The helper's own test went with it, so the backend suite is 471 tests where it was
+472. One first-read behaviour stays as it was and is worth a later look: the persisted path treats
+an absent row as changed, so a deployment's first `getCapacityReview()` logs four
+`usage.capacity.review.changed` lines, some with `reviewRequired: false`.
 
-None of the three items is removed here, because each is a kernel edit that would re-open the gate
-table above. They are the first thing to settle if this branch is prepared for merge.
+A misplaced doc comment was fixed in the same pass, as a fourth change: the block describing
+`#monthsBefore` sat above `#capacityMonths` and explained why that code does *not* filter by
+generation, which is the opposite of what `#capacityMonths` does. It is moved back, with no code
+change.
+
+The four changes remove 78 lines and add 11. Every gate in the table above was then re-run at
+`29fd572`, and each kept its earlier result, including the release manifest at 19 workers, 85
+modules and 36 asset blobs, and `pnpm test`'s one failure still being only
+[#79](https://github.com/haonan-c/azhen/issues/79).
 
 Acceptance therefore still needs: [#79](https://github.com/haonan-c/azhen/issues/79),
 [#80](https://github.com/haonan-c/azhen/issues/80) or an argument that it is unreachable, and a
-decision on the three hygiene items and the accepted disclosure.
+decision on the accepted disclosure.
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
