@@ -2952,10 +2952,6 @@ export async function runAgent(
   let turnFailure: {
     message: string;
     code?: string;
-    insufficientUsageCredit?: {
-      availableSubunits: bigint;
-      requiredSubunits: bigint;
-    };
   } | undefined;
 
   // Turn cap, replacing the old stepCountIs(30).
@@ -3025,20 +3021,11 @@ export async function runAgent(
         if (message.stopReason === "error" || message.stopReason === "aborted") {
           // Persist nothing from a failed or cancelled model request; rethrown after the loop
           // returns.
-          let failedMessage = message as AssistantMessage & {
-            usageCreditErrorCode?: string;
-            insufficientUsageCredit?: {
-              availableSubunits: bigint;
-              requiredSubunits: bigint;
-            };
-          };
+          let failedMessage = message as AssistantMessage & {usageCreditErrorCode?: string};
           turnFailure = {
             message: message.errorMessage ?? "The model request failed.",
             ...(failedMessage.usageCreditErrorCode
               ? {code: failedMessage.usageCreditErrorCode}
-              : {}),
-            ...(failedMessage.insufficientUsageCredit
-              ? {insufficientUsageCredit: failedMessage.insufficientUsageCredit}
               : {}),
           };
           break;
@@ -3197,10 +3184,7 @@ export async function runAgent(
     throw new AgentTurnError(
         turnFailure.message,
         httpStatusFromError(turnFailure.message, handle),
-        {
-          code: turnFailure.code,
-          insufficientUsageCredit: turnFailure.insufficientUsageCredit,
-        });
+        {code: turnFailure.code});
   }
 
   // The turn ran, so there is no checkpoint to report.

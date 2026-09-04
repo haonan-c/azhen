@@ -912,12 +912,10 @@ describe("DeepSeek Agent model metering", () => {
     expect(result.stopReason).toBe("error");
     expect((result as unknown as {usageCreditErrorCode?: string}).usageCreditErrorCode)
       .toBe("INSUFFICIENT_USAGE_CREDIT");
-    expect((result as unknown as {
-      insufficientUsageCredit?: {availableSubunits: bigint; requiredSubunits: bigint}
-    }).insufficientUsageCredit).toEqual({
-      availableSubunits: 0n,
-      requiredSubunits: expect.any(BigInt),
-    });
+    // The code classifies the failure; no amount rides along, because the chat this message
+    // reaches belongs to the workspace and a balance belongs to one collaborator.
+    expect(result as unknown as Record<string, unknown>)
+      .not.toHaveProperty("insufficientUsageCredit");
     expect(providerCalls).toBe(0);
     await user.getUsageCreditBalance();
     const account = await runInDurableObject(user, (_instance, state) =>
