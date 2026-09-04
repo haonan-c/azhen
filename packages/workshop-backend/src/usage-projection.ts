@@ -740,12 +740,17 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    *
    * A report must never name a row that its month object has not stored, so visibility stops one
    * below the oldest row still waiting for delivery rather than at the assigned watermark.
+   *
+   * A generation being cleaned up is excluded. Its rows are older than everything a report can
+   * read, and they are queued only to be deleted, so counting them would drag visibility back
+   * below where it already was -- and the compaction floor a report is checked against only rises.
    */
   #reportVisibleWatermark(meta: ProjectionMetaRow): bigint {
     const pending = this.ctx.storage.sql.exec<{applied_watermark: string}>(`
       SELECT applied_watermark FROM usage_projection_month_outbox
+      WHERE generation != ?
       ORDER BY length(applied_watermark), applied_watermark LIMIT 1
-    `).toArray()[0];
+    `, meta.cleanup_generation ?? "").toArray()[0];
     return pending === undefined
       ? BigInt(meta.report_watermark) : BigInt(pending.applied_watermark) - 1n;
   }
@@ -756,8 +761,15 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * A deployment upgraded from a single-object Projection holds applied rows the outbox never saw.
    * Routing them through the same outbox means migration has no path of its own: delivery moves
    * each row to its month object and retires the root's copy exactly as it does for a new fact.
+   *
+   * A generation being cleaned up is skipped, for the reason its own cleanup already states: a row
+   * that is about to be deleted never needs delivering. Cleanup drops that generation's outbox
+   * entries in one statement but deletes its fact rows a page at a time, so between two turns
+   * those rows look exactly like rows that were never routed. Routing them delivers a retired
+   * generation back into the month objects cleanup has already cleared, and re-registers it in
+   * `usage_projection_months`, which no later cleanup stage visits.
    */
-  #routeUnroutedAppliedRows(): void {
+  #routeUnroutedAppliedRows(cleanupGeneration: string | null): void {
     const rows = this.ctx.storage.sql.exec<{
       generation: string;
       fact_id: string;
@@ -769,12 +781,13 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
              facts.applied_watermark
       FROM usage_projection_facts AS facts
       WHERE facts.applied = 1 AND facts.applied_watermark IS NOT NULL
+        AND facts.generation != ?
         AND NOT EXISTS (
           SELECT 1 FROM usage_projection_month_outbox AS outbox
           WHERE outbox.generation = facts.generation AND outbox.fact_id = facts.fact_id
         )
       LIMIT 64
-    `).toArray();
+    `, cleanupGeneration ?? "").toArray();
     for (const row of rows) {
       const sourceTime = row.occurred_at ?? row.bucket_start;
       if (sourceTime === null) continue;
@@ -825,7 +838,7 @@ export class UsageProjection extends DurableObject<Cloudflare.Env> {
    * row. Returns whether the outbox is now empty.
    */
   async #deliverMonthOutboxStep(): Promise<boolean> {
-    this.#routeUnroutedAppliedRows();
+    this.#routeUnroutedAppliedRows(this.#meta().cleanup_generation);
     const pending = this.ctx.storage.sql.exec<{month: string}>(`
       SELECT month FROM usage_projection_month_outbox
       ORDER BY length(applied_watermark), applied_watermark LIMIT 1

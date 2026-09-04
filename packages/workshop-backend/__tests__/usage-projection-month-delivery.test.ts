@@ -240,6 +240,77 @@ describe("Usage Projection month delivery", () => {
     expect((await projection.getReportCoordinates()).ingestionWatermark).toBe(0n);
   });
 
+  it("leaves a retired generation out of the router and the report watermark", async () => {
+    const projectionName = `delivery-retired-${crypto.randomUUID()}`;
+    const projection = await ready(projectionName);
+    const principal = crypto.randomUUID();
+    expect((await projection.ingest([aggregate(principal)])).rejected).toEqual([]);
+    const live = (await projection.getReportCoordinates()).ingestionWatermark;
+
+    // The state a retired generation passes through. `#cleanRetiredGenerationMonths` drops its
+    // outbox entries in one statement, because a row it is about to delete never needs delivering,
+    // while its fact rows go 64 at a time in the later 'facts' stage. More than one page of them
+    // therefore sits applied and unrouted between two turns, which is what the router looks for.
+    // Their watermarks are older than anything live, because the generation was retired first.
+    const retiredPage = 65;
+    await runInDurableObject(projection, (_instance, state) => {
+      const zeroes = Array.from({length: 19}, () => "'0'").join(", ");
+      for (let index = 0; index < retiredPage; index += 1) {
+        state.storage.sql.exec(`
+          INSERT INTO usage_projection_facts (
+            generation, fact_id, fact_hash, principal_ref, source_sequence,
+            bucket_start, summary_fact_id, summary_revision, summary_dimension_key,
+            summary_snapshot_value, source, row_kind, metered_kind, usage_kind, outcome, pricing,
+            cache_hit_input, cache_miss_input, cache_write_input, output_tokens, reasoning_tokens,
+            provider_cost, charged_credits, metered_use_count, billable_api_operations,
+            pre_execution_failures, unknown_operations, metering_attempts, held_reservations,
+            released_reservations, settled_reservations, unreserved_attempts,
+            active_user_contribution, unpriced_model_uses, unpriced_api_operations,
+            applied, applied_watermark
+          ) VALUES (
+            '0', ?, 'retired-hash', ?, ?,
+            '2026-07-24T12:00:00.000Z', ?, '1', 'retired-dimension',
+            '0', 'agent', 'aggregate', 'model', 'model', 'accepted', 'priced',
+            ${zeroes},
+            1, '1'
+          )
+        `, `retired-fact-${index}`, principal, `${index + 1}`, `retired-summary-${index}`);
+      }
+      state.storage.sql.exec(`
+        UPDATE usage_projection_meta SET cleanup_generation = '0', cleanup_stage = 'facts'
+        WHERE singleton = 1
+      `);
+    });
+    expect((await projection.getReportCoordinates()).ingestionWatermark).toBe(live);
+
+    // One turn: cleanup removes its page of retired rows, then delivery runs the router over what
+    // is left.
+    await runDurableObjectAlarm(projection);
+
+    // Re-queueing a retired row puts its old watermark back in the outbox, and the report
+    // watermark reads the oldest queued row, so a report opened now freezes below a compaction
+    // floor that only ever rises. A retired generation is also about to be deleted, so delivering
+    // it writes rows back into the month objects cleanup just cleared.
+    const after = await runInDurableObject(projection, (_instance, state) => ({
+      retiredRoot: state.storage.sql.exec<{n: string}>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS n FROM usage_projection_facts WHERE generation = '0'
+      `).one().n,
+      retiredMonths: state.storage.sql.exec<{n: string}>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS n FROM usage_projection_months WHERE generation = '0'
+      `).one().n,
+      expired: state.storage.sql.exec<{n: string}>(`
+        SELECT CAST(COUNT(*) AS TEXT) AS n FROM usage_projection_expired_sequences
+        WHERE generation = '0'
+      `).one().n,
+    }));
+    // Cleanup removed its page of 64 and left one row for the next turn; delivery must not have
+    // taken it. The 'months' cleanup stage has already run and no later stage visits that table,
+    // so a month re-registered here for a retired generation would never be removed again.
+    expect(after).toEqual({retiredRoot: "1", retiredMonths: "0", expired: "0"});
+    expect(await outbox(projection)).toEqual([]);
+    expect((await projection.getReportCoordinates()).ingestionWatermark).toBe(live);
+  });
+
   it("drains a retained outbox row through the maintenance alarm", async () => {
     const projection = await ready(`delivery-retry-${crypto.randomUUID()}`);
     const principal = crypto.randomUUID();
