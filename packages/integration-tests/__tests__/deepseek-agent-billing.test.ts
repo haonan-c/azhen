@@ -1041,6 +1041,15 @@ describe("DeepSeek Agent billing", () => {
     if (!hook) throw new Error("Expected the registered Scheduler Hook.");
     let scheduleId: string | undefined;
 
+    // Enable the Hook before the restart, not after it. The callback is due on a wall clock the
+    // restart does not wait for, and a delivery that arrives while the Hook is off is not retried
+    // for RECOVERY_DELAY_MS, five minutes, so enabling afterwards raced the restart against a
+    // budget no constant can cover. Enabling first also makes the restart prove more: the Hook
+    // capability is one that survived, so it has to re-acquire the Overseer rather than being
+    // created fresh against a running one.
+    await builderWorkspace.enableHook(hook.id);
+    hookEnableComplete = true;
+
     gadget[Symbol.dispose]();
     spawner[Symbol.dispose]();
     builderWorkspace[Symbol.dispose]();
@@ -1053,16 +1062,6 @@ describe("DeepSeek Agent billing", () => {
     // persisted Hook capability still has a live reference to the Overseer.
     await harness.restartRuntime();
     loaderReloadComplete = true;
-
-    const enablingSession = await signInWhenAvailable(builderName);
-    const enablingPublicApi = enablingSession.publicApi;
-    const enablingBuilder = enablingSession.user;
-    const enablingWorkspace = await enablingBuilder.openGadget(workspaceId);
-    await enablingWorkspace.enableHook(hook.id);
-    hookEnableComplete = true;
-    enablingWorkspace[Symbol.dispose]();
-    enablingBuilder[Symbol.dispose]();
-    enablingPublicApi[Symbol.dispose]();
 
     await Promise.race([
       scheduledCall,
@@ -1555,7 +1554,12 @@ describe("DeepSeek Agent billing", () => {
     expect(actionProviderCalls).toBe(2);
     expect(schedulerProviderCalls).toBe(providerCallsBeforeQuiescence);
     expect(schedulerProviderAttempts.filter(attempt => attempt.kind === "unclassified")).toEqual([]);
-    expect(registrationInitialAttempts).toHaveLength(1);
+    // The opening registration request is a model call that carries no side effect of its own, so
+    // the agent may retry it exactly as it may retry the tool-result call below; measured under
+    // load the retry arrives about a second after the first. What must stay exact is the Hook,
+    // and the `waitFor` above already requires exactly one of those.
+    expect(registrationInitialAttempts.length).toBeGreaterThanOrEqual(1);
+    expect(registrationInitialAttempts.length).toBeLessThanOrEqual(2);
     expect(registrationToolResultAttempts.length).toBeGreaterThanOrEqual(1);
     expect(registrationToolResultAttempts.length).toBeLessThanOrEqual(2);
     if (registrationToolResultAttempts.length === 2) {
