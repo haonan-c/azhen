@@ -1059,3 +1059,55 @@ tests must retain the runtime assertion. Mock provider tests are not production 
   controlled external mocks. No upload, promotion, deployment, production configuration or
   charging change, production contact, push, merge, pull request, Issue closure, or worktree
   deletion occurred.
+
+### 2026-08-29 — Issues #73 and #74 integration into `dev`
+
+- The deployment Usage Projection is now sharded by UTC month. `54df43a` merged #73 and #74 into
+  `dev` and both Issues are closed with verification comments. Two rounds of two-axis review
+  (Standards and Spec) found eight real defects across the two Issues; all eight are fixed in the
+  merged branch.
+- Three of those defects are worth recording because each was silent:
+  - `f906d8e` gates the rebuild switchover on an empty `usage_projection_month_outbox` for the new
+    generation. A report bounds its rows by a watermark, and a rebuild assigns watermarks in rebuild
+    order rather than source-time order, so switching to a generation whose rows were still queued
+    would have reported a source-time scattered subset against complete totals.
+  - `ee8daa8` clears `usage_projection_expired_sequences` and `usage_projection_month_outbox` for
+    the stale generation when a rebuild is requested. Without it a restarted rebuild inherited the
+    previous attempt's queue.
+  - `e1adc02` bounds month maintenance: `expireDetailBefore` and the compaction step now stop at the
+    first incomplete month, and compaction filters by generation. `#monthsBefore` deliberately does
+    not filter by generation, because a rebuild can restore detail the reported generation already
+    expired.
+- Two review findings were examined and rejected as correct behaviour rather than defects. A
+  `deliveryPendingEventCount: 0n` was pre-existing and semantically right, and a synthetic
+  empty-registry rebuild reporting `charged_credits=0` for its summary generation is the defined
+  outcome, confirmed by probing `usage_projection_totals` directly.
+- #75 is open as a follow-up: lifetime Usage Summary Fact growth in the Projection root object is
+  bounded by nothing today, and the sharding moved detail out of the root without moving Summaries.
+
+### 2026-08-29 — Issue #42 User Story acceptance audit
+
+- `8b0f914` adds `ISSUE-42-STORY-ACCEPTANCE.md`, mapping all 71 User Stories to the sub-issue that
+  built each one and to a named test that proves it. The index parsed for the audit is 1,865 tests
+  under `packages/`, of which 619 are usage, credit, metering, billing, or charge tests in 82 files.
+- 66 stories pass. Story 60 is IN PROGRESS under #66. Stories 34 and 65 are PARTIAL. Stories 26 and
+  66 are OPEN and are now tracked in #76. Every OPEN and PARTIAL finding is display; no finding
+  touches the balance, reservation, charge, or Credit Ledger authority.
+- The audit's own method note matters for repeating it: the first index missed every single-quoted
+  test name, which hid both User-facing Usage Credit frontend suites entirely. Parse `"`, `'`, and
+  template names, or the corpus silently under-reports.
+- #42 remains open. It is not to be closed without explicit confirmation.
+
+### 2026-08-29 — Toolchain findings recorded during Issue #66
+
+- `pnpm build` can report success while a package does not type-check. After `AdminUsageOverview`
+  lost its `capacityReview` member in `workshop-shared`, `pnpm build` exited 0 while a direct
+  per-package `tsc` reported four errors, three frontend and one backend. Vite+'s task cache does
+  not invalidate downstream packages on a `workshop-shared` API change. Verify a shared API change
+  with a direct per-package `tsc`, not with the cached recursive build.
+- `@cloudflare/vitest-pool-workers` 0.20.3 re-wraps a Durable Object's prototype in a new `Proxy` on
+  every construction, so a long test that constructs thousands of objects overflows the stack
+  (measured: failure after 2,073 constructions). `patches/@cloudflare__vitest-pool-workers@0.20.3.patch`
+  wraps once, and `scripts/vitest-pool-workers-patch.test.js` pins both that the patch is declared
+  in `pnpm-workspace.yaml` and that it wraps a single time. This was the reason the #66 capacity run
+  had never completed.
