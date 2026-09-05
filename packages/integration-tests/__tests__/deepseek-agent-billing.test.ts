@@ -1377,7 +1377,10 @@ describe("DeepSeek Agent billing", () => {
     let schedulerProviderCalls = 0;
     let lastSchedulerChatState = "not-polled";
     let lastSchedulerHookCount = -1;
-    const schedulerProviderAttempts: ({kind: "registration-initial" | "scheduled"} | {
+    const schedulerProviderAttempts: ({kind: "scheduled"} | {
+      kind: "registration-initial";
+      requestHash: string;
+    } | {
       kind: "registration-tool-result";
       requestHash: string;
       toolCallIdentity: string;
@@ -1406,7 +1409,10 @@ describe("DeepSeek Agent billing", () => {
         message.role === "tool" || typeof message.tool_call_id === "string").length;
       if (payload.tools.length === 12 && messages.length === 2 && lastMessage?.role === "user" &&
           toolCallMessageCount === 0 && toolResultCount === 0) {
-        schedulerProviderAttempts.push({kind: "registration-initial"});
+        schedulerProviderAttempts.push({
+          kind: "registration-initial",
+          requestHash: createHash("sha256").update(requestBody).digest("hex"),
+        });
         return deepSeekNamedToolCallSse("executeCode", {
           code: `
             import { restore } from "cloudflare:workers";
@@ -1560,6 +1566,9 @@ describe("DeepSeek Agent billing", () => {
     // and the `waitFor` above already requires exactly one of those.
     expect(registrationInitialAttempts.length).toBeGreaterThanOrEqual(1);
     expect(registrationInitialAttempts.length).toBeLessThanOrEqual(2);
+    if (registrationInitialAttempts.length === 2) {
+      expect(registrationInitialAttempts[1]).toEqual(registrationInitialAttempts[0]);
+    }
     expect(registrationToolResultAttempts.length).toBeGreaterThanOrEqual(1);
     expect(registrationToolResultAttempts.length).toBeLessThanOrEqual(2);
     if (registrationToolResultAttempts.length === 2) {
