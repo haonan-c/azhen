@@ -106,6 +106,7 @@ import type { SelectableItem } from "./ResourcePicker";
 import GatekeeperModal from "./GatekeeperModal";
 import { GatekeeperIcon } from "./components/GatekeeperIcon";
 import { formatNoun, formatOfferNoun, FORMAT_ICONS } from "./components/format/formats";
+import { formatUsageCreditSubunits } from "./components/billing/formatUsageCredits";
 import { FormatMiniature } from "./components/format/FormatVisuals";
 import { formatIconDataUrl } from "./components/format/formatIconImage";
 import { locateMessageFormatRefs } from "./components/format/messageFormatRefs";
@@ -7792,10 +7793,18 @@ function ChatInterface({
                               msg.sequence === lastMessageSequence &&
                               !isAgentActive;
                             const expanded = expandedErrors.has(key);
-                            // A chat is workspace-wide, so a rejected reservation names no amount
-                            // here: the balance it would state belongs to one collaborator.
-                            const errorMessage =
+                            const insufficientUsageCredit =
                               msg.code === USAGE_CREDIT_ERROR_CODES.insufficientCredit
+                                ? msg.insufficientUsageCredit
+                                : undefined;
+                            const errorMessage = insufficientUsageCredit
+                              ? uiMessages.conversation_insufficient_usage_credit({
+                                available: formatUsageCreditSubunits(
+                                  insufficientUsageCredit.availableSubunits),
+                                required: formatUsageCreditSubunits(
+                                  insufficientUsageCredit.requiredSubunits),
+                              })
+                              : msg.code === USAGE_CREDIT_ERROR_CODES.insufficientCredit
                                 ? uiMessages.conversation_insufficient_usage_credit_fallback()
                                 : msg.code === "usage_limit"
                                   ? uiMessages.conversation_legacy_usage_limit()

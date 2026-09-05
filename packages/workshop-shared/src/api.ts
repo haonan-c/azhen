@@ -446,6 +446,17 @@ export const USAGE_CREDIT_ERROR_CODES = {
 export type UsageCreditErrorCode =
     typeof USAGE_CREDIT_ERROR_CODES[keyof typeof USAGE_CREDIT_ERROR_CODES];
 
+/**
+ * The two amounts a User needs in order to act on a rejected reservation, both in Usage Credit
+ * subunits. Neither reveals provider cost, the deployment multiplier, or another User.
+ */
+export type InsufficientUsageCreditAmounts = {
+  /** Usage Credit subunits the User can still reserve. */
+  availableSubunits: bigint;
+  /** Usage Credit subunits the rejected reservation asked for. */
+  requiredSubunits: bigint;
+};
+
 /** Messages for Usage Credit failures thrown without a surviving code; clients match these only as
  * a classification fallback. */
 export const USAGE_CREDIT_ERROR_MESSAGES: Record<UsageCreditErrorCode, string> = {
@@ -455,17 +466,33 @@ export const USAGE_CREDIT_ERROR_MESSAGES: Record<UsageCreditErrorCode, string> =
 const usageCreditErrors = codedErrorFamily(USAGE_CREDIT_ERROR_MESSAGES);
 
 /**
- * Creates the expected rejection a reservation returns when the balance cannot fund it.
- *
- * The rejection carries its code and nothing else. A balance belongs to one User, while the chat a
- * failed turn writes to belongs to the whole workspace, so no amount travels with this error.
+ * Creates the expected rejection a reservation returns when the balance cannot fund it, carrying
+ * the two amounts the User surface states back to the User.
  */
-export function createInsufficientUsageCreditError(): Error & {code: UsageCreditErrorCode} {
-  return usageCreditErrors.create(USAGE_CREDIT_ERROR_CODES.insufficientCredit);
+export function createInsufficientUsageCreditError(amounts: InsufficientUsageCreditAmounts):
+    Error & {code: UsageCreditErrorCode} & InsufficientUsageCreditAmounts {
+  return Object.assign(
+    usageCreditErrors.create(USAGE_CREDIT_ERROR_CODES.insufficientCredit), amounts);
 }
 
 /** Reads the machine-readable code from an expected Usage Credit failure. */
 export const getUsageCreditErrorCode = usageCreditErrors.getCode;
+
+/**
+ * Reads the two amounts from a rejected reservation. Returns undefined when the error is not an
+ * insufficient-credit rejection or when the amounts did not survive an older deployment, so a
+ * client falls back to a message without them rather than showing a fabricated number.
+ */
+export function getInsufficientUsageCreditAmounts(
+    error: unknown): InsufficientUsageCreditAmounts | undefined {
+  if (getUsageCreditErrorCode(error) !== USAGE_CREDIT_ERROR_CODES.insufficientCredit ||
+      typeof error !== "object" || error === null ||
+      !("availableSubunits" in error) || typeof error.availableSubunits !== "bigint" ||
+      !("requiredSubunits" in error) || typeof error.requiredSubunits !== "bigint") {
+    return undefined;
+  }
+  return {availableSubunits: error.availableSubunits, requiredSubunits: error.requiredSubunits};
+}
 
 /**
  * Number of exact integer subunits in one Usage Credit. The 10^18 scale keeps amounts exact even
@@ -3758,6 +3785,8 @@ export type AiChatMessageBody = {
   message: string;
   /** Optional machine-readable code for presenting a stable category of error. */
   code?: string;
+  /** Amounts for an insufficient Usage Credit reservation, when the rejection carried them. */
+  insufficientUsageCredit?: InsufficientUsageCreditAmounts;
 } | {
   /**
    * Indicates that a callback was received on the agent's `self` object. When the agent uses

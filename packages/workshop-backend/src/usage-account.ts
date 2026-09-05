@@ -1984,7 +1984,10 @@ export class UsageAccount {
       const availableSubunits = totals.ledgerBalanceSubunits - totals.reservedSubunits;
       if (availableSubunits < amountSubunits) {
         return {
-          error: createInsufficientUsageCreditError(),
+          error: createInsufficientUsageCreditError({
+            availableSubunits,
+            requiredSubunits: amountSubunits,
+          }),
         };
       }
 
@@ -2136,7 +2139,10 @@ export class UsageAccount {
         const availableSubunits = totals.ledgerBalanceSubunits - totals.reservedSubunits;
         if (availableSubunits < reservationAmountSubunits) {
           return {
-            error: createInsufficientUsageCreditError(),
+            error: createInsufficientUsageCreditError({
+              availableSubunits,
+              requiredSubunits: reservationAmountSubunits,
+            }),
           };
         }
         const reservation: CreditReservation = {
@@ -2565,7 +2571,10 @@ export class UsageAccount {
           const availableSubunits = totals.ledgerBalanceSubunits - totals.reservedSubunits;
           if (availableSubunits < reservationAmountSubunits) {
             return {
-              error: createInsufficientUsageCreditError(),
+              error: createInsufficientUsageCreditError({
+                availableSubunits,
+                requiredSubunits: reservationAmountSubunits,
+              }),
             };
           }
           this.storage.kv.put<CreditReservation>(RESERVATION_PREFIX + operationId, {

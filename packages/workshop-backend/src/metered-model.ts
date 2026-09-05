@@ -14,9 +14,11 @@ import type {
 import type { UserDurableObject } from "./user.js";
 import { createWorkshopLogger } from "./observability.js";
 import {
+  getInsufficientUsageCreditAmounts,
   getUsageCreditErrorCode,
   USAGE_CREDIT_ERROR_CODES,
   type AiModelProvider,
+  type InsufficientUsageCreditAmounts,
   type ModelChargeSnapshot,
 } from "@gadgets/workshop-shared/api";
 
@@ -194,7 +196,10 @@ export function meterModelHandle(
                 operation.reservationBound,
               );
               if (begun.status === "insufficient-credit") {
-                meteringFailure = {code: USAGE_CREDIT_ERROR_CODES.insufficientCredit};
+                meteringFailure = {
+                  code: USAGE_CREDIT_ERROR_CODES.insufficientCredit,
+                  insufficientUsageCredit: begun.amounts,
+                };
                 throw new Error("Insufficient Usage Credit.");
               }
             } else {
@@ -209,7 +214,13 @@ export function meterModelHandle(
             return finalPayload;
           } catch (error) {
             const code = getUsageCreditErrorCode(error);
-            if (code !== undefined) meteringFailure = {code};
+            const amounts = getInsufficientUsageCreditAmounts(error);
+            if (code !== undefined || amounts !== undefined) {
+              meteringFailure = {
+                code,
+                insufficientUsageCredit: amounts,
+              };
+            }
             throw error;
           }
         },
@@ -325,10 +336,12 @@ function messageFromEvent(event: AssistantMessageEvent): AssistantMessage {
 
 type MeteringFailure = {
   code?: string;
+  insufficientUsageCredit?: InsufficientUsageCreditAmounts;
 };
 
 type MeteredAssistantMessage = AssistantMessage & {
   usageCreditErrorCode?: string;
+  insufficientUsageCredit?: InsufficientUsageCreditAmounts;
 };
 
 function annotateMeteringFailure(
@@ -340,6 +353,9 @@ function annotateMeteringFailure(
     error: {
       ...error,
       ...(failure.code ? {usageCreditErrorCode: failure.code} : {}),
+      ...(failure.insufficientUsageCredit
+        ? {insufficientUsageCredit: failure.insufficientUsageCredit}
+        : {}),
     },
   };
 }

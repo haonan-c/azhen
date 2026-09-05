@@ -439,6 +439,7 @@
   "conversation_connection_set_up": "Set up",
   "conversation_error": "Error",
   "conversation_error_prefix": "Error: ",
+  "conversation_insufficient_usage_credit": "Not enough Usage Credits. Available balance: {available}; this operation requires: {required}.",
   "conversation_insufficient_usage_credit_fallback": "Not enough Usage Credits for this operation.",
   "conversation_insufficient_usage_credit_link": "View your Usage Credit balance",
   "conversation_legacy_usage_limit": "This message came from a retired usage limit. Retry to use the current Usage Credits.",

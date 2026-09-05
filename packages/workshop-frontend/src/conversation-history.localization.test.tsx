@@ -350,7 +350,7 @@ describe('localized conversation history', () => {
     expect(onOpenGadget).toHaveBeenCalledWith(11)
   }, 15_000)
 
-  it('states no amount and offers the balance link after a rejected reservation', async () => {
+  it('shows the localized Usage Credit amounts and balance link after a rejected reservation', async () => {
     window.history.replaceState({}, '', '/zh/workspace/7')
     const disposable = { [Symbol.dispose]: vi.fn<() => void>() }
     const overseer = {
@@ -375,6 +375,10 @@ describe('localized conversation history', () => {
         type: 'error',
         code: 'INSUFFICIENT_USAGE_CREDIT',
         message: 'Insufficient Usage Credit.',
+        insufficientUsageCredit: {
+          availableSubunits: 0n,
+          requiredSubunits: 2_000_000_000_000_000_000n,
+        },
       }]}),
     } as unknown as RpcStub<Overseer>
 
@@ -397,9 +401,7 @@ describe('localized conversation history', () => {
       />,
     ))
 
-    // No amount is stated: the chat is workspace-wide, and a balance belongs to one collaborator.
-    expect(container.textContent).toContain('错误：使用额度不足，无法执行本次操作。')
-    expect(container.textContent).not.toContain('可用余额')
+    expect(container.textContent).toContain('错误：使用额度不足。可用余额：0；本次需要：2。')
     const balanceLink = [...container.querySelectorAll<HTMLAnchorElement>('a')]
       .find(anchor => anchor.textContent === '查看使用额度余额')
     expect(balanceLink?.getAttribute('href')).toBe('/zh/profile#usage')
@@ -422,8 +424,7 @@ describe('localized conversation history', () => {
     ))
 
     expect(container.textContent)
-      .toContain('Error: Not enough Usage Credits for this operation.')
-    expect(container.textContent).not.toContain('Available balance')
+      .toContain('Error: Not enough Usage Credits. Available balance: 0; this operation requires: 2.')
     const englishBalanceLink = [...container.querySelectorAll<HTMLAnchorElement>('a')]
       .find(anchor => anchor.textContent === 'View your Usage Credit balance')
     expect(englishBalanceLink?.getAttribute('href')).toBe('/profile#usage')

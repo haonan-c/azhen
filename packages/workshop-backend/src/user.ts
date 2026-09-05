@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, USAGE_CREDIT_ERROR_CODES, getUsageCreditErrorCode, type UsageCreditBalanceSubscriber } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, USAGE_CREDIT_ERROR_CODES, getUsageCreditErrorCode, getInsufficientUsageCreditAmounts, type InsufficientUsageCreditAmounts, type UsageCreditBalanceSubscriber } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, type BillableOperation, type BillableOperationAuthorizer, type BillableOperationOutcome } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget } from "cloudflare:workers";
@@ -1147,7 +1147,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       chargeSnapshot: ModelChargeSnapshot,
       reservationBound: ModelUsageReservationBound): Promise<
         {status: "begun"; attempt: ModelMeteringAttempt} |
-        {status: "insufficient-credit"}>
+        {status: "insufficient-credit"; amounts: InsufficientUsageCreditAmounts}>
   {
     try {
       return {
@@ -1163,7 +1163,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       if (getUsageCreditErrorCode(error) !== USAGE_CREDIT_ERROR_CODES.insufficientCredit) {
         throw error;
       }
-      return {status: "insufficient-credit"};
+      const amounts = getInsufficientUsageCreditAmounts(error);
+      if (!amounts) throw error;
+      return {status: "insufficient-credit", amounts};
     }
   }
 
