@@ -997,12 +997,24 @@ three-arm discriminated union with `startedAt` present only on the two dated arm
 shape matches the declaration with nothing widened. Every new exported member carries a doc comment,
 as the kernel rule requires.
 
-`pnpm test` has one intermittent failure on this host, and no other:
-`deepseek-agent-billing` > "traces owner and two collaborators through App, Action, restart, and
-Scheduler", filed as [#79](https://github.com/haonan-c/azhen/issues/79). A runtime restart re-runs
-the agent's Scheduler Hook registration turn, so the test sees two registrations instead of one. It
-fails the same way with the #78 fix reverted, and it is not on the Usage Credit path. Six full-file
-runs with the fix gave three clean and three failed.
+`pnpm test` passes. It carried one intermittent failure for most of this branch's life,
+`deepseek-agent-billing`'s two Scheduler tracers, filed as
+[#79](https://github.com/haonan-c/azhen/issues/79) and now fixed.
+
+That entry read "a runtime restart re-runs the agent's Scheduler Hook registration turn". It does
+not. Timestamping every registration request the provider received showed the two arriving 1.1s
+apart, back to back with no reload between them: the agent retrying a model request, not a turn
+re-running. Only one Hook was ever created, which the test's own `waitFor` already required. The
+assertion had pinned a retryable model call to exactly one attempt, where the same test models the
+call three lines below it as a bounded range; it now matches.
+
+The sibling tracer had a second, unrelated cause. It enabled its Hook after the restart while the
+callback counted down on a wall clock the restart does not wait for, and `ScheduleDriver` leaves a
+delivery whose Hook is off for `RECOVERY_DELAY_MS` — five minutes — so once the restart outran the
+15s horizon the test waited 40s for a call already dropped. The Hook is now enabled before the
+restart, which also makes the restart prove more: the capability is one that survived it and has to
+re-acquire the Overseer. Under six CPU burners that test failed 3 of 3 before and passes 3 of 3
+after; the whole file passes 3 of 3 unloaded. Fixed in `f7157eb`.
 
 A second failure was recorded here and has since been fixed, which is worth keeping because the
 reasoning that first dismissed it was wrong. `usage-projection.test.ts` > "rebuilds a new
@@ -1130,9 +1142,15 @@ one failure rather than stopping partway.
 [#80](https://github.com/haonan-c/azhen/issues/80) was then reproduced and fixed, and the gate
 table was re-run a fourth time at `c8496f7` with the same results.
 
-Acceptance therefore still needs [#79](https://github.com/haonan-c/azhen/issues/79) and nothing
-else. [#82](https://github.com/haonan-c/azhen/issues/82) is a health-field misreport found on the
-way and is not on the acceptance path.
+[#79](https://github.com/haonan-c/azhen/issues/79) was then fixed, and the gate table was re-run a
+fifth time at `f7157eb`. **`pnpm test` passes with no failure**, which it had not done on this
+branch before.
+
+Every gate in the table above now passes, and no issue remains on the acceptance path.
+[#82](https://github.com/haonan-c/azhen/issues/82) is a health-field misreport found on the way and
+is not one; the question #79 opened, whether an agent turn interrupted mid-flight may re-run its
+`executeCode`, is a fair question that this branch's evidence does not answer and does not depend
+on.
 
 No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
 Issue closure is part of this verification branch.
