@@ -1152,5 +1152,27 @@ is not one; the question #79 opened, whether an agent turn interrupted mid-fligh
 `executeCode`, is a fair question that this branch's evidence does not answer and does not depend
 on.
 
-No PR, deployment, upload, release promotion, production charging change, worktree deletion, or
-Issue closure is part of this verification branch.
+## Closure
+
+The Issue is closed on this evidence, which is the one line of the original scope statement that
+has changed: closure was excluded while any gate was open, and none is.
+
+What that closure does and does not assert:
+
+- The **amended reduced target** is met, not the full one. Registered Users and the aligned
+  one-second peak reach 100% of target; daily active Users and rolling thirty-day records stay at
+  one fifth by construction, and the three measurements showing the full profile is not reachable
+  on this host stand as written above.
+- The evidence is a **complete formal driver run**, accepted by the driver's own
+  `validateCapacityResult` and privacy scan, not a hand-assembled capacity step.
+- Four defects were found and fixed on the way, none of them in the original scope:
+  [#78](https://github.com/haonan-c/azhen/issues/78),
+  [#79](https://github.com/haonan-c/azhen/issues/79),
+  [#80](https://github.com/haonan-c/azhen/issues/80) and
+  [#81](https://github.com/haonan-c/azhen/issues/81). Their fixes live on this branch and have not
+  been merged.
+- [#82](https://github.com/haonan-c/azhen/issues/82) stays open. It is a health-field misreport, off
+  the acceptance path, and it is not fixed here.
+
+No PR, deployment, upload, release promotion, production charging change, or worktree deletion is
+part of this verification branch. Merging it remains a separate decision.
